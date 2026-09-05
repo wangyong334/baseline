@@ -2,7 +2,6 @@
 import gc
 import hashlib
 import json
-import math
 import os
 from pathlib import Path
 
@@ -284,46 +283,13 @@ def smoke(split):
     print("DUAL FP32 TWO-STEP SMOKE TEST: OK", flush=True)
 
 
-def linear_epoch_lr(epoch, epochs, start_lr, end_lr):
-    """Epoch 0 uses start_lr; epoch epochs-1 uses end_lr (inclusive)."""
-    if epochs < 2:
-        raise ValueError("Linear LR requires at least 2 epochs")
-    if not (math.isfinite(start_lr) and math.isfinite(end_lr)
-            and 0 < end_lr <= start_lr):
-        raise ValueError("Require finite 0 < lr_end <= lr for linear decay")
-    if epoch <= 0:
-        return start_lr
-    if epoch >= epochs - 1:
-        return end_lr
-    return start_lr + (end_lr - start_lr) * epoch / (epochs - 1)
-
-
-def lr_policy(config):
-    """Old YAML files retain the original StepLR behavior."""
-    name = getattr(config, "lr_schedule", "step")
-    if name == "step":
-        return {"name": "step", "start_lr": config.lr,
-                "step_size": 10, "gamma": 0.1}
-    if name != "linear":
-        raise ValueError("lr_schedule must be step or linear")
-    end_lr = getattr(config, "lr_end", None)
-    if end_lr is None:
-        raise ValueError("Linear LR requires explicit lr_end in YAML")
-    linear_epoch_lr(0, config.epochs, config.lr, end_lr)
-    return {"name": "linear", "start_lr": config.lr, "end_lr": end_lr,
-            "epochs": config.epochs, "endpoint": "last training epoch"}
-
-
 def train(split):
-    policy = lr_policy(cfg)  # Validate before creating any experiment directory.
     setup(37)
-    print("LR policy:", json.dumps(policy), flush=True)
     # Exclusive new directory prevents accidental overwrite of previous experiments.
     root = Path(cfg.model_save_root)
     root.mkdir(parents=True, exist_ok=False)
     (root / "run_config.json").write_text(json.dumps({
         "config": vars(cfg), "split": split, "precision": "FP32, AMP off",
-        "lr_policy": policy,
         "visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "torch": torch.__version__, "gpu_names": [torch.cuda.get_device_name(i) for i in (0, 1)],
         "validation": "eval mode; epochs >= 40; foreground IoU threshold 0.9",
@@ -339,16 +305,10 @@ def train(split):
     loader = make_loader(train_data, True)
     criterion = STCLoss(k=cfg.k, t=cfg.t, cfg=cfg).cuda(0)
     optimizer = torch.optim.Adam(net.parameters(), lr=cfg.lr)
-    scheduler = (torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
-                 if policy["name"] == "step" else None)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
     val_loader = make_loader(make_dataset("val"), False)
     best_iou, best_loss = -float("inf"), float("inf")
     for epoch in range(cfg.epochs):
-        if policy["name"] == "linear":
-            for group in optimizer.param_groups:
-                group["lr"] = linear_epoch_lr(epoch, cfg.epochs, cfg.lr, policy["end_lr"])
-        epoch_lr = optimizer.param_groups[0]["lr"]
-        print("EPOCH_START epoch=%d lr=%.12g" % (epoch, epoch_lr), flush=True)
         net.train()
         total = 0.0
         memory(reset=True)
@@ -370,12 +330,7 @@ def train(split):
             progress.set_postfix(loss=value)
             del preds, loss, batch
         optimizer.zero_grad(set_to_none=True)
-        if scheduler is not None:
-            scheduler.step()
-        else:
-            # Match existing next_lr logging; hold the endpoint after the last epoch.
-            for group in optimizer.param_groups:
-                group["lr"] = linear_epoch_lr(epoch + 1, cfg.epochs, cfg.lr, policy["end_lr"])
+        scheduler.step()
         mean_loss = total / len(loader)
         if mean_loss < best_loss:
             best_loss = mean_loss
@@ -402,7 +357,7 @@ def train(split):
                 torch.save(cpu_state(net), root / "best_iou_seed37.pt")
             del evaluator
         torch.save(cpu_state(net), root / "last_seed37.pt")
-        record = {"epoch": epoch, "mean_batch_loss": mean_loss, "lr": epoch_lr,
+        record = {"epoch": epoch, "mean_batch_loss": mean_loss,
                   "val_iou": val_iou, "next_lr": optimizer.param_groups[0]["lr"],
                   "memory": memory()}
         with (root / "metrics.jsonl").open("a", encoding="utf-8") as stream:
