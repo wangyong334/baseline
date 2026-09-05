@@ -1,0 +1,4 @@
+# ninja log v7
+0	13085	1782125034658665623	/home/a/chennuo/EV-UAV-main/lib/hais_ops/build/temp.linux-x86_64-cpython-39/src/cuda.o	1a25f1b07b1d6cd9
+0	17001	1782125034658665623	/home/a/chennuo/EV-UAV-main/lib/hais_ops/build/temp.linux-x86_64-cpython-39/src/hais_ops.o	e580871dfb1767de
+1	19734	1782125034658665623	/home/a/chennuo/EV-UAV-main/lib/hais_ops/build/temp.linux-x86_64-cpython-39/src/hais_ops_api.o	9d0b88c22f60dd94
