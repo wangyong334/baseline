@@ -1,0 +1,40 @@
+# Local rate-coding hybrid: T is NOT physical event time. From-scratch seed 37.
+STRUCTURE:
+  model_name: evissgnet
+  width: 12
+  block_residual: True
+  block_reps: 2
+  use_coords: True
+DATA:
+  input_channel: 4
+  root: /media/stephen/nvme0n1/wy_data/datasets/EV-UAV-dataset
+  whole_t: 8000
+  res: [346, 260]
+TRAIN:
+  epochs: 50
+  batch_size: 1
+  train_workers: 0
+  optim: Adam
+  lr: 0.001
+  lr_schedule: linear
+  lr_end: 0.0001
+  k: 3
+  t: 5
+  max_events_num: 700000
+  model_save_root: log/snn_v0_localrate_T4_seed37
+SNN:
+  seed: 37
+  snn_steps: 4
+  snn_beta: 0.9
+  snn_threshold: 1.0
+  snn_stages: [3, 4]
+  diagnostic_interval: 20
+  validation_start: 40
+TEST:
+  vis: False
+  eval: True
+  roc: True
+  pd_detT: 50
+  correct_thresh: 0.0001
+  save: False
+  model_path: log/snn_v0_localrate_T4_seed37/best_iou_seed37.pt
