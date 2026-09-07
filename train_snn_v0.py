@@ -151,6 +151,10 @@ def snapshot(root, variant, mode, split):
              "utils/eval.py", "dataset/ev_uav.py", "dataset/basedataset.py",
              "configs/configs.py", "utils/semantic_cpu.py"]
     hashes = {}
+    if variant == "clip":
+        names.append("model/evspsegnet_clip_v0.py")
+    if variant == "quant":
+        names.extend(["model/evspsegnet_quant_v0.py", "model/quant_rate.py"])
     for name in names:
         src = source_root / name
         dst = root / "source" / name
@@ -163,7 +167,11 @@ def snapshot(root, variant, mode, split):
               "precision": "FP32", "torch": torch.__version__,
               "gpus": [torch.cuda.get_device_name(d) for d in (0, 1)],
               "source_sha256": hashes,
-              "protocol": "Local constant-current LIF rate code; no physical-time streaming; no energy claim"}
+              "protocol": ("Static five-level nearest quantization with half-up ties; Hardtanh-mask STE; no time, membrane or energy claim"
+                           if variant == "quant" else
+                           "Continuous clip(x,0,1), ordinary Hardtanh gradient; no spikes or membrane; same activation sites"
+                           if variant == "clip" else
+                           "Local constant-current LIF rate code; no physical-time streaming; no energy claim")}
     (root / "run_config.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
 
 
@@ -173,8 +181,8 @@ def main():
     torch.cuda.set_device(0)
     mode = os.environ.get("EVUAV_MODE", "smoke")
     variant = os.environ.get("EVUAV_VARIANT", "snn")
-    if mode not in ("smoke", "overfit", "train", "test") or variant not in ("ann", "snn"):
-        raise ValueError("mode=smoke/overfit/train/test; variant=ann/snn")
+    if mode not in ("smoke", "overfit", "train", "test") or variant not in ("ann", "snn", "clip", "quant"):
+        raise ValueError("mode=smoke/overfit/train/test; variant=ann/snn/clip/quant")
     split = int(os.environ.get("EVUAV_MP_SPLIT", "2"))
     if cfg.diagnostic_interval < 1:
         raise ValueError("diagnostic_interval must be positive")
@@ -190,13 +198,27 @@ def main():
     root = None
     if mode in ("train", "overfit"):
         default = cfg.model_save_root if mode == "train" else cfg.model_save_root + "_overfit"
-        if variant == "ann" and not os.environ.get("EVUAV_RUN_DIR"):
-            raise ValueError("ANN control requires its own EVUAV_RUN_DIR")
+        if variant in ("ann", "clip", "quant") and not os.environ.get("EVUAV_RUN_DIR"):
+            raise ValueError("Control variant requires its own EVUAV_RUN_DIR")
         root = Path(os.environ.get("EVUAV_RUN_DIR", default))
         snapshot(root, variant, mode, split)
-    net = (evspsegnet_snn_v0(cfg, split) if variant == "snn" else evspsegnet_mp(cfg, split))
+    if variant == "quant":
+        from model.evspsegnet_quant_v0 import evspsegnet_quant_v0
+        net = evspsegnet_quant_v0(cfg, split)
+    elif variant == "clip":
+        from model.evspsegnet_clip_v0 import evspsegnet_clip_v0
+        net = evspsegnet_clip_v0(cfg, split)
+    else:
+        net = (evspsegnet_snn_v0(cfg, split) if variant == "snn" else evspsegnet_mp(cfg, split))
     emit({"mode": mode, "variant": variant, "seed": cfg.seed,
           "spike_sites": getattr(net, "spike_sites", []), "steps": cfg.snn_steps})
+    if variant == "clip":
+        emit({"activation": "clip(x,0,1)", "activation_sites": net.activation_sites,
+              "spiking": False, "note": "snn_steps/beta unused; normal Hardtanh gradient"})
+    if variant == "quant":
+        emit({"activation": "floor(4*clip(x,0,1)+0.5)/4", "activation_sites": net.activation_sites,
+              "spiking": False, "gradient": "STE: 1 for 0<x<1, otherwise 0",
+              "note": "No time steps; shares output levels but NOT the LIF input-output mapping"})
     if mode == "test":
         checkpoint = Path(os.environ.get("EVUAV_CHECKPOINT", cfg.model_path))
         metadata = checkpoint.parent / "run_config.json"
