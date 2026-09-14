@@ -20,6 +20,25 @@ from utils.stcloss import STCLoss
 from utils.eval import evalute
 
 
+def run_seed():
+    """Seed comes from YAML (or EVUAV_SEED); 37 keeps older configs reproducible."""
+    value = os.environ.get("EVUAV_SEED")
+    if value is None:
+        value = getattr(cfg, "seed", 37)
+    seed = int(value)
+    if seed < 0:
+        raise ValueError("seed must be non-negative")
+    return seed
+
+
+def validation_start():
+    """First epoch that runs validation. Default 0 = validate every epoch."""
+    start = int(getattr(cfg, "validation_start", 0))
+    if not 0 <= start < cfg.epochs:
+        raise ValueError("validation_start must be within [0, epochs)")
+    return start
+
+
 def finite(tensor, name):
     if not torch.isfinite(tensor).all().item():
         raise RuntimeError("Nonfinite value: " + name)
@@ -183,7 +202,7 @@ def compare(split):
     clear_unused()
 
     def run(label, parallel):
-        setup(37)
+        setup(run_seed())
         net = evspsegnet_mp(cfg, split) if parallel else evspsegnet(cfg).cuda(0)
         net.train()
         initial = cpu_state(net)
@@ -249,7 +268,7 @@ def compare(split):
 
 
 def smoke(split):
-    setup(37)
+    setup(run_seed())
     net = evspsegnet_mp(cfg, split).train()
     dataset = make_dataset("train")
     criterion = STCLoss(k=cfg.k, t=cfg.t, cfg=cfg).cuda(0)
@@ -314,19 +333,55 @@ def lr_policy(config):
             "epochs": config.epochs, "endpoint": "last training epoch"}
 
 
+def final_summary(history, seed, policy, tail=5):
+    """Report the mean over the final epochs, not just the best single epoch.
+
+    `best_val_iou` is a maximum over noisy per-epoch evaluations and is therefore
+    optimistically biased; `final_mean_iou` is the statistic to compare across
+    seeds and across methods.
+    """
+    scored = [record for record in history if record.get("val_iou") is not None]
+    summary = {"seed": seed, "lr_policy": policy,
+               "epochs_completed": len(history),
+               "validated_epochs": len(scored)}
+    if not scored:
+        return summary
+    ious = [record["val_iou"] for record in scored]
+    accs = [record["val_acc"] for record in scored
+            if record.get("val_acc") is not None]
+    window = min(tail, len(scored))
+    tail_ious = ious[-window:]
+    tail_accs = accs[-window:] if accs else []
+    summary.update({
+        "best_val_iou": max(ious),
+        "best_val_iou_epoch": scored[int(np.argmax(ious))]["epoch"],
+        "final_epoch_iou": ious[-1],
+        "final_window": window,
+        "final_mean_iou": float(np.mean(tail_ious)),
+        "final_std_iou": float(np.std(tail_ious, ddof=1)) if window > 1 else 0.0,
+        "final_mean_acc": float(np.mean(tail_accs)) if tail_accs else None,
+        "selection_bias_gap": max(ious) - float(np.mean(tail_ious)),
+    })
+    return summary
+
+
 def train(split):
     policy = lr_policy(cfg)  # Validate before creating any experiment directory.
-    setup(37)
+    seed = run_seed()
+    val_start = validation_start()
+    setup(seed)
     print("LR policy:", json.dumps(policy), flush=True)
+    print("Seed:", seed, "validation from epoch:", val_start, flush=True)
     # Exclusive new directory prevents accidental overwrite of previous experiments.
     root = Path(cfg.model_save_root)
     root.mkdir(parents=True, exist_ok=False)
     (root / "run_config.json").write_text(json.dumps({
         "config": vars(cfg), "split": split, "precision": "FP32, AMP off",
-        "lr_policy": policy,
+        "lr_policy": policy, "seed": seed, "validation_start": val_start,
         "visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "torch": torch.__version__, "gpu_names": [torch.cuda.get_device_name(i) for i in (0, 1)],
-        "validation": "eval mode; epochs >= 40; foreground IoU threshold 0.9",
+        "validation": ("eval mode; epochs >= %d; foreground IoU threshold 0.9"
+                       % val_start),
         "source_sha256": {
             name: hashlib.sha256((Path(__file__).resolve().parent / name).read_bytes()).hexdigest()
             for name in ("train_mp.py", "model/evspsegnet_mp.py", "model/evspsegnet.py",
@@ -343,6 +398,7 @@ def train(split):
                  if policy["name"] == "step" else None)
     val_loader = make_loader(make_dataset("val"), False)
     best_iou, best_loss = -float("inf"), float("inf")
+    history = []
     for epoch in range(cfg.epochs):
         if policy["name"] == "linear":
             for group in optimizer.param_groups:
@@ -379,9 +435,10 @@ def train(split):
         mean_loss = total / len(loader)
         if mean_loss < best_loss:
             best_loss = mean_loss
-            torch.save(cpu_state(net), root / "best_loss_seed37.pt")
+            torch.save(cpu_state(net), root / ("best_loss_seed%d.pt" % seed))
         val_iou = None
-        if epoch >= 40:
+        val_acc = None
+        if epoch >= val_start:
             net.eval()
             evaluator = evalute(cfg)
             with torch.no_grad():
@@ -395,20 +452,28 @@ def train(split):
                     }
                     del preds, voxel, mapping, batch
             val_iou = evaluator.evaluate_semantic_segmantation_miou().item()
+            val_acc = evaluator.evaluate_semantic_segmantation_accuracy().item()
             if not np.isfinite(val_iou):
                 raise RuntimeError("Nonfinite validation IoU")
             if val_iou > best_iou:
                 best_iou = val_iou
-                torch.save(cpu_state(net), root / "best_iou_seed37.pt")
+                torch.save(cpu_state(net), root / ("best_iou_seed%d.pt" % seed))
             del evaluator
-        torch.save(cpu_state(net), root / "last_seed37.pt")
+        torch.save(cpu_state(net), root / ("last_seed%d.pt" % seed))
         record = {"epoch": epoch, "mean_batch_loss": mean_loss, "lr": epoch_lr,
-                  "val_iou": val_iou, "next_lr": optimizer.param_groups[0]["lr"],
+                  "val_iou": val_iou, "val_acc": val_acc, "seed": seed,
+                  "next_lr": optimizer.param_groups[0]["lr"],
                   "memory": memory()}
         with (root / "metrics.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record) + "\n")
         print(json.dumps(record), flush=True)
+        history.append(record)
         clear_unused()
+
+    summary = final_summary(history, seed, policy)
+    (root / "summary.json").write_text(
+        json.dumps(summary, indent=2), encoding="utf-8")
+    print("SUMMARY_JSON", json.dumps(summary, sort_keys=True), flush=True)
     print("TRAINING FINISHED:", root, flush=True)
 
 

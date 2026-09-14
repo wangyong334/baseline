@@ -1,0 +1,39 @@
+# Corrected baseline protocol. Differs from evisseg_evuav_mp_linear.yaml in:
+#   - lr / lr_end follow the paper (1e-2 -> 1e-3), not the released 1e-3 -> 1e-4
+#   - validation_start: 0 (validate every epoch, not only the last 10)
+#   - seed is explicit so a run is reproducible from its config alone
+# Everything else (FP32, split=2, batch_size 1, 700k events, 50 epochs) is unchanged.
+STRUCTURE:
+  model_name: evissgnet
+  width: 12
+  block_residual: True
+  block_reps: 2
+  use_coords: True
+DATA:
+  input_channel: 4
+  root: /media/stephen/nvme0n1/wy_data/datasets/EV-UAV-dataset
+  whole_t: 8000
+  res: [346, 260]
+TRAIN:
+  epochs: 50
+  batch_size: 1
+  train_workers: 0
+  optim: Adam
+  lr: 0.01
+  lr_schedule: linear
+  lr_end: 0.001
+  k: 3
+  t: 5
+  stc_gamma: 1.0
+  max_events_num: 700000
+  seed: 37
+  validation_start: 0
+  model_save_root: log/baseline_v2_paperlr_seed37
+TEST:
+  vis: False
+  eval: True
+  roc: True
+  pd_detT: 50
+  correct_thresh: 0.0001
+  save: True
+  model_path: log/baseline_v2_paperlr_seed37/best_iou_seed37.pt
