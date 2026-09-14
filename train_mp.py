@@ -31,6 +31,15 @@ def run_seed():
     return seed
 
 
+def save_root():
+    """Experiment directory: EVUAV_SAVE_ROOT overrides YAML model_save_root.
+
+    Lets one config serve a multi-seed sweep without editing the YAML, since
+    the directory is created with exist_ok=False to prevent overwriting a run.
+    """
+    return Path(os.environ.get("EVUAV_SAVE_ROOT") or cfg.model_save_root)
+
+
 def validation_start():
     """First epoch that runs validation. Default 0 = validate every epoch."""
     start = int(getattr(cfg, "validation_start", 0))
@@ -373,11 +382,13 @@ def train(split):
     print("LR policy:", json.dumps(policy), flush=True)
     print("Seed:", seed, "validation from epoch:", val_start, flush=True)
     # Exclusive new directory prevents accidental overwrite of previous experiments.
-    root = Path(cfg.model_save_root)
+    root = save_root()
     root.mkdir(parents=True, exist_ok=False)
+    print("Save root:", root, flush=True)
     (root / "run_config.json").write_text(json.dumps({
         "config": vars(cfg), "split": split, "precision": "FP32, AMP off",
         "lr_policy": policy, "seed": seed, "validation_start": val_start,
+        "save_root": str(root),
         "visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "torch": torch.__version__, "gpu_names": [torch.cuda.get_device_name(i) for i in (0, 1)],
         "validation": ("eval mode; epochs >= %d; foreground IoU threshold 0.9"
@@ -451,8 +462,7 @@ def train(split):
                         "seg_gt": batch["seg_label"].reshape(-1).cpu(),
                     }
                     del preds, voxel, mapping, batch
-            val_iou = evaluator.evaluate_semantic_segmantation_miou().item()
-            val_acc = evaluator.evaluate_semantic_segmantation_accuracy().item()
+            val_iou, val_acc = evaluator.evaluate_iou_and_accuracy()
             if not np.isfinite(val_iou):
                 raise RuntimeError("Nonfinite validation IoU")
             if val_iou > best_iou:

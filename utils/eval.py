@@ -56,6 +56,33 @@ class evalute():
         fa = self.false_num / (self.frame_num * 346 * 260)
         return pd, fa
 
+    def evaluate_iou_and_accuracy(self, thresh=0.9):
+        """Both metrics in one pass, without mutating anything in self.matches.
+
+        The two functions below threshold their concatenated tensors in place and
+        expect device-consistent inputs, so calling them back to back on the same
+        stored predictions is unsafe. Validation uses this method instead; the
+        originals are left untouched so test.py reproduces published numbers.
+        """
+        if not self.matches:
+            raise RuntimeError('No predictions accumulated')
+        gt = torch.cat([v['seg_gt'].detach().reshape(-1).float().cpu()
+                        for v in self.matches.values()], dim=0)
+        pred = torch.cat([v['seg_pred'].detach().reshape(-1).float().cpu()
+                          for v in self.matches.values()], dim=0)
+        if gt.shape != pred.shape:
+            raise RuntimeError('Prediction/label length mismatch: %s vs %s'
+                               % (tuple(pred.shape), tuple(gt.shape)))
+        # Out-of-place threshold; the stored tensors keep their raw probabilities.
+        binary = (pred >= thresh)
+        positive = (gt == 1)
+        intersection = (positive & binary).sum().item()
+        union = (positive | binary).sum().item()
+        iou = intersection / union if union else float('nan')
+        total = positive.sum().item()
+        accuracy = (binary[positive].sum().item() / total) if total else float('nan')
+        return iou, accuracy
+
     def evaluate_semantic_segmantation_miou(self, thresh=0.9):
         seg_gt_list = []
         seg_pred_list = []
