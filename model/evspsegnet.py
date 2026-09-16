@@ -122,22 +122,30 @@ class evspsegnet(nn.Module):
             block(width, width, 3, norm_fn=norm_fn, padding=1, indice_key='subm1',conv_type='gd'),
         )
 
+        # 基线 K5 修复：时间核宽 3、步长 4、padding 1 时，本层输入 t%4==2 无直接下采样连接。
+        # 仅将三对下采样/逆卷积核改为 [3,3,5]，保留空间核、步长、padding 和其他模块。
+        # 与已验证的 K5 实验一致；旧 K3 基线权重形状不兼容，需使用 K5 权重或从头训练。
         self.conv2 = spconv.SparseSequential(
-            block(width, 2*width, 3, norm_fn=norm_fn, stride=[2,2,4], padding=1, indice_key='spconv2', conv_type='spconv'),
+            # 原基线：block(width, 2*width, 3, norm_fn=norm_fn, stride=[2,2,4], padding=1, indice_key='spconv2', conv_type='spconv'),
+            block(width, 2*width, [3,3,5], norm_fn=norm_fn, stride=[2,2,4], padding=1, indice_key='spconv2', conv_type='spconv'),
             block(2*width, 2*width, 3, norm_fn=norm_fn, padding=1, indice_key='subm2', conv_type='gd',ad_channels=16),
         )
         self.pa2 = patch_attention(2*width, (176, 144, 2048), indice_key='pa2')
 
         self.conv3 = spconv.SparseSequential(
 
-            block(2*width, 4*width, 3, norm_fn=norm_fn, stride=[2,2,4], padding=1, indice_key='spconv3', conv_type='spconv'),
+            # 原基线：block(2*width, 4*width, 3, norm_fn=norm_fn, stride=[2,2,4], padding=1, indice_key='spconv3', conv_type='spconv'),
+            # 补齐本层时间下采样覆盖，配对的 inv_conv3 同步使用 K5。
+            block(2*width, 4*width, [3,3,5], norm_fn=norm_fn, stride=[2,2,4], padding=1, indice_key='spconv3', conv_type='spconv'),
             block(4*width, 4*width, 3, norm_fn=norm_fn, padding=1, indice_key='subm3', conv_type='gd',ad_channels=8),
         )
         self.pa3 = patch_attention(4*width, (88, 72, 512), indice_key='pa3')
 
         self.conv4 = spconv.SparseSequential(
 
-            block(4*width, 4*width, 3, norm_fn=norm_fn, stride=[2,2,4], padding=1, indice_key='spconv4', conv_type='spconv'),
+            # 原基线：block(4*width, 4*width, 3, norm_fn=norm_fn, stride=[2,2,4], padding=1, indice_key='spconv4', conv_type='spconv'),
+            # 补齐本层时间下采样覆盖，配对的 inv_conv4 同步使用 K5。
+            block(4*width, 4*width, [3,3,5], norm_fn=norm_fn, stride=[2,2,4], padding=1, indice_key='spconv4', conv_type='spconv'),
             block(4*width, 4*width, 3, norm_fn=norm_fn, padding=1, indice_key='subm4', conv_type='gd',ad_channels=0),
         )
         self.pa4 = patch_attention(4*width, (44, 36, 256), indice_key='pa4')
@@ -145,17 +153,23 @@ class evspsegnet(nn.Module):
         # decoder
         self.conv_up_t4 = SparseBasicBlock(4*width, 4*width, indice_key='subm4', norm_fn=norm_fn)
         self.conv_up_m4 = block(8*width, 4*width, 3, norm_fn=norm_fn, padding=1, indice_key='subm4',conv_type='gd')
-        self.inv_conv4 = block(4*width, 4*width, 3, norm_fn=norm_fn, indice_key='spconv4', conv_type='inverseconv')
+        # 原基线：self.inv_conv4 = block(4*width, 4*width, 3, norm_fn=norm_fn, indice_key='spconv4', conv_type='inverseconv')
+        # 逆卷积复用 spconv4 的连接索引，核尺寸必须与对应下采样一致。
+        self.inv_conv4 = block(4*width, 4*width, [3,3,5], norm_fn=norm_fn, indice_key='spconv4', conv_type='inverseconv')
 
 
         self.conv_up_t3 = SparseBasicBlock(4*width, 4*width, indice_key='subm3', norm_fn=norm_fn)
         self.conv_up_m3 = block(8*width, 4*width, 3, norm_fn=norm_fn, padding=1, indice_key='subm3',conv_type='gd')
-        self.inv_conv3 = block(4*width, 2*width, 3, norm_fn=norm_fn, indice_key='spconv3', conv_type='inverseconv')
+        # 原基线：self.inv_conv3 = block(4*width, 2*width, 3, norm_fn=norm_fn, indice_key='spconv3', conv_type='inverseconv')
+        # 与 spconv3 配对，保持下采样/逆卷积连接一致。
+        self.inv_conv3 = block(4*width, 2*width, [3,3,5], norm_fn=norm_fn, indice_key='spconv3', conv_type='inverseconv')
 
 
         self.conv_up_t2 = SparseBasicBlock(2*width, 2*width, indice_key='subm2', norm_fn=norm_fn)
         self.conv_up_m2 = block(4*width, 2*width, 3, norm_fn=norm_fn, indice_key='subm2',conv_type='gd')
-        self.inv_conv2 = block(2*width, width, 3, norm_fn=norm_fn, indice_key='spconv2', conv_type='inverseconv')
+        # 原基线：self.inv_conv2 = block(2*width, width, 3, norm_fn=norm_fn, indice_key='spconv2', conv_type='inverseconv')
+        # 与 spconv2 配对，保持下采样/逆卷积连接一致。
+        self.inv_conv2 = block(2*width, width, [3,3,5], norm_fn=norm_fn, indice_key='spconv2', conv_type='inverseconv')
 
 
         self.conv_up_t1 = SparseBasicBlock(width, width, indice_key='subm1', norm_fn=norm_fn)
