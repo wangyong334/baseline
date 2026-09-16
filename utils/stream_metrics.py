@@ -65,10 +65,18 @@ def first_detection_latencies(t, label, target_id, pred_prob, window_ms, thresho
                               correct_thresh, net_ms_per_window):
     """计算一个序列内每个目标的首次检出延迟。
 
-    检出条件（沿用原 Pd 判定）：某窗口内该目标的正标签事件中，
+    检出条件（判定式沿用原 Pd）：某窗口内该目标的正标签事件中，
         预测为正的数量 / 该目标本窗正事件数 >= correct_thresh
     额外要求至少 1 个事件被预测为正：correct_thresh=1e-4（默认配置）时两者等价，
     只有 correct_thresh=0 时才会不同（原判定会把"一个都没预测对"也算检出）。
+
+    ⚠ 分帧口径与原 roc_update 不同，两者的数不能互相替代：
+        本函数  windows = t // window_ms          —— 含边界，每个事件恰好落入一帧
+        原代码  (ts > i*T) & (ts < (i+1)*T)       —— 严格不等号，t 为 T 的整数倍时
+                                                     不落入任何一帧，被排除出 Pd/Fa
+    这里刻意用 t // window_ms：延迟是本仓库新增的指标，没有与论文对齐的包袱，
+    正确分帧比复刻原代码的边界行为更有意义。但因此"检出窗口 k_d"与原 Pd 的
+    "检出帧"在边界事件上可能不一致，报告时不要把两者当作同一口径。
     延迟定义：
         latency = (k_d + 1) * window_ms + net_ms_per_window - t_first
         k_d      首个满足检出条件的窗口

@@ -34,6 +34,8 @@ def parse_args():
                         help="名称=预测目录，可重复；例如 baseline=dump/baseline_test")
     parser.add_argument("--threshold", type=float, default=0.9)
     parser.add_argument("--window-ms", type=int, default=50)
+    parser.add_argument("--pd-detT", type=int, default=50,
+                        help="原 roc_update 的等效帧长，用于 D 组口径量化")
     parser.add_argument("--out-json", default=None)
     return parser.parse_args()
 
@@ -158,6 +160,59 @@ def check_b_readout_purity(stacked, names, window_ms):
     }
 
 
+def check_d_eval_caveats(stacked, names, threshold, det_t):
+    """D. 量化原仓库 utils/eval.py 里三处已知口径问题对 Pd/Fa 的实际影响。
+
+    这三处都在原仓库代码里，基线与 V1 同等受影响，所以**不要修改 eval.py**——
+    改了就和论文 0.5518、基线 v2 0.6188 都不可比。这里只量化，不修正。
+
+      D1 严格不等号：roc_update 用 (ts > i*T) & (ts < (i+1)*T)，
+         t 恰好是 T 的整数倍时不落入任何一帧，被静默排除出 Pd/Fa（IoU/ACC 不受影响）。
+      D2 分母差一：frame_num 累加 int(跨度/T)，但循环跑 int(跨度/T)+1 次，Fa 分母偏小。
+      D3 uint8 溢出：false_mask 用 uint8 累加，同一像素同一帧累计到 256 会归零，
+         该像素从连通域统计中消失。这里统计实际的单帧单像素最大虚警数。
+    """
+    ref = stacked[names[0]]
+    t = ref["t"]
+    n = int(t.shape[0])
+    det_t = int(det_t)
+
+    on_boundary = (t % det_t) == 0
+    n_b = int(np.count_nonzero(on_boundary))
+    pos = ref["label"] == 1
+    out = {
+        "D1_boundary_excluded": {
+            "events": n_b,
+            "ratio": n_b / n if n else float("nan"),
+            "positive_events": int(np.count_nonzero(on_boundary & pos)),
+            "pos_ratio_on_boundary": (float(np.count_nonzero(on_boundary & pos)) / n_b) if n_b else float("nan"),
+            "pos_ratio_overall": float(np.count_nonzero(pos)) / n if n else float("nan"),
+        },
+        "D2_frame_denominator": {
+            "loops": int((t.max() - t.min()) / det_t + 1),
+            "frame_num": int((t.max() - t.min()) / det_t),
+            "fa_inflation": 1.0 / int((t.max() - t.min()) / det_t),
+        },
+    }
+    # D3：按 (帧, 像素) 统计各方法的虚警计数峰值
+    frame = t // det_t
+    key = ((frame.astype(np.int64) * 512 + ref["y"]) * 1024 + ref["x"]).astype(np.int64)
+    d3 = {}
+    for name in names:
+        fp = (~pos) & (stacked[name]["prob"] >= threshold)
+        if not np.count_nonzero(fp):
+            d3[name] = {"max_count_per_pixel_frame": 0, "overflow_risk": False}
+            continue
+        k = np.sort(key[fp])
+        starts = np.flatnonzero(np.concatenate(([True], k[1:] != k[:-1])))
+        sizes = np.diff(np.concatenate((starts, [k.shape[0]])))
+        peak = int(sizes.max())
+        d3[name] = {"max_count_per_pixel_frame": peak, "overflow_risk": peak >= 256,
+                    "pixels_at_risk": int(np.count_nonzero(sizes >= 256))}
+    out["D3_uint8_overflow"] = d3
+    return out
+
+
 def check_c_operating_point(stacked, names, threshold):
     """C. 各方法在全集上的工作点：整体 IoU / 召回 / 误报，以及预测概率分布。"""
     ref = stacked[names[0]]
@@ -217,10 +272,29 @@ def main():
         print("               正样本概率 p10/p50/p90 = %.3f/%.3f/%.3f | 负样本 p50/p90/p99 = %.3f/%.3f/%.3f" % (
             tuple(m["prob_quantiles_on_pos"]) + tuple(m["prob_quantiles_on_neg"])))
 
+    d = check_d_eval_caveats(stacked, names, args.threshold, args.pd_detT)
+    print("\n【D】原仓库 eval.py 的三处口径问题（只量化，不修改 eval.py）")
+    b1 = d["D1_boundary_excluded"]
+    print("  D1 严格不等号排除的事件: %d (%.3f%%)，其中正样本 %d" % (
+        b1["events"], 100 * b1["ratio"], b1["positive_events"]))
+    print("     被排除子集的正样本比例 %.4f vs 全集 %.4f  →  %s" % (
+        b1["pos_ratio_on_boundary"], b1["pos_ratio_overall"],
+        "分布接近，对 Pd 近似无偏" if abs(b1["pos_ratio_on_boundary"] - b1["pos_ratio_overall"])
+        < 0.2 * max(b1["pos_ratio_overall"], 1e-9) else "分布明显偏离，需单独说明"))
+    b2 = d["D2_frame_denominator"]
+    print("  D2 循环 %d 次但 frame_num 记 %d  →  Fa 偏大约 %.2f%%" % (
+        b2["loops"], b2["frame_num"], 100 * b2["fa_inflation"]))
+    for name in names:
+        b3 = d["D3_uint8_overflow"][name]
+        print("  D3 %-12s 单帧单像素虚警峰值 %d  →  %s" % (
+            name, b3["max_count_per_pixel_frame"],
+            "【有溢出风险】%d 个像素 >= 256" % b3.get("pixels_at_risk", 0)
+            if b3["overflow_risk"] else "远低于 256，uint8 未溢出"))
+
     if args.out_json:
         with open(args.out_json, "w") as fh:
-            json.dump({"temporal_residue": a, "readout_purity": b, "operating_point": c},
-                      fh, indent=2, ensure_ascii=False)
+            json.dump({"temporal_residue": a, "readout_purity": b, "operating_point": c,
+                       "eval_caveats": d}, fh, indent=2, ensure_ascii=False)
         print("\n已写入 %s" % args.out_json)
 
 

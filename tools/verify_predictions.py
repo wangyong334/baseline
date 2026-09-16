@@ -84,6 +84,17 @@ def check_alignment(methods):
                 report["mismatches"].append("%s: 事件坐标/顺序不同" % fname)
             if not np.array_equal(a["labels"], b["labels"]):
                 report["mismatches"].append("%s: 标签不同" % fname)
+            # Pd 完全按 target_id 分组统计，坐标与标签相同但目标编号不同时 Pd 仍会不可比，
+            # 所以必须单独核对；缺字段时明确降级而不是默默算作“已核验”。
+            if "target_id" in a and "target_id" in b:
+                if not np.array_equal(a["target_id"], b["target_id"]):
+                    report["mismatches"].append("%s: target_id 不同（Pd 不可比）" % fname)
+            else:
+                missing = [n for n, v in ((ref_name, a), (other, b)) if "target_id" not in v]
+                report.setdefault("unverified", []).append(
+                    "%s: %s 的 dump 缺 target_id，Pd 的输入对齐未核验" % (fname, "/".join(missing)))
+    if report.get("unverified"):
+        report["unverified"] = sorted(set(u.split(":")[1].strip() for u in report["unverified"]))
     return report
 
 
@@ -224,10 +235,28 @@ def sequence_properties(item, window_ms):
             "target_events_per_window": float(tgt_win[tgt_win > 0].mean()) if np.any(tgt_win > 0) else 0.0}
 
 
+def _average_ranks(x):
+    """返回平均秩：并列元素共享它们秩的平均值（与 scipy.stats.rankdata 的 'average' 一致）。
+
+    两次 argsort 的写法会把并列值排成不同的秩，在有重复值时算出的相关系数是错的。
+    """
+    x = np.asarray(x, dtype=np.float64)
+    order = np.argsort(x, kind="stable")
+    ranks = np.empty(x.shape[0], dtype=np.float64)
+    sorted_x = x[order]
+    i = 0
+    while i < sorted_x.shape[0]:
+        j = i + 1
+        while j < sorted_x.shape[0] and sorted_x[j] == sorted_x[i]:
+            j += 1
+        ranks[order[i:j]] = 0.5 * (i + j - 1)      # 该并列组的平均秩（0 基）
+        i = j
+    return ranks
+
+
 def spearman(a, b):
-    """斯皮尔曼秩相关系数（用 numpy 实现，样本少时仅供参考）。"""
-    ra = np.argsort(np.argsort(a)).astype(float)
-    rb = np.argsort(np.argsort(b)).astype(float)
+    """斯皮尔曼秩相关系数（numpy 实现，正确处理并列值）。"""
+    ra, rb = _average_ranks(a), _average_ranks(b)
     if ra.std() == 0 or rb.std() == 0:
         return float("nan")
     return float(np.corrcoef(ra, rb)[0, 1])
