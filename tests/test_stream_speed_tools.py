@@ -2,15 +2,20 @@
 
 服务器上这些工具要用真实数据跑几十分钟，这里先确认它们在小数据上能跑通、计数口径正确。
 """
+import os
+import sys
 import unittest
 
 import numpy as np
 import torch
 
-from dataset.stream_source import NumpyWindowSource
-from model.evspsegnet_stream import LAYER_NAMES, EvSpSegNetStream, estimate_operations
-from tests.test_stream_layerwise import CFG, Q99, SMALL, WINDOWS, H, W, make_net, synthetic_sequence
-from tools import baseline_energy, bench_stream_speed, check_stream_execution, stream_energy
+# 直接从测试目录导入共用的合成数据，避免环境里第三方安装的同名 tests 包遮挡
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from dataset.stream_source import NumpyWindowSource  # noqa: E402
+from model.evspsegnet_stream import LAYER_NAMES, EvSpSegNetStream, estimate_operations  # noqa: E402
+from test_stream_layerwise import CFG, Q99, SMALL, WINDOWS, H, W, make_net, synthetic_sequence  # noqa: E402
+from tools import baseline_energy, bench_stream_speed, check_stream_execution, stream_energy  # noqa: E402
 
 TOOL_CFG = dict(CFG, lr=1e-3, seed=37, tbptt_k=4, n_windows=WINDOWS)
 CPU = torch.device("cpu")

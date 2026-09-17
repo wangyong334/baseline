@@ -95,6 +95,9 @@ def account(operations, nonzero_fraction, n_windows):
 def main():
     """入口：计算非零输入占比 -> 逐个换算 eval 结果 -> 读取基线结果 -> 打印对比表并写 JSON。"""
     args = parse_args()
+    missing = [path for path in list(args.eval_json) + list(args.baseline_json) if not os.path.isfile(path)]
+    if missing:
+        raise SystemExit("找不到以下结果文件，请先生成或修正路径: %s" % missing)
     from dataset.ev_uav_stream import EvUAVStream
     from utils.stream_common import load_flat_config
 

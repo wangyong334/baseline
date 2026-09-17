@@ -153,6 +153,9 @@ def summarize_records(records):
 def main():
     """入口：加载原网络与权重 -> 逐序列推理并计数 -> 汇总能耗 -> 原评估函数核对 IoU/ACC。"""
     args = parse_args()
+    for path in (args.config, args.checkpoint):
+        if not os.path.isfile(path):
+            raise SystemExit("找不到文件: %s（K5 基线权重可用 find log -name 'best_iou_seed*.pt' 查找）" % path)
     sys.argv = [sys.argv[0], "--config", args.config]
 
     import numpy as np
