@@ -1,0 +1,58 @@
+# 流式 SNN V1 + 电流合并解码器（从零训练用）
+# 解码阶段 I = ConvT4x4_s2_p1(S_deep) + Conv3x3(S_skip)，所有突触输入都是脉冲；其余与 evisseg_stream_v1.yaml 完全相同。
+# 只想得到与已训练 V1 完全等价的权重、不重训：用 tools/convert_to_merged_decoder.py 换算即可。
+# 50 ms 块因果；每窗一次 LIF 更新；5 个时间 bin 是输入通道，不是 SNN 时间步。
+DATA:
+  root: /media/stephen/nvme0n1/wy_data/datasets/EV-UAV-dataset
+  stats_path: configs/stream_v1_train_stats.json   # 由 tools/stream_train_stats.py 生成
+  window_ms: 50
+  n_windows: 160
+  time_bins: 5
+  height: 260
+  width_px: 346
+  pad_height: 264          # 3 次 stride=2 下采样，对齐到 8 的倍数；只补右侧和下侧
+  pad_width: 352
+  input_clip: 3.0          # X = clip(log1p(C)/q99, 0, 3)
+
+NET:
+  channels: [12, 24, 48, 48]   # 约 0.10M 参数，不与原 4.0M 模型对齐
+  neuron: lif                  # lif | relu（ReLU 仅用于对照与诊断）
+  state_mode: carry            # carry | reset_each_window（等价 beta=0）
+  norm: none                   # none | groupnorm_noshift（备选）
+  v_threshold: 1.0
+  tau_init_ms: 200.0           # beta0 = exp(-50/200) ≈ 0.779
+  tau_min_ms: 50.0
+  tau_max_ms: 2000.0
+  readout_hidden: 32
+  merged_decoder: true          # 电流合并解码器；原 V1 配置无此键，默认 false
+
+CALIB:
+  calib_sequences: 8           # 固定种子选出的训练序列
+  calib_windows: 32            # 每个序列取前 32 个连续窗口，带状态前向
+  calib_samples_per_channel: 2048
+  calib_min_positive: 1024     # 正电流样本不足时回退整层分位数
+  calib_quantile: 0.99
+  calib_gain_min: 0.05
+  calib_gain_max: 20.0
+
+TRAIN:
+  seed: 37
+  epochs: 50
+  lr: 0.001
+  lr_end: 0.0001               # 按 epoch 线性衰减
+  tbptt_k: 16
+  optimizer_step: per_sequence # per_sequence（默认）| per_chunk（欠拟合时的回退预案）
+  grad_clip: 1.0
+  pos_weight_cap: 30.0         # pos_weight = min(train_neg/train_pos, 30)
+  train_subset_size: 24        # 训练子集评估，用于区分欠拟合与泛化问题
+  num_workers: 2
+  deterministic: true
+  save_root: log/stream_merged_decoder_seed37
+
+EVAL:
+  threshold: 0.9               # 与基线一致
+  pd_detT: 50
+  correct_thresh: 0.0001
+  rolling_window: 10
+  segments: [[0, 15], [64, 79], [144, 159]]
+  timing_warmup_windows: 20

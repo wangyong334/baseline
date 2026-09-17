@@ -10,15 +10,28 @@
     up1   ConvT2x2 24->12 (S6)，与 S1 拼接 -> dec1 Conv3x3 24->12 -> 增益 -> LIF7  264x352
     读出  MLP([U_pre7(x,y), p, t_local]) -> 原始 logit（模型内不做 sigmoid）
 所有卷积 bias=False；默认不使用 BN/GN（零输入 -> 零电流）。
+原版的问题：ConvT 输出是实数，与跳连脉冲拼接后，解码卷积有一半输入是实数（只能按 MAC 计）。
+
+merged_decoder=True（电流合并解码器）时，每个解码阶段写成两路突触电流之和：
+    up3   ConvT4x4 s2 p1 48->48 (S4)  +  dec3 Conv3x3 48->48 (S3)  -> 增益 -> LIF5   66x88
+    up2   ConvT4x4 s2 p1 48->24 (S5)  +  dec2 Conv3x3 24->24 (S2)  -> 增益 -> LIF6  132x176
+    up1   ConvT4x4 s2 p1 24->12 (S6)  +  dec1 Conv3x3 12->12 (S1)  -> 增益 -> LIF7  264x352
+所有突触运算的输入都是 0/1 脉冲，仍为 7 组状态、读出不变。原版 ConvT2x2 与解码卷积之间没有非线性，
+Conv3x3(cat[ConvT2x2(S_deep), S_skip]) 可以精确合成上式，训练好的原版权重可无损换算，
+见 merge_decoder_state_dict 与 tools/convert_to_merged_decoder.py。
 """
+from collections import OrderedDict
+
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from model.lif2d_stream import ChannelGain, ReLUNeuron, StreamingLIF2d
 from utils.stream_common import gains_from_positive_samples
 
 LAYER_NAMES = ("enc1", "enc2", "enc3", "enc4", "dec3", "dec2", "dec1")
+DECODER_STAGES = (("up3", "dec3"), ("up2", "dec2"), ("up1", "dec1"))
 
 
 def make_norm(kind, channels):
@@ -33,7 +46,8 @@ def make_norm(kind, channels):
 class SpikingConvBlock(nn.Module):
     """一个"卷积 -> 归一化插槽 -> 逐通道增益 -> 神经元"单元。
 
-    forward(x, state) -> (spikes, new_state, u_pre, pre_gain_current)
+    forward(x, state, extra_current=None) -> (spikes, new_state, u_pre, pre_gain_current)
+        extra_current 为另一路突触电流（电流合并解码器中来自 ConvT），在归一化之前与本层卷积相加；
         pre_gain_current 是乘增益之前的电流，只用于增益校准统计。
     """
 
@@ -50,8 +64,11 @@ class SpikingConvBlock(nn.Module):
             raise ValueError("未知的 neuron 类型: %s" % neuron)
         self.out_ch = out_ch
 
-    def forward(self, x, state):
-        current = self.norm(self.conv(x))
+    def forward(self, x, state, extra_current=None):
+        current = self.conv(x)
+        if extra_current is not None:
+            current = current + extra_current
+        current = self.norm(current)
         spikes, new_state, u_pre = self.neuron(self.gain(current), state)
         return spikes, new_state, u_pre, current
 
@@ -72,10 +89,12 @@ class EvSpSegNetStream(nn.Module):
 
     def __init__(self, in_channels=12, channels=(12, 24, 48, 48), neuron="lif", norm="none",
                  state_mode="carry", readout_hidden=32, dt_ms=50.0, tau_init_ms=200.0,
-                 tau_min_ms=50.0, tau_max_ms=2000.0, v_threshold=1.0):
+                 tau_min_ms=50.0, tau_max_ms=2000.0, v_threshold=1.0, merged_decoder=False):
         super(EvSpSegNetStream, self).__init__()
         if state_mode not in ("carry", "reset_each_window"):
             raise ValueError("state_mode 必须是 carry 或 reset_each_window")
+        if not isinstance(merged_decoder, bool):
+            raise ValueError("merged_decoder 必须是 YAML 布尔值（true/false）")
         c1, c2, c3, c4 = channels
         lif = dict(dt_ms=dt_ms, tau_init_ms=tau_init_ms, tau_min_ms=tau_min_ms,
                    tau_max_ms=tau_max_ms, v_threshold=v_threshold)
@@ -84,16 +103,24 @@ class EvSpSegNetStream(nn.Module):
         self.enc2 = block(c1, c2, 2)
         self.enc3 = block(c2, c3, 2)
         self.enc4 = block(c3, c4, 2)
-        self.up3 = nn.ConvTranspose2d(c4, c3, 2, stride=2, bias=False)
-        self.dec3 = block(c3 + c3, c3, 1)
-        self.up2 = nn.ConvTranspose2d(c3, c2, 2, stride=2, bias=False)
-        self.dec2 = block(c2 + c2, c2, 1)
-        self.up1 = nn.ConvTranspose2d(c2, c1, 2, stride=2, bias=False)
-        self.dec1 = block(c1 + c1, c1, 1)
+        if merged_decoder:
+            # ConvT4x4/s2/p1 负责深层脉冲，解码卷积只接跳连脉冲；两路电流在神经元内相加
+            upsample = lambda i, o: nn.ConvTranspose2d(i, o, 4, stride=2, padding=1, bias=False)  # noqa: E731
+            self.up3, self.dec3 = upsample(c4, c3), block(c3, c3, 1)
+            self.up2, self.dec2 = upsample(c3, c2), block(c2, c2, 1)
+            self.up1, self.dec1 = upsample(c2, c1), block(c1, c1, 1)
+        else:
+            self.up3 = nn.ConvTranspose2d(c4, c3, 2, stride=2, bias=False)
+            self.dec3 = block(c3 + c3, c3, 1)
+            self.up2 = nn.ConvTranspose2d(c3, c2, 2, stride=2, bias=False)
+            self.dec2 = block(c2 + c2, c2, 1)
+            self.up1 = nn.ConvTranspose2d(c2, c1, 2, stride=2, bias=False)
+            self.dec1 = block(c1 + c1, c1, 1)
         self.readout = nn.Sequential(nn.Linear(c1 + 2, readout_hidden), nn.ReLU(),
                                      nn.Linear(readout_hidden, 1))
         self.state_mode = state_mode
         self.neuron_kind = neuron
+        self.merged_decoder = merged_decoder
         # 读出消融开关，默认关闭；只在评估阶段由命令行设置，不影响训练
         self.readout_ablation = "none"
         self.v_threshold = float(v_threshold)
@@ -109,13 +136,21 @@ class EvSpSegNetStream(nn.Module):
         if mode not in ("carry", "reset_each_window"):
             raise ValueError("state_mode 必须是 carry 或 reset_each_window")
         prev = states if (mode == "carry" and states is not None) else [None] * 7
+        if len(prev) != 7:
+            raise ValueError("states 应为 7 个膜电位，收到 %d 个" % len(prev))
         s1, n1, u1, i1 = self.enc1(x, prev[0])
         s2, n2, u2, i2 = self.enc2(s1, prev[1])
         s3, n3, u3, i3 = self.enc3(s2, prev[2])
         s4, n4, u4, i4 = self.enc4(s3, prev[3])
-        s5, n5, u5, i5 = self.dec3(torch.cat([self.up3(s4), s3], 1), prev[4])
-        s6, n6, u6, i6 = self.dec2(torch.cat([self.up2(s5), s2], 1), prev[5])
-        s7, n7, u7, i7 = self.dec1(torch.cat([self.up1(s6), s1], 1), prev[6])
+        if self.merged_decoder:
+            # 两路突触电流在神经元内相加：跳连脉冲经解码卷积，深层脉冲经 ConvT（作为 extra_current）
+            s5, n5, u5, i5 = self.dec3(s3, prev[4], self.up3(s4))
+            s6, n6, u6, i6 = self.dec2(s2, prev[5], self.up2(s5))
+            s7, n7, u7, i7 = self.dec1(s1, prev[6], self.up1(s6))
+        else:
+            s5, n5, u5, i5 = self.dec3(torch.cat([self.up3(s4), s3], 1), prev[4])
+            s6, n6, u6, i6 = self.dec2(torch.cat([self.up2(s5), s2], 1), prev[5])
+            s7, n7, u7, i7 = self.dec1(torch.cat([self.up1(s6), s1], 1), prev[6])
         # 高级索引 u7[b, :, y, x] 的结果形状为 [N, C]
         feat = u7[events["b"], :, events["y"], events["x"]]
         extra = torch.stack([events["p"].to(feat.dtype), events["t_local"].to(feat.dtype)], 1)
@@ -144,6 +179,46 @@ def count_parameters(net):
     for name, p in net.named_parameters():
         groups[name.split(".")[0]] = groups.get(name.split(".")[0], 0) + p.numel()
     return {"total": int(sum(groups.values())), "by_module": groups}
+
+
+def merge_decoder_state_dict(state_dict):
+    """把原版 V1 权重精确换算为电流合并解码器（merged_decoder=True）的权重，不改变网络函数。
+
+    原版每个解码阶段：I = Conv3x3_p1( cat[ ConvT2x2_s2(S_deep), S_skip ] )
+                        = Conv3x3_a( ConvT2x2_s2(S_deep) ) + Conv3x3_b(S_skip)
+    第一项是两个线性、平移等变的运算串联，等于一个 ConvT4x4_s2_p1：
+      低分辨率位置 i 经 ConvT2x2_s2 覆盖高分辨率 2i..2i+1，再经 Conv3x3_p1 覆盖 2i-1..2i+2；
+      ConvT4x4_s2_p1 把位置 i 写到 2i-1+k（k=0..3），覆盖范围完全相同。
+    因此合并核就是该组合对单位冲激的响应。换算在 float64 下完成，再转回原精度。
+
+    只适用于 ConvT 与解码卷积之间没有非线性的结构：原版 V1（含 ReLU 对照；groupnorm_noshift 也可以，
+    因为归一化作用在两路之和上）。已删除的 10 层版本在 ConvT 后插了 LIF，其权重含 up*_spike，
+    形状与原版相同却不是线性串联，这里显式拒绝，避免被静默换算成错误结果。
+    输入: 原版 EvSpSegNetStream 的 state_dict。输出: 新的 OrderedDict，除 up*/dec*.conv 外原样复制。
+    """
+    if any(key.split(".")[0].endswith("_spike") for key in state_dict):
+        raise ValueError("权重含 up*_spike（已删除的 10 层脉冲解码器），ConvT 与解码卷积之间有 LIF，不能换算")
+    merged = OrderedDict((key, value.detach().clone()) for key, value in state_dict.items())
+    for up, dec in DECODER_STAGES:
+        up_weight = state_dict[up + ".weight"]
+        conv_weight = state_dict[dec + ".conv.weight"]
+        if tuple(up_weight.shape[2:]) != (2, 2):
+            raise ValueError("%s 的核为 %s，不是原版 2x2（可能已经是合并形式）" % (up, tuple(up_weight.shape[2:])))
+        if tuple(conv_weight.shape[2:]) != (3, 3):
+            raise ValueError("%s.conv 的核不是 3x3" % dec)
+        deep_ch, up_ch = int(up_weight.shape[0]), int(up_weight.shape[1])
+        if int(conv_weight.shape[1]) <= up_ch:
+            raise ValueError("%s.conv 输入通道 %d 不大于 ConvT 输出通道 %d，没有跳连部分"
+                             % (dec, int(conv_weight.shape[1]), up_ch))
+        impulse = torch.zeros(deep_ch, deep_ch, 3, 3, dtype=torch.float64)
+        channel = torch.arange(deep_ch)
+        impulse[channel, channel, 1, 1] = 1.0                      # 每个输入通道在 (1,1) 放一个单位冲激
+        response = F.conv2d(F.conv_transpose2d(impulse, up_weight.detach().cpu().double(), stride=2),
+                            conv_weight[:, :up_ch].detach().cpu().double(), padding=1)
+        merged[up + ".weight"] = response[:, :, 1:5, 1:5].to(
+            dtype=up_weight.dtype, device=up_weight.device).contiguous()
+        merged[dec + ".conv.weight"] = conv_weight[:, up_ch:].detach().clone().contiguous()
+    return merged
 
 
 def calibrate_gains(net, sequence_factory, quantile, samples_per_channel, min_positive,
@@ -207,6 +282,7 @@ def estimate_operations(net, height, width, firing_rates, events_per_window):
         稠密运算数 dense = C_out * C_in * k*k * H_out * W_out（ConvT 按输入位置计）
         输入是脉冲的部分记为 SOP ≈ 输入发放率 * dense（常用近似）
         输入是实数的部分记为 MAC：第一层（实数计数输入）、解码器中 ConvT 输出的通道、读出 MLP
+        电流合并解码器中 ConvT 与解码卷积的输入都是脉冲，解码阶段全部记为 SOP
     输入: firing_rates 为 {层名: 该层平均发放率}；events_per_window 为平均每窗事件数（读出 MLP 按事件计）。
     输出: {"dense_ops", "mac", "sop", "per_layer": [...]}
     """
@@ -237,13 +313,27 @@ def estimate_operations(net, height, width, firing_rates, events_per_window):
         d_up = conv_t.in_channels * conv_t.out_channels * k * (hw // 4)
         add(up, 0.0, firing_rates[deep] * d_up, d_up)               # 输入是深层脉冲
         conv = getattr(net, dec).conv
-        k = conv.kernel_size[0] * conv.kernel_size[1]
-        real_part = conv.out_channels * conv_t.out_channels * k * hw  # ConvT 输出为实数 -> MAC
-        spike_part = conv.out_channels * (conv.in_channels - conv_t.out_channels) * k * hw
-        add(dec, real_part, firing_rates[skip] * spike_part, real_part + spike_part)
+        if net.merged_decoder:
+            d_dec = conv_ops(conv, hw)                               # 只接跳连脉冲
+            add(dec, 0.0, firing_rates[skip] * d_dec, d_dec)
+        else:
+            k = conv.kernel_size[0] * conv.kernel_size[1]
+            real_part = conv.out_channels * conv_t.out_channels * k * hw  # ConvT 输出为实数 -> MAC
+            spike_part = conv.out_channels * (conv.in_channels - conv_t.out_channels) * k * hw
+            add(dec, real_part, firing_rates[skip] * spike_part, real_part + spike_part)
     lin1, lin2 = net.readout[0], net.readout[2]
     per_event = lin1.in_features * lin1.out_features + lin2.in_features * lin2.out_features
     add("readout", per_event * float(events_per_window), 0.0, per_event * float(events_per_window))
+    if net.neuron_kind != "lif":                                     # ReLU 对照没有脉冲，全部按 MAC 计
+        for layer in layers:
+            layer["mac"], layer["sop"] = layer["dense"], 0.0
+    state_size = dict(size)
+    for level in (1, 2, 3):
+        state_size["dec%d" % level] = size["enc%d" % level]
+    state_elements = sum(block.out_ch * state_size[name]
+                         for name, block in zip(LAYER_NAMES, net.blocks()))
     return {"dense_ops": sum(l["dense"] for l in layers), "mac": sum(l["mac"] for l in layers),
             "sop": sum(l["sop"] for l in layers), "per_layer": layers,
-            "note": "SOP 为基于发放率的理论估计；当前 GPU 实现仍执行稠密卷积"}
+            "state_elements": state_elements if net.neuron_kind == "lif" else 0,
+            "note": "SOP 为基于发放率的理论估计；当前 GPU 实现仍执行稠密卷积；"
+                    "未计入膜电位更新、增益、访存及预后处理成本，state_elements 按单序列统计"}

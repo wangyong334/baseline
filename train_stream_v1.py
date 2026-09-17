@@ -115,12 +115,15 @@ def load_stats(cfg):
 
 def build_net(cfg, device):
     """按配置构造网络并移动到设备。"""
+    if cfg.get("spiking_decoder", False):
+        raise ValueError("spiking_decoder（ConvT 后加 LIF 的 10 层版本）已删除；请改用 merged_decoder")
     net = EvSpSegNetStream(
         in_channels=2 + 2 * int(cfg["time_bins"]), channels=tuple(cfg["channels"]),
         neuron=cfg["neuron"], norm=cfg["norm"], state_mode=cfg["state_mode"],
         readout_hidden=int(cfg["readout_hidden"]), dt_ms=float(cfg["window_ms"]),
         tau_init_ms=float(cfg["tau_init_ms"]), tau_min_ms=float(cfg["tau_min_ms"]),
-        tau_max_ms=float(cfg["tau_max_ms"]), v_threshold=float(cfg["v_threshold"]))
+        tau_max_ms=float(cfg["tau_max_ms"]), v_threshold=float(cfg["v_threshold"]),
+        merged_decoder=cfg.get("merged_decoder", False))
     return net.to(device)
 
 
