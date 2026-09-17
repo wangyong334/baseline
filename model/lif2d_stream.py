@@ -7,6 +7,7 @@
     tau   = tau_min + (tau_max - tau_min) * sigmoid(a)，beta = exp(-dt / tau)
 状态由调用者显式传入和返回，模块内部不保存膜电位（不会进入 checkpoint）。
 每个 50 ms 窗口只调用一次神经元：5 个时间 bin 是输入通道，不是 SNN 时间步。
+forward 逐窗调用（流式推理、增益校准）；forward_steps 一次处理一个片段的多个窗口（逐层时间并行训练），两者等价。
 """
 import math
 
@@ -79,6 +80,29 @@ class StreamingLIF2d(nn.Module):
         new_state = u_pre - self.v_threshold * spikes.detach()
         return spikes, new_state, u_pre
 
+    def forward_steps(self, current, state, carry=True, keep_u_pre=True):
+        """按时间顺序处理一个片段的 T 个窗口，与连续调用 forward T 次数学等价（逐层时间并行训练用）。
+
+        输入: current [T,B,C,H,W] 各窗口电流；state 片段开始前的膜电位 [B,C,H,W] 或 None；
+              carry=False 表示 reset_each_window，每一步都不使用上一状态。
+        输出: (spikes [T,B,C,H,W], 最后一步软复位后的膜电位 [B,C,H,W], u_pre [T,B,C,H,W] 或 None)
+        膜电位递推只在神经元内部逐像素进行，卷积已由调用者在 T*B 维上批量算完。
+        """
+        steps = int(current.shape[0])
+        if steps == 0:
+            raise ValueError("片段至少需要 1 个窗口")
+        beta = self.beta().to(current.dtype).view(1, -1, 1, 1)
+        spikes, u_pres = [], []
+        for t in range(steps):
+            prev = state if carry else None
+            u_pre = current[t] if prev is None else beta * prev + current[t]
+            spike = SurrogateSpike.apply(u_pre - self.v_threshold)
+            state = u_pre - self.v_threshold * spike.detach()
+            spikes.append(spike)
+            if keep_u_pre:
+                u_pres.append(u_pre)
+        return torch.stack(spikes), state, (torch.stack(u_pres) if keep_u_pre else None)
+
 
 class ReLUNeuron(nn.Module):
     """ReLU 对照神经元（无状态、非脉冲），用于"脉冲网络 vs 非循环 ANN"对照和过拟合诊断。
@@ -91,6 +115,10 @@ class ReLUNeuron(nn.Module):
         super(ReLUNeuron, self).__init__()
 
     def forward(self, current, state):
+        return torch.relu(current), None, current
+
+    def forward_steps(self, current, state, carry=True, keep_u_pre=True):
+        """多窗口版本 [T,B,C,H,W]；无状态，各窗口互不影响。"""
         return torch.relu(current), None, current
 
 

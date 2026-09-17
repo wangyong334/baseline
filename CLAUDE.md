@@ -13,15 +13,19 @@
 3. 流式 SNN V1（v1-1，09-16）：test IoU 0.8363（3 种子），参数 0.105M，50 ms 块因果
 4. 结果核验（v1-2，09-16）：确认 V1 没有评估错误或信息泄漏；发现原基线代码的时间下采样 bug
 5. 基线 K5 修复（09-16）：基线 test IoU 从 0.6188 提到 0.8011，V1 的领先缩小到 +0.035
-6. 解码器全脉冲化（方案 C 电流合并，09-17）：对已训练 V1 严格等价换算，指标不变，理论能耗 2.24 → 0.60 mJ
+6. 解码器全脉冲化（方案 C 电流合并，09-17）：对已训练 V1 严格等价换算，指标不变，每窗理论能耗 2.24 → 0.60 mJ
 
-**进行中**：方案 C 从零训练 seed37（`log/stream_merged_decoder_seed37`）
+**进行中**
+- 方案 C 从零训练 seed37（`log/stream_merged_decoder_seed37`）
+- 训练加速 A 与能耗统计工具（09-17）：代码和本地测试已完成，待在服务器 1 号卡上用 seed37 做等价核对、计时、基线能耗统计，然后重训
 
 **主要发现**
 - 原基线代码三次时间下采样都漏掉 `t%4==2` 的时间片，这部分事件 IoU 只有 0.27–0.32；修复后基线大幅提升
 - V1 原解码器可以精确改写为两路脉冲电流之和，所有突触输入变成脉冲，能耗降 73%，精度不变
 - 跨窗记忆的贡献很弱：carry 只比 reset 高 0.016，而种子间标准差是 0.013
 - 单窗耗时里预处理约 13 ms（64%），网络约 7 ms；剩余理论能耗约 93% 来自 enc1 的实数输入
+- V1 训练一轮约 540 s：训练约 410 s（25.7 ms/窗）+ 评估约 125 s（23%），GPU 利用率约 10%。时间主要耗在 CPU 逐窗预处理和逐窗调用小算子上，不在 GPU 计算
+- TBPTT 16 窗意味着梯度只回传 800 ms，而 τ 上限是 2000 ms，这可能是跨窗记忆弱的原因之一（tau1000 变体更好也与此一致）
 
 ## 2. 基线：EV-SpSegNet
 
@@ -73,8 +77,9 @@ Chen et al., *Event-based Tiny Object Detection: A Benchmark Dataset and Baselin
 | v1-2 `9bb2a0e` | 核验与诊断工具（`verify_predictions`、`diagnose_gap`） | V1 比基线高 21 个点，结果反常 | 数据对齐、指标实现、读出消融均无问题；定位到基线 bug |
 | 基线 K5 `7081aa6` | 修复基线时间下采样 | 同上 | 基线 0.8011，V1 在 test 上领先 +0.035，val 上 +0.013 |
 | 10 层 LIF（已删除） | 三个 ConvT 后各加增益 + LIF | 原解码器 ConvT 输出实数，占理论能耗 99% | 状态增加 195 万，冒烟时新层几乎不发放，需要重训；放弃，无训练结果 |
-| **方案 C** `6cc2d31` | 电流合并解码器 `I = ConvT4×4_s2_p1(S_deep) + Conv3×3(S_skip)`，以及权重换算工具 | 同上；另外比较过最近邻上采样（需重训，能耗不更省） | 与原 V1 数学等价，可直接换算：3 种子指标差 ≤ 2e-4，能耗 2.24 → 0.60 mJ，状态数不变 |
+| **方案 C** `6cc2d31` | 电流合并解码器 `I = ConvT4×4_s2_p1(S_deep) + Conv3×3(S_skip)`，以及权重换算工具 | 同上；另外比较过最近邻上采样（需重训，能耗不更省） | 与原 V1 数学等价，可直接换算：3 种子指标差 ≤ 2e-4，每窗能耗 2.24 → 0.60 mJ，状态数不变 |
 | 方案 C 从零训练 | 用合并形式直接训练 | 看这种参数化直接训练是否更好（函数空间更大） | 进行中（seed37） |
+| 训练加速 A | GPU 构造输入（事件常驻显存、查表归一化，与 numpy 输入逐位相同）；片段内逐层时间并行 `forward_chunk`（卷积按 T 个窗口批量算，只有膜电位按时间递推）；训练子集评估可隔轮 | 训练 7–9 h、GPU 利用率 10%；预期约快 3–4 倍，要再快需融合 LIF 时间循环或多序列 batch | 本地 float64 等价测试通过；待服务器核对与计时。`--mode eval` 仍走原实现 |
 
 补充分析：
 - **稀疏卷积**：输入像素占用仅 0.5%，但卷积扩散加下采样后深层接近稠密；GPU 上收益小，所以没有采用。
@@ -107,6 +112,8 @@ Chen et al., *Event-based Tiny Object Detection: A Benchmark Dataset and Baselin
 | 窗长 / 时间分箱设计 | 候选 | 50 ms / 5 bin 尚未消融，可考虑自适应窗 |
 | 静止 / 慢速目标 | 远期 | 论文自陈局限，多模态或记忆机制 |
 | 公平比较 | 需要 | 参数量不对齐（0.105M 对 0.94M）；基线 Patch Attention 未修 |
+| 同口径能效对比 | 工具已写，待跑 | 160 步是 160 段新数据，应按每 8 秒比较；基线稀疏卷积只在事件上计算，SNN 的 enc1 在全图上计 MAC。`baseline_energy.py` 测基线实际连接数，`stream_energy.py` 给出 SNN 稠密 / 事件驱动两种口径；决定论文能否主张节能 |
+| 可并行训练的脉冲神经元 | 候选 | 训练时整段并行、推理时递推（去复位或线性递推，参考 PSN / 脉冲 SSM）；训练变快后可做完整 160 窗 BPTT，同时针对跨窗记忆弱 |
 
 ## 5. 代码地图
 
@@ -121,14 +128,15 @@ Chen et al., *Event-based Tiny Object Detection: A Benchmark Dataset and Baselin
 | `train_stream_v1.py` | 入口 `--mode smoke/overfit/train/eval`；TBPTT 训练、逐窗推理、评估、发放率监控、计时 |
 | `dataset/stream_windows.py` | 纯 numpy：读 NPZ、切窗、12 通道计数、归一化、按下标回填、训练集统计 |
 | `dataset/ev_uav_stream.py` | 按序列加载、窗口转张量 |
+| `dataset/stream_source.py` | 窗口数据来源：numpy 逐窗（原实现）或设备端按片段构造（`input_device`） |
 | `model/lif2d_stream.py` | LIF、代理梯度、逐通道增益、ReLU 对照 |
-| `model/evspsegnet_stream.py` | 网络（`merged_decoder` 开关）、权重合并换算、增益校准、运算量估计 |
+| `model/evspsegnet_stream.py` | 网络（`merged_decoder` 开关；逐窗 `forward` / 片段逐层 `forward_chunk`）、权重合并换算、增益校准、运算量估计 |
 | `utils/stream_common.py`、`utils/stream_metrics.py` | 配置、学习率、TBPTT 分段、校准数学、健康检查；逐窗与延迟指标 |
 | `configs/evisseg_stream_v1.yaml`、`evisseg_stream_merged_decoder.yaml` | V1、方案 C 配置（后者只多 `merged_decoder: true` 与保存目录） |
 | `tests/test_stream_*.py` | 单元测试 |
 | `README_STREAM_V1.md`、`README_STREAM_MERGED_DECODER.md` | 运行说明、方案 C 原理 |
 
-**工具**：`tools/stream_train_stats.py`（训练集统计）、`dump_baseline_predictions.py`（导出基线逐事件预测并打印原指标）、`verify_predictions.py`（多方法对齐与指标核验）、`diagnose_gap.py`（按 t%4 分组、读出上限、eval 口径量化）、`convert_to_merged_decoder.py`（V1 → 方案 C 换算，含等价核对）。
+**工具**：`tools/stream_train_stats.py`（训练集统计）、`dump_baseline_predictions.py`（导出基线逐事件预测并打印原指标）、`verify_predictions.py`（多方法对齐与指标核验）、`diagnose_gap.py`（按 t%4 分组、读出上限、eval 口径量化）、`convert_to_merged_decoder.py`（V1 → 方案 C 换算，含等价核对）、`check_stream_execution.py`（加速选项与原实现的等价核对）、`bench_stream_speed.py`（训练/评估计时分解）、`baseline_energy.py`（基线稀疏卷积实际运算量与能耗）、`stream_energy.py`（SNN 每 8 秒能耗的两种口径与基线对比）。
 
 **其他**：`outputs/`（V1 示意图、合并等价性独立验证）、`References/`（论文 PDF）、V1 架构讲解页 <https://claude.ai/artifact/TYCEZjySwtjWbeFnRR9xWS>（对应原版解码器）。
 
@@ -180,6 +188,21 @@ for f in sorted(glob.glob("log/*/eval_*_best_val_iou_seed*.json")):
 EOF
 ```
 
+### 训练加速与能耗：核对 → 计时 → 能耗 → 重训
+
+```bash
+CK=log/stream_v1_seed37/best_val_iou_seed37.pt; GPU=1
+# 等价核对（输入逐位、float64 逻辑、float32 数值、整个验证集 IoU），最后一行应为 EXECUTION CHECK PASSED
+CUDA_VISIBLE_DEVICES=$GPU python tools/check_stream_execution.py --checkpoint $CK --split val --full-split     > run/check_stream_execution_s37.log 2>&1
+# 计时分解（四种组合 × 训练/评估，前向/反向，小输入对照只看规模变化；加速以重训日志 epoch_seconds 为准）
+CUDA_VISIBLE_DEVICES=$GPU python tools/bench_stream_speed.py --checkpoint $CK     --reference-metrics log/stream_v1_seed37/metrics.jsonl > run/bench_stream_speed_s37.log 2>&1
+# 能耗：基线实际运算量（GPU）→ SNN 两种口径并对比（CPU）
+CUDA_VISIBLE_DEVICES=$GPU python tools/baseline_energy.py --config configs/evisseg_evuav_baseline_v2_repolr.yaml     --checkpoint log/baseline_k5_repolr_seed37/best_iou_seed37.pt --split test > run/baseline_energy_s37.log 2>&1
+python tools/stream_energy.py --config configs/evisseg_stream_v1.yaml --split test     --eval-json log/stream_v1_seed37/eval_test_best_val_iou_seed37.json log/stream_v1_seed37/eval_test_best_val_iou_seed37_merged.json     --baseline-json log/baseline_k5_repolr_seed37/energy_test_best_iou_seed37.json
+# 用加速选项重训（与 log/stream_v1_seed37 的曲线和耗时对照）
+nohup env CUDA_VISIBLE_DEVICES=$GPU python train_stream_v1.py --config configs/evisseg_stream_v1.yaml --mode train     --seed 37 --execution layer --input-device gpu --train-subset-every 5     --save-root log/stream_v1_fast_seed37 > run/stream_v1_fast_seed37.log 2>&1 &
+```
+
 ### 基线 K5（双卡）：训练 → 验证集 → 测试集
 
 ```bash
@@ -229,9 +252,11 @@ done
 
 ### 效率
 
-| 版本 | 理论能耗（MAC 4.6 pJ / AC 0.9 pJ，实测发放率） | 膜电位状态 | 单窗耗时 |
+| 版本 | 理论能耗（每 50 ms 窗；MAC 4.6 pJ / AC 0.9 pJ，实测发放率） | 膜电位状态 | 单窗耗时 |
 |---|---|---|---|
-| 流式 V1 | 2.24 mJ（MAC 占 99%） | 7 层，397 万 | 约 19–20 ms（预处理 13 + 网络 7，GPU 空闲时） |
-| 方案 C（换算） | 0.59–0.61 mJ（MAC 约 93%，来自 enc1） | 同上 | — |
+| 流式 V1 | 2.24 mJ/窗，8 s 约 358 mJ（MAC 占 99%） | 7 层，397 万 | 约 19–20 ms（预处理 13 + 网络 7，GPU 空闲时） |
+| 方案 C（换算） | 0.59–0.61 mJ/窗，8 s 约 96 mJ（MAC 约 93%，来自 enc1 全图稠密计数） | 同上 | — |
+
+`estimate_operations` 按单窗统计；enc1 在全图（含 99.5% 空像素）上计 MAC。基线能耗尚未统计，两者还没有同口径对比。
 
 V1 单卡训练 50 轮约 6.6–7.6 小时。

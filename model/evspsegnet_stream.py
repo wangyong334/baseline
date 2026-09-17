@@ -19,6 +19,10 @@ merged_decoder=True（电流合并解码器）时，每个解码阶段写成两�
 所有突触运算的输入都是 0/1 脉冲，仍为 7 组状态、读出不变。原版 ConvT2x2 与解码卷积之间没有非线性，
 Conv3x3(cat[ConvT2x2(S_deep), S_skip]) 可以精确合成上式，训练好的原版权重可无损换算，
 见 merge_decoder_state_dict 与 tools/convert_to_merged_decoder.py。
+
+两种执行方式（数学等价，见 tests/test_stream_layerwise.py 与 tools/check_stream_execution.py）：
+    forward        逐窗：每个窗口依次经过 7 层（流式推理、增益校准、正式评估）
+    forward_chunk  逐层：一个 TBPTT 片段的 T 个窗口先整体过完一层再进入下一层（训练加速）
 """
 from collections import OrderedDict
 
@@ -71,6 +75,20 @@ class SpikingConvBlock(nn.Module):
         current = self.norm(current)
         spikes, new_state, u_pre = self.neuron(self.gain(current), state)
         return spikes, new_state, u_pre, current
+
+    def forward_steps(self, x, state, carry, keep_u_pre, extra_current=None):
+        """一个片段的多窗口版本：卷积在 T*B 维上批量计算，神经元再按时间递推。
+
+        输入: x [T,B,C_in,H,W]；extra_current 为已展平的 [T*B,C_out,H',W'] 或 None。
+        输出: (spikes [T,B,...], 最后一步膜电位 [B,...], u_pre [T,B,...] 或 None)。不返回增益前电流（校准仍逐窗做）。
+        """
+        steps, batch = int(x.shape[0]), int(x.shape[1])
+        current = self.conv(x.reshape((steps * batch,) + tuple(x.shape[2:])))
+        if extra_current is not None:
+            current = current + extra_current
+        current = self.gain(self.norm(current))
+        current = current.view((steps, batch) + tuple(current.shape[1:]))
+        return self.neuron.forward_steps(current, state, carry, keep_u_pre)
 
 
 class EvSpSegNetStream(nn.Module):
@@ -153,6 +171,70 @@ class EvSpSegNetStream(nn.Module):
             s7, n7, u7, i7 = self.dec1(torch.cat([self.up1(s6), s1], 1), prev[6])
         # 高级索引 u7[b, :, y, x] 的结果形状为 [N, C]
         feat = u7[events["b"], :, events["y"], events["x"]]
+        logits = self._readout(feat, events)
+        info = None
+        if collect:
+            info = {"spikes": [s1, s2, s3, s4, s5, s6, s7],
+                    "u_pre": [u1, u2, u3, u4, u5, u6, u7],
+                    "current": [i1, i2, i3, i4, i5, i6, i7]}
+        return logits, [n1, n2, n3, n4, n5, n6, n7], info
+
+    def forward_chunk(self, x, events, states, state_mode=None, collect=False):
+        """逐层时间并行：一次处理一个片段的 T 个连续窗口，与按时间顺序调用 forward T 次数学等价。
+
+        本网络层与层之间没有时间反馈，每层的输出序列只取决于它的输入序列，
+        所以可以逐层推进：卷积把 T 个窗口当作一个 batch 算完，只有神经元内部的膜电位按时间递推。
+        输入:
+            x       [T,B,12,H,W]
+            events  在 forward 的字段之外多一个 t（事件所在窗口在片段内的序号，long [N]）；b 为序列在 batch 内的序号
+            states  片段开始前的 7 个膜电位 [B,C,H,W]，或 None
+        输出: (logits [N]，顺序与 events 相同, 片段结束时的 7 个膜电位, info)
+            collect=True 时 info 含每层 [T,B,C,H,W] 的 spikes 与 u_pre（不含增益前电流）。
+        流式推理与增益校准仍使用 forward。
+        """
+        mode = self.state_mode if state_mode is None else state_mode
+        if mode not in ("carry", "reset_each_window"):
+            raise ValueError("state_mode 必须是 carry 或 reset_each_window")
+        prev = states if (mode == "carry" and states is not None) else [None] * 7
+        if len(prev) != 7:
+            raise ValueError("states 应为 7 个膜电位，收到 %d 个" % len(prev))
+        if x.dim() != 5:
+            raise ValueError("forward_chunk 的输入应为 [T,B,C,H,W]，收到 %d 维" % x.dim())
+        carry = mode == "carry"
+        steps, batch = int(x.shape[0]), int(x.shape[1])
+
+        def flat(seq):
+            return seq.reshape((steps * batch,) + tuple(seq.shape[2:]))
+
+        def unflat(tensor):
+            return tensor.view((steps, batch) + tuple(tensor.shape[1:]))
+
+        s1, n1, u1 = self.enc1.forward_steps(x, prev[0], carry, collect)
+        s2, n2, u2 = self.enc2.forward_steps(s1, prev[1], carry, collect)
+        s3, n3, u3 = self.enc3.forward_steps(s2, prev[2], carry, collect)
+        s4, n4, u4 = self.enc4.forward_steps(s3, prev[3], carry, collect)
+        if self.merged_decoder:
+            s5, n5, u5 = self.dec3.forward_steps(s3, prev[4], carry, collect, self.up3(flat(s4)))
+            s6, n6, u6 = self.dec2.forward_steps(s2, prev[5], carry, collect, self.up2(flat(s5)))
+            s7, n7, u7 = self.dec1.forward_steps(s1, prev[6], carry, True, self.up1(flat(s6)))
+        else:
+            s5, n5, u5 = self.dec3.forward_steps(torch.cat([unflat(self.up3(flat(s4))), s3], 2), prev[4],
+                                                 carry, collect)
+            s6, n6, u6 = self.dec2.forward_steps(torch.cat([unflat(self.up2(flat(s5))), s2], 2), prev[5],
+                                                 carry, collect)
+            s7, n7, u7 = self.dec1.forward_steps(torch.cat([unflat(self.up1(flat(s6))), s1], 2), prev[6],
+                                                 carry, True)
+        # 高级索引 u7[t, b, :, y, x] 的结果形状为 [N, C]
+        feat = u7[events["t"], events["b"], :, events["y"], events["x"]]
+        logits = self._readout(feat, events)
+        info = None
+        if collect:
+            info = {"spikes": [s1, s2, s3, s4, s5, s6, s7],
+                    "u_pre": [u1, u2, u3, u4, u5, u6, u7]}
+        return logits, [n1, n2, n3, n4, n5, n6, n7], info
+
+    def _readout(self, feat, events):
+        """逐事件读出：MLP([膜电位特征, p, t_local]) -> 原始 logit [N]。"""
         extra = torch.stack([events["p"].to(feat.dtype), events["t_local"].to(feat.dtype)], 1)
         # 读出消融（只用于评估，不重新训练）：用来判断预测到底依赖哪一路信息
         #   none          正常
@@ -164,13 +246,7 @@ class EvSpSegNetStream(nn.Module):
             feat = torch.zeros_like(feat)
         elif self.readout_ablation != "none":
             raise ValueError("未知的 readout_ablation: %s" % self.readout_ablation)
-        logits = self.readout(torch.cat([feat, extra], 1)).squeeze(1)
-        info = None
-        if collect:
-            info = {"spikes": [s1, s2, s3, s4, s5, s6, s7],
-                    "u_pre": [u1, u2, u3, u4, u5, u6, u7],
-                    "current": [i1, i2, i3, i4, i5, i6, i7]}
-        return logits, [n1, n2, n3, n4, n5, n6, n7], info
+        return self.readout(torch.cat([feat, extra], 1)).squeeze(1)
 
 
 def count_parameters(net):

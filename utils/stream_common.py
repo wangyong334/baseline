@@ -77,6 +77,17 @@ def select_subset(names, size, seed):
     return sorted(names[i] for i in picked)
 
 
+def subset_due(epoch, epochs, every):
+    """训练子集评估是否在本轮进行：每 every 轮一次（第 every-1、2*every-1... 轮），最后一轮总是评估。
+
+    训练子集评估只用于诊断，不参与选模型；每轮的打乱与 TBPTT 首段长度按 (seed, epoch) 重新设种，
+    因此评估频率不影响训练本身。every=1 即每轮评估（原行为）。
+    """
+    if int(every) < 1:
+        raise ValueError("train_subset_every 必须 >= 1")
+    return (int(epoch) + 1) % int(every) == 0 or int(epoch) == int(epochs) - 1
+
+
 def summarize_history(history, seed, tail=5):
     """汇总训练历史（每轮一条记录），字段与 utils/aggregate.py 兼容。
 

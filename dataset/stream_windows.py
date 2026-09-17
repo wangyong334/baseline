@@ -199,6 +199,26 @@ def normalize_counts(counts, q99, clip_max):
     return np.clip(out, 0.0, float(clip_max)).astype(np.float32)
 
 
+def normalization_table(q99, clip_max, max_entries=1 << 22):
+    """把 normalize_counts 预先算成查找表，供 GPU 构造输入时查表（与 CPU 输入逐位相同）。
+
+    输出: (table, n_sat)
+        table  float32 [C, n_sat+1]，table[c, n] 就是 normalize_counts 对通道 c、计数 n 的输出
+        n_sat  饱和计数：计数 >= n_sat 时输出恒为 clip_max，查表时把计数截断到 n_sat 即可
+    表由 normalize_counts 本身算出，不重写公式；log1p 单调，超过 n_sat 的计数必然被截断到 clip_max。
+    """
+    q = np.asarray(q99, dtype=np.float32)
+    # log1p(n)/q >= clip_max  <=>  n >= expm1(clip_max*q)；多留 2 个余量吸收 float32 舍入
+    n_sat = int(np.ceil(np.expm1(float(clip_max) * float(q.max())))) + 2
+    if n_sat + 1 > int(max_entries):
+        raise ValueError("饱和计数 %d 过大（q99 最大 %.3f），不适合查表" % (n_sat, float(q.max())))
+    counts = np.tile(np.arange(n_sat + 1, dtype=np.int64), (q.shape[0], 1, 1))   # [C, 1, n_sat+1]
+    table = normalize_counts(counts, q, clip_max)[:, 0, :]
+    if not np.all(table[:, -1] == np.float32(clip_max)):
+        raise AssertionError("查找表末项没有饱和到 clip_max")
+    return np.ascontiguousarray(table), n_sat
+
+
 def build_window_input(seq, k, q99, time_bins, pad_height, pad_width, clip_max):
     """构造第 k 个窗口的网络输入与读出所需的逐事件数据。
 

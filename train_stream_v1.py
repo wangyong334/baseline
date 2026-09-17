@@ -6,6 +6,13 @@
     train    正式训练：每个序列一次参数更新，每个 epoch 结束验证并保存
     eval     评估 checkpoint：同一权重分别用 carry 与 reset_each_window 跑完整 160 窗
 不修改原仓库任何文件；主指标调用原 utils/eval.py 的函数计算。
+
+训练加速选项（TRAIN 小节或命令行；缺省值 = 原实现，结果与旧版本一致）：
+    input_device        cpu（numpy 逐窗构造）| gpu（事件常驻显存，按片段构造，输入逐位相同）
+    execution           step（逐窗逐层）| layer（片段内逐层时间并行，数学等价）
+    train_subset_every  每隔几轮评估一次训练子集（1 = 每轮；验证集始终每轮评估并据此选模型）
+    eval_chunk          layer 模式下每轮验证时一次处理的窗口数
+--mode eval 始终使用原实现（step + cpu）：论文指标与逐窗延迟都来自它。
 """
 import os
 
@@ -25,18 +32,20 @@ import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 
 from dataset.ev_uav_stream import EvUAVStream, make_sequence_loader, window_to_device  # noqa: E402
+from dataset.stream_source import INPUT_DEVICES, make_window_source  # noqa: E402
 from dataset.stream_windows import refill_by_index  # noqa: E402
 from model.evspsegnet_stream import (LAYER_NAMES, EvSpSegNetStream, calibrate_gains,  # noqa: E402
                                      count_parameters, estimate_operations)
 from model.lif2d_stream import StreamingLIF2d, detach_states  # noqa: E402
 from utils.stream_common import (health_warnings, linear_epoch_lr, load_flat_config,  # noqa: E402
-                                 make_chunks, select_subset, summarize_history)
+                                 make_chunks, select_subset, subset_due, summarize_history)
 from utils.stream_metrics import (first_detection_latencies, iou_from_counts, rolling_iou,  # noqa: E402
                                   segment_iou, summarize_latencies, window_confusion)
 
 SOURCE_FILES = ("train_stream_v1.py", "dataset/stream_windows.py", "dataset/ev_uav_stream.py",
-                "model/lif2d_stream.py", "model/evspsegnet_stream.py", "utils/stream_common.py",
-                "utils/stream_metrics.py", "utils/eval.py")
+                "dataset/stream_source.py", "model/lif2d_stream.py", "model/evspsegnet_stream.py",
+                "utils/stream_common.py", "utils/stream_metrics.py", "utils/eval.py")
+EXECUTIONS = ("step", "layer")
 
 
 # ---------------------------------------------------------------------------
@@ -64,12 +73,30 @@ def parse_args():
                         help="eval 模式的读出消融：zero_extra 屏蔽 p/t_local；zero_feature 屏蔽网络特征")
     parser.add_argument("--dump-dir", default=None,
                         help="eval 模式：把训练时状态模式下的逐事件预测按序列保存为 NPZ，供 tools/verify_predictions.py 独立核验")
+    parser.add_argument("--execution", choices=EXECUTIONS, default=None,
+                        help="训练与每轮验证的执行方式：step 逐窗（原实现）| layer 逐层时间并行")
+    parser.add_argument("--input-device", choices=INPUT_DEVICES, default=None,
+                        help="窗口输入在哪里构造：cpu（原实现）| gpu（网络所在设备）")
+    parser.add_argument("--train-subset-every", type=int, default=None, help="每隔几轮评估一次训练子集")
     parser.add_argument("--device", default="cuda:0")
     return parser.parse_args()
 
 
+def speed_options(cfg):
+    """读取并校验训练加速选项，缺省值即原实现。返回 (execution, input_device)。"""
+    execution = cfg.get("execution", "step")
+    input_device = cfg.get("input_device", "cpu")
+    if execution not in EXECUTIONS:
+        raise ValueError("execution 必须是 %s 之一，收到 %r" % (EXECUTIONS, execution))
+    if input_device not in INPUT_DEVICES:
+        raise ValueError("input_device 必须是 %s 之一，收到 %r" % (INPUT_DEVICES, input_device))
+    if int(cfg.get("train_subset_every", 1)) < 1 or int(cfg.get("eval_chunk", 32)) < 1:
+        raise ValueError("train_subset_every 与 eval_chunk 必须 >= 1")
+    return execution, input_device
+
+
 def build_config(args):
-    """读取 YAML，并用命令行覆盖 seed / state_mode / neuron / save_root。返回展平的配置字典。"""
+    """读取 YAML，并用命令行覆盖 seed / state_mode / neuron / save_root / 加速选项。返回展平的配置字典。"""
     cfg = load_flat_config(args.config)
     if args.seed is not None:
         cfg["seed"] = args.seed
@@ -79,6 +106,13 @@ def build_config(args):
         cfg["neuron"] = args.neuron
     if args.save_root is not None:
         cfg["save_root"] = args.save_root
+    if args.execution is not None:
+        cfg["execution"] = args.execution
+    if args.input_device is not None:
+        cfg["input_device"] = args.input_device
+    if args.train_subset_every is not None:
+        cfg["train_subset_every"] = args.train_subset_every
+    speed_options(cfg)
     return cfg
 
 
@@ -217,25 +251,30 @@ class LayerMonitor(object):
         self.data = {}
 
     def update(self, info):
-        """累加一个窗口的 info（来自 net(..., collect=True)）。"""
+        """累加 info：逐窗 forward 的每层 [B,C,H,W]，或 forward_chunk 的每层 [T,B,C,H,W]（T 个窗口）。
+
+        两种形状按窗口计数，结果相同；计数用整数累加，避免片段内元素过多时 float32 求和舍入。
+        """
         with torch.no_grad():
             for name, spikes, u_pre in zip(LAYER_NAMES, info["spikes"], info["u_pre"]):
-                active = (spikes > 0).float()
+                if spikes.dim() == 4:
+                    spikes, u_pre = spikes.unsqueeze(0), u_pre.unsqueeze(0)
+                active = spikes > 0
                 d = self.data.get(name)
                 if d is None:
                     d = {"spike_sum": torch.zeros((), device=spikes.device, dtype=torch.float64),
                          "elements": 0, "windows": 0,
-                         "channel_spikes": torch.zeros(spikes.shape[1], device=spikes.device,
+                         "channel_spikes": torch.zeros(spikes.shape[2], device=spikes.device,
                                                        dtype=torch.float64),
-                         "neuron_windows": torch.zeros(spikes.shape[1:], device=spikes.device),
+                         "neuron_windows": torch.zeros(spikes.shape[2:], device=spikes.device),
                          "u_abs_max": torch.zeros((), device=spikes.device),
                          "big": torch.zeros((), device=spikes.device, dtype=torch.float64)}
                     self.data[name] = d
                 d["spike_sum"] += active.sum().double()
                 d["elements"] += active.numel()
-                d["windows"] += 1
-                d["channel_spikes"] += active.sum(dim=(0, 2, 3)).double()
-                d["neuron_windows"] += (active.sum(0) > 0).float()
+                d["windows"] += int(spikes.shape[0])
+                d["channel_spikes"] += active.sum(dim=(0, 1, 3, 4)).double()
+                d["neuron_windows"] += (active.sum(1) > 0).sum(0).float()
                 u_abs = u_pre.abs()
                 d["u_abs_max"] = torch.maximum(d["u_abs_max"], u_abs.max())
                 d["big"] += (u_abs > 10.0 * self.v_threshold).sum().double()
@@ -335,17 +374,21 @@ def train_sequence(net, seq, optimizer, cfg, q99, pos_weight, device, rng, max_w
       optimizer_step=per_sequence：梯度跨片段累加，损失除以整条序列事件数，序列结束时裁剪并更新一次
       optimizer_step=per_chunk   ：回退预案，每段除以本段事件数并更新一次
     空窗口照常前向（使状态衰减），只是不产生损失；没有事件的片段不调用 backward。
+    execution=layer 时每个片段调用一次 forward_chunk，片段损失是片段内全部事件的求和，与逐窗求和相同。
     max_windows 仅供冒烟测试截断使用。
     返回: {"loss_sum", "events", "grad_norms", "missing_grads", "steps"}
     """
     k = int(cfg["tbptt_k"])
+    execution, _ = speed_options(cfg)
     n_windows = seq.n_windows if max_windows is None else min(int(max_windows), seq.n_windows)
     chunks = make_chunks(n_windows, k, int(rng.randint(1, k + 1)))
     per_sequence = cfg["optimizer_step"] == "per_sequence"
     if cfg["optimizer_step"] not in ("per_sequence", "per_chunk"):
         raise ValueError("optimizer_step 必须是 per_sequence 或 per_chunk")
     total_events = int(seq.bounds[n_windows] - seq.bounds[0])
-    weight = torch.tensor([pos_weight], dtype=torch.float32, device=device)
+    dtype = next(net.parameters()).dtype
+    source = make_window_source(seq, cfg, q99, device, dtype)
+    weight = torch.tensor([pos_weight], dtype=dtype, device=device)
     loss_sum, steps, grad_norms, missing = 0.0, 0, {}, []
 
     def step():
@@ -362,14 +405,22 @@ def train_sequence(net, seq, optimizer, cfg, q99, pos_weight, device, rng, max_w
         if not per_sequence:
             optimizer.zero_grad(set_to_none=True)
         chunk_loss, chunk_events = None, 0
-        for w in range(start, end):
-            x, events, labels, _ = window_to_device(seq, w, q99, cfg, device)
-            logits, states, _ = net(x, events, states)
+        if execution == "layer":
+            x, events, labels, _ = source.chunk(start, end)
+            logits, states, _ = net.forward_chunk(x, events, states)
             if labels.numel():
-                term = F.binary_cross_entropy_with_logits(logits, labels, pos_weight=weight,
-                                                          reduction="sum")
-                chunk_loss = term if chunk_loss is None else chunk_loss + term
-                chunk_events += int(labels.numel())
+                chunk_loss = F.binary_cross_entropy_with_logits(logits, labels, pos_weight=weight,
+                                                                reduction="sum")
+                chunk_events = int(labels.numel())
+        else:
+            for w in range(start, end):
+                x, events, labels, _ = source.window(w)
+                logits, states, _ = net(x, events, states)
+                if labels.numel():
+                    term = F.binary_cross_entropy_with_logits(logits, labels, pos_weight=weight,
+                                                              reduction="sum")
+                    chunk_loss = term if chunk_loss is None else chunk_loss + term
+                    chunk_events += int(labels.numel())
         if chunk_loss is not None:
             denominator = total_events if per_sequence else chunk_events
             (chunk_loss / denominator).backward()
@@ -395,25 +446,49 @@ def run_sequence(net, seq, cfg, q99, device, state_mode, monitor=None, timer=Non
         probs      按文件原始事件顺序回填的预测概率（numpy float32，长度 N）
         confusion  [n_windows, 4] 每窗 TP/FP/FN/正事件数（阈值 cfg["threshold"]）
     调用方负责 torch.no_grad() 与 net.eval()。
+    execution=layer 时每 eval_chunk 个窗口调用一次 forward_chunk（吞吐快，但不能用来测单窗延迟，timer 必须为空）。
     """
+    execution, _ = speed_options(cfg)
+    if execution == "layer" and timer is not None:
+        raise ValueError("逐窗延迟只能在 execution=step 下测量")
     threshold = float(cfg["threshold"])
+    source = make_window_source(seq, cfg, q99, device, next(net.parameters()).dtype)
     states = None
     index_parts, prob_parts = [], []
     confusion = np.zeros((seq.n_windows, 4), dtype=np.int64)
-    for k in range(seq.n_windows):
-        t0 = timer.now() if timer else None
-        x, events, _, idx = window_to_device(seq, k, q99, cfg, device)
-        t1 = timer.now() if timer else None
-        logits, states, info = net(x, events, states, state_mode=state_mode, collect=monitor is not None)
-        t2 = timer.now() if timer else None
-        prob = torch.sigmoid(logits).float().cpu().numpy()
-        if timer:
-            timer.add(t1 - t0, t2 - t1, timer.now() - t2)
-        if monitor is not None:
-            monitor.update(info)
-        index_parts.append(idx)
-        prob_parts.append(prob)
-        confusion[k] = window_confusion(prob, seq.label[idx], threshold)
+    if execution == "layer":
+        size = int(cfg.get("eval_chunk", 32))
+        for start in range(0, seq.n_windows, size):
+            end = min(start + size, seq.n_windows)
+            x, events, _, idx = source.chunk(start, end)
+            logits, states, info = net.forward_chunk(x, events, states, state_mode=state_mode,
+                                                     collect=monitor is not None)
+            prob = torch.sigmoid(logits).float().cpu().numpy()
+            if monitor is not None:
+                monitor.update(info)
+            offset = 0
+            for k in range(start, end):
+                count = int(seq.bounds[k + 1] - seq.bounds[k])
+                part_idx, part_prob = idx[offset:offset + count], prob[offset:offset + count]
+                index_parts.append(part_idx)
+                prob_parts.append(part_prob)
+                confusion[k] = window_confusion(part_prob, seq.label[part_idx], threshold)
+                offset += count
+    else:
+        for k in range(seq.n_windows):
+            t0 = timer.now() if timer else None
+            x, events, _, idx = source.window(k)
+            t1 = timer.now() if timer else None
+            logits, states, info = net(x, events, states, state_mode=state_mode, collect=monitor is not None)
+            t2 = timer.now() if timer else None
+            prob = torch.sigmoid(logits).float().cpu().numpy()
+            if timer:
+                timer.add(t1 - t0, t2 - t1, timer.now() - t2)
+            if monitor is not None:
+                monitor.update(info)
+            index_parts.append(idx)
+            prob_parts.append(prob)
+            confusion[k] = window_confusion(prob, seq.label[idx], threshold)
     probs = refill_by_index(seq.n_events, index_parts, prob_parts)
     return probs, confusion
 
@@ -614,6 +689,9 @@ def mode_train(args, cfg):
         run_calibration(net, cfg, q99, device, root)
     subset = select_subset(train_file_names(cfg), int(cfg["train_subset_size"]), seed + 2000)
     train_set = EvUAVStream(cfg["root"], "train", cfg)
+    execution, input_device = speed_options(cfg)
+    print("执行方式 %s | 输入构造 %s | 训练子集每 %d 轮评估 | 验证片段 %d 窗" % (
+        execution, input_device, int(cfg.get("train_subset_every", 1)), int(cfg.get("eval_chunk", 32))), flush=True)
     for epoch in range(start_epoch, epochs):
         lr = linear_epoch_lr(epoch, epochs, float(cfg["lr"]), float(cfg["lr_end"]))
         for group in optimizer.param_groups:
@@ -635,11 +713,14 @@ def mode_train(args, cfg):
         train_seconds = time.perf_counter() - t0
         grad_mean = {k: v / max(n_seq, 1) for k, v in grad_acc.items()}
         val = evaluate_split(net, cfg, q99, device, "val", cfg["state_mode"], collect_layers=True)
-        sub = evaluate_split(net, cfg, q99, device, "train", cfg["state_mode"], names=subset)
+        sub = None
+        if subset_due(epoch, epochs, int(cfg.get("train_subset_every", 1))):
+            sub = evaluate_split(net, cfg, q99, device, "train", cfg["state_mode"], names=subset)
         taus = tau_statistics(net)
         record = {"epoch": epoch, "seed": seed, "lr": lr, "loss_per_event": loss_sum / max(event_sum, 1),
                   "val_iou": val["iou"], "val_acc": val["acc"],
-                  "train_subset_iou": sub["iou"], "train_subset_acc": sub["acc"],
+                  "train_subset_iou": sub["iou"] if sub else None, "train_subset_acc": sub["acc"] if sub else None,
+                  "execution": execution, "input_device": input_device,
                   "train_seconds": train_seconds, "epoch_seconds": time.perf_counter() - t0,
                   "peak_memory_gib": peak_memory_gib(device), "grad_norms": grad_mean,
                   "layers": val["layers"], "tau": taus,
@@ -651,9 +732,9 @@ def mode_train(args, cfg):
             best = val["iou"]
             save_checkpoint(root / ("best_val_iou_seed%d.pt" % seed), net, optimizer, epoch, best, cfg, stats)
         save_checkpoint(root / "last.pt", net, optimizer, epoch, best, cfg, stats)
-        print("epoch %d lr %.2e loss/event %.5f val IoU %.4f ACC %.4f | train-subset IoU %.4f | %.0fs | 警告 %d" % (
-            epoch, lr, record["loss_per_event"], val["iou"], val["acc"], sub["iou"],
-            record["epoch_seconds"], len(record["warnings"])), flush=True)
+        print("epoch %d lr %.2e loss/event %.5f val IoU %.4f ACC %.4f | train-subset IoU %s | %.0fs（训练 %.0fs）| 警告 %d" % (
+            epoch, lr, record["loss_per_event"], val["iou"], val["acc"], "%.4f" % sub["iou"] if sub else "-",
+            record["epoch_seconds"], train_seconds, len(record["warnings"])), flush=True)
         for w in record["warnings"]:
             print("  [health]", w, flush=True)
     summary = summarize_history(history, seed)
@@ -677,6 +758,10 @@ def mode_eval(args, cfg):
     for key in ("threshold", "pd_detT", "correct_thresh", "rolling_window", "segments",
                 "timing_warmup_windows"):
         train_cfg[key] = cfg[key]
+    # 正式评估始终走原实现：论文指标与逐窗延迟都以它为准，与训练时用的加速选项无关
+    if args.execution == "layer" or args.input_device == "gpu":
+        print("注意：--mode eval 固定使用 execution=step、input_device=cpu，忽略命令行加速选项", flush=True)
+    train_cfg["execution"], train_cfg["input_device"] = "step", "cpu"
     seed_everything(int(train_cfg["seed"]), bool(train_cfg["deterministic"]))
     q99 = np.asarray(ckpt["stats"]["q99"], dtype=np.float32)
     net = build_net(train_cfg, device)
