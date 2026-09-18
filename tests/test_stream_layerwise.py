@@ -285,10 +285,13 @@ class TrainingLoopTests(unittest.TestCase):
         cfg = T.build_config(args)
         self.assertEqual((cfg["execution"], cfg["input_device"], cfg["train_subset_every"], cfg["tbptt_k"]),
                          ("layer", "gpu", 5, 32))
-        default = T.build_config(SimpleNamespace(**dict(
+        # 代码级缺省（配置里没有这些键时）仍是原实现，保证旧配置与旧 checkpoint 行为不变
+        self.assertEqual(T.speed_options({}), ("step", "cpu"))
+        # 随仓库发布的 YAML 则默认走加速路径（09-18 起），复现原实现要显式加命令行参数
+        shipped = T.build_config(SimpleNamespace(**dict(
             vars(args), execution=None, input_device=None, train_subset_every=None, tbptt_k=None)))
-        self.assertEqual(T.speed_options(default), ("step", "cpu"))
-        self.assertEqual(default["tbptt_k"], 16)
+        self.assertEqual(T.speed_options(shipped), ("layer", "gpu"))
+        self.assertEqual((shipped["train_subset_every"], shipped["tbptt_k"]), (5, 16))
         with self.assertRaises(ValueError):
             T.build_config(SimpleNamespace(**dict(vars(args), tbptt_k=0)))
 

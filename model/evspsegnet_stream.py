@@ -363,7 +363,7 @@ def calibrate_gains(net, sequence_factory, quantile, samples_per_channel, min_po
     return reports
 
 
-def estimate_operations(net, height, width, firing_rates, events_per_window):
+def estimate_operations(net, height, width, firing_rates, events_per_window, input_density=None):
     """估计单个窗口的理论运算量（面向神经形态硬件的理论值，不代表 GPU 实测能耗）。
 
     约定：
@@ -372,6 +372,9 @@ def estimate_operations(net, height, width, firing_rates, events_per_window):
         输入是实数的部分记为 MAC：第一层（实数计数输入）、解码器中 ConvT 输出的通道、读出 MLP
         电流合并解码器中 ConvT 与解码卷积的输入都是脉冲，解码阶段全部记为 SOP
     输入: firing_rates 为 {层名: 该层平均发放率}；events_per_window 为平均每窗事件数（读出 MLP 按事件计）。
+        input_density 为输入中非零元素的占比（实测值，可选）。给出时额外返回事件驱动口径的 enc1 运算量：
+        卷积按输入散射时一个非零输入驱动 C_out*k*k 次乘加，所以 enc1 运算数 = 稠密运算数 * 非零占比，
+        与基线稀疏卷积"只在有事件的位置计算"是同一口径（见 tools/stream_energy.py）。
     输出: {"dense_ops", "mac", "sop", "per_layer": [...]}
     """
     h, w = int(height), int(width)
@@ -420,8 +423,15 @@ def estimate_operations(net, height, width, firing_rates, events_per_window):
         state_size["dec%d" % level] = size["enc%d" % level]
     state_elements = sum(block.out_ch * state_size[name]
                          for name, block in zip(LAYER_NAMES, net.blocks()))
-    return {"dense_ops": sum(l["dense"] for l in layers), "mac": sum(l["mac"] for l in layers),
-            "sop": sum(l["sop"] for l in layers), "per_layer": layers,
-            "state_elements": state_elements if net.stateful else 0,
-            "note": "SOP 为基于发放率的理论估计；当前 GPU 实现仍执行稠密卷积；"
-                    "未计入膜电位更新、增益、访存及预后处理成本，state_elements 按单序列统计"}
+    result = {"dense_ops": sum(l["dense"] for l in layers), "mac": sum(l["mac"] for l in layers),
+              "sop": sum(l["sop"] for l in layers), "per_layer": layers,
+              "state_elements": state_elements if net.stateful else 0}
+    if input_density is not None:
+        enc1 = layers[0]
+        result["input_density"] = float(input_density)
+        result["mac_event_driven"] = result["mac"] - enc1["mac"] + enc1["dense"] * float(input_density)
+    result["note"] = ("SOP 为基于发放率的理论估计；当前 GPU 实现仍执行稠密卷积；"
+                      "未计入膜电位更新、增益、访存及预后处理成本，state_elements 按单序列统计；"
+                      "mac_event_driven 为事件驱动口径（enc1 只计非零输入），与基线稀疏卷积同口径")
+    return result
+

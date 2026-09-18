@@ -445,7 +445,14 @@ def train_sequence(net, seq, optimizer, cfg, q99, pos_weight, device, rng, max_w
             "missing_grads": missing, "steps": steps}
 
 
-def run_sequence(net, seq, cfg, q99, device, state_mode, monitor=None, timer=None):
+def count_nonzero_input(stats, x):
+    """累计输入中的非零元素个数与总数（事件驱动口径的能耗要用；stats 为 None 时什么都不做）。"""
+    if stats is not None:
+        stats["nonzero"] += int((x != 0).sum())
+        stats["elements"] += int(x.numel())
+
+
+def run_sequence(net, seq, cfg, q99, device, state_mode, monitor=None, timer=None, input_stats=None):
     """推理一个完整序列（全部窗口，按时间顺序，状态按 state_mode 处理）。
 
     返回: (probs, confusion)
@@ -453,6 +460,7 @@ def run_sequence(net, seq, cfg, q99, device, state_mode, monitor=None, timer=Non
         confusion  [n_windows, 4] 每窗 TP/FP/FN/正事件数（阈值 cfg["threshold"]）
     调用方负责 torch.no_grad() 与 net.eval()。
     execution=layer 时每 eval_chunk 个窗口调用一次 forward_chunk（吞吐快，但不能用来测单窗延迟，timer 必须为空）。
+    input_stats 不为空时，累计输入中非零元素的个数与总数（事件驱动口径的能耗要用，见 estimate_operations）。
     """
     execution, _ = speed_options(cfg)
     if execution == "layer" and timer is not None:
@@ -467,6 +475,7 @@ def run_sequence(net, seq, cfg, q99, device, state_mode, monitor=None, timer=Non
         for start in range(0, seq.n_windows, size):
             end = min(start + size, seq.n_windows)
             x, events, _, idx = source.chunk(start, end)
+            count_nonzero_input(input_stats, x)
             logits, states, info = net.forward_chunk(x, events, states, state_mode=state_mode,
                                                      collect=monitor is not None)
             prob = torch.sigmoid(logits).float().cpu().numpy()
@@ -484,6 +493,7 @@ def run_sequence(net, seq, cfg, q99, device, state_mode, monitor=None, timer=Non
         for k in range(seq.n_windows):
             t0 = timer.now() if timer else None
             x, events, _, idx = source.window(k)
+            count_nonzero_input(input_stats, x)
             t1 = timer.now() if timer else None
             logits, states, info = net(x, events, states, state_mode=state_mode, collect=monitor is not None)
             t2 = timer.now() if timer else None
@@ -516,6 +526,7 @@ def evaluate_split(net, cfg, q99, device, split, state_mode, names=None, full=Fa
                                         correct_thresh=cfg["correct_thresh"]))
     monitor = LayerMonitor(net.v_threshold) if (collect_layers or full) else None
     timer = WindowTimer(cfg["timing_warmup_windows"], device) if full else None
+    input_stats = {"nonzero": 0, "elements": 0} if full else None
     confusion_sum = np.zeros((int(cfg["n_windows"]), 4), dtype=np.int64)
     kept, total_events = [], 0
     was_training = net.training
@@ -523,7 +534,8 @@ def evaluate_split(net, cfg, q99, device, split, state_mode, names=None, full=Fa
     with torch.no_grad():
         for i in range(len(dataset)):
             seq = dataset[i]
-            probs, confusion = run_sequence(net, seq, cfg, q99, device, state_mode, monitor, timer)
+            probs, confusion = run_sequence(net, seq, cfg, q99, device, state_mode, monitor, timer,
+                                            input_stats)
             confusion_sum += confusion
             total_events += seq.n_events
             evaluator.matches[str(i)] = {"seg_pred": torch.from_numpy(probs),
@@ -565,8 +577,10 @@ def evaluate_split(net, cfg, q99, device, split, state_mode, names=None, full=Fa
             "per_window": {"tp": tp.tolist(), "fp": fp.tolist(), "fn": fn.tolist(), "pos": npos.tolist()},
             "latency": summarize_latencies(records),
             "timing": timing,
+            "input_nonzero_fraction": input_stats["nonzero"] / float(max(input_stats["elements"], 1)),
             "operations": estimate_operations(net, cfg["pad_height"], cfg["pad_width"], rates,
-                                              total_events / float(len(dataset) * int(cfg["n_windows"]))),
+                                              total_events / float(len(dataset) * int(cfg["n_windows"])),
+                                              input_stats["nonzero"] / float(max(input_stats["elements"], 1))),
         })
     return result
 

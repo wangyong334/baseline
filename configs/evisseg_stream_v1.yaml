@@ -43,10 +43,12 @@ TRAIN:
   pos_weight_cap: 30.0         # pos_weight = min(train_neg/train_pos, 30)
   train_subset_size: 24        # 训练子集评估，用于区分欠拟合与泛化问题
   num_workers: 2
-  # 训练加速（缺省即原实现；--mode eval 始终用 step + cpu）
-  execution: step              # step 逐窗 | layer 片段内逐层时间并行（数学等价）
-  input_device: cpu            # cpu numpy 逐窗构造 | gpu 事件常驻显存按片段构造（输入逐位相同）
-  train_subset_every: 1        # 训练子集每几轮评估一次（验证集始终每轮评估、选模型）
+  # 训练加速：默认走加速路径（每轮 545 -> 73 s）。与原实现数学等价，已在 float64 下核对，
+  # 见 tools/check_stream_execution.py。要复现 09-16 那批原实现的数字，加 --execution step --input-device cpu。
+  # --mode eval 始终用 step + cpu，不受这里影响：论文指标与逐窗延迟都来自原实现。
+  execution: layer             # step 逐窗（原实现）| layer 片段内逐层时间并行
+  input_device: gpu            # cpu numpy 逐窗构造（原实现）| gpu 事件常驻显存按片段构造（输入逐位相同）
+  train_subset_every: 5        # 训练子集每几轮评估一次（只用于诊断；验证集始终每轮评估、选模型）
   eval_chunk: 32               # layer 模式每轮验证时一次处理的窗口数
   deterministic: true
   save_root: log/stream_v1_seed37

@@ -181,5 +181,64 @@ class ThresholdSweepTests(unittest.TestCase):
             self.assertGreater(rows[0]["recall"], rows[1]["recall"])     # 阈值越高召回越低
             self.assertLessEqual(rows[0]["precision"], rows[1]["precision"])
 
+class SummarizeRunsTests(unittest.TestCase):
+    """汇总工具：分组、跨种子求均值、按训练时的状态模式取主指标、两种能耗口径。"""
+
+    def write_eval(self, root, run, seed, split, iou, mode="carry", density=None):
+        import json
+        directory = os.path.join(root, "%s_seed%d" % (run, seed))
+        os.makedirs(directory, exist_ok=True)
+        net = EvSpSegNetStream(channels=SMALL, merged_decoder=True)
+        ops = estimate_operations(net, 16, 16, dict.fromkeys(LAYER_NAMES, 0.1), 5, density)
+        other = "reset_each_window" if mode == "carry" else "carry"
+        payload = {"epoch": 7, "parameters": {"total": 123}, "trained_state_mode": mode, "neuron": "lif",
+                   mode: {"iou": iou, "acc": 0.9, "pd": 0.94, "fa": 1e-5, "operations": ops,
+                          "layers": {n: {"firing_rate": 0.1} for n in LAYER_NAMES},
+                          "tau": {"enc1": {"tau_mean": 200.0}},
+                          "segment_iou": {"0-15": iou - 0.05}, "latency": {"latency_median_ms": 55.0,
+                                                                           "detection_rate": 1.0}},
+                   other: {"iou": iou - 0.2}}
+        if density is not None:
+            payload[mode]["input_nonzero_fraction"] = density
+        with open(os.path.join(directory, "eval_%s_best_val_iou_seed%d.json" % (split, seed)), "w",
+                  encoding="utf-8") as stream:
+            json.dump(payload, stream)
+
+    def test_grouping_modes_and_energy(self):
+        from tools import summarize_runs as S
+        import tempfile
+        with tempfile.TemporaryDirectory() as root:
+            self.write_eval(root, "runA", 37, "test", 0.80, density=0.001)
+            self.write_eval(root, "runA", 38, "test", 0.84, density=0.001)
+            self.write_eval(root, "runB", 37, "test", 0.50, mode="reset_each_window")
+            self.write_eval(root, "runA", 37, "val", 0.88, density=0.001)
+            runs = S.collect(root, "test", "")
+            self.assertEqual(sorted(runs), ["runA", "runB"])
+            self.assertEqual(len(runs["runA"]), 2)
+            a = S.summarize(runs["runA"], 0.5, 160)
+            self.assertAlmostEqual(a["iou"], 0.82)
+            self.assertAlmostEqual(a["iou_std"], 0.0283, places=3)
+            self.assertAlmostEqual(a["other_mode_iou"], 0.62)     # 另一种状态模式
+            self.assertTrue(a["measured_density"])                # 用的是结果里实测的占比
+            self.assertLess(a["energy_event_mj"], a["energy_dense_mj"])
+            b = S.summarize(runs["runB"], 0.5, 160)
+            self.assertEqual(b["state_mode"], "reset_each_window")
+            self.assertAlmostEqual(b["iou"], 0.50)                # reset 训练的模型不按 carry 取主指标
+            self.assertFalse(b["measured_density"])
+            self.assertEqual(len(S.collect(root, "val", "")), 1)
+            self.assertEqual(sorted(S.collect(root, "test", "runB")), ["runB"])
+
+    def test_energy_matches_manual_formula(self):
+        from tools import summarize_runs as S
+        net = EvSpSegNetStream(channels=SMALL, merged_decoder=True)
+        ops = estimate_operations(net, 16, 16, dict.fromkeys(LAYER_NAMES, 0.1), 5)
+        dense, event = S.energy_mj_per_8s(ops, 0.01, 160)
+        expected = (ops["mac"] * 4.6e-12 + ops["sop"] * 0.9e-12) * 1e3 * 160
+        self.assertAlmostEqual(dense, expected, delta=1e-9)
+        enc1 = [r for r in ops["per_layer"] if r["layer"] == "enc1"][0]
+        mac_event = ops["mac"] - enc1["mac"] + enc1["dense"] * 0.01
+        self.assertAlmostEqual(event, (mac_event * 4.6e-12 + ops["sop"] * 0.9e-12) * 1e3 * 160, delta=1e-9)
+
+
 if __name__ == "__main__":
     unittest.main()
