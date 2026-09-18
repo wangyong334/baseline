@@ -446,10 +446,19 @@ def train_sequence(net, seq, optimizer, cfg, q99, pos_weight, device, rng, max_w
 
 
 def count_nonzero_input(stats, x):
-    """累计输入中的非零元素个数与总数（事件驱动口径的能耗要用；stats 为 None 时什么都不做）。"""
+    """累计输入中的非零元素个数与总数（事件驱动口径的能耗要用；stats 为 None 时什么都不做）。
+
+    计数留在张量上累加、结束时才取值：如果每个窗口都 int(...) 取回主机，就会每窗同步一次 GPU，
+    既拖慢评估，也会污染逐窗计时（论文的延迟数字来自那里）。调用位置同样要放在计时区间之外。
+    """
     if stats is not None:
-        stats["nonzero"] += int((x != 0).sum())
+        stats["nonzero"] = stats["nonzero"] + (x != 0).sum()
         stats["elements"] += int(x.numel())
+
+
+def nonzero_fraction(stats):
+    """把累计结果换算成非零元素占比（在这里才同步一次）。"""
+    return float(stats["nonzero"]) / float(max(stats["elements"], 1))
 
 
 def run_sequence(net, seq, cfg, q99, device, state_mode, monitor=None, timer=None, input_stats=None):
@@ -493,13 +502,13 @@ def run_sequence(net, seq, cfg, q99, device, state_mode, monitor=None, timer=Non
         for k in range(seq.n_windows):
             t0 = timer.now() if timer else None
             x, events, _, idx = source.window(k)
-            count_nonzero_input(input_stats, x)
             t1 = timer.now() if timer else None
             logits, states, info = net(x, events, states, state_mode=state_mode, collect=monitor is not None)
             t2 = timer.now() if timer else None
             prob = torch.sigmoid(logits).float().cpu().numpy()
             if timer:
                 timer.add(t1 - t0, t2 - t1, timer.now() - t2)
+            count_nonzero_input(input_stats, x)          # 放在计时之后，不计入单窗耗时
             if monitor is not None:
                 monitor.update(info)
             index_parts.append(idx)
@@ -577,10 +586,10 @@ def evaluate_split(net, cfg, q99, device, split, state_mode, names=None, full=Fa
             "per_window": {"tp": tp.tolist(), "fp": fp.tolist(), "fn": fn.tolist(), "pos": npos.tolist()},
             "latency": summarize_latencies(records),
             "timing": timing,
-            "input_nonzero_fraction": input_stats["nonzero"] / float(max(input_stats["elements"], 1)),
+            "input_nonzero_fraction": nonzero_fraction(input_stats),
             "operations": estimate_operations(net, cfg["pad_height"], cfg["pad_width"], rates,
                                               total_events / float(len(dataset) * int(cfg["n_windows"])),
-                                              input_stats["nonzero"] / float(max(input_stats["elements"], 1))),
+                                              nonzero_fraction(input_stats)),
         })
     return result
 
@@ -700,6 +709,10 @@ def mode_train(args, cfg):
         net.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         start_epoch, best = int(ckpt["epoch"]) + 1, float(ckpt["best_val_iou"])
+        previous = (ckpt["config"].get("execution", "step"), ckpt["config"].get("input_device", "cpu"))
+        if previous != speed_options(cfg):
+            print("注意：续训的执行方式与原运行不同（%s -> %s）。两者数学等价，但浮点舍入不同，"
+                  "曲线不会与不中断的运行逐位一致" % (previous, speed_options(cfg)), flush=True)
         history = [json.loads(line) for line in metrics_path.read_text(encoding="utf-8").splitlines() if line]
         history = [h for h in history if h["epoch"] < start_epoch]
         print("从 epoch %d 继续" % start_epoch, flush=True)

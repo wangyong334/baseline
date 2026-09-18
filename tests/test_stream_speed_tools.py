@@ -240,5 +240,36 @@ class SummarizeRunsTests(unittest.TestCase):
         self.assertAlmostEqual(event, (mac_event * 4.6e-12 + ops["sop"] * 0.9e-12) * 1e3 * 160, delta=1e-9)
 
 
+class InputDensityTests(unittest.TestCase):
+    """评估时记录的非零输入占比：两种执行方式都要等于直接数出来的值。"""
+
+    def test_counts_match_direct_count_in_both_executions(self):
+        import train_stream_v1 as T
+        seq = synthetic_sequence(seed=8)
+        net = make_net(merged=True, seed=4).float().eval()
+        source = NumpyWindowSource(seq, CFG, Q99, CPU)
+        expected_nonzero = sum(int((source.window(k)[0] != 0).sum()) for k in range(WINDOWS))
+        expected_total = WINDOWS * 12 * H * W
+        for execution, input_device in (("step", "cpu"), ("layer", "gpu")):
+            cfg = dict(TOOL_CFG, execution=execution, input_device=input_device)
+            stats = {"nonzero": 0, "elements": 0}
+            with torch.no_grad():
+                T.run_sequence(net, seq, cfg, Q99, CPU, "carry", input_stats=stats)
+            self.assertEqual(int(stats["nonzero"]), expected_nonzero, execution)
+            self.assertEqual(stats["elements"], expected_total, execution)
+            self.assertAlmostEqual(T.nonzero_fraction(stats), expected_nonzero / float(expected_total), places=12)
+
+    def test_operations_carry_event_driven_accounting(self):
+        net = EvSpSegNetStream(channels=SMALL, merged_decoder=True)
+        rates = dict.fromkeys(LAYER_NAMES, 0.1)
+        plain = estimate_operations(net, 16, 16, rates, 5)
+        self.assertNotIn("mac_event_driven", plain)          # 不给占比时不额外报告
+        with_density = estimate_operations(net, 16, 16, rates, 5, 0.01)
+        enc1 = [r for r in with_density["per_layer"] if r["layer"] == "enc1"][0]
+        self.assertAlmostEqual(with_density["mac_event_driven"],
+                               plain["mac"] - enc1["mac"] + enc1["dense"] * 0.01, delta=1e-6)
+        self.assertEqual(with_density["input_density"], 0.01)
+
+
 if __name__ == "__main__":
     unittest.main()
