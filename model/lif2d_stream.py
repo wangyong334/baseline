@@ -7,6 +7,8 @@
     tau   = tau_min + (tau_max - tau_min) * sigmoid(a)，beta = exp(-dt / tau)
 状态由调用者显式传入和返回，模块内部不保存膜电位（不会进入 checkpoint）。
 每个 50 ms 窗口只调用一次神经元：5 个时间 bin 是输入通道，不是 SNN 时间步。
+三种神经元用于分离"脉冲"与"跨窗记忆"两个因素：StreamingLIF2d（有状态+二值）、
+StreamingGraded2d（有状态+实数）、ReLUNeuron（无状态+实数）。
 forward 逐窗调用（流式推理、增益校准）；forward_steps 一次处理一个片段的多个窗口（逐层时间并行训练），两者等价。
 """
 import math
@@ -70,15 +72,20 @@ class StreamingLIF2d(nn.Module):
         """返回每个通道的衰减系数 beta = exp(-dt/tau)，形状 [C]。"""
         return torch.exp(-self.dt_ms / self.tau())
 
+    def activate(self, u_pre):
+        """膜电位 -> (输出, 是否发放)。LIF 输出 0/1 脉冲，复位量由"是否发放"决定。"""
+        spikes = SurrogateSpike.apply(u_pre - self.v_threshold)
+        return spikes, spikes.detach()
+
     def forward(self, current, state):
         if state is None:
             u_pre = current
         else:
             beta = self.beta().to(current.dtype).view(1, -1, 1, 1)
             u_pre = beta * state + current
-        spikes = SurrogateSpike.apply(u_pre - self.v_threshold)
-        new_state = u_pre - self.v_threshold * spikes.detach()
-        return spikes, new_state, u_pre
+        output, fired = self.activate(u_pre)
+        new_state = u_pre - self.v_threshold * fired
+        return output, new_state, u_pre
 
     def forward_steps(self, current, state, carry=True, keep_u_pre=True):
         """按时间顺序处理一个片段的 T 个窗口，与连续调用 forward T 次数学等价（逐层时间并行训练用）。
@@ -96,12 +103,30 @@ class StreamingLIF2d(nn.Module):
         for t in range(steps):
             prev = state if carry else None
             u_pre = current[t] if prev is None else beta * prev + current[t]
-            spike = SurrogateSpike.apply(u_pre - self.v_threshold)
-            state = u_pre - self.v_threshold * spike.detach()
-            spikes.append(spike)
+            output, fired = self.activate(u_pre)
+            state = u_pre - self.v_threshold * fired
+            spikes.append(output)
             if keep_u_pre:
                 u_pres.append(u_pre)
         return torch.stack(spikes), state, (torch.stack(u_pres) if keep_u_pre else None)
+
+
+class StreamingGraded2d(StreamingLIF2d):
+    """有状态但不发放的对照：阈值、复位、时间常数、代理梯度都与 LIF 相同，只有发放幅值不同。
+
+        LIF     发放时传出 1
+        graded  发放时传出膜电位 U_pre 本身（本类）
+    因此相同输入下膜电位轨迹与 LIF 完全一致，唯一的差别是"下游收到的是二值还是实数"。
+    幅值刚好在阈值处等于 v_th = 1，与脉冲同量级，不会因为幅值变小而让深层沉默；
+    高于阈值的部分正是二值化丢掉的信息。梯度同样经过代理梯度，阈值以下也有梯度，避免死区把对照拖垮。
+
+    三个对照的关系：lif 有状态+二值；graded 有状态+实数；relu 无状态+实数。
+    输出是实数，下游卷积输入不再是脉冲，理论能耗按 MAC 计（见 estimate_operations）。
+    """
+
+    def activate(self, u_pre):
+        fired = SurrogateSpike.apply(u_pre - self.v_threshold)
+        return fired * u_pre, fired.detach()
 
 
 class ReLUNeuron(nn.Module):

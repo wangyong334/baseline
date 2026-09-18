@@ -3,7 +3,7 @@
 全部在 CPU 上用 float64 小网络运行，不需要数据集：
     1. 查找表归一化与 normalize_counts 逐位相同；torch 输入构造与 numpy 输入构造逐位相同
     2. LIF.forward_steps 与逐窗 forward 等价（前向与梯度）
-    3. forward_chunk 与逐窗 forward 等价：两种解码器 × LIF/ReLU × carry/reset，跨片段传递状态，含梯度
+    3. forward_chunk 与逐窗 forward 等价：两种解码器 × LIF/graded/ReLU × carry/reset，跨片段传递状态，含梯度
     4. train_sequence / run_sequence 在四种选项组合下结果一致（更新后参数、概率、每窗混淆矩阵、发放统计）
 误差一律用 (a - b).abs().max() 比较，不用 torch.testing.assert_close（torch 1.9 默认比较步长）。
 """
@@ -35,6 +35,11 @@ def max_error(a, b):
     return float((a.detach() - b.detach()).abs().max()) if a.numel() else 0.0
 
 
+def rel_error(a, b):
+    """相对误差：最大绝对误差 / max(量级, 1)。graded 对照放大了增益，膜电位量级很大，只能比相对误差。"""
+    return max_error(a, b) / max(float(a.detach().abs().max()), 1.0) if a.numel() else 0.0
+
+
 def synthetic_sequence(seed=0, n=900):
     """合成序列：含两个空窗、一个计数超过查表饱和值的热点像素，文件顺序打乱（检验下标回填）。"""
     rng = np.random.RandomState(seed)
@@ -59,6 +64,12 @@ def make_net(merged=False, neuron="lif", seed=5, threshold=0.05):
     for block in net.blocks():
         if hasattr(block.neuron, "v_threshold"):
             block.neuron.v_threshold = threshold
+    if neuron == "graded":
+        # graded 的发放幅值就是膜电位（约等于阈值）。这里把阈值调低到 0.05 是为了让小网络有活动，
+        # 但那样幅值也只有 0.05，信号会逐层缩小。放大增益让幅值回到 1 附近，与 LIF 的二值输出同量级。
+        # 真实网络阈值为 1、增益经过校准，本来就是同量级，不需要这一步。
+        for block in net.blocks():
+            block.gain.set_gain(torch.full((block.out_ch,), 1.0 / threshold, dtype=torch.float64))
     return net
 
 
@@ -151,7 +162,7 @@ class ForwardChunkTests(unittest.TestCase):
         seq = synthetic_sequence()
         source = TorchWindowSource(seq, CFG, Q99, torch.device("cpu"), torch.float64)
         for merged in (False, True):
-            for neuron in ("lif", "relu"):
+            for neuron in ("lif", "graded", "relu"):
                 for mode in ("carry", "reset_each_window"):
                     with self.subTest(merged=merged, neuron=neuron, mode=mode):
                         self.check_pair(source, merged, neuron, mode)
@@ -184,15 +195,15 @@ class ForwardChunkTests(unittest.TestCase):
                 spikes_a = torch.stack([w[layer] for w in info_a["spikes"][start:end]])
                 u_pre_a = torch.stack([w[layer] for w in info_a["u_pre"][start:end]])
                 self.assertEqual(int(((spikes_a > 0) != (info["spikes"][layer] > 0)).sum()), 0, LAYER_NAMES[layer])
-                self.assertLess(max_error(u_pre_a, info["u_pre"][layer]), TOL, LAYER_NAMES[layer])
+                self.assertLess(rel_error(u_pre_a, info["u_pre"][layer]), TOL, LAYER_NAMES[layer])
                 active[layer] += int((info["spikes"][layer] > 0).sum())
             for a, b in zip(chunk_states_a[i], states):
                 if a is None:
                     self.assertIsNone(b)
                 else:
-                    self.assertLess(max_error(a, b), TOL)
+                    self.assertLess(rel_error(a, b), TOL)
         logits_b = torch.cat(logits_b)
-        self.assertLess(max_error(logits_a, logits_b), TOL)
+        self.assertLess(rel_error(logits_a, logits_b), TOL)
         (logits_b * weights).sum().backward()
         self.assertTrue(all(n > 0 for n in active), active)             # 每层都有发放
         for (name, pa), (_, pb) in zip(net_a.named_parameters(), net_b.named_parameters()):
@@ -269,11 +280,17 @@ class TrainingLoopTests(unittest.TestCase):
         self.assertEqual([e for e in range(50) if subset_due(e, 50, 1)], list(range(50)))
         self.assertEqual([e for e in range(12) if subset_due(e, 12, 5)], [4, 9, 11])
         args = SimpleNamespace(config="configs/evisseg_stream_v1.yaml", seed=None, state_mode=None, neuron=None,
-                               save_root=None, execution="layer", input_device="gpu", train_subset_every=5)
+                               save_root=None, execution="layer", input_device="gpu", train_subset_every=5,
+                               tbptt_k=32)
         cfg = T.build_config(args)
-        self.assertEqual((cfg["execution"], cfg["input_device"], cfg["train_subset_every"]), ("layer", "gpu", 5))
-        self.assertEqual(T.speed_options(T.build_config(SimpleNamespace(**dict(
-            vars(args), execution=None, input_device=None, train_subset_every=None)))), ("step", "cpu"))
+        self.assertEqual((cfg["execution"], cfg["input_device"], cfg["train_subset_every"], cfg["tbptt_k"]),
+                         ("layer", "gpu", 5, 32))
+        default = T.build_config(SimpleNamespace(**dict(
+            vars(args), execution=None, input_device=None, train_subset_every=None, tbptt_k=None)))
+        self.assertEqual(T.speed_options(default), ("step", "cpu"))
+        self.assertEqual(default["tbptt_k"], 16)
+        with self.assertRaises(ValueError):
+            T.build_config(SimpleNamespace(**dict(vars(args), tbptt_k=0)))
 
 
 if __name__ == "__main__":

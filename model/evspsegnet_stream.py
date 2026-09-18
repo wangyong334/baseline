@@ -31,7 +31,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model.lif2d_stream import ChannelGain, ReLUNeuron, StreamingLIF2d
+from model.lif2d_stream import ChannelGain, ReLUNeuron, StreamingGraded2d, StreamingLIF2d
 from utils.stream_common import gains_from_positive_samples
 
 LAYER_NAMES = ("enc1", "enc2", "enc3", "enc4", "dec3", "dec2", "dec1")
@@ -62,6 +62,8 @@ class SpikingConvBlock(nn.Module):
         self.gain = ChannelGain(out_ch)
         if neuron == "lif":
             self.neuron = StreamingLIF2d(out_ch, **lif_kwargs)
+        elif neuron == "graded":
+            self.neuron = StreamingGraded2d(out_ch, **lif_kwargs)
         elif neuron == "relu":
             self.neuron = ReLUNeuron()
         else:
@@ -148,6 +150,16 @@ class EvSpSegNetStream(nn.Module):
     def blocks(self):
         """按前向拓扑顺序返回 7 个脉冲卷积单元（校准必须按这个顺序逐层进行）。"""
         return [getattr(self, name) for name in LAYER_NAMES]
+
+    @property
+    def spiking(self):
+        """输出是否为 0/1 脉冲（只有 lif 是；graded 与 relu 输出实数）。"""
+        return self.neuron_kind == "lif"
+
+    @property
+    def stateful(self):
+        """是否保留跨窗膜电位（lif 与 graded 保留，relu 没有状态）。"""
+        return self.neuron_kind in ("lif", "graded")
 
     def forward(self, x, events, states, state_mode=None, collect=False):
         mode = self.state_mode if state_mode is None else state_mode
@@ -400,7 +412,7 @@ def estimate_operations(net, height, width, firing_rates, events_per_window):
     lin1, lin2 = net.readout[0], net.readout[2]
     per_event = lin1.in_features * lin1.out_features + lin2.in_features * lin2.out_features
     add("readout", per_event * float(events_per_window), 0.0, per_event * float(events_per_window))
-    if net.neuron_kind != "lif":                                     # ReLU 对照没有脉冲，全部按 MAC 计
+    if not net.spiking:                       # graded / relu 对照输出实数，没有脉冲，全部按 MAC 计
         for layer in layers:
             layer["mac"], layer["sop"] = layer["dense"], 0.0
     state_size = dict(size)
@@ -410,6 +422,6 @@ def estimate_operations(net, height, width, firing_rates, events_per_window):
                          for name, block in zip(LAYER_NAMES, net.blocks()))
     return {"dense_ops": sum(l["dense"] for l in layers), "mac": sum(l["mac"] for l in layers),
             "sop": sum(l["sop"] for l in layers), "per_layer": layers,
-            "state_elements": state_elements if net.neuron_kind == "lif" else 0,
+            "state_elements": state_elements if net.stateful else 0,
             "note": "SOP 为基于发放率的理论估计；当前 GPU 实现仍执行稠密卷积；"
                     "未计入膜电位更新、增益、访存及预后处理成本，state_elements 按单序列统计"}

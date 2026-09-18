@@ -14,7 +14,7 @@ DATA:
 
 NET:
   channels: [12, 24, 48, 48]   # 约 0.10M 参数，不与原 4.0M 模型对齐
-  neuron: lif                  # lif | relu（ReLU 仅用于对照与诊断）
+  neuron: lif                  # lif 有状态+脉冲 | graded 有状态+实数 | relu 无状态+实数（后两者用于对照）
   state_mode: carry            # carry | reset_each_window（等价 beta=0）
   norm: none                   # none | groupnorm_noshift（备选）
   v_threshold: 1.0

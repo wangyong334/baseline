@@ -61,7 +61,8 @@ def parse_args():
     parser.add_argument("--save-root", default=None, help="输出目录，默认取 YAML 的 save_root")
     parser.add_argument("--seed", type=int, default=None, help="覆盖 YAML 中的 seed")
     parser.add_argument("--state-mode", choices=("carry", "reset_each_window"), default=None)
-    parser.add_argument("--neuron", choices=("lif", "relu"), default=None)
+    parser.add_argument("--neuron", choices=("lif", "graded", "relu"), default=None,
+                        help="lif 有状态+脉冲 | graded 有状态+实数（分离脉冲与记忆的对照）| relu 无状态+实数")
     parser.add_argument("--checkpoint", default=None, help="eval 模式使用的权重文件")
     parser.add_argument("--split", choices=("val", "test"), default="val")
     parser.add_argument("--sequence", default=None, help="overfit 模式的序列文件名")
@@ -78,6 +79,7 @@ def parse_args():
     parser.add_argument("--input-device", choices=INPUT_DEVICES, default=None,
                         help="窗口输入在哪里构造：cpu（原实现）| gpu（网络所在设备）")
     parser.add_argument("--train-subset-every", type=int, default=None, help="每隔几轮评估一次训练子集")
+    parser.add_argument("--tbptt-k", type=int, default=None, help="覆盖 YAML 中的 TBPTT 片段长度（窗口数）")
     parser.add_argument("--device", default="cuda:0")
     return parser.parse_args()
 
@@ -112,6 +114,10 @@ def build_config(args):
         cfg["input_device"] = args.input_device
     if args.train_subset_every is not None:
         cfg["train_subset_every"] = args.train_subset_every
+    if args.tbptt_k is not None:
+        if args.tbptt_k < 1:
+            raise ValueError("--tbptt-k 必须 >= 1")
+        cfg["tbptt_k"] = args.tbptt_k
     speed_options(cfg)
     return cfg
 

@@ -111,5 +111,75 @@ class BenchToolTests(unittest.TestCase):
         self.assertAlmostEqual(p["epoch_s_high"], p["epoch_s_low"] + 99 * 0.5)
 
 
+
+class GradedNeuronTests(unittest.TestCase):
+    """有状态但不发放的对照：膜电位轨迹必须与 LIF 一致，只有输出不同。"""
+
+    def test_membrane_matches_lif_and_output_is_graded(self):
+        from model.lif2d_stream import StreamingGraded2d, StreamingLIF2d
+        torch.manual_seed(0)
+        args = dict(dt_ms=50.0, tau_init_ms=200.0, tau_min_ms=50.0, tau_max_ms=2000.0, v_threshold=1.0)
+        lif, graded = StreamingLIF2d(3, **args).double(), StreamingGraded2d(3, **args).double()
+        graded.a.data.copy_(lif.a.data)
+        current = torch.rand(6, 2, 3, 4, 5, dtype=torch.float64) * 3
+        spikes, state_a, u_a = lif.forward_steps(current, None)
+        values, state_b, u_b = graded.forward_steps(current, None)
+        self.assertLess(float((u_a - u_b).abs().max()), 1e-12)          # 膜电位轨迹一致
+        self.assertLess(float((state_a - state_b).abs().max()), 1e-12)  # 复位后的状态也一致
+        self.assertTrue(torch.equal((values > 0).double(), spikes))     # 发放位置一致
+        self.assertLess(float((values - spikes * u_a).abs().max()), 1e-12)   # 发放时传出膜电位本身
+        self.assertGreater(float(values.max()), 1.0)                    # 输出是实数，不是 0/1
+        self.assertGreaterEqual(float(values[values > 0].min()), 1.0)   # 幅值不小于阈值，与脉冲同量级
+
+    def test_network_flags_and_operations(self):
+        for kind, spiking, stateful in (("lif", True, True), ("graded", False, True), ("relu", False, False)):
+            net = EvSpSegNetStream(channels=SMALL, neuron=kind, merged_decoder=True)
+            self.assertEqual((net.spiking, net.stateful), (spiking, stateful), kind)
+            ops = estimate_operations(net, 16, 16, dict.fromkeys(LAYER_NAMES, 0.2), 5)
+            if spiking:
+                self.assertGreater(ops["sop"], 0.0)
+            else:
+                self.assertEqual(ops["sop"], 0.0, kind)
+                self.assertAlmostEqual(ops["mac"], ops["dense_ops"], delta=1e-6)
+            self.assertEqual(ops["state_elements"] > 0, stateful, kind)
+
+
+class ThresholdSweepTests(unittest.TestCase):
+    def test_event_metrics_and_interpolation(self):
+        from tools import sweep_threshold as S
+        labels = np.array([1, 1, 0, 0], dtype=np.float32)
+        probs = np.array([0.95, 0.4, 0.92, 0.1], dtype=np.float32)
+        m = S.event_metrics(labels, probs, 0.9)
+        self.assertEqual((m["tp"], m["fp"], m["fn"]), (1, 1, 1))
+        self.assertAlmostEqual(m["iou"], 1 / 3.0)
+        self.assertAlmostEqual(m["recall"], 0.5)
+        self.assertAlmostEqual(m["precision"], 0.5)
+        rows = [{"threshold": 0.9, "fa": 1e-6, "iou": 0.80, "recall": 0.7, "precision": 0.9, "pd": 0.85},
+                {"threshold": 0.5, "fa": 1e-4, "iou": 0.70, "recall": 0.9, "precision": 0.6, "pd": 0.95}]
+        point = S.interpolate_at_fa(rows, 1e-5)                 # log 空间正中间
+        self.assertAlmostEqual(point["threshold"], 0.7, places=6)
+        self.assertAlmostEqual(point["pd"], 0.90, places=6)
+        self.assertIsNone(S.interpolate_at_fa(rows, 1e-9))      # 超出范围不外推
+
+    def test_sweep_on_synthetic_dump(self):
+        from tools import sweep_threshold as S
+        import tempfile
+        rng = np.random.RandomState(0)
+        with tempfile.TemporaryDirectory() as directory:
+            for i in range(2):
+                n = 500
+                labels = (rng.rand(n) < 0.2).astype(np.float32)
+                probs = np.clip(labels * 0.6 + rng.rand(n) * 0.4, 0, 1).astype(np.float32)
+                locs = np.stack([np.zeros(n), rng.randint(0, 346, n), rng.randint(0, 260, n),
+                                 rng.randint(0, 8000, n)], 1).astype(np.int64)
+                np.savez(os.path.join(directory, "seq%d.npz" % i), locs=locs, labels=labels,
+                         probabilities=probs, target_id=labels.astype(np.float64))
+            sequences = S.load_dump(directory)
+            self.assertEqual(len(sequences), 2)
+            rows = S.sweep(sequences, [0.5, 0.9], with_pd=False, pd_detT=50, correct_thresh=1e-4)
+            self.assertEqual([r["threshold"] for r in rows], [0.5, 0.9])
+            self.assertGreater(rows[0]["recall"], rows[1]["recall"])     # 阈值越高召回越低
+            self.assertLessEqual(rows[0]["precision"], rows[1]["precision"])
+
 if __name__ == "__main__":
     unittest.main()

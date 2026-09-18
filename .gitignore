@@ -3,6 +3,7 @@ __pycache__/
 *.pt
 log/
 run/
+Res/
 .venv-stream-check/
 References/
 .idea/
