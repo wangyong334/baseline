@@ -77,6 +77,13 @@ def parse_args():
     parser.add_argument("--train-subset-every", type=int, default=None)
     parser.add_argument("--tbptt-k", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=None, help="覆盖 YAML 中的 epochs（本地冒烟用）")
+    parser.add_argument("--tag", default=None, help="eval 模式：结果文件名后缀，用于区分同一 checkpoint 的多组判决层设置")
+    parser.add_argument("--cusum-velocities", type=float, nargs="+", default=None,
+                        help="覆盖速度假设的单轴取值，例如 --cusum-velocities 0（只保留静止假设，做运动补偿的对照）")
+    parser.add_argument("--cusum-aggregate", choices=("sum", "mean", "lme"), default=None,
+                        help="足迹证据聚合：lme/mean 对空间相关稳健，sum 要求像素独立")
+    parser.add_argument("--cusum-track-tau-ms", type=float, default=None, help="管道强度记忆的时间常数，0 关闭")
+    parser.add_argument("--readout-delays", type=int, nargs="+", default=None, help="逐事件延迟读出的窗数")
     parser.add_argument("--device", default="cuda:0")
     return parser.parse_args()
 
@@ -86,7 +93,9 @@ def build_config(args):
     cfg = load_flat_config(args.config)
     overrides = {"seed": args.seed, "state_mode": args.state_mode, "neuron": args.neuron,
                  "save_root": args.save_root, "root": args.data_root, "train_subset_every": args.train_subset_every,
-                 "tbptt_k": args.tbptt_k, "epochs": args.epochs}
+                 "tbptt_k": args.tbptt_k, "epochs": args.epochs, "cusum_axis_velocities": args.cusum_velocities,
+                 "cusum_aggregate": args.cusum_aggregate, "cusum_track_tau_ms": args.cusum_track_tau_ms,
+                 "readout_delays": args.readout_delays}
     for key, value in overrides.items():
         if value is not None:
             cfg[key] = value
@@ -614,19 +623,28 @@ def mode_eval(args, cfg):
     device = torch.device(args.device)
     ckpt = torch.load(args.checkpoint, map_location=device)
     train_cfg = dict(ckpt["config"])
+    # 判决层（CUSUM）与评估口径没有可学习参数，一律取自当前 YAML / 命令行：
+    # 同一个 checkpoint 可以直接跑"静止 vs 运动补偿""lme vs sum""记忆开关"等对照，不必重训
     for key in ("root", "threshold", "pd_detT", "correct_thresh", "rolling_window", "segments",
-                "readout_delays", "eval_chunk", "fusion_weight", "alarm_thetas", "alarm_radius"):
+                "readout_delays", "eval_chunk", "fusion_weight", "alarm_thetas", "alarm_radius",
+                "cusum_axis_velocities", "cusum_footprint", "cusum_compensator", "cusum_nb_kappa",
+                "cusum_aggregate", "cusum_track_tau_ms"):
         if key in cfg:
             train_cfg[key] = cfg[key]
+    train_cfg.setdefault("readout_delays", [1, 2, 5])
     seed_everything(int(train_cfg["seed"]), bool(train_cfg["deterministic"]))
     frontend, model, cusum = build_all(train_cfg, device)
     model.load_state_dict(ckpt["model"])
     if not bool(model.backbone.gain_calibrated):
         raise RuntimeError("checkpoint 中的增益未校准")
-    out_path = Path(args.checkpoint).parent / ("eval_%s_%s.json" % (args.split, Path(args.checkpoint).stem))
+    suffix = ("_" + args.tag) if args.tag else ""
+    out_path = Path(args.checkpoint).parent / ("eval_%s_%s%s.json" % (args.split, Path(args.checkpoint).stem, suffix))
     if out_path.exists() and not args.overwrite:
         raise RuntimeError("结果已存在: %s（使用 --overwrite 覆盖）" % out_path)
     results = {"checkpoint": args.checkpoint, "epoch": ckpt["epoch"], "design_version": DESIGN_VERSION,
+               "tag": args.tag, "trained_design_version": ckpt.get("design_version"),
+               "cusum": {"velocities": train_cfg["cusum_axis_velocities"], "aggregate": train_cfg.get("cusum_aggregate"),
+                         "track_tau_ms": train_cfg.get("cusum_track_tau_ms"), "footprint": train_cfg["cusum_footprint"]},
                "parameters": count_parameters(model), "trained_state_mode": train_cfg["state_mode"],
                "neuron": train_cfg["neuron"], "readout_delays": train_cfg["readout_delays"]}
     for mode in ("carry", "reset_each_window"):
