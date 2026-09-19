@@ -112,6 +112,42 @@ def first_detection_latencies(t, label, target_id, pred_prob, window_ms, thresho
     return results
 
 
+def first_detection_latencies_published(t, label, target_id, pred_prob, window_ms, threshold, correct_thresh,
+                                        publish_window):
+    """首次检出延迟（V2 延迟读出用）：检出条件与 first_detection_latencies 相同，但第 k 窗事件的结果
+    在第 publish_window[k] 窗末才发布（延迟读出；序列末尾的延迟可能被截断，所以按实际发布窗计算）。
+
+    latency = (publish_window[k_d] + 1) * window_ms - t_first；未计入网络计算与排队时间。
+    输出格式与 first_detection_latencies 相同（另加 publish_window）。
+    """
+    results = []
+    positive = label == 1
+    publish_window = np.asarray(publish_window)
+    for tid in np.unique(target_id[positive]):
+        if tid == 0:
+            continue
+        mask = positive & (target_id == tid)
+        times = t[mask]
+        t_first = int(times.min())
+        windows = times // int(window_ms)
+        hit = pred_prob[mask] >= float(threshold)
+        detect = None
+        for k in np.unique(windows):
+            in_k = windows == k
+            n_k = int(np.count_nonzero(in_k))
+            n_hit = int(np.count_nonzero(hit & in_k))
+            if n_k and float(n_hit) / float(n_k) >= float(correct_thresh) and n_hit > 0:
+                detect = int(k)
+                break
+        latency, published = None, None
+        if detect is not None:
+            published = int(publish_window[detect])
+            latency = float((published + 1) * int(window_ms) - t_first)
+        results.append({"target_id": float(tid), "t_first_ms": t_first, "detect_window": detect,
+                        "publish_window": published, "latency_ms": latency})
+    return results
+
+
 def summarize_latencies(records):
     """汇总所有序列的首次检出延迟：目标数、检出数、检出率、延迟均值/中位数/P90（只统计已检出目标）。"""
     lat = np.array([r["latency_ms"] for r in records if r["latency_ms"] is not None], dtype=np.float64)

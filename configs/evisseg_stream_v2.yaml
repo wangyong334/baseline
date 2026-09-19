@@ -1,0 +1,82 @@
+# 流式 SNN V2（方案一，设计 v2-1）：证据前端 + V1 电流合并解码器骨干 + mark/强度两个头 + 漂移 CUSUM 判决
+# 50 ms 块因果；骨干每窗一次 LIF 更新；前端与 CUSUM 无可学习参数。说明见 README_STREAM_V2.md。
+DATA:
+  root: /media/stephen/nvme0n1/wy_data/datasets/EV-UAV-dataset
+  window_ms: 50
+  n_windows: 160
+  time_bins: 5             # 仅为复用 V1 的 NPZ 读取接口；V2 特征不分箱，事件时间精确到毫秒进入时间矩
+  height: 260
+  width_px: 346
+  pad_height: 264
+  pad_width: 352
+
+FRONTEND:
+  fe_taus_ms: [20, 100, 500, 2000]     # 时间矩的时间尺度；2 s 尺度用于长时程证据
+  fe_dipole_taus_ms: [100, 500]        # 极性偶极所用的时间尺度（必须在 fe_taus_ms 中）
+  fe_dipole_radius: 3                  # 偶极邻域 7x7
+  bg_fast_ms: 500                      # 背景快速估计（取 15x15 邻域平均，跟随成片杂波）
+  bg_slow_ms: 5000                     # 背景慢速逐像素估计（热像素、常亮闪烁）
+  bg_prior: 0.01                       # 背景先验：每像素每窗期望事件数
+  bg_prior_windows: 2                  # 先验的伪窗数
+  bg_floor: 0.001                      # mu0 下限
+  bg_smooth_radius: 7
+
+NET:
+  channels: [12, 24, 48, 48]
+  neuron: lif                          # lif | graded | relu（对照）
+  state_mode: carry                    # 只作用于骨干；前端与 CUSUM 始终保持状态
+  norm: none
+  v_threshold: 1.0
+  tau_init_ms: 200.0
+  tau_min_ms: 50.0
+  tau_max_ms: 2000.0
+  merged_decoder: true
+  head_hidden: 16                      # 逐像素头的隐藏通道（0 = 直接 1x1 线性）
+  mark_prior: 0.03                     # mark 头偏置初值 = logit(目标事件先验占比)
+  intensity_prior: 0.0002              # 强度头偏置初值 = log(每像素每窗目标事件数先验)
+  log_g_max: 8.0
+
+CUSUM:
+  cusum_axis_velocities: [-4, -2, -1, 0, 1, 2, 4]   # 像素/窗，二维网格 7x7 = 49 个假设
+  cusum_footprint: 3
+  cusum_compensator: poisson           # poisson | negbin（逐像素的背景边缘分布）
+  cusum_nb_kappa: null                 # negbin 的离散参数
+  cusum_aggregate: lme                 # 足迹内证据聚合：lme / mean 对像素间任意相关都成立；sum 要求像素条件独立
+  cusum_track_tau_ms: 250              # 管道强度记忆的时间常数（离开目标的管道持续产生负证据）；0 关闭
+  readout_delays: [1, 2, 5]            # 逐事件延迟读出的窗数（50/100/250 ms）
+  fusion_weight: 1.0                   # 轨迹证据融合分数 = mark + w * F(d)；w 用 tools/calibrate_fusion.py 在 val 上校准
+  alarm_thetas: [8, 12, 16]            # 位置级告警阈值（带复位）；每位置每窗虚警率上界 V/(e^theta-1)
+  alarm_radius: 4                      # 告警离目标事件 <= 4 像素（切比雪夫距离）算真告警
+
+CALIB:
+  calib_sequences: 8
+  calib_windows: 32
+  calib_samples_per_channel: 2048
+  calib_min_positive: 1024
+  calib_quantile: 0.99
+  calib_gain_min: 0.05
+  calib_gain_max: 20.0
+
+TRAIN:
+  seed: 37
+  epochs: 50
+  lr: 0.001
+  lr_end: 0.0001
+  tbptt_k: 16
+  grad_clip: 1.0
+  loss_mark_weight: 1.0                # 逐事件 BCE（无 pos_weight）
+  loss_intensity_weight: 1.0           # 当前窗目标强度场的泊松负对数似然
+  loss_intensity_smooth: 3             # 目标计数先在 3x3 邻域内平均成强度场
+  train_subset_size: 24
+  train_subset_every: 5
+  num_workers: 2
+  eval_chunk: 32
+  deterministic: true
+  save_root: log/stream_v2_seed37
+
+EVAL:
+  threshold: 0.9
+  pd_detT: 50
+  correct_thresh: 0.0001
+  rolling_window: 10
+  segments: [[0, 15], [64, 79], [144, 159]]

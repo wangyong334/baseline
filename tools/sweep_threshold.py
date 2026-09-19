@@ -15,6 +15,8 @@ ReLU 保守得多（Pd 0.85、虚警 6.5e-6）。这种情况下直接比逐事�
     python tools/sweep_threshold.py --target-fa 1e-5 \
         --dump-dir log/verify/v1_s37_test log/verify/relu_s37_test log/verify/baseline_k5_s37_test
 默认阈值网格 0.1~0.99；只想快速看 IoU 曲线可加 --no-pd（跳过较慢的 Pd/Fa 统计）。
+V2 的导出里除 probabilities（net 读出）外还有 prob_fused_d1 等字段，用"目录:字段"指定，例如
+    --dump-dir log/verify/stream_v2_s37_test log/verify/stream_v2_s37_test:prob_fused_d1 log/verify/v1_s37_test
 """
 import argparse
 import json
@@ -32,7 +34,8 @@ DEFAULT_THRESHOLDS = (0.1, 0.3, 0.5, 0.7, 0.8, 0.9, 0.95, 0.99)
 def parse_args():
     """解析命令行参数。"""
     parser = argparse.ArgumentParser(description="阈值扫描与等虚警率比较")
-    parser.add_argument("--dump-dir", nargs="+", required=True, help="一个或多个逐事件预测目录，每个目录是一个模型")
+    parser.add_argument("--dump-dir", nargs="+", required=True,
+                        help="一个或多个逐事件预测目录，每个目录是一个模型；可写成 目录:字段 选择概率字段（默认 probabilities）")
     parser.add_argument("--thresholds", nargs="*", type=float, default=list(DEFAULT_THRESHOLDS))
     parser.add_argument("--target-fa", nargs="*", type=float, default=[1e-5, 6.5e-6],
                         help="在这些虚警率处插值比较（默认取 LIF 与 ReLU 在 0.9 阈值下的两个虚警率）")
@@ -44,8 +47,16 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_dump(directory, max_sequences=0):
-    """读取一个目录下的逐事件预测，返回按文件名排序的序列列表。"""
+def split_spec(spec):
+    """把"目录"或"目录:字段"拆成 (目录, 概率字段)。目录本身存在时不拆（兼容含冒号的 Windows 路径）。"""
+    if os.path.isdir(spec) or ":" not in spec:
+        return spec, "probabilities"
+    directory, key = spec.rsplit(":", 1)
+    return directory, key
+
+
+def load_dump(directory, max_sequences=0, key="probabilities"):
+    """读取一个目录下的逐事件预测（概率取字段 key），返回按文件名排序的序列列表。"""
     names = sorted(n for n in os.listdir(directory) if n.endswith(".npz"))
     if max_sequences:
         names = names[:int(max_sequences)]
@@ -56,7 +67,7 @@ def load_dump(directory, max_sequences=0):
         with np.load(os.path.join(directory, name)) as data:
             out.append({"name": name, "locs": np.asarray(data["locs"]),
                         "labels": np.asarray(data["labels"]).astype(np.float32),
-                        "probs": np.asarray(data["probabilities"]).astype(np.float32),
+                        "probs": np.asarray(data[key]).astype(np.float32),
                         "target_id": np.asarray(data["target_id"])})
     return out
 
@@ -126,12 +137,13 @@ def interpolate_at_fa(rows, target_fa):
 def main():
     """入口：逐个目录扫描阈值 -> 打印曲线 -> 在目标虚警率处对齐比较 -> 写 JSON。"""
     args = parse_args()
-    missing = [d for d in args.dump_dir if not os.path.isdir(d)]
+    missing = [d for d in args.dump_dir if not os.path.isdir(split_spec(d)[0])]
     if missing:
         raise SystemExit("找不到目录: %s" % missing)
     results = {}
     for directory in args.dump_dir:
-        sequences = load_dump(directory, args.max_sequences)
+        path, key = split_spec(directory)
+        sequences = load_dump(path, args.max_sequences, key)
         events = sum(s["labels"].shape[0] for s in sequences)
         print("%s | %d 条序列 | %d 个事件" % (directory, len(sequences), events), flush=True)
         results[directory] = {"sequences": len(sequences), "events": int(events),

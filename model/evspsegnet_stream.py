@@ -103,13 +103,16 @@ class EvSpSegNetStream(nn.Module):
         state_mode 'carry'（使用 states）或 'reset_each_window'（忽略 states，等价 beta=0）；
                    None 时使用构造参数中的默认值
         collect    True 时 info 返回每层的脉冲、u_pre、增益前电流（用于监控与校准）
-        logits     [N] 每个事件的原始 logit
+        logits     [N] 每个事件的原始 logit；events 为 None 或没有读出头时为 None
         new_states 7 个软复位后的膜电位（ReLU 版本为 None 列表）
+    forward_dense / forward_dense_chunk 只跑骨干，返回最后一层复位前膜电位 u7（V2 在其上接自己的输出头）。
+    use_readout=False 时不创建逐事件读出 MLP（V2 使用），state_dict 中也就没有 readout.*。
     """
 
     def __init__(self, in_channels=12, channels=(12, 24, 48, 48), neuron="lif", norm="none",
                  state_mode="carry", readout_hidden=32, dt_ms=50.0, tau_init_ms=200.0,
-                 tau_min_ms=50.0, tau_max_ms=2000.0, v_threshold=1.0, merged_decoder=False):
+                 tau_min_ms=50.0, tau_max_ms=2000.0, v_threshold=1.0, merged_decoder=False,
+                 use_readout=True):
         super(EvSpSegNetStream, self).__init__()
         if state_mode not in ("carry", "reset_each_window"):
             raise ValueError("state_mode 必须是 carry 或 reset_each_window")
@@ -136,8 +139,10 @@ class EvSpSegNetStream(nn.Module):
             self.dec2 = block(c2 + c2, c2, 1)
             self.up1 = nn.ConvTranspose2d(c2, c1, 2, stride=2, bias=False)
             self.dec1 = block(c1 + c1, c1, 1)
-        self.readout = nn.Sequential(nn.Linear(c1 + 2, readout_hidden), nn.ReLU(),
-                                     nn.Linear(readout_hidden, 1))
+        self.readout = None
+        if use_readout:
+            self.readout = nn.Sequential(nn.Linear(c1 + 2, readout_hidden), nn.ReLU(),
+                                         nn.Linear(readout_hidden, 1))
         self.state_mode = state_mode
         self.neuron_kind = neuron
         self.merged_decoder = merged_decoder
@@ -161,13 +166,31 @@ class EvSpSegNetStream(nn.Module):
         """是否保留跨窗膜电位（lif 与 graded 保留，relu 没有状态）。"""
         return self.neuron_kind in ("lif", "graded")
 
-    def forward(self, x, events, states, state_mode=None, collect=False):
+    def _previous_states(self, states, state_mode):
+        """按状态模式整理上一窗的 7 个膜电位：reset_each_window 或没有历史时全部为 None。"""
         mode = self.state_mode if state_mode is None else state_mode
         if mode not in ("carry", "reset_each_window"):
             raise ValueError("state_mode 必须是 carry 或 reset_each_window")
         prev = states if (mode == "carry" and states is not None) else [None] * 7
         if len(prev) != 7:
             raise ValueError("states 应为 7 个膜电位，收到 %d 个" % len(prev))
+        return mode, prev
+
+    def forward(self, x, events, states, state_mode=None, collect=False):
+        u7, new_states, info = self.forward_dense(x, states, state_mode, collect)
+        logits = None
+        if events is not None and self.readout is not None:
+            # 高级索引 u7[b, :, y, x] 的结果形状为 [N, C]
+            feat = u7[events["b"], :, events["y"], events["x"]]
+            logits = self._readout(feat, events)
+        return logits, new_states, info
+
+    def forward_dense(self, x, states, state_mode=None, collect=False):
+        """逐窗前向骨干（不做逐事件读出）。
+
+        输入/参数同 forward。输出: (u7 [B,C1,H,W] 最后一层复位前膜电位, 新的 7 个膜电位, info)。
+        """
+        _, prev = self._previous_states(states, state_mode)
         s1, n1, u1, i1 = self.enc1(x, prev[0])
         s2, n2, u2, i2 = self.enc2(s1, prev[1])
         s3, n3, u3, i3 = self.enc3(s2, prev[2])
@@ -181,15 +204,12 @@ class EvSpSegNetStream(nn.Module):
             s5, n5, u5, i5 = self.dec3(torch.cat([self.up3(s4), s3], 1), prev[4])
             s6, n6, u6, i6 = self.dec2(torch.cat([self.up2(s5), s2], 1), prev[5])
             s7, n7, u7, i7 = self.dec1(torch.cat([self.up1(s6), s1], 1), prev[6])
-        # 高级索引 u7[b, :, y, x] 的结果形状为 [N, C]
-        feat = u7[events["b"], :, events["y"], events["x"]]
-        logits = self._readout(feat, events)
         info = None
         if collect:
             info = {"spikes": [s1, s2, s3, s4, s5, s6, s7],
                     "u_pre": [u1, u2, u3, u4, u5, u6, u7],
                     "current": [i1, i2, i3, i4, i5, i6, i7]}
-        return logits, [n1, n2, n3, n4, n5, n6, n7], info
+        return u7, [n1, n2, n3, n4, n5, n6, n7], info
 
     def forward_chunk(self, x, events, states, state_mode=None, collect=False):
         """逐层时间并行：一次处理一个片段的 T 个连续窗口，与按时间顺序调用 forward T 次数学等价。
@@ -204,12 +224,21 @@ class EvSpSegNetStream(nn.Module):
             collect=True 时 info 含每层 [T,B,C,H,W] 的 spikes 与 u_pre（不含增益前电流）。
         流式推理与增益校准仍使用 forward。
         """
-        mode = self.state_mode if state_mode is None else state_mode
-        if mode not in ("carry", "reset_each_window"):
-            raise ValueError("state_mode 必须是 carry 或 reset_each_window")
-        prev = states if (mode == "carry" and states is not None) else [None] * 7
-        if len(prev) != 7:
-            raise ValueError("states 应为 7 个膜电位，收到 %d 个" % len(prev))
+        u7, new_states, info = self.forward_dense_chunk(x, states, state_mode, collect)
+        logits = None
+        if events is not None and self.readout is not None:
+            # 高级索引 u7[t, b, :, y, x] 的结果形状为 [N, C]
+            feat = u7[events["t"], events["b"], :, events["y"], events["x"]]
+            logits = self._readout(feat, events)
+        return logits, new_states, info
+
+    def forward_dense_chunk(self, x, states, state_mode=None, collect=False):
+        """逐层时间并行的骨干前向（不做逐事件读出），与逐窗调用 forward_dense T 次数学等价。
+
+        输入: x [T,B,C,H,W]；states / state_mode 同 forward_chunk。
+        输出: (u7 [T,B,C1,H,W], 片段结束时的 7 个膜电位, info)。
+        """
+        mode, prev = self._previous_states(states, state_mode)
         if x.dim() != 5:
             raise ValueError("forward_chunk 的输入应为 [T,B,C,H,W]，收到 %d 维" % x.dim())
         carry = mode == "carry"
@@ -236,14 +265,11 @@ class EvSpSegNetStream(nn.Module):
                                                  carry, collect)
             s7, n7, u7 = self.dec1.forward_steps(torch.cat([unflat(self.up1(flat(s6))), s1], 2), prev[6],
                                                  carry, True)
-        # 高级索引 u7[t, b, :, y, x] 的结果形状为 [N, C]
-        feat = u7[events["t"], events["b"], :, events["y"], events["x"]]
-        logits = self._readout(feat, events)
         info = None
         if collect:
             info = {"spikes": [s1, s2, s3, s4, s5, s6, s7],
                     "u_pre": [u1, u2, u3, u4, u5, u6, u7]}
-        return logits, [n1, n2, n3, n4, n5, n6, n7], info
+        return u7, [n1, n2, n3, n4, n5, n6, n7], info
 
     def _readout(self, feat, events):
         """逐事件读出：MLP([膜电位特征, p, t_local]) -> 原始 logit [N]。"""
@@ -412,9 +438,10 @@ def estimate_operations(net, height, width, firing_rates, events_per_window, inp
             real_part = conv.out_channels * conv_t.out_channels * k * hw  # ConvT 输出为实数 -> MAC
             spike_part = conv.out_channels * (conv.in_channels - conv_t.out_channels) * k * hw
             add(dec, real_part, firing_rates[skip] * spike_part, real_part + spike_part)
-    lin1, lin2 = net.readout[0], net.readout[2]
-    per_event = lin1.in_features * lin1.out_features + lin2.in_features * lin2.out_features
-    add("readout", per_event * float(events_per_window), 0.0, per_event * float(events_per_window))
+    if net.readout is not None:
+        lin1, lin2 = net.readout[0], net.readout[2]
+        per_event = lin1.in_features * lin1.out_features + lin2.in_features * lin2.out_features
+        add("readout", per_event * float(events_per_window), 0.0, per_event * float(events_per_window))
     if not net.spiking:                       # graded / relu 对照输出实数，没有脉冲，全部按 MAC 计
         for layer in layers:
             layer["mac"], layer["sop"] = layer["dense"], 0.0
