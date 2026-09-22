@@ -71,19 +71,34 @@ python tools/synth_events.py --out /media/stephen/nvme0n1/wy_data/datasets/synth
 eval 结果 `eval_<split>_<ckpt>.json`：`<carry|reset_each_window>.readouts.<net|fused_d*>` 为逐事件指标（原 eval 口径）与
 首次检出延迟；`.alarms.<theta>` 为告警输出的检出率、首次告警延迟、虚警连通域率与上界。
 
-## 关键对照（都用配置项实现，不新增模块）
+## 消融与对照（全部用配置项/命令行实现，不改代码）
 
-| 对照 | 配置 | 回答的问题 |
+**A. 评估时切换，不用重训**（判决层与读出都没有可学习参数，同一份权重直接跑）：
+
+| 消融 | 命令行 | 证明什么 |
 |---|---|---|
-| V1 | `train_stream_v1.py` | 基准 |
-| 新前端 + 单头 | `loss_intensity_weight: 0`，只看 net | 输入表示单独带来多少 |
-| 新前端 + 双头（零额外等待） | 默认，net 读出 | 强度头的联合训练有没有帮助 |
-| 静止证据积累 | `cusum_axis_velocities: [0]` | 与下一行对比："记忆跟着目标走"是否必要 |
-| 运动补偿证据积累 | 默认 7×7 | 核心机制 |
-| 管道记忆关闭 | `cusum_track_tau_ms: 0` | 负证据（预测落空）的作用 |
-| 相关性稳健 vs 独立假设 | `cusum_aggregate: lme / sum` | 稳健性的代价（告警延迟） |
-| 等待时间公平对照 | 静止积累 + 同样的 d | 延迟读出的收益是"多看了 d 窗"还是"沿轨迹看" |
-| SNN 的贡献 | `--neuron relu` | 同样前端、双头、判决下换 ReLU 骨干（注意 reset_each_window 只重置骨干，前端与判决仍有记忆） |
+| 只留静止假设 | `--cusum-velocities 0 --tag static` | 运动补偿（记忆跟着目标走）是否必要 |
+| 关掉管道强度记忆 | `--cusum-track-tau-ms 0 --tag nomem` | 负证据（预测落空）的作用 |
+| 聚合方式 | `--cusum-aggregate sum --tag sum` | 相关性稳健的代价（告警延迟） |
+| 延迟读出 | `--readout-delays 1 2 5` | 延迟—精度曲线；与静止假设同样的 d 做"等待时间公平对照" |
+| 骨干跨窗状态 | `--state-mode reset_each_window` | 骨干记忆的作用（注意前端与判决层仍有记忆） |
+| 完全不用判决层 | 看 `net` 读出 | 判决层的净增益 |
+| 告警阈值 / 足迹 / 补偿器 / 融合权重 | 配置项 | 各自的敏感度 |
+
+**B. 需要重训**（改变了学习到的部分或输入通道）：
+
+| 消融 | 配置 / 命令行 | 证明什么 |
+|---|---|---|
+| 单头（去掉强度头） | `loss_intensity_weight: 0` | 强度头的联合训练有没有帮助（此时判决层无预测可用） |
+| 前端递进链 ①只有计数+固定背景 | `--fe-features count --bg-mode constant` | 近似 V1 的输入，作为前端链条的起点 |
+| ②加自适应背景 | `--fe-features count` | 背景归一化值多少 |
+| ③加多尺度时间矩 | `--fe-features count ratio age` | 长时间尺度（含 2 s）值多少 |
+| ④加极性偶极（完整版） | 默认 | 偶极值多少 |
+| 时间尺度集合 | `fe_taus_ms: [20, 100]` 等 | 2 s 尺度单独的贡献 |
+| 神经元类型 | `--neuron relu` / `graded` | 脉冲骨干的贡献（同样前端、双头、判决） |
+| TBPTT 长度、合并解码器 | `--tbptt-k` / `merged_decoder` | 沿用 V1 的结论，一般不重做 |
+
+注：`bg_mode: constant` 同时关掉判决层的自适应补偿，虚警上界的前提（mu0 不低于真实背景）在事件密集的序列上会不成立——这正是"为什么需要背景模型"的证据，报告时要说明。
 
 ## 本地已核对的内容（CPU，无真实数据）
 

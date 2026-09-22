@@ -10,12 +10,15 @@ EvidenceFrontEnd   逐窗递推的前端，输出网络输入特征、只用过�
     时间矩（每个时间尺度 tau、每个极性，事件时间精确到毫秒，不分箱）：
         A = sum_e exp(-age_e/tau)，B = sum_e exp(-age_e/tau)*age_e，age 为事件到窗末的时长（ms）
         A(k) = d*A(k-1) + a_new，B(k) = d*(B(k-1) + dt*A(k-1)) + b_new，d = exp(-dt/tau)
-    特征（全部与背景强度成比例归一化，没有事件的位置为 0）：
+    特征（全部与背景强度成比例归一化，没有事件的位置为 0；用 features 选择要输出哪几组，消融用）：
         count    log1p( 本窗该极性计数 / (mu0/2) )                                  2 通道
         ratio    log1p( A / (mu0*tau/(2*dt)) )  背景下的期望值为 1，即"比平时多几倍"     2K 通道
         age      min( B/(A+eps)/tau, 3 )         事件的平均年龄（以 tau 为单位）          2K 通道
         dipole   ON 质心 - OFF 质心（局部 (2R+1)^2 邻域，按两极性事件量加权），/R          2*len(dipole_taus) 通道
                  运动的小目标前沿为一种极性、后沿为另一种，偶极方向就是运动轴；噪声与闪烁的偶极期望为 0
+消融开关（默认与完整版一致，不影响主路径）：
+    features  输出哪几组特征，任意子集：("count", "ratio", "age", "dipole")
+    bg_mode   adaptive 自适应背景（默认）；constant 用固定先验代替 mu0（关掉背景归一化，同时作用于特征与判决层）
 """
 import math
 
@@ -23,6 +26,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+FEATURE_GROUPS = ("count", "ratio", "age", "dipole")
 
 
 class EventChunkSource(object):
@@ -123,12 +128,22 @@ class EvidenceFrontEnd(nn.Module):
         bg_prior          背景先验（每像素每窗期望事件数），bg_prior_windows 为先验的伪窗数 n0
         bg_floor          mu0 的下限
         bg_smooth_radius  快速背景估计的邻域平均半径 r
+        features          输出的特征组（消融用，默认全部）
+        bg_mode           adaptive / constant（constant 即关掉背景归一化，mu0 固定为 bg_prior）
     状态（字典）：A, B [B,2K,H,W]；S_fast, S_slow [B,1,H,W]；W_fast, W_slow 浮点数；k 已处理窗数。
     """
 
     def __init__(self, taus_ms, window_ms, dipole_taus_ms, dipole_radius=3, bg_fast_ms=500.0,
-                 bg_slow_ms=5000.0, bg_prior=0.01, bg_prior_windows=2.0, bg_floor=1e-3, bg_smooth_radius=7):
+                 bg_slow_ms=5000.0, bg_prior=0.01, bg_prior_windows=2.0, bg_floor=1e-3, bg_smooth_radius=7,
+                 features=FEATURE_GROUPS, bg_mode="adaptive"):
         super(EvidenceFrontEnd, self).__init__()
+        self.features = tuple(str(f) for f in features)
+        unknown = [f for f in self.features if f not in FEATURE_GROUPS]
+        if unknown or not self.features:
+            raise ValueError("features 只能取 %s 的非空子集，收到 %s" % (FEATURE_GROUPS, features))
+        if bg_mode not in ("adaptive", "constant"):
+            raise ValueError("bg_mode 必须是 adaptive 或 constant")
+        self.bg_mode = bg_mode
         self.taus = [float(t) for t in taus_ms]
         self.window_ms = float(window_ms)
         self.dipole_index = []
@@ -153,17 +168,21 @@ class EvidenceFrontEnd(nn.Module):
 
     @property
     def n_features(self):
-        """输出特征通道数 = 2 + 4K + 2*len(dipole_taus)。"""
-        return 2 + 4 * len(self.taus) + 2 * len(self.dipole_index)
+        """输出特征通道数（按 features 选择）：count 2 + ratio/age 各 2K + dipole 2*len(dipole_taus)。"""
+        return len(self.feature_names())
 
     def feature_names(self):
         """每个特征通道的名称（写进配置记录，方便核对通道顺序）。"""
-        names = ["count_pos", "count_neg"]
+        names = []
+        if "count" in self.features:
+            names += ["count_pos", "count_neg"]
         for kind in ("ratio", "age"):
-            for tau in self.taus:
-                names += ["%s%g_pos" % (kind, tau), "%s%g_neg" % (kind, tau)]
-        for j in self.dipole_index:
-            names += ["dipole%g_x" % self.taus[j], "dipole%g_y" % self.taus[j]]
+            if kind in self.features:
+                for tau in self.taus:
+                    names += ["%s%g_pos" % (kind, tau), "%s%g_neg" % (kind, tau)]
+        if "dipole" in self.features:
+            for j in self.dipole_index:
+                names += ["dipole%g_x" % self.taus[j], "dipole%g_y" % self.taus[j]]
         return names
 
     def init_state(self, batch, height, width, device, dtype=torch.float32):
@@ -174,8 +193,14 @@ class EvidenceFrontEnd(nn.Module):
                 "W_fast": 0.0, "W_slow": 0.0, "k": 0}
 
     def background(self, state):
-        """只用已处理窗口的计数估计本窗的背景强度 mu0 [B,1,H,W]（每像素每窗期望事件数）。"""
+        """只用已处理窗口的计数估计本窗的背景强度 mu0 [B,1,H,W]（每像素每窗期望事件数）。
+
+        bg_mode="constant" 时直接返回先验常数（背景归一化的消融；此时判决层的补偿也不再自适应，
+        虚警上界的前提"mu0 不低于真实背景"在事件密集的序列上会不成立）。
+        """
         n0, prior = self.bg_prior_windows, self.bg_prior
+        if self.bg_mode == "constant":
+            return torch.full_like(state["S_fast"], max(prior, self.bg_floor))
         fast = (state["S_fast"] + n0 * prior) / (state["W_fast"] + n0)
         slow = (state["S_slow"] + n0 * prior) / (state["W_slow"] + n0)
         r = self.bg_smooth_radius
@@ -219,9 +244,11 @@ class EvidenceFrontEnd(nn.Module):
         count_feat = torch.log1p(counts / (0.5 * mu0))
         ratio = torch.log1p(A / (mu0 * tau / (2.0 * dt)))
         age = torch.clamp(B / (A + 1e-3) / tau, max=3.0)
-        parts = [count_feat, ratio, age]
-        for j in self.dipole_index:
-            parts.append(self.dipole(A[:, 2 * j:2 * j + 1], A[:, 2 * j + 1:2 * j + 2]))
+        available = {"count": count_feat, "ratio": ratio, "age": age}
+        parts = [available[name] for name in ("count", "ratio", "age") if name in self.features]
+        if "dipole" in self.features:
+            for j in self.dipole_index:
+                parts.append(self.dipole(A[:, 2 * j:2 * j + 1], A[:, 2 * j + 1:2 * j + 2]))
         return new_state, torch.cat(parts, 1), mu0, total
 
     def run_chunk(self, state, chunk):

@@ -18,7 +18,7 @@ import numpy as np
 import torch
 
 from dataset import stream_windows as sw
-from dataset.stream_features import EventChunkSource, EvidenceFrontEnd
+from dataset.stream_features import FEATURE_GROUPS, EventChunkSource, EvidenceFrontEnd
 from model.evidence_neuron import LOG_ZERO, DriftCUSUM, TubeReadout, pixel_evidence, shift2d, velocity_grid
 from model.evidence_snn import EvidenceSNN
 
@@ -377,6 +377,29 @@ class FrontEndTests(unittest.TestCase):
         self.assertLess(float(d[0, 0, 4, 4]), -0.5)
         self.assertLess(abs(float(d[0, 1, 4, 4])), 1e-9)
         self.assertEqual(float(frontend.dipole(A_pos, torch.zeros_like(A_neg)).abs().max()), 0.0)
+
+    def test_feature_group_selection_and_constant_background(self):
+        # 消融开关：features 选择特征组（通道数与顺序随之变化，其余通道的数值不变）；bg_mode=constant 关掉背景归一化
+        chunk = self.source.chunk(0, 4)
+        full = make_frontend()
+        state = full.init_state(1, H, W, "cpu", torch.float64)
+        _, feats_full, mu_full, _ = full.run_chunk(state, chunk)
+        names_full = full.feature_names()
+        for subset in (("count",), ("count", "dipole"), ("ratio", "age"), FEATURE_GROUPS):
+            fe = EvidenceFrontEnd(TAUS, 50.0, [100.0], dipole_radius=2, bg_smooth_radius=2, features=subset).double()
+            _, feats, mu, _ = fe.run_chunk(fe.init_state(1, H, W, "cpu", torch.float64), chunk)
+            names = fe.feature_names()
+            self.assertEqual(int(feats.shape[2]), fe.n_features)
+            self.assertEqual(len(names), fe.n_features)
+            self.assertEqual(max_error(mu, mu_full), 0.0)                    # 背景估计与特征选择无关
+            for i, name in enumerate(names):                                  # 选中的通道数值与完整版逐位相同
+                self.assertEqual(max_error(feats[:, :, i], feats_full[:, :, names_full.index(name)]), 0.0, name)
+        const = EvidenceFrontEnd(TAUS, 50.0, [100.0], dipole_radius=2, bg_smooth_radius=2,
+                                 bg_prior=0.02, bg_mode="constant").double()
+        _, _, mu_const, _ = const.run_chunk(const.init_state(1, H, W, "cpu", torch.float64), chunk)
+        self.assertEqual(float(mu_const.min()), 0.02)
+        self.assertEqual(float(mu_const.max()), 0.02)
+        self.assertRaises(ValueError, EvidenceFrontEnd, TAUS, 50.0, [], features=("count", "unknown"))
 
     def test_features_are_zero_without_events_and_finite(self):
         state = self.frontend.init_state(1, H, W, "cpu", torch.float64)

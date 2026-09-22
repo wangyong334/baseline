@@ -29,7 +29,7 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
 from dataset.ev_uav_stream import EvUAVStream, make_sequence_loader  # noqa: E402
-from dataset.stream_features import EventChunkSource, EvidenceFrontEnd  # noqa: E402
+from dataset.stream_features import FEATURE_GROUPS, EventChunkSource, EvidenceFrontEnd  # noqa: E402
 from dataset.stream_windows import refill_by_index  # noqa: E402
 from model.evidence_neuron import DriftCUSUM, TubeReadout, velocity_grid  # noqa: E402
 from model.evidence_snn import EvidenceSNN  # noqa: E402
@@ -84,6 +84,17 @@ def parse_args():
                         help="足迹证据聚合：lme/mean 对空间相关稳健，sum 要求像素独立")
     parser.add_argument("--cusum-track-tau-ms", type=float, default=None, help="管道强度记忆的时间常数，0 关闭")
     parser.add_argument("--readout-delays", type=int, nargs="+", default=None, help="逐事件延迟读出的窗数")
+    parser.add_argument("--fe-features", nargs="+", choices=FEATURE_GROUPS, default=None,
+                        help="前端输出哪几组特征（消融；改变输入通道数，需要重新训练）")
+    parser.add_argument("--bg-mode", choices=("adaptive", "constant"), default=None,
+                        help="adaptive 自适应背景（默认）| constant 关掉背景归一化（消融；需要重新训练）")
+    parser.add_argument("--fe-taus-ms", type=float, nargs="+", default=None,
+                        help="覆盖时间矩的时间尺度（消融，例如去掉 2 s 尺度；需要重新训练）")
+    parser.add_argument("--fe-dipole-taus-ms", type=float, nargs="+", default=None,
+                        help="覆盖偶极所用的时间尺度（必须是 fe_taus_ms 的子集；需要重新训练）")
+    parser.add_argument("--loss-mark-weight", type=float, default=None, help="逐事件 BCE 的权重")
+    parser.add_argument("--loss-intensity-weight", type=float, default=None,
+                        help="强度场泊松似然的权重（设 0 = 只留 mark 头的单头消融；需要重新训练）")
     parser.add_argument("--device", default="cuda:0")
     return parser.parse_args()
 
@@ -95,7 +106,9 @@ def build_config(args):
                  "save_root": args.save_root, "root": args.data_root, "train_subset_every": args.train_subset_every,
                  "tbptt_k": args.tbptt_k, "epochs": args.epochs, "cusum_axis_velocities": args.cusum_velocities,
                  "cusum_aggregate": args.cusum_aggregate, "cusum_track_tau_ms": args.cusum_track_tau_ms,
-                 "readout_delays": args.readout_delays}
+                 "readout_delays": args.readout_delays, "fe_features": args.fe_features, "bg_mode": args.bg_mode,
+                 "fe_taus_ms": args.fe_taus_ms, "fe_dipole_taus_ms": args.fe_dipole_taus_ms,
+                 "loss_mark_weight": args.loss_mark_weight, "loss_intensity_weight": args.loss_intensity_weight}
     for key, value in overrides.items():
         if value is not None:
             cfg[key] = value
@@ -109,7 +122,7 @@ def build_frontend(cfg):
     return EvidenceFrontEnd(
         cfg["fe_taus_ms"], cfg["window_ms"], cfg["fe_dipole_taus_ms"], cfg["fe_dipole_radius"],
         cfg["bg_fast_ms"], cfg["bg_slow_ms"], cfg["bg_prior"], cfg["bg_prior_windows"], cfg["bg_floor"],
-        cfg["bg_smooth_radius"])
+        cfg["bg_smooth_radius"], cfg.get("fe_features", FEATURE_GROUPS), cfg.get("bg_mode", "adaptive"))
 
 
 def build_model(cfg, frontend):

@@ -20,6 +20,8 @@ FRONTEND:
   bg_prior_windows: 2                  # 先验的伪窗数
   bg_floor: 0.001                      # mu0 下限
   bg_smooth_radius: 7
+  fe_features: [count, ratio, age, dipole]   # 前端输出哪几组特征（消融用；改了要重新训练）
+  bg_mode: adaptive                    # adaptive 自适应背景 | constant 固定先验（关掉背景归一化，消融用）
 
 NET:
   channels: [12, 24, 48, 48]
