@@ -112,7 +112,7 @@ class EvSpSegNetStream(nn.Module):
     def __init__(self, in_channels=12, channels=(12, 24, 48, 48), neuron="lif", norm="none",
                  state_mode="carry", readout_hidden=32, dt_ms=50.0, tau_init_ms=200.0,
                  tau_min_ms=50.0, tau_max_ms=2000.0, v_threshold=1.0, merged_decoder=False,
-                 use_readout=True):
+                 use_readout=True, u_floor=None, u_ceil=None):
         super(EvSpSegNetStream, self).__init__()
         if state_mode not in ("carry", "reset_each_window"):
             raise ValueError("state_mode 必须是 carry 或 reset_each_window")
@@ -120,7 +120,7 @@ class EvSpSegNetStream(nn.Module):
             raise ValueError("merged_decoder 必须是 YAML 布尔值（true/false）")
         c1, c2, c3, c4 = channels
         lif = dict(dt_ms=dt_ms, tau_init_ms=tau_init_ms, tau_min_ms=tau_min_ms,
-                   tau_max_ms=tau_max_ms, v_threshold=v_threshold)
+                   tau_max_ms=tau_max_ms, v_threshold=v_threshold, u_floor=u_floor, u_ceil=u_ceil)
         block = lambda i, o, s: SpikingConvBlock(i, o, s, neuron, norm, lif)  # noqa: E731
         self.enc1 = block(in_channels, c1, 1)
         self.enc2 = block(c1, c2, 2)

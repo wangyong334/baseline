@@ -48,8 +48,26 @@ DESIGN_VERSION = "v2-1"
 SOURCE_FILES = ("train_stream_v2.py", "dataset/stream_features.py", "dataset/stream_windows.py",
                 "dataset/ev_uav_stream.py", "model/evidence_neuron.py", "model/evidence_snn.py",
                 "model/evspsegnet_stream.py", "model/lif2d_stream.py", "utils/evidence_loss.py",
-                "utils/stream_common.py", "utils/stream_metrics.py", "utils/eval.py")
+                "utils/alarm_metrics.py", "utils/stream_common.py", "utils/stream_metrics.py", "utils/eval.py")
 PRIMARY = "net"
+# 决定前端输入、网络结构与神经元动力学的配置项。膜电位上下界、bg_mode 不在 state_dict 里，
+# 续训或评估时 load_state_dict 查不出它们不一致，只能按配置核对（见 config_drift）
+MODEL_KEYS = ("window_ms", "fe_taus_ms", "fe_dipole_taus_ms", "fe_dipole_radius", "bg_fast_ms", "bg_slow_ms",
+              "bg_prior", "bg_prior_windows", "bg_floor", "bg_smooth_radius", "fe_features", "bg_mode",
+              "channels", "neuron", "norm", "state_mode", "v_threshold", "neuron_u_floor", "neuron_u_ceil",
+              "tau_init_ms", "tau_min_ms", "tau_max_ms", "merged_decoder", "head_hidden", "mark_prior",
+              "intensity_prior", "log_g_max")
+# 续训还要求优化过程一致（epochs 除外：延长训练是合理操作，只提示不拦截）
+TRAINING_KEYS = MODEL_KEYS + ("seed", "lr", "lr_end", "tbptt_k", "grad_clip", "loss_mark_weight",
+                              "loss_intensity_weight", "loss_intensity_smooth")
+# 旧 checkpoint 里没有、后来才加的键，缺省值 = 加入之前的行为
+CONFIG_DEFAULTS = {"fe_features": list(FEATURE_GROUPS), "bg_mode": "adaptive", "loss_intensity_smooth": 3,
+                   "neuron_u_floor": None, "neuron_u_ceil": None}
+# 需要重新训练才生效的命令行参数（参数名, 配置键）：eval 模式一律取 checkpoint 的值，给了不同的值就报错
+RETRAIN_FLAGS = (("neuron", "neuron"), ("state_mode", "state_mode"), ("fe_features", "fe_features"),
+                 ("bg_mode", "bg_mode"), ("fe_taus_ms", "fe_taus_ms"), ("fe_dipole_taus_ms", "fe_dipole_taus_ms"),
+                 ("neuron_u_floor", "neuron_u_floor"), ("neuron_u_ceil", "neuron_u_ceil"),
+                 ("loss_mark_weight", "loss_mark_weight"), ("loss_intensity_weight", "loss_intensity_weight"))
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +113,11 @@ def parse_args():
     parser.add_argument("--loss-mark-weight", type=float, default=None, help="逐事件 BCE 的权重")
     parser.add_argument("--loss-intensity-weight", type=float, default=None,
                         help="强度场泊松似然的权重（设 0 = 只留 mark 头的单头消融；需要重新训练）")
+    parser.add_argument("--neuron-u-floor", type=float, default=None,
+                        help="跨窗携带的膜电位下界（以 v_th 为单位，例如 -1）。不给 = 不设界，与旧实现逐位相同；"
+                             "需要重新训练。动机见 09-23 的膜电位诊断：深层被压到 -30~-60 个阈值后无法恢复")
+    parser.add_argument("--neuron-u-ceil", type=float, default=None,
+                        help="跨窗携带的膜电位上界（以 v_th 为单位，例如 4）。不给 = 不设界；需要重新训练")
     parser.add_argument("--device", default="cuda:0")
     return parser.parse_args()
 
@@ -108,13 +131,56 @@ def build_config(args):
                  "cusum_aggregate": args.cusum_aggregate, "cusum_track_tau_ms": args.cusum_track_tau_ms,
                  "readout_delays": args.readout_delays, "fe_features": args.fe_features, "bg_mode": args.bg_mode,
                  "fe_taus_ms": args.fe_taus_ms, "fe_dipole_taus_ms": args.fe_dipole_taus_ms,
-                 "loss_mark_weight": args.loss_mark_weight, "loss_intensity_weight": args.loss_intensity_weight}
+                 "loss_mark_weight": args.loss_mark_weight, "loss_intensity_weight": args.loss_intensity_weight,
+                 "neuron_u_floor": args.neuron_u_floor, "neuron_u_ceil": args.neuron_u_ceil}
     for key, value in overrides.items():
         if value is not None:
             cfg[key] = value
+    validate_config(cfg)
+    return cfg
+
+
+def validate_config(cfg):
+    """构造任何模块之前的一致性检查：没有意义的组合直接报错，而不是训练几小时后才发现白跑了。"""
     if int(cfg["tbptt_k"]) < 1 or int(cfg["train_subset_every"]) < 1 or int(cfg["eval_chunk"]) < 1:
         raise ValueError("tbptt_k、train_subset_every、eval_chunk 必须 >= 1")
-    return cfg
+    w_mark, w_int = float(cfg["loss_mark_weight"]), float(cfg["loss_intensity_weight"])
+    if w_mark < 0 or w_int < 0 or (w_mark == 0 and w_int == 0):
+        raise ValueError("损失权重必须非负且不能同时为 0（mark %g，intensity %g）" % (w_mark, w_int))
+    if cfg.get("neuron_u_floor") is not None or cfg.get("neuron_u_ceil") is not None:
+        if cfg["neuron"] == "relu":
+            raise ValueError("ReLU 对照没有膜电位，neuron_u_floor / neuron_u_ceil 对它无效")
+        if cfg["state_mode"] == "reset_each_window":
+            raise ValueError("reset_each_window 不携带跨窗膜电位，neuron_u_floor / neuron_u_ceil 对它无效")
+
+
+def normalized(value):
+    """配置值的比较形式：元组转列表、数值转浮点（YAML 的 1 与命令行的 1.0 视为相同，布尔值保持原样）。"""
+    if isinstance(value, (list, tuple)):
+        return [normalized(v) for v in value]
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    return value
+
+
+def config_value(cfg, key):
+    """取一项配置用于比较；旧配置里没有的键按加入之前的行为取缺省值（CONFIG_DEFAULTS）。"""
+    return normalized(cfg.get(key, CONFIG_DEFAULTS.get(key)))
+
+
+def config_drift(saved, current, keys):
+    """两份配置在 keys 上的差异 {键: (saved 的值, current 的值)}；没有差异时为空字典。"""
+    return {key: (config_value(saved, key), config_value(current, key)) for key in keys
+            if config_value(saved, key) != config_value(current, key)}
+
+
+def eval_conflicts(args, cfg, ckpt_cfg):
+    """eval 模式下命令行给了、但与 checkpoint 取值不同的"需要重新训练"的参数（它们不会生效，只会让结果被贴错标签）。"""
+    out = []
+    for attr, key in RETRAIN_FLAGS:
+        if getattr(args, attr, None) is not None and config_value(cfg, key) != config_value(ckpt_cfg, key):
+            out.append("--%s（命令行 %r，checkpoint %r）" % (attr.replace("_", "-"), cfg.get(key), ckpt_cfg.get(key)))
+    return out
 
 
 def build_frontend(cfg):
@@ -131,7 +197,8 @@ def build_model(cfg, frontend):
         frontend.n_features, tuple(cfg["channels"]), cfg["neuron"], cfg["norm"], cfg["state_mode"],
         float(cfg["window_ms"]), float(cfg["tau_init_ms"]), float(cfg["tau_min_ms"]), float(cfg["tau_max_ms"]),
         float(cfg["v_threshold"]), bool(cfg["merged_decoder"]), int(cfg["head_hidden"]),
-        float(cfg["mark_prior"]), float(cfg["intensity_prior"]), float(cfg["log_g_max"]))
+        float(cfg["mark_prior"]), float(cfg["intensity_prior"]), float(cfg["log_g_max"]),
+        cfg.get("neuron_u_floor"), cfg.get("neuron_u_ceil"))
 
 
 def build_cusum(cfg):
@@ -269,7 +336,7 @@ def train_sequence(model, frontend, seq, optimizer, cfg, device, rng, max_window
 
 
 def run_sequence(model, frontend, cusum, seq, cfg, device, state_mode, monitor=None, with_cusum=True,
-                 input_stats=None, alarm_eval=None):
+                 input_stats=None, alarm_eval=None, feature_probe=None):
     """推理一个完整序列（全部窗口，按时间顺序，按 eval_chunk 分片段执行）。
 
     返回: (probs, extra, confusion)
@@ -281,6 +348,7 @@ def run_sequence(model, frontend, cusum, seq, cfg, device, state_mode, monitor=N
                    （序列末尾不足 d 窗时在最后一窗发布，延迟被截断）
         confusion  [n_windows, 4] net 读出每窗 TP/FP/FN/正事件数
     alarm_eval 不为空时，另外按 alarm_thetas 各维护一份带复位的膜电位，把每窗的位置级告警图交给它（utils/alarm_metrics.py）。
+    feature_probe 不为空时，每个片段调用一次 feature_probe(feats, mu0)（诊断用钩子，见 tools/diagnose_membrane.py）。
     调用方负责 torch.no_grad() 与 model.eval()。
     """
     threshold = float(cfg["threshold"])
@@ -322,6 +390,8 @@ def run_sequence(model, frontend, cusum, seq, cfg, device, state_mode, monitor=N
         if input_stats is not None:
             input_stats["nonzero"] = input_stats["nonzero"] + (feats != 0).sum()
             input_stats["elements"] += int(feats.numel())
+        if feature_probe is not None:
+            feature_probe(feats, mu0)
         mark, log_g, states, info = model.forward_chunk(feats, states, state_mode=state_mode,
                                                          collect=monitor is not None)
         if monitor is not None:
@@ -438,14 +508,21 @@ def evaluate_split(model, frontend, cusum, cfg, device, split, state_mode, names
         tp, fp, fn, npos = (confusion_sum[:, j] for j in range(4))
         rates = {name: s["firing_rate"] for name, s in result["layers"].items()}
         density = float(input_stats["nonzero"]) / float(max(input_stats["elements"], 1))
+        events_per_window = total_events / float(len(dataset) * int(cfg["n_windows"]))
         result.update({
             "segment_iou": segment_iou(tp, fp, fn, cfg["segments"]),
             "rolling_iou": [None if math.isnan(v) else v
                             for v in rolling_iou(tp, fp, fn, int(cfg["rolling_window"])).tolist()],
             "input_nonzero_fraction": density,
+            "events_per_window": events_per_window,
             "operations_backbone": estimate_operations(
-                model.backbone, cfg["pad_height"], cfg["pad_width"], rates,
-                total_events / float(len(dataset) * int(cfg["n_windows"])), density),
+                model.backbone, cfg["pad_height"], cfg["pad_width"], rates, events_per_window, density),
+            # 前端与判决层没有可学习参数，但都是每窗全画面的实数运算，不计入能耗口径会低估整机代价
+            "operations_frontend": frontend.estimate_operations(
+                cfg["pad_height"], cfg["pad_width"], events_per_window),
+            "operations_decision": cusum.estimate_operations(
+                cfg["pad_height"], cfg["pad_width"], events_per_window,
+                cfg["readout_delays"], len(cfg.get("alarm_thetas") or [])),
         })
     return result
 
@@ -461,7 +538,9 @@ def prepare_run(args, cfg, allow_existing=False):
     seed_everything(int(cfg["seed"]), bool(cfg["deterministic"]))
     frontend, model, cusum = build_all(cfg, device)
     root = Path(cfg["save_root"])
-    root.mkdir(parents=True, exist_ok=allow_existing)
+    if root.exists() and not allow_existing:
+        raise RuntimeError("输出目录已存在: %s（换一个 --save-root；train 模式要接着训用 --resume）" % root)
+    root.mkdir(parents=True, exist_ok=True)
     write_json(root / ("run_config_%s.json" % args.mode), {
         "design_version": DESIGN_VERSION, "args": vars(args), "config": cfg,
         "features": frontend.feature_names(), "velocities": cusum.velocities,
@@ -550,15 +629,32 @@ def save_checkpoint(path, model, optimizer, epoch, best_val_iou, cfg):
                 "best_val_iou": best_val_iou, "config": cfg, "design_version": DESIGN_VERSION}, str(path))
 
 
+def load_resume_checkpoint(cfg, device):
+    """读取 save_root/last.pt 并核对配置。在 prepare_run 之前调用：核对失败时不会覆盖原来的 run_config。"""
+    path = Path(cfg["save_root"]) / "last.pt"
+    if not path.exists():
+        raise RuntimeError("找不到续训用的 checkpoint: %s" % path)
+    ckpt = torch.load(str(path), map_location=device)
+    saved = ckpt.get("config", {})
+    drift = config_drift(saved, cfg, TRAINING_KEYS)
+    if drift:
+        raise RuntimeError("续训的配置与 checkpoint 不一致（膜电位上下界等不在 state_dict 里，加载权重时查不出来），"
+                           "请用原训练的同一条命令再加 --resume。不一致的项：" +
+                           "；".join("%s: checkpoint=%r 当前=%r" % (k, a, b) for k, (a, b) in sorted(drift.items())))
+    if saved.get("epochs") is not None and int(saved["epochs"]) != int(cfg["epochs"]):
+        print("[注意] epochs 由 %s 改为 %s，学习率计划随之改变" % (saved["epochs"], cfg["epochs"]), flush=True)
+    return ckpt
+
+
 def mode_train(args, cfg):
     """正式训练：每轮设定学习率 -> 逐序列训练 -> val（net 读出）与训练子集评估 -> 保存。"""
+    ckpt = load_resume_checkpoint(cfg, torch.device(args.device)) if args.resume else None
     device, frontend, model, cusum, root = prepare_run(args, cfg, allow_existing=args.resume)
     optimizer = torch.optim.Adam(model.parameters(), lr=float(cfg["lr"]))
     seed, epochs = int(cfg["seed"]), int(cfg["epochs"])
     start_epoch, best, history = 0, -float("inf"), []
     metrics_path = root / "metrics.jsonl"
-    if args.resume:
-        ckpt = torch.load(str(root / "last.pt"), map_location=device)
+    if ckpt is not None:
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         start_epoch, best = int(ckpt["epoch"]) + 1, float(ckpt["best_val_iou"])
@@ -636,6 +732,10 @@ def mode_eval(args, cfg):
     device = torch.device(args.device)
     ckpt = torch.load(args.checkpoint, map_location=device)
     train_cfg = dict(ckpt["config"])
+    conflicts = eval_conflicts(args, cfg, train_cfg)
+    if conflicts:
+        raise ValueError("eval 模式的网络、前端与神经元配置一律取自 checkpoint；下列参数需要重新训练才生效，"
+                         "在这里给出只会让结果被贴错标签：" + "；".join(conflicts))
     # 判决层（CUSUM）与评估口径没有可学习参数，一律取自当前 YAML / 命令行：
     # 同一个 checkpoint 可以直接跑"静止 vs 运动补偿""lme vs sum""记忆开关"等对照，不必重训
     for key in ("root", "threshold", "pd_detT", "correct_thresh", "rolling_window", "segments",
@@ -659,7 +759,9 @@ def mode_eval(args, cfg):
                "cusum": {"velocities": train_cfg["cusum_axis_velocities"], "aggregate": train_cfg.get("cusum_aggregate"),
                          "track_tau_ms": train_cfg.get("cusum_track_tau_ms"), "footprint": train_cfg["cusum_footprint"]},
                "parameters": count_parameters(model), "trained_state_mode": train_cfg["state_mode"],
-               "neuron": train_cfg["neuron"], "readout_delays": train_cfg["readout_delays"]}
+               "neuron": train_cfg["neuron"], "readout_delays": train_cfg["readout_delays"],
+               "neuron_u_floor": train_cfg.get("neuron_u_floor"), "neuron_u_ceil": train_cfg.get("neuron_u_ceil"),
+               "config": train_cfg}
     for mode in ("carry", "reset_each_window"):
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)

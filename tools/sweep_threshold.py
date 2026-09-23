@@ -161,7 +161,7 @@ def main():
                 else:
                     print("%-48s %9.4f %8.4f %8.4f %8.4f" % (
                         directory[-48:], point["threshold"], point["iou"], point["recall"], point["pd"]))
-    os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)     # --out 只给文件名时 dirname 为空
     with open(args.out, "w", encoding="utf-8") as stream:
         json.dump({"thresholds": args.thresholds, "target_fa": args.target_fa, "results": results},
                   stream, indent=2, ensure_ascii=False)

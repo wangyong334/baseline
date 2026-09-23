@@ -185,6 +185,63 @@ class EvidenceFrontEnd(nn.Module):
                 names += ["dipole%g_x" % self.taus[j], "dipole%g_y" % self.taus[j]]
         return names
 
+    def estimate_operations(self, height, width, events_per_window):
+        """估计前端每窗的理论运算量（前端没有可学习参数，但全是逐事件/逐像素的实数运算，必须计入能耗）。
+
+        三类分开报告，不合并成一个数——神经形态硬件上它们的单位代价差一个数量级：
+            mac            乘加（含除法，按一次乘加计）
+            elementwise    加、比较、取大、裁剪、平移取数
+            transcendental exp / log / log1p / softplus（通常按查表或 10~20 倍 MAC 计）
+        另给 reducible_ops：盒式滤波与偶极卷积用可分离核/滑动窗实现能省掉的运算数（各按自己的类别计——
+        背景平滑省的是加法，偶极省的是乘加），用来说明"直接实现"与"优化实现"的差距，**不从总数里扣**。
+
+        输入: height/width 画布大小（与骨干同口径，含补零区域）；events_per_window 平均每窗事件数。
+        输出: {"mac", "elementwise", "transcendental", "reducible_ops", "state_elements", "per_part", "note"}
+        """
+        p = float(int(height) * int(width))
+        e = float(events_per_window)
+        k = len(self.taus)
+        r = int(self.bg_smooth_radius)
+        rad = self.dipole_radius
+        parts = []
+
+        def add(name, mac=0.0, elementwise=0.0, transcendental=0.0, reducible=0.0):
+            parts.append({"part": name, "mac": float(mac), "elementwise": float(elementwise),
+                          "transcendental": float(transcendental), "reducible_ops": float(reducible)})
+
+        # 逐事件：计数累加；每个时间尺度上 w = exp(-age/tau) 与 w*age，各自散射累加一次
+        add("事件累加与时间矩权重", mac=2 * k * e, elementwise=e + 2 * k * e, transcendental=k * e)
+        # 逐像素：A = decay*A_old + a（1 次乘加）；B = decay*(B_old + dt*A_old) + b（2 次乘加 + 1 次加）
+        add("时间矩递推", mac=6 * k * p, elementwise=2 * k * p)
+        if self.bg_mode == "constant":
+            add("背景估计（固定先验）", elementwise=p)
+        else:
+            box = (2 * r + 1) ** 2 if r > 0 else 0        # avg_pool2d 直接实现：k^2 次加法
+            separable = 2 * (2 * r + 1) if r > 0 else 0   # 盒式滤波可分离 + 滑动窗
+            add("背景估计（两尺度 EMA + 盒式平滑）", mac=4 * p,
+                elementwise=3 * p + box * p, reducible=max(box - separable, 0) * p)
+        if "count" in self.features:
+            add("计数特征 log1p(N/(mu0/2))", mac=4 * p, transcendental=2 * p)
+        if "ratio" in self.features:
+            add("比值特征 log1p(A/(mu0*tau/2dt))", mac=6 * k * p, transcendental=2 * k * p)
+        if "age" in self.features:
+            add("年龄特征 clamp(B/A/tau)", mac=4 * k * p, elementwise=4 * k * p)
+        if "dipole" in self.features and self.dipole_index:
+            scales = len(self.dipole_index)
+            side = (2 * rad + 1) ** 2
+            direct = 2 * 3 * side * p * scales             # 2 个极性平面 × 3 个核（和、x 偏移、y 偏移）
+            sep = 2 * 3 * 2 * (2 * rad + 1) * p * scales   # 三个核都是外积，可分离
+            add("极性偶极（局部质心卷积）", mac=direct + 11 * p * scales, elementwise=8 * p * scales,
+                reducible=max(direct - sep, 0.0))
+        total = {key: float(sum(part[key] for part in parts))
+                 for key in ("mac", "elementwise", "transcendental", "reducible_ops")}
+        total["state_elements"] = int(4 * k * p + 2 * p)   # A、B 各 2K 通道，背景两个尺度各 1 通道
+        total["per_part"] = parts
+        total["note"] = ("前端无可学习参数，但每窗都要做逐像素递推；这里按直接实现计数。"
+                         "reducible_ops 是盒式平滑与偶极卷积用可分离/滑动窗实现能省掉的部分（未从总数扣除）。"
+                         "除法按一次 MAC 计；exp/log/log1p/softplus 单列，硬件代价通常是 MAC 的 10~20 倍。")
+        return total
+
     def init_state(self, batch, height, width, device, dtype=torch.float32):
         """序列开头的状态：没有历史，背景强度等于先验。"""
         K2 = 2 * len(self.taus)

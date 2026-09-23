@@ -44,6 +44,8 @@ class StreamingLIF2d(nn.Module):
         tau_init_ms  初始时间常数（V1 为 200 ms -> beta0 约 0.779）
         tau_min_ms / tau_max_ms  时间常数范围，通过 sigmoid 平滑约束，没有硬裁剪
         v_threshold  发放阈值
+        u_floor / u_ceil  跨窗携带的膜电位下界 / 上界（以 v_th 为单位，None = 不设界；要求 u_floor <= 0 < u_ceil），
+                     只夹携带出去的状态，见 bound_state
     forward(current, state) -> (spikes, new_state, u_pre)
         current   [B,C,H,W] 输入电流
         state     上一窗口的膜电位 [B,C,H,W]，None 表示没有历史（序列开头或 reset 模式）
@@ -52,7 +54,8 @@ class StreamingLIF2d(nn.Module):
         u_pre     [B,C,H,W] 复位前膜电位，最后一层用它做逐事件读出
     """
 
-    def __init__(self, channels, dt_ms, tau_init_ms, tau_min_ms, tau_max_ms, v_threshold):
+    def __init__(self, channels, dt_ms, tau_init_ms, tau_min_ms, tau_max_ms, v_threshold,
+                 u_floor=None, u_ceil=None):
         super(StreamingLIF2d, self).__init__()
         if not tau_min_ms < tau_init_ms < tau_max_ms:
             raise ValueError("需要 tau_min < tau_init < tau_max")
@@ -63,6 +66,29 @@ class StreamingLIF2d(nn.Module):
         self.tau_min_ms = float(tau_min_ms)
         self.tau_max_ms = float(tau_max_ms)
         self.v_threshold = float(v_threshold)
+        # 符号检查同时保证了 u_floor < u_ceil；最常见的误用是命令行漏了负号（-1 写成 1）
+        if u_floor is not None and float(u_floor) > 0:
+            raise ValueError("u_floor 必须 <= 0（以 v_th 为单位，收到 %s）：正的下界让携带的膜电位永远高于静息，"
+                             "多半是漏了负号" % u_floor)
+        if u_ceil is not None and float(u_ceil) <= 0:
+            raise ValueError("u_ceil 必须 > 0（以 v_th 为单位，收到 %s）" % u_ceil)
+        self.u_floor = None if u_floor is None else float(u_floor) * self.v_threshold
+        self.u_ceil = None if u_ceil is None else float(u_ceil) * self.v_threshold
+
+    def bound_state(self, state):
+        """把跨窗携带的膜电位夹在 [u_floor, u_ceil]（以 v_th 为单位给定，构造时已折算）。
+
+        为什么只夹"携带出去的"状态、不夹本窗的 U_pre：本窗是否发放由 U_pre 决定，夹它会改变发放判据；
+        夹住携带值只改变"下一窗从多深处起步"，这正是要修的东西。
+
+        动机（09-23 诊断）：LIF 对持续负电流的直流增益是 1/(1-beta)，而正向有"发放即减阈值"的复位、
+        负向没有任何复位，于是 enc4/dec3 的膜电位中位数掉到 -32/-63 个阈值，发放率只剩 7%，等于死了。
+        判决层的 CUSUM 神经元由推导自带静息地板 0（C = max(0, C_pre)），骨干的 LIF 缺的就是这一条。
+        两个界都为 None 时本方法是恒等映射，数值与旧实现逐位相同。
+        """
+        if self.u_floor is None and self.u_ceil is None:
+            return state
+        return torch.clamp(state, min=self.u_floor, max=self.u_ceil)
 
     def tau(self):
         """返回每个通道的时间常数（毫秒），形状 [C]。"""
@@ -84,7 +110,7 @@ class StreamingLIF2d(nn.Module):
             beta = self.beta().to(current.dtype).view(1, -1, 1, 1)
             u_pre = beta * state + current
         output, fired = self.activate(u_pre)
-        new_state = u_pre - self.v_threshold * fired
+        new_state = self.bound_state(u_pre - self.v_threshold * fired)
         return output, new_state, u_pre
 
     def forward_steps(self, current, state, carry=True, keep_u_pre=True):
@@ -104,7 +130,7 @@ class StreamingLIF2d(nn.Module):
             prev = state if carry else None
             u_pre = current[t] if prev is None else beta * prev + current[t]
             output, fired = self.activate(u_pre)
-            state = u_pre - self.v_threshold * fired
+            state = self.bound_state(u_pre - self.v_threshold * fired)
             spikes.append(output)
             if keep_u_pre:
                 u_pres.append(u_pre)

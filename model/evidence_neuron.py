@@ -212,6 +212,61 @@ class DriftCUSUM(nn.Module):
         C, C_pre, M, alarm = self.accumulate(state["C"], shifts, ell, theta, reset_on_alarm)
         return {"G": G, "C": C, "C_pre": C_pre, "ell": ell, "shifts": shifts, "k": k + 1}, M, alarm
 
+    def estimate_operations(self, height, width, events_per_window=0.0, readout_delays=(), alarm_thetas=0):
+        """估计判决层每窗的理论运算量（无可学习参数，但每窗都要在 V 个假设 × 全画面上算）。
+
+        分类与前端相同（mac / elementwise / transcendental / reducible_ops），口径见
+        EvidenceFrontEnd.estimate_operations。告警通道每个阈值各维护一份膜电位，所以按 1 + len(alarm_thetas) 份计。
+        延迟读出按事件计：第 k 窗的事件要在之后 d 窗里沿 V 条管道各取一次值并累加。
+
+        输入: height/width 画布大小；events_per_window 平均每窗事件数；readout_delays 延迟读出的 d 列表；
+              alarm_thetas 告警阈值个数（0 表示不跑告警通道）。
+        """
+        p = float(int(height) * int(width))
+        e = float(events_per_window)
+        v = float(self.n_hypotheses)
+        f = int(self.footprint)
+        parts = []
+
+        def add(name, mac=0.0, elementwise=0.0, transcendental=0.0, reducible=0.0):
+            parts.append({"part": name, "mac": float(mac), "elementwise": float(elementwise),
+                          "transcendental": float(transcendental), "reducible_ops": float(reducible)})
+
+        # 强度预测：exp(log_g) 一次；每个假设平移一次网络强度；有记忆时再平移旧 G、乘 rho、取大
+        if self.track_decay > 0:
+            add("管道强度预测（含记忆）", mac=v * p, elementwise=3 * v * p, transcendental=p)
+        else:
+            add("管道强度预测（无记忆）", elementwise=v * p, transcendental=p)
+        # 逐像素证据 e = N*log r - psi：log(clamp(G))、log(mu0)、psi、softplus(log g - log mu0)
+        tr = 2 * v * p + p                                     # log(G) 与 softplus 里的 log1p
+        tr += 2 * v * p if self.compensator == "negbin" else v * p   # psi：negbin 多一次 log1p
+        add("逐像素对数似然比", mac=v * p, elementwise=2 * v * p, transcendental=tr + v * p)
+        if f > 1:
+            box = float(f * f)
+            separable = 2.0 * f
+            if self.aggregate == "lme":
+                add("足迹聚合 lme", elementwise=(box + 2) * v * p, transcendental=2 * v * p,
+                    reducible=max(box - separable, 0.0) * v * p)
+            else:
+                add("足迹聚合 %s" % self.aggregate, mac=(v * p if self.aggregate == "sum" else 0.0),
+                    elementwise=box * v * p, reducible=max(box - separable, 0.0) * v * p)
+        copies = 1 + int(alarm_thetas)
+        # 膜电位：平移、加证据、relu、logsumexp（减最大值、exp、求和、log）；告警另加比较与复位
+        add("膜电位累加（%d 份：读出 1 + 告警 %d）" % (copies, int(alarm_thetas)),
+            elementwise=copies * 5 * v * p + int(alarm_thetas) * (v + 1) * p,
+            transcendental=copies * (v * p + p))
+        for d in readout_delays:
+            add("延迟读出 d=%d（逐事件）" % int(d),
+                elementwise=e * (2 * float(d) * v + v), transcendental=e * (v + 1))
+        total = {key: float(sum(part[key] for part in parts))
+                 for key in ("mac", "elementwise", "transcendental", "reducible_ops")}
+        total["state_elements"] = int(2 * v * p * copies)     # 每份膜电位 V 通道，另加管道强度 G
+        total["hypotheses"] = int(self.n_hypotheses)
+        total["per_part"] = parts
+        total["note"] = ("判决层是稠密的：无论事件多稀疏，每窗都要在 V 个假设 × 全画面上更新。"
+                         "要让它随事件稀疏度下降，需要块稀疏执行（方案三），当前实现没有。")
+        return total
+
     def gather_along(self, tensor, k_from, k_to, b, y, x):
         """取 tensor [B,V,H,W] 在"第 k_from 窗经过 (y,x) 的各假设管道"于第 k_to 窗所在位置的值。
 

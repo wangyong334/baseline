@@ -27,12 +27,14 @@ class EvidenceSNN(nn.Module):
 
     def __init__(self, in_channels, channels=(12, 24, 48, 48), neuron="lif", norm="none", state_mode="carry",
                  dt_ms=50.0, tau_init_ms=200.0, tau_min_ms=50.0, tau_max_ms=2000.0, v_threshold=1.0,
-                 merged_decoder=True, head_hidden=16, mark_prior=0.03, intensity_prior=2e-4, log_g_max=8.0):
+                 merged_decoder=True, head_hidden=16, mark_prior=0.03, intensity_prior=2e-4, log_g_max=8.0,
+                 u_floor=None, u_ceil=None):
         super(EvidenceSNN, self).__init__()
         self.backbone = EvSpSegNetStream(
             in_channels=in_channels, channels=tuple(channels), neuron=neuron, norm=norm, state_mode=state_mode,
             dt_ms=dt_ms, tau_init_ms=tau_init_ms, tau_min_ms=tau_min_ms, tau_max_ms=tau_max_ms,
-            v_threshold=v_threshold, merged_decoder=merged_decoder, use_readout=False)
+            v_threshold=v_threshold, merged_decoder=merged_decoder, use_readout=False,
+            u_floor=u_floor, u_ceil=u_ceil)
         c1 = int(channels[0])
         if int(head_hidden) > 0:
             last = nn.Conv2d(int(head_hidden), 2, 1, bias=True)
