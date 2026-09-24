@@ -1,0 +1,171 @@
+{
+ "target_fa": 3e-06,
+ "windows": 160,
+ "points": [
+  {
+   "name": "EV-SpSegNet K5 (offline)",
+   "family": "ANN",
+   "latency": "offline 8 s",
+   "energy_mj": 174.1312365969,
+   "energy_low": 174.1312365969,
+   "energy_high": 174.1312365969,
+   "iou_0.9": 0.814284537667472,
+   "fa_0.9": 2.8790633319865848e-06,
+   "seeds_0.9": 1,
+   "iou_at_fa": 0.8155314247032927,
+   "seeds_at_fa": 1,
+   "energy_source": "C:/Users/admin/AppData/Local/Temp/claude/d-----D-EV-UAV/17339651-1193-4d8f-bd9f-21a91bf7aa31/scratchpad/r4/log\\energy/stream_energy_test.json | baselines[0]",
+   "sweeps": [
+    "energy/threshold_sweep_test.json | log/verify/baseline_k5_s37_test"
+   ]
+  },
+  {
+   "name": "Streaming V1 (SNN)",
+   "family": "SNN",
+   "latency": "50 ms",
+   "energy_mj": 8.272770122125001,
+   "energy_low": 8.272770122125001,
+   "energy_high": 8.272770122125001,
+   "iou_0.9": 0.8363403770761818,
+   "fa_0.9": 1.0449048662700965e-05,
+   "seeds_0.9": 3,
+   "iou_at_fa": 0.7908724485569896,
+   "seeds_at_fa": 2,
+   "energy_source": "C:/Users/admin/AppData/Local/Temp/claude/d-----D-EV-UAV/17339651-1193-4d8f-bd9f-21a91bf7aa31/scratchpad/r4/log\\energy/stream_energy_test.json | log/stream_v1_seed37/eval_test_best_val_iou_seed37_merged.json",
+   "sweeps": [
+    "energy/threshold_sweep_test.json | log/verify/v1_s37_test",
+    "energy/threshold_sweep_test.json | log/verify/v1_s38_test",
+    "energy/threshold_sweep_test.json | log/verify/v1_s39_test"
+   ]
+  },
+  {
+   "name": "Streaming V1-ReLU (ANN)",
+   "family": "ANN",
+   "latency": "50 ms",
+   "energy_mj": 781.0,
+   "energy_low": 781.0,
+   "energy_high": 781.0,
+   "iou_0.9": 0.8435001411286702,
+   "fa_0.9": 6.48884329110946e-06,
+   "seeds_0.9": 3,
+   "iou_at_fa": 0.8256947011993141,
+   "seeds_at_fa": 3,
+   "energy_source": "CLAUDE.md §7 效率：ReLU 对照 8 s 781 mJ（全部按 MAC 计）",
+   "sweeps": [
+    "energy/threshold_sweep_test.json | log/verify/relu_s37_test",
+    "energy/threshold_sweep_test.json | log/verify/relu_s38_test",
+    "energy/threshold_sweep_test.json | log/verify/relu_s39_test"
+   ]
+  },
+  {
+   "name": "V2 LIF, net",
+   "family": "SNN",
+   "latency": "50 ms",
+   "energy_mj": 88.51893515012499,
+   "energy_low": 82.349069786725,
+   "energy_high": 95.37434110945831,
+   "iou_0.9": 0.7998265817621815,
+   "fa_0.9": 2.1453601246303907e-06,
+   "seeds_0.9": 3,
+   "iou_at_fa": 0.8213919946690412,
+   "seeds_at_fa": 3,
+   "energy_source": "C:/Users/admin/AppData/Local/Temp/claude/d-----D-EV-UAV/17339651-1193-4d8f-bd9f-21a91bf7aa31/scratchpad/r5/log\\energy/energy_v2_round5.json",
+   "sweeps": [
+    "energy/threshold_sweep_v21_all_test.json | log/verify/stream_v21_s37_test",
+    "energy/threshold_sweep_v21_all_test.json | log/verify/stream_v21_s38_test",
+    "energy/threshold_sweep_v21_all_test.json | log/verify/stream_v21_s39_test"
+   ]
+  },
+  {
+   "name": "V2 LIF, d2",
+   "family": "SNN",
+   "latency": "150 ms",
+   "energy_mj": 460.74220172084995,
+   "energy_low": 148.72022151795,
+   "energy_high": 807.4332908351832,
+   "iou_0.9": 0.8754759143265561,
+   "fa_0.9": 2.938794936384647e-06,
+   "seeds_0.9": 3,
+   "iou_at_fa": 0.8751536146609397,
+   "seeds_at_fa": 3,
+   "energy_source": "C:/Users/admin/AppData/Local/Temp/claude/d-----D-EV-UAV/17339651-1193-4d8f-bd9f-21a91bf7aa31/scratchpad/r5/log\\energy/energy_v2_round5.json",
+   "sweeps": [
+    "energy/threshold_sweep_v21_all_test.json | log/verify/stream_v21_s37_test:prob_fused_d2",
+    "energy/threshold_sweep_v21_all_test.json | log/verify/stream_v21_s38_test:prob_fused_d2",
+    "energy/threshold_sweep_v21_all_test.json | log/verify/stream_v21_s39_test:prob_fused_d2"
+   ]
+  },
+  {
+   "name": "V2 LIF+floor, net",
+   "family": "SNN",
+   "latency": "50 ms",
+   "energy_mj": 88.113819561325,
+   "energy_low": 81.943954197925,
+   "energy_high": 94.96922552065833,
+   "iou_0.9": 0.8569500490784164,
+   "fa_0.9": 1.7919481319418578e-06,
+   "seeds_0.9": 1,
+   "iou_at_fa": 0.8774212983637365,
+   "seeds_at_fa": 1,
+   "energy_source": "C:/Users/admin/AppData/Local/Temp/claude/d-----D-EV-UAV/17339651-1193-4d8f-bd9f-21a91bf7aa31/scratchpad/r5/log\\energy/energy_v2_round5.json",
+   "sweeps": [
+    "energy/sweep_v21_floor4_s37_test.json | log/verify/v21_floor4_s37_test"
+   ]
+  },
+  {
+   "name": "V2 LIF+floor, d2",
+   "family": "SNN",
+   "latency": "150 ms",
+   "energy_mj": 460.33708613205,
+   "energy_low": 148.31510592914998,
+   "energy_high": 807.0281752463831,
+   "iou_0.9": 0.8966037939356353,
+   "fa_0.9": 3.0761776265001893e-06,
+   "seeds_0.9": 1,
+   "iou_at_fa": 0.895676952359596,
+   "seeds_at_fa": 1,
+   "energy_source": "C:/Users/admin/AppData/Local/Temp/claude/d-----D-EV-UAV/17339651-1193-4d8f-bd9f-21a91bf7aa31/scratchpad/r5/log\\energy/energy_v2_round5.json",
+   "sweeps": [
+    "energy/sweep_v21_floor4_s37_test.json | log/verify/v21_floor4_s37_test:prob_fused_d2"
+   ]
+  },
+  {
+   "name": "V2 ReLU, net",
+   "family": "ANN",
+   "latency": "50 ms",
+   "energy_mj": 645.281613652075,
+   "energy_low": 639.111748288675,
+   "energy_high": 652.1370196114084,
+   "iou_0.9": 0.883438926447378,
+   "fa_0.9": 2.739689588391107e-06,
+   "seeds_0.9": 3,
+   "iou_at_fa": 0.8851052815256383,
+   "seeds_at_fa": 3,
+   "energy_source": "C:/Users/admin/AppData/Local/Temp/claude/d-----D-EV-UAV/17339651-1193-4d8f-bd9f-21a91bf7aa31/scratchpad/r5/log\\energy/energy_v2_round5.json",
+   "sweeps": [
+    "energy/sweep_v21_relu_s37_test.json | log/verify/v21_relu_s37_test",
+    "energy/sweep_v21_relu_s38_test.json | log/verify/v21_relu_s38_test",
+    "energy/sweep_v21_relu_s39_test.json | log/verify/v21_relu_s39_test"
+   ]
+  },
+  {
+   "name": "V2 ReLU, d2",
+   "family": "ANN",
+   "latency": "150 ms",
+   "energy_mj": 1017.5048802228001,
+   "energy_low": 705.4829000199002,
+   "energy_high": 1364.1959693371334,
+   "iou_0.9": 0.8932667239469438,
+   "fa_0.9": 4.087632794307371e-06,
+   "seeds_0.9": 3,
+   "iou_at_fa": 0.8863229585023024,
+   "seeds_at_fa": 3,
+   "energy_source": "C:/Users/admin/AppData/Local/Temp/claude/d-----D-EV-UAV/17339651-1193-4d8f-bd9f-21a91bf7aa31/scratchpad/r5/log\\energy/energy_v2_round5.json",
+   "sweeps": [
+    "energy/sweep_v21_relu_s37_test.json | log/verify/v21_relu_s37_test:prob_fused_d2",
+    "energy/sweep_v21_relu_s38_test.json | log/verify/v21_relu_s38_test:prob_fused_d2",
+    "energy/sweep_v21_relu_s39_test.json | log/verify/v21_relu_s39_test:prob_fused_d2"
+   ]
+  }
+ ]
+}
