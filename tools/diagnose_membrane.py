@@ -33,7 +33,7 @@ import torch  # noqa: E402
 from dataset.ev_uav_stream import EvUAVStream  # noqa: E402
 from model.evspsegnet_stream import LAYER_NAMES  # noqa: E402
 from train_stream_v1 import seed_everything  # noqa: E402
-from train_stream_v2 import build_all, build_config, run_sequence  # noqa: E402
+from train_stream_v2 import build_all, run_sequence  # noqa: E402
 
 QUANTILES = (0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99)
 SAMPLE_PER_CHUNK = 20000        # 每个片段、每层/每通道随机抽这么多个元素估分位数

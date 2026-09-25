@@ -50,9 +50,13 @@ CUSUM:
   cusum_nb_kappa: null                 # negbin 的离散参数
   cusum_aggregate: lme                 # 足迹内证据聚合：lme / mean 对像素间任意相关都成立；sum 要求像素条件独立
   cusum_track_tau_ms: 250              # 管道强度记忆的时间常数（离开目标的管道持续产生负证据）；0 关闭
+  # 判决层的评估时开关（09-24 阶段 0 实测有效，见 model/evidence_neuron.py 模块说明）；下面的取值 = 原实现，逐位相同
+  cusum_memory_gain: 1.0               # 非对称记忆 λ：加分用 max(新鲜强度, λ·rho·旧 G)，扣分用带记忆的 G
+  cusum_gate_eps: 0.0                  # 预测门控 ε：低于 ε 的强度与记忆置 0（稀疏执行的前提）
+  cusum_reset_radius: 0                # 告警时复位邻域半径 r 内的全部假设；0 = 只复位告警位置
   readout_delays: [1, 2, 5]            # 逐事件延迟读出的窗数（50/100/250 ms）
   fusion_weight: 1.0                   # 轨迹证据融合分数 = mark + w * F(d)；w 用 tools/calibrate_fusion.py 在 val 上校准
-  alarm_thetas: [8, 12, 16]            # 位置级告警阈值（带复位）；每位置每窗虚警率上界 V/(e^theta-1)
+  alarm_thetas: [8, 12, 16]            # 位置级告警阈值（带复位）；每位置每窗虚警率紧界 (1+1/L)/(e^theta-1)，与 V 无关
   alarm_radius: 4                      # 告警离目标事件 <= 4 像素（切比雪夫距离）算真告警
 
 CALIB:

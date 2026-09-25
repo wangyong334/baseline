@@ -8,7 +8,6 @@
 误差一律用 (a - b).abs().max() 比较，不用 torch.testing.assert_close（torch 1.9 默认比较步长）。
 """
 import copy
-import math
 import unittest
 from types import SimpleNamespace
 
@@ -172,7 +171,7 @@ class ForwardChunkTests(unittest.TestCase):
         net_b = copy.deepcopy(net_a)
         g = torch.Generator().manual_seed(3)
 
-        states, logits_a, loss_a, info_a = None, [], 0.0, {"spikes": [], "u_pre": []}
+        states, logits_a, info_a = None, [], {"spikes": [], "u_pre": []}
         chunk_states_a = []
         for start, end in CHUNKS:
             for k in range(start, end):

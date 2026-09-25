@@ -13,7 +13,7 @@ import torch
 
 from model.evidence_neuron import DriftCUSUM, velocity_grid
 from model.evspsegnet_stream import LAYER_NAMES
-from tests.test_stream_v2_evidence import CFG, H, W, WINDOWS, make_frontend, make_model, synthetic_sequence
+from tests.test_stream_v2_evidence import CFG, WINDOWS, make_frontend, make_model, synthetic_sequence
 from tools.diagnose_membrane import (SAMPLE_PER_CHUNK, MembraneProbe, Reservoir, backbone_threshold,
                                      merge_polarity, polarity_stats, window_occupancy)
 from train_stream_v1 import LayerMonitor

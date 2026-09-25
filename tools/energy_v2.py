@@ -74,6 +74,21 @@ def analyse(result, windows, scale):
     return {"rows": rows, "total_dense_mj_per_8s": dense, "total_event_driven_mj_per_8s": event}
 
 
+def sparse_decision(result, windows, scale, total_without_decision):
+    """稀疏同步执行下的判决层能耗：eval 结果里 operations_decision_sparse 的每个门控档位一行。
+
+    活跃比例取自 ε = 0 的运行时是"门控到 ε 之后"的比例（门控后的 G 恰好是未门控 G 的截断），
+    但精度要用 --cusum-gate-eps ε 的运行另测。旧结果没有这个字段时返回空字典。
+    """
+    out = {}
+    for eps, ops in sorted(result.get("operations_decision_sparse", {}).items(), key=lambda kv: float(kv[0])):
+        mac, ac, tr = module_terms(ops)
+        mj = energy_pj(mac, ac, tr, scale) * 1e-9 * windows
+        out[eps] = {"active_fraction": float(ops.get("active_fraction", 1.0)), "decision_mj_per_8s": mj,
+                    "total_event_driven_mj_per_8s": total_without_decision + mj}
+    return out
+
+
 def print_report(path, result, report, baseline_mj, scale):
     """终端表格。"""
     print("\n########", path)
@@ -113,6 +128,12 @@ def main():
             str(s): analyse(result, args.windows, s)["total_event_driven_mj_per_8s"]
             for s in TRANSCENDENTAL_SCALES}
         print_report(path, result, report, args.baseline_mj, args.transcendental_macs)
+        rows = {row["part"]: row["mj_per_8s"] for row in report["rows"]}
+        report["decision_sparse"] = sparse_decision(result, args.windows, args.transcendental_macs,
+                                                    rows["骨干（事件驱动）"] + rows["证据前端"])
+        for eps, row in report["decision_sparse"].items():
+            print("判决层稀疏同步（门控 ε=%s，足迹活跃比例 %.4f）：%.2f mJ/8s；整机（事件驱动口径）%.2f mJ/8s" % (
+                eps, row["active_fraction"], row["decision_mj_per_8s"], row["total_event_driven_mj_per_8s"]))
         print("exp/log 折算敏感性（事件驱动口径 mJ/8s）：" +
               "，".join("%.0fx -> %.2f" % (s, report["sensitivity"][str(s)]) for s in TRANSCENDENTAL_SCALES))
         out["runs"][path] = report

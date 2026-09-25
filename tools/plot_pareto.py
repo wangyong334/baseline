@@ -179,7 +179,8 @@ def sliding_points(summaries, sweeps):
 # 标签相对点的偏移（点，水平对齐）；右上角几个点挤在一起，逐个指定方向避免重叠
 LABEL_OFFSETS = {"V2 LIF+floor, d2": (-7, 7, "right"), "V2 ReLU, d2": (6, -13, "left"),
                  "V2 ReLU, net": (-7, 7, "right"), "V2 LIF, d2": (7, -13, "left"),
-                 "Streaming V1-ReLU (ANN)": (-7, 6, "right")}
+                 "Streaming V1-ReLU (ANN)": (-7, 6, "right"), "V2 LIF+floor, net": (-7, 6, "right"),
+                 "V2 LIF, net": (-7, -12, "right")}
 STYLE = {  # (颜色, 标记)；SNN 用青色，ANN 用灰 / 橙；标记表示延迟
     "SNN": "#1d7f92", "ANN": "#b0632a", "offline 8 s": "^", "50 ms": "o", "150 ms": "s"}
 
@@ -203,6 +204,9 @@ def plot(points, out):
         if slides:
             ax.plot([p["energy_mj"] for p in slides], [p[key] for p in slides], color=STYLE["ANN"], lw=1.0,
                     ls="--", zorder=1)
+            ax.annotate("K5 causal sliding window\n(50 ms output, context 0.25-8 s, 1 seed)",
+                        (slides[-1]["energy_mj"], slides[-1][key]), textcoords="offset points", xytext=(4, 10),
+                        fontsize=7, color=STYLE["ANN"], ha="right")
         for p in points:
             if p[key] is None:
                 continue
@@ -218,10 +222,15 @@ def plot(points, out):
             seeds = p["seeds_0.9"] if key == "iou_0.9" else p["seeds_at_fa"]
             label = p["name"] + ("" if seeds >= 3 else " (%d seed%s)" % (seeds, "" if seeds == 1 else "s"))
             dx, dy, ha = LABEL_OFFSETS.get(p["name"], (6, 4, "left"))
+            if "context_ms" in p:  # 滑窗各点只标上下文长度，整条曲线的名字单独标一次（1 s 以上几个点几乎重合）
+                label, dx, dy, ha = "%g s" % (p["context_ms"] / 1000.0), 0, -12, "center"
+                if p["context_ms"] in (1000, 2000):
+                    label = ""
             ax.annotate(label, (p["energy_mj"], p[key]), textcoords="offset points", xytext=(dx, dy), fontsize=7.2,
                         color="#333333", ha=ha)
         ax.set_xscale("log")
-        ax.set_xlim(4, 3000)
+        has_sliding = any("context_ms" in p for p in points)
+        ax.set_xlim(4, 30000 if has_sliding else 3000)
         ax.set_xlabel("theoretical energy per 8 s (mJ, event-driven accounting)")
         ax.set_title(title, fontsize=9.5)
         ax.grid(True, which="both", color="#e6e6e6", lw=0.6)
@@ -232,8 +241,9 @@ def plot(points, out):
                  fontsize=6.8, color="#666666")
     axes[0].axhline(0.7556, color="#999999", lw=0.8, ls=":")
     axes[0].text(4.5, 0.7505, "PointEvent 75.56 (offline, energy n/a)", fontsize=6.8, color="#666666")
-    axes[0].set_ylim(0.742, 0.908)
-    axes[1].set_ylim(0.782, 0.905)
+    low = min([p[k] for p in points for k in ("iou_0.9", "iou_at_fa") if p[k] is not None] + [0.742])
+    axes[0].set_ylim(min(0.742, low - 0.012), 0.908)
+    axes[1].set_ylim(min(0.782, low - 0.012), 0.905)
     handles = [plt.Line2D([], [], marker="o", ls="", markerfacecolor=STYLE["SNN"], markeredgecolor=STYLE["SNN"],
                           label="spiking (SNN)"),
                plt.Line2D([], [], marker="o", ls="", markerfacecolor="white", markeredgecolor=STYLE["ANN"], label="ANN"),

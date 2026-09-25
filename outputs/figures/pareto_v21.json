@@ -139,7 +139,7 @@
    "iou_0.9": 0.883438926447378,
    "fa_0.9": 2.739689588391107e-06,
    "seeds_0.9": 3,
-   "iou_at_fa": 0.8851052815256383,
+   "iou_at_fa": 0.8851052815256382,
    "seeds_at_fa": 3,
    "energy_source": "C:/Users/admin/AppData/Local/Temp/claude/d-----D-EV-UAV/17339651-1193-4d8f-bd9f-21a91bf7aa31/scratchpad/r5/log\\energy/energy_v2_round5.json",
    "sweeps": [
@@ -166,6 +166,96 @@
     "energy/sweep_v21_relu_s38_test.json | log/verify/v21_relu_s38_test:prob_fused_d2",
     "energy/sweep_v21_relu_s39_test.json | log/verify/v21_relu_s39_test:prob_fused_d2"
    ]
+  },
+  {
+   "name": "K5 sliding 0.25 s",
+   "family": "ANN",
+   "latency": "50 ms",
+   "energy_mj": 837.9762072211499,
+   "energy_low": 837.9762072211499,
+   "energy_high": 837.9762072211499,
+   "iou_0.9": 0.7002132534980774,
+   "fa_0.9": 2.762586703410364e-06,
+   "seeds_0.9": 1,
+   "iou_at_fa": 0.7050536836661334,
+   "seeds_at_fa": 1,
+   "energy_source": "C:/Users/admin/AppData/Local/Temp/claude/d-----D-EV-UAV/17339651-1193-4d8f-bd9f-21a91bf7aa31/scratchpad/sliding_k5/log/sliding_k5/summary_test.json",
+   "sweeps": [
+    "log/sliding_k5/ctx250_s50_test"
+   ],
+   "context_ms": 250
+  },
+  {
+   "name": "K5 sliding 0.5 s",
+   "family": "ANN",
+   "latency": "50 ms",
+   "energy_mj": 1670.9793430534667,
+   "energy_low": 1670.9793430534667,
+   "energy_high": 1670.9793430534667,
+   "iou_0.9": 0.7557255029678345,
+   "fa_0.9": 1.989062426455462e-06,
+   "seeds_0.9": 1,
+   "iou_at_fa": 0.7796271215574389,
+   "seeds_at_fa": 1,
+   "energy_source": "C:/Users/admin/AppData/Local/Temp/claude/d-----D-EV-UAV/17339651-1193-4d8f-bd9f-21a91bf7aa31/scratchpad/sliding_k5/log/sliding_k5/summary_test.json",
+   "sweeps": [
+    "log/sliding_k5/ctx500_s50_test"
+   ],
+   "context_ms": 500
+  },
+  {
+   "name": "K5 sliding 1 s",
+   "family": "ANN",
+   "latency": "50 ms",
+   "energy_mj": 3255.4255125115837,
+   "energy_low": 3255.4255125115837,
+   "energy_high": 3255.4255125115837,
+   "iou_0.9": 0.7570160627365112,
+   "fa_0.9": 1.947250303376819e-06,
+   "seeds_0.9": 1,
+   "iou_at_fa": 0.782069084701609,
+   "seeds_at_fa": 1,
+   "energy_source": "C:/Users/admin/AppData/Local/Temp/claude/d-----D-EV-UAV/17339651-1193-4d8f-bd9f-21a91bf7aa31/scratchpad/sliding_k5/log/sliding_k5/summary_test.json",
+   "sweeps": [
+    "log/sliding_k5/ctx1000_s50_test"
+   ],
+   "context_ms": 1000
+  },
+  {
+   "name": "K5 sliding 2 s",
+   "family": "ANN",
+   "latency": "50 ms",
+   "energy_mj": 6093.6810319996,
+   "energy_low": 6093.6810319996,
+   "energy_high": 6093.6810319996,
+   "iou_0.9": 0.7570328116416931,
+   "fa_0.9": 1.947250303376819e-06,
+   "seeds_0.9": 1,
+   "iou_at_fa": 0.78163393131753,
+   "seeds_at_fa": 1,
+   "energy_source": "C:/Users/admin/AppData/Local/Temp/claude/d-----D-EV-UAV/17339651-1193-4d8f-bd9f-21a91bf7aa31/scratchpad/sliding_k5/log/sliding_k5/summary_test.json",
+   "sweeps": [
+    "log/sliding_k5/ctx2000_s50_test"
+   ],
+   "context_ms": 2000
+  },
+  {
+   "name": "K5 sliding 8 s",
+   "family": "ANN",
+   "latency": "50 ms",
+   "energy_mj": 13957.812595488833,
+   "energy_low": 13957.812595488833,
+   "energy_high": 13957.812595488833,
+   "iou_0.9": 0.7574939131736755,
+   "fa_0.9": 1.947250303376819e-06,
+   "seeds_0.9": 1,
+   "iou_at_fa": 0.7815128768681667,
+   "seeds_at_fa": 1,
+   "energy_source": "C:/Users/admin/AppData/Local/Temp/claude/d-----D-EV-UAV/17339651-1193-4d8f-bd9f-21a91bf7aa31/scratchpad/sliding_k5/log/sliding_k5/summary_test.json",
+   "sweeps": [
+    "log/sliding_k5/ctx8000_s50_test"
+   ],
+   "context_ms": 8000
   }
  ]
 }

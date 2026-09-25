@@ -1,7 +1,10 @@
 """核对漂移 CUSUM 的虚警保证：纯背景下，任意"只用过去"的目标强度预测都不能让告警率超过理论上界。
 
-理论（model/evidence_neuron.py）：每个速度假设一条管道；带复位时，每位置每窗的虚警率
-    <= V / (e^theta - 1)        （V 为速度假设数，逐假设的 Shiryaev-Roberts 上鞅论证 + 按假设求和）
+理论（model/evidence_neuron.py）：每个速度假设一条管道；按位置告警、复位该位置全部假设时，每位置每窗的虚警率
+    <= (1 + 1/L) / (e^theta - 1)   紧界，与速度假设数 V 无关（Q_k = sum_x mean_v R_v 的 Shiryaev-Roberts 论证）
+    <= V / (e^theta - 1)           早先的并集界（仍输出，便于和旧结果对照）
+判决层的评估时开关（--memory-gain λ、--gate-eps ε、--reset-radius r，缺省 = 原实现）任意取值都不应超过紧界，
+每个开关单独跑一遍本脚本即为合成核对。
 条件：预测只依赖过去；每个像素的补偿项不小于其背景条件分布的累积量生成函数（泊松时 mu0 >= 真实均值）；
       足迹聚合为 lme / mean 时对像素间相关性无要求，sum 时要求像素条件独立。
 
@@ -64,7 +67,8 @@ def run(scenario, pred, theta, aggregate, args, device):
     compensator = "negbin" if scenario == "negbin_negbin_comp" else "poisson"
     velocities = velocity_grid(args.axis_velocities)
     cusum = DriftCUSUM(velocities, footprint=args.footprint, compensator=compensator, nb_kappa=args.kappa,
-                       aggregate=aggregate, track_decay=args.track_decay)
+                       aggregate=aggregate, track_decay=args.track_decay, memory_gain=args.memory_gain,
+                       gate_eps=args.gate_eps, reset_radius=args.reset_radius)
     generator = torch.Generator(device=device).manual_seed(args.seed)
     size, mu = args.size, args.mu
     state = cusum.init_state(1, size, size, device, torch.float64)
@@ -87,7 +91,7 @@ def run(scenario, pred, theta, aggregate, args, device):
             alarms += int(alarm.sum())
             counted += size * size
         prev = counts
-    return alarms / float(max(counted, 1)), cusum.n_hypotheses
+    return alarms / float(max(counted, 1)), cusum.n_hypotheses, args.steps - args.burn_in
 
 
 def main():
@@ -106,6 +110,9 @@ def main():
     parser.add_argument("--scenarios", nargs="+", default=["poisson_oracle", "poisson_conservative", "poisson_under",
                                                            "negbin_poisson_comp", "negbin_negbin_comp",
                                                            "poisson_frontend", "poisson_sync"])
+    parser.add_argument("--memory-gain", type=float, default=1.0, help="非对称记忆 λ（1 = 原实现）")
+    parser.add_argument("--gate-eps", type=float, default=0.0, help="预测门控 ε（0 = 原实现）")
+    parser.add_argument("--reset-radius", type=int, default=0, help="告警复位邻域半径 r（0 = 原实现）")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--out", default=None)
@@ -113,19 +120,23 @@ def main():
     device = torch.device(args.device)
     torch.manual_seed(args.seed)                     # 负二项的 Gamma 采样用全局随机数
     rows = []
-    print("%-22s %-5s %-9s %6s %12s %12s %8s" % ("scenario", "aggr", "predictor", "theta", "alarm_rate", "bound",
-                                                  "ratio"))
+    print("判决层开关: memory_gain %g, gate_eps %g, reset_radius %d" % (
+        args.memory_gain, args.gate_eps, args.reset_radius))
+    print("%-22s %-5s %-9s %6s %12s %12s %8s %8s" % ("scenario", "aggr", "predictor", "theta", "alarm_rate",
+                                                      "tight", "ratio", "ratio_V"))
     for scenario in args.scenarios:
         for aggregate in args.aggregates:
             for pred in args.predictors:
                 for theta in args.thetas:
-                    rate, V = run(scenario, pred, theta, aggregate, args, device)
+                    rate, V, L = run(scenario, pred, theta, aggregate, args, device)
                     bound = V / (math.exp(theta) - 1.0)
+                    tight = (1.0 + 1.0 / max(L, 1)) / (math.exp(theta) - 1.0)
                     rows.append({"scenario": scenario, "aggregate": aggregate, "predictor": pred, "theta": theta,
-                                 "alarm_rate": rate, "bound": bound, "ratio": rate / bound, "hypotheses": V})
-                    print("%-22s %-5s %-9s %6.1f %12.3e %12.3e %8.3f%s" % (
-                        scenario, aggregate, pred, theta, rate, bound, rate / bound,
-                        "  <-- 超过上界" if rate > bound else ""), flush=True)
+                                 "alarm_rate": rate, "bound": bound, "ratio": rate / bound, "hypotheses": V,
+                                 "tight_bound": tight, "ratio_tight": rate / tight})
+                    print("%-22s %-5s %-9s %6.1f %12.3e %12.3e %8.3f %8.3f%s" % (
+                        scenario, aggregate, pred, theta, rate, tight, rate / tight, rate / bound,
+                        "  <-- 超过紧界" if rate > tight else ""), flush=True)
     if args.out:
         os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
         with open(args.out, "w", encoding="utf-8") as stream:

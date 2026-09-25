@@ -27,6 +27,7 @@ from types import SimpleNamespace  # noqa: E402
 
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
+import torch.nn.functional as F  # noqa: E402
 
 from dataset.ev_uav_stream import EvUAVStream, make_sequence_loader  # noqa: E402
 from dataset.stream_features import FEATURE_GROUPS, EventChunkSource, EvidenceFrontEnd  # noqa: E402
@@ -50,6 +51,8 @@ SOURCE_FILES = ("train_stream_v2.py", "dataset/stream_features.py", "dataset/str
                 "model/evspsegnet_stream.py", "model/lif2d_stream.py", "utils/evidence_loss.py",
                 "utils/alarm_metrics.py", "utils/stream_common.py", "utils/stream_metrics.py", "utils/eval.py")
 PRIMARY = "net"
+# 判决层活跃比例统计的门控档位：门控后的 G 恰好是未门控 G 按 ε 截断，所以一次 ε=0 的运行就能读出各档
+ACTIVITY_EPS = (1e-3, 3e-3, 1e-2, 3e-2, 1e-1)
 # 决定前端输入、网络结构与神经元动力学的配置项。膜电位上下界、bg_mode 不在 state_dict 里，
 # 续训或评估时 load_state_dict 查不出它们不一致，只能按配置核对（见 config_drift）
 MODEL_KEYS = ("window_ms", "fe_taus_ms", "fe_dipole_taus_ms", "fe_dipole_radius", "bg_fast_ms", "bg_slow_ms",
@@ -101,7 +104,19 @@ def parse_args():
     parser.add_argument("--cusum-aggregate", choices=("sum", "mean", "lme"), default=None,
                         help="足迹证据聚合：lme/mean 对空间相关稳健，sum 要求像素独立")
     parser.add_argument("--cusum-track-tau-ms", type=float, default=None, help="管道强度记忆的时间常数，0 关闭")
+    parser.add_argument("--cusum-footprint", type=int, default=None, help="证据聚合足迹边长（奇数，1 = 逐像素不聚合）")
+    parser.add_argument("--cusum-memory-gain", type=float, default=None,
+                        help="非对称记忆 λ ∈ [0,1]：加分用 max(新鲜强度, λ·rho·旧 G)，扣分仍用带记忆的 G；1 = 原实现")
+    parser.add_argument("--cusum-gate-eps", type=float, default=None,
+                        help="预测门控 ε：低于 ε 的强度与记忆置 0（稀疏执行的前提）；0 = 原实现")
+    parser.add_argument("--cusum-reset-radius", type=int, default=None,
+                        help="告警时复位邻域半径 r 内的全部假设（清掉共享过目标证据的兄弟管道）；0 = 原实现")
+    parser.add_argument("--alarm-thetas", type=float, nargs="+", default=None, help="覆盖位置级告警的阈值列表")
+    parser.add_argument("--eval-state-modes", nargs="+", choices=("carry", "reset_each_window"), default=None,
+                        help="eval 模式跑哪几种骨干状态（默认两种都跑；只比判决层时给 carry 省一半时间）")
     parser.add_argument("--readout-delays", type=int, nargs="+", default=None, help="逐事件延迟读出的窗数")
+    parser.add_argument("--eval-sequences", type=int, default=0,
+                        help="eval 模式只用该划分按文件名排序的前 N 条序列（冒烟用；0 = 全部）。结果不能当正式数字")
     parser.add_argument("--fe-features", nargs="+", choices=FEATURE_GROUPS, default=None,
                         help="前端输出哪几组特征（消融；改变输入通道数，需要重新训练）")
     parser.add_argument("--bg-mode", choices=("adaptive", "constant"), default=None,
@@ -129,6 +144,9 @@ def build_config(args):
                  "save_root": args.save_root, "root": args.data_root, "train_subset_every": args.train_subset_every,
                  "tbptt_k": args.tbptt_k, "epochs": args.epochs, "cusum_axis_velocities": args.cusum_velocities,
                  "cusum_aggregate": args.cusum_aggregate, "cusum_track_tau_ms": args.cusum_track_tau_ms,
+                 "cusum_footprint": args.cusum_footprint, "cusum_memory_gain": args.cusum_memory_gain,
+                 "cusum_gate_eps": args.cusum_gate_eps, "cusum_reset_radius": args.cusum_reset_radius,
+                 "alarm_thetas": args.alarm_thetas,
                  "readout_delays": args.readout_delays, "fe_features": args.fe_features, "bg_mode": args.bg_mode,
                  "fe_taus_ms": args.fe_taus_ms, "fe_dipole_taus_ms": args.fe_dipole_taus_ms,
                  "loss_mark_weight": args.loss_mark_weight, "loss_intensity_weight": args.loss_intensity_weight,
@@ -202,11 +220,14 @@ def build_model(cfg, frontend):
 
 
 def build_cusum(cfg):
-    """按配置构造漂移 CUSUM 判决层（无参数）。管道强度记忆的衰减 rho = exp(-窗长 / cusum_track_tau_ms)，0 表示关闭。"""
+    """按配置构造漂移 CUSUM 判决层（无参数）。管道强度记忆的衰减 rho = exp(-窗长 / cusum_track_tau_ms)，0 表示关闭。
+    三个评估时开关（非对称记忆 λ、门控 ε、复位半径 r）缺省时取原实现的值。"""
     tau = float(cfg.get("cusum_track_tau_ms", 0.0))
     decay = math.exp(-float(cfg["window_ms"]) / tau) if tau > 0 else 0.0
     return DriftCUSUM(velocity_grid(cfg["cusum_axis_velocities"]), int(cfg["cusum_footprint"]),
-                      cfg["cusum_compensator"], cfg.get("cusum_nb_kappa"), cfg.get("cusum_aggregate", "lme"), decay)
+                      cfg["cusum_compensator"], cfg.get("cusum_nb_kappa"), cfg.get("cusum_aggregate", "lme"), decay,
+                      float(cfg.get("cusum_memory_gain", 1.0)), float(cfg.get("cusum_gate_eps", 0.0)),
+                      int(cfg.get("cusum_reset_radius", 0)))
 
 
 def build_all(cfg, device):
@@ -335,8 +356,47 @@ def train_sequence(model, frontend, seq, optimizer, cfg, device, rng, max_window
     return sums
 
 
+class DecisionActivity(object):
+    """判决层的活跃比例：稀疏同步执行时每窗需要计算的 (假设, 像素) 占比。
+
+    每窗对每个门控档位 ε 统计：
+        active     带记忆的强度 G >= ε 的 (假设, 像素) 占比
+        footprint  按足迹膨胀后的占比——足迹内有一个活跃像素，该神经元的聚合证据就不为 0，需要计算
+        c_positive 读出膜电位 C > 0 的占比（需要存储状态的神经元；不门控时的值，只作参考）
+    只统计 >= 当前 gate_eps 的档位（门控后更低的档位没有意义），并总是包含 gate_eps 本身（> 0 时）。
+    统计在设备上累加，序列结束时不做同步；summary() 时才取回。
+    """
+
+    def __init__(self, eps_list, cusum):
+        gate = float(cusum.gate_eps)
+        eps = sorted(set([float(e) for e in eps_list if float(e) >= gate] + ([gate] if gate > 0 else [])))
+        self.eps, self.footprint = eps, int(cusum.footprint)
+        self.active = [0.0] * len(eps)
+        self.dilated = [0.0] * len(eps)
+        self.c_positive = 0.0
+        self.windows = 0
+
+    def update(self, state):
+        G, C = state["G"], state["C"]
+        f = self.footprint
+        for i, eps in enumerate(self.eps):
+            act = (G >= eps).to(G.dtype)
+            self.active[i] = self.active[i] + act.mean()
+            dil = act if f == 1 else F.max_pool2d(act, f, stride=1, padding=f // 2)
+            self.dilated[i] = self.dilated[i] + dil.mean()
+        self.c_positive = self.c_positive + (C > 0).to(C.dtype).mean()
+        self.windows += 1
+
+    def summary(self):
+        n = float(max(self.windows, 1))
+        return {"eps": self.eps, "windows": self.windows,
+                "active_fraction": [float(a) / n for a in self.active],
+                "footprint_active_fraction": [float(d) / n for d in self.dilated],
+                "c_positive_fraction": float(self.c_positive) / n}
+
+
 def run_sequence(model, frontend, cusum, seq, cfg, device, state_mode, monitor=None, with_cusum=True,
-                 input_stats=None, alarm_eval=None, feature_probe=None):
+                 input_stats=None, alarm_eval=None, feature_probe=None, activity=None):
     """推理一个完整序列（全部窗口，按时间顺序，按 eval_chunk 分片段执行）。
 
     返回: (probs, extra, confusion)
@@ -349,6 +409,7 @@ def run_sequence(model, frontend, cusum, seq, cfg, device, state_mode, monitor=N
         confusion  [n_windows, 4] net 读出每窗 TP/FP/FN/正事件数
     alarm_eval 不为空时，另外按 alarm_thetas 各维护一份带复位的膜电位，把每窗的位置级告警图交给它（utils/alarm_metrics.py）。
     feature_probe 不为空时，每个片段调用一次 feature_probe(feats, mu0)（诊断用钩子，见 tools/diagnose_membrane.py）。
+    activity 不为空时，每窗把判决层状态交给它统计活跃比例（DecisionActivity）。
     调用方负责 torch.no_grad() 与 model.eval()。
     """
     threshold = float(cfg["threshold"])
@@ -412,6 +473,8 @@ def run_sequence(model, frontend, cusum, seq, cfg, device, state_mode, monitor=N
             confusion[k] = window_confusion(part_prob, seq.label[part_idx], threshold)
             if with_cusum:
                 c_state, _, _ = cusum.step(c_state, total[t], mu0[t], prev_log_g)
+                if activity is not None:
+                    activity.update(c_state)
                 sl = slice(offset, offset + count)
                 window_info[k] = (part_idx, logits[sl])
                 collect(readout.step(c_state, k, ev["b"][sl], ev["y"][sl], ev["x"][sl], k))
@@ -455,6 +518,7 @@ def evaluate_split(model, frontend, cusum, cfg, device, split, state_mode, names
     if full and cfg.get("alarm_thetas"):
         alarm_eval = AlarmEvaluator(cfg["alarm_thetas"], cfg["height"], cfg["width_px"], cfg["window_ms"],
                                     int(cfg.get("alarm_radius", 4)), cusum.n_hypotheses)
+    activity = DecisionActivity(cfg.get("activity_eps", ACTIVITY_EPS), cusum) if full else None
     confusion_sum = np.zeros((int(cfg["n_windows"]), 4), dtype=np.int64)
     kept, total_events = [], 0
     was_training = model.training
@@ -463,7 +527,8 @@ def evaluate_split(model, frontend, cusum, cfg, device, split, state_mode, names
         for i in range(len(dataset)):
             seq = dataset[i]
             probs, extra, confusion = run_sequence(model, frontend, cusum, seq, cfg, device, state_mode, monitor,
-                                                   with_cusum=full, input_stats=input_stats, alarm_eval=alarm_eval)
+                                                   with_cusum=full, input_stats=input_stats, alarm_eval=alarm_eval,
+                                                   activity=activity)
             confusion_sum += confusion
             total_events += seq.n_events
             for name in readouts:
@@ -524,6 +589,15 @@ def evaluate_split(model, frontend, cusum, cfg, device, split, state_mode, names
                 cfg["pad_height"], cfg["pad_width"], events_per_window,
                 cfg["readout_delays"], len(cfg.get("alarm_thetas") or [])),
         })
+        if activity is not None and activity.windows:
+            # 稀疏同步执行的运算量估计：按各门控档位的足迹活跃比例缩放逐 (假设, 像素) 的项
+            act = activity.summary()
+            result["decision_activity"] = act
+            result["operations_decision_sparse"] = {
+                "%g" % eps: cusum.estimate_operations(
+                    cfg["pad_height"], cfg["pad_width"], events_per_window, cfg["readout_delays"],
+                    len(cfg.get("alarm_thetas") or []), active_fraction=min(1.0, frac))
+                for eps, frac in zip(act["eps"], act["footprint_active_fraction"])}
     return result
 
 
@@ -741,7 +815,8 @@ def mode_eval(args, cfg):
     for key in ("root", "threshold", "pd_detT", "correct_thresh", "rolling_window", "segments",
                 "readout_delays", "eval_chunk", "fusion_weight", "alarm_thetas", "alarm_radius",
                 "cusum_axis_velocities", "cusum_footprint", "cusum_compensator", "cusum_nb_kappa",
-                "cusum_aggregate", "cusum_track_tau_ms"):
+                "cusum_aggregate", "cusum_track_tau_ms", "cusum_memory_gain", "cusum_gate_eps", "cusum_reset_radius",
+                "activity_eps"):
         if key in cfg:
             train_cfg[key] = cfg[key]
     train_cfg.setdefault("readout_delays", [1, 2, 5])
@@ -757,12 +832,21 @@ def mode_eval(args, cfg):
     results = {"checkpoint": args.checkpoint, "epoch": ckpt["epoch"], "design_version": DESIGN_VERSION,
                "tag": args.tag, "trained_design_version": ckpt.get("design_version"),
                "cusum": {"velocities": train_cfg["cusum_axis_velocities"], "aggregate": train_cfg.get("cusum_aggregate"),
-                         "track_tau_ms": train_cfg.get("cusum_track_tau_ms"), "footprint": train_cfg["cusum_footprint"]},
+                         "track_tau_ms": train_cfg.get("cusum_track_tau_ms"), "footprint": train_cfg["cusum_footprint"],
+                         "memory_gain": cusum.memory_gain, "gate_eps": cusum.gate_eps,
+                         "reset_radius": cusum.reset_radius, "alarm_thetas": train_cfg.get("alarm_thetas")},
                "parameters": count_parameters(model), "trained_state_mode": train_cfg["state_mode"],
                "neuron": train_cfg["neuron"], "readout_delays": train_cfg["readout_delays"],
                "neuron_u_floor": train_cfg.get("neuron_u_floor"), "neuron_u_ceil": train_cfg.get("neuron_u_ceil"),
                "config": train_cfg}
-    for mode in ("carry", "reset_each_window"):
+    modes = tuple(args.eval_state_modes) if args.eval_state_modes else ("carry", "reset_each_window")
+    names = None
+    if args.eval_sequences:
+        directory = os.path.join(train_cfg["root"], args.split)
+        names = sorted(n for n in os.listdir(directory) if n.endswith(".npz"))[:int(args.eval_sequences)]
+        results["eval_sequences"] = names
+        print("冒烟：只评估 %d 条序列 %s（结果不能当正式数字）" % (len(names), names), flush=True)
+    for mode in modes:
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
         dump = None
@@ -770,7 +854,8 @@ def mode_eval(args, cfg):
             dump = args.dump_dir
             os.makedirs(dump, exist_ok=True)
         t0 = time.perf_counter()
-        r = evaluate_split(model, frontend, cusum, train_cfg, device, args.split, mode, full=True, dump_dir=dump)
+        r = evaluate_split(model, frontend, cusum, train_cfg, device, args.split, mode, full=True, dump_dir=dump,
+                           names=names)
         r["seconds"] = time.perf_counter() - t0
         r["peak_memory_gib"] = peak_memory_gib(device)
         r["tau"] = tau_statistics(model)
@@ -781,9 +866,20 @@ def mode_eval(args, cfg):
                 mode, name, m["iou"], m["acc"], m["pd"], m["fa"], m["latency"].get("latency_median_ms")), flush=True)
         print("[%s] 分段 IoU (net) %s" % (mode, {k: round(v, 4) for k, v in r["segment_iou"].items()}), flush=True)
         for theta, a in r.get("alarms", {}).items():
-            print("[%s] 告警 theta=%s  检出率 %.3f  首次告警延迟中位数 %s ms  虚警率 %.3e（上界 %.3e）" % (
-                mode, theta, a["detection_rate"], a.get("latency_median_ms"), a["false_alarm_rate"],
-                a["bound_per_location_window"]), flush=True)
+            print("[%s] 告警 theta=%s  检出率 %.3f  首次告警延迟中位数 %s ms  虚警率 %.3e（紧界 %.3e）"
+                  "  去重虚警 %.0f/小时  到近期目标距离 %s  纯背景窗告警位置率 %s（%d 窗，紧界下期望 %.1f 个）" % (
+                      mode, theta, a["detection_rate"], a.get("latency_median_ms"), a["false_alarm_rate"],
+                      a["tight_bound_per_location_window"], a["false_events_per_hour"],
+                      a["false_distance_to_recent_target"],
+                      "—" if a["pure_alarm_location_rate"] is None else "%.3e" % a["pure_alarm_location_rate"],
+                      a["pure_windows"], a["pure_expected_alarms_at_bound"]), flush=True)
+            print("[%s]   theta=%s 纯背景 start %d 窗 / after %d 窗，越界检验 p = %.3g / %.3g" % (
+                mode, theta, a["pure_start_windows"], a["pure_after_windows"], a["pure_start_violation_p"],
+                a["pure_after_violation_p"]), flush=True)
+        if "decision_activity" in r:
+            act = r["decision_activity"]
+            print("[%s] 判决层活跃比例（足迹膨胀后）%s" % (mode, "，".join(
+                "ε=%g: %.4f" % (e, f) for e, f in zip(act["eps"], act["footprint_active_fraction"]))), flush=True)
     write_json(out_path, results)
     print("EVAL FINISHED:", out_path, flush=True)
 
