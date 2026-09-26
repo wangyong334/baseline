@@ -308,10 +308,12 @@ class EvalIntegration(unittest.TestCase):
         argv = ["train_stream_v2.py", "--config", config, "--mode", "eval"]
         with mock.patch.object(sys, "argv", argv):
             cfg = tv2.build_config(tv2.parse_args())
-        self.assertTrue(cfg["attr"])
-        self.assertEqual(tv2.readout_names(cfg), ["net", "fused_d1", "fused_d2", "fused_d5",
-                                                  "attr_d1", "attr_d2", "attr_d5"])
-        extra = ["--attr-delays", "2", "10", "--attr-variants", "backfill", "direct", "--attr-update", "generic",
+        self.assertFalse(cfg["attr"])                              # 09-26 起默认关闭
+        self.assertEqual(tv2.readout_names(cfg), ["net", "fused_d1", "fused_d2", "fused_d5"])
+        with mock.patch.object(sys, "argv", argv + ["--attr", "on"]):
+            self.assertEqual(tv2.readout_names(tv2.build_config(tv2.parse_args())),
+                             ["net", "fused_d1", "fused_d2", "fused_d5", "attr_d1", "attr_d2", "attr_d5"])
+        extra = ["--attr", "on", "--attr-delays", "2", "10", "--attr-variants", "backfill", "direct", "--attr-update", "generic",
                  "--attr-tube-birth", "off", "--hyp", "lag=3", "confirm_theta=5.5", "--no-alarms",
                  "--alarm-thetas", "8"]
         with mock.patch.object(sys, "argv", argv + extra):

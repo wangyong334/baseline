@@ -86,7 +86,7 @@ TRAIN:
   save_root: log/stream_v2_seed37
 
 ATTR:                                  # V2-2 回溯分布修正（评估时运行，无可学习参数；设计页第 7-8 节）
-  attr: true                           # false = 只有 V2-1 的读出（与 V2-1 baseline 逐位相同）
+  attr: false                          # 09-26 s37 实测无收益且评估慢 4 倍，默认关闭；要评估时 --attr on
   attr_delays: [1, 2, 5]               # 固定等待的窗数（与 fused_d 同口径；要看起始段回溯再加 10）
   attr_weight: 1.0                     # 式 (17) 的修正权重 w
   attr_cap: 3.0                        # 修正上限 c
