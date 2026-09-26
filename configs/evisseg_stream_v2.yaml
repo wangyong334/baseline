@@ -1,4 +1,5 @@
-# 流式 SNN V2（方案一，设计 v2-1）：证据前端 + V1 电流合并解码器骨干 + mark/强度两个头 + 漂移 CUSUM 判决
+# 流式 SNN V2 冻结版（09-26）：证据前端 + V1 电流合并解码器骨干 + mark/强度两个头 + 漂移 CUSUM 判决
+# 本文件的默认值就是冻结基线：LIF 膜电位下界 -4、判决层稀疏执行 epsilon = 0.03、不算告警、eval 只跑 carry、V2-2 关闭。
 # 50 ms 块因果；骨干每窗一次 LIF 更新；前端与 CUSUM 无可学习参数。说明见 README_STREAM_V2.md。
 DATA:
   root: /media/stephen/nvme0n1/wy_data/datasets/EV-UAV-dataset
@@ -29,10 +30,11 @@ NET:
   state_mode: carry                    # 只作用于骨干；前端与 CUSUM 始终保持状态
   norm: none
   v_threshold: 1.0
-  # 跨窗携带的膜电位上下界（以 v_th 为单位；null = 不设界，与 v2-1 原实现逐位相同）
+  # 跨窗携带的膜电位上下界（以 v_th 为单位；null = 不设界，即 v2-1 原实现）
   # 09-23 诊断：LIF 对持续负电流的直流增益是 1/(1-beta)，正向有发放复位、负向没有，
   # enc4/dec3 的膜电位中位数掉到 -32/-63 个阈值、发放率只剩 7%。下界就是补上缺的那条复位。
-  neuron_u_floor: null
+  # 冻结基线用 -4（需重训）；无下界对照用 --neuron-u-floor none。relu / reset_each_window 没有跨窗膜电位，自动置 null
+  neuron_u_floor: -4
   neuron_u_ceil: null
   tau_init_ms: 200.0
   tau_min_ms: 50.0

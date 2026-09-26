@@ -19,10 +19,8 @@ import os
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")   # 必须在导入 torch 之前设置
 
 import argparse  # noqa: E402
-import hashlib  # noqa: E402
 import json  # noqa: E402
 import math  # noqa: E402
-import random  # noqa: E402
 import time  # noqa: E402
 from pathlib import Path  # noqa: E402
 from types import SimpleNamespace  # noqa: E402
@@ -34,17 +32,19 @@ import torch.nn.functional as F  # noqa: E402
 from dataset.ev_uav_stream import EvUAVStream, make_sequence_loader, window_to_device  # noqa: E402
 from dataset.stream_source import INPUT_DEVICES, make_window_source  # noqa: E402
 from dataset.stream_windows import refill_by_index  # noqa: E402
-from model.evspsegnet_stream import (LAYER_NAMES, EvSpSegNetStream, calibrate_gains,  # noqa: E402
-                                     count_parameters, estimate_operations)
-from model.lif2d_stream import StreamingLIF2d, detach_states  # noqa: E402
+from model.evspsegnet_stream import EvSpSegNetStream, calibrate_gains, count_parameters, estimate_operations  # noqa: E402
+from model.lif2d_stream import detach_states  # noqa: E402
 from utils.stream_common import (health_warnings, linear_epoch_lr, load_flat_config,  # noqa: E402
                                  make_chunks, select_subset, subset_due, summarize_history)
 from utils.stream_metrics import (first_detection_latencies, iou_from_counts, rolling_iou,  # noqa: E402
                                   segment_iou, summarize_latencies, window_confusion)
+# 这些运行工具已移到 utils/stream_run.py（V2 起共用）；这里仍以原名导出，旧的 T.seed_everything 等写法不变
+from utils.stream_run import (LayerMonitor, file_hashes, peak_memory_gib, seed_everything,  # noqa: E402,F401
+                              tau_statistics, train_file_names, write_json)
 
 SOURCE_FILES = ("train_stream_v1.py", "dataset/stream_windows.py", "dataset/ev_uav_stream.py",
                 "dataset/stream_source.py", "model/lif2d_stream.py", "model/evspsegnet_stream.py",
-                "utils/stream_common.py", "utils/stream_metrics.py", "utils/eval.py")
+                "utils/stream_common.py", "utils/stream_metrics.py", "utils/stream_run.py", "utils/eval.py")
 EXECUTIONS = ("step", "layer")
 
 
@@ -122,21 +122,6 @@ def build_config(args):
     return cfg
 
 
-def seed_everything(seed, deterministic):
-    """固定 Python/numpy/torch 随机种子；deterministic=True 时要求确定性算法。
-
-    若冒烟测试报 "does not have a deterministic implementation"，把 YAML 中 deterministic 改为 false。
-    """
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = False
-    if deterministic:
-        torch.backends.cudnn.deterministic = True
-        torch.use_deterministic_algorithms(True)
-
-
 def load_stats(cfg):
     """读取训练集统计 JSON（由 tools/stream_train_stats.py 生成），返回 (stats, q99, pos_weight)。
 
@@ -167,29 +152,9 @@ def build_net(cfg, device):
     return net.to(device)
 
 
-def train_file_names(cfg):
-    """返回训练集全部 NPZ 文件名（排序）。"""
-    directory = os.path.join(cfg["root"], "train")
-    return sorted(n for n in os.listdir(directory) if n.endswith(".npz"))
-
-
 def source_hashes():
     """记录本次运行所用源码的 sha256，写进 run_config.json，方便事后核对代码版本。"""
-    here = Path(__file__).resolve().parent
-    return {name: hashlib.sha256((here / name).read_bytes()).hexdigest()
-            for name in SOURCE_FILES if (here / name).exists()}
-
-
-def write_json(path, payload):
-    """以 UTF-8、缩进格式写 JSON。"""
-    Path(path).write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-
-
-def peak_memory_gib(device):
-    """返回当前设备的峰值显存（GiB）；CPU 运行时返回 None。"""
-    if device.type != "cuda":
-        return None
-    return round(torch.cuda.max_memory_allocated(device) / 2 ** 30, 3)
+    return file_hashes(SOURCE_FILES)
 
 
 # ---------------------------------------------------------------------------
@@ -238,85 +203,6 @@ def run_calibration(net, cfg, q99, device, out_dir):
 # ---------------------------------------------------------------------------
 # 监控
 # ---------------------------------------------------------------------------
-
-
-class LayerMonitor(object):
-    """累计每层的发放与膜电位统计（在 GPU 上累加，汇总时才同步）。
-
-    统计量：
-        firing_rate          整层所有元素的平均发放率（含空像素，用于理论 SOP 估计）
-        silent_channel_frac  评估期间一次都没发放的通道占比
-        always_on_frac       发放窗口占比 > 90% 的神经元占比（饱和）
-        u_abs_max            |U_pre| 最大值
-        big_membrane_frac    |U_pre| > 10*阈值 的元素占比
-    ReLU 版本把"激活 > 0"视为发放。
-    """
-
-    def __init__(self, v_threshold):
-        self.v_threshold = float(v_threshold)
-        self.data = {}
-
-    def update(self, info):
-        """累加 info：逐窗 forward 的每层 [B,C,H,W]，或 forward_chunk 的每层 [T,B,C,H,W]（T 个窗口）。
-
-        两种形状按窗口计数，结果相同；计数用整数累加，避免片段内元素过多时 float32 求和舍入。
-        """
-        with torch.no_grad():
-            for name, spikes, u_pre in zip(LAYER_NAMES, info["spikes"], info["u_pre"]):
-                if spikes.dim() == 4:
-                    spikes, u_pre = spikes.unsqueeze(0), u_pre.unsqueeze(0)
-                active = spikes > 0
-                d = self.data.get(name)
-                if d is None:
-                    d = {"spike_sum": torch.zeros((), device=spikes.device, dtype=torch.float64),
-                         "elements": 0, "windows": 0,
-                         "channel_spikes": torch.zeros(spikes.shape[2], device=spikes.device,
-                                                       dtype=torch.float64),
-                         "neuron_windows": torch.zeros(spikes.shape[2:], device=spikes.device),
-                         "u_abs_max": torch.zeros((), device=spikes.device),
-                         "big": torch.zeros((), device=spikes.device, dtype=torch.float64)}
-                    self.data[name] = d
-                d["spike_sum"] += active.sum().double()
-                d["elements"] += active.numel()
-                d["windows"] += int(spikes.shape[0])
-                d["channel_spikes"] += active.sum(dim=(0, 1, 3, 4)).double()
-                d["neuron_windows"] += (active.sum(1) > 0).sum(0).float()
-                u_abs = u_pre.abs()
-                d["u_abs_max"] = torch.maximum(d["u_abs_max"], u_abs.max())
-                d["big"] += (u_abs > 10.0 * self.v_threshold).sum().double()
-
-    def summary(self):
-        """返回 {层名: 统计字典}。"""
-        out = {}
-        for name, d in self.data.items():
-            out[name] = {
-                "firing_rate": float(d["spike_sum"]) / max(d["elements"], 1),
-                "silent_channel_frac": float((d["channel_spikes"] == 0).float().mean()),
-                "always_on_frac": float(((d["neuron_windows"] / max(d["windows"], 1)) > 0.9)
-                                        .float().mean()),
-                "u_abs_max": float(d["u_abs_max"]),
-                "big_membrane_frac": float(d["big"]) / max(d["elements"], 1),
-            }
-        return out
-
-
-def tau_statistics(net):
-    """返回每个 LIF 层的 tau/beta 最小/平均/最大值，以及贴近上下界的通道占比（ReLU 版本返回空字典）。"""
-    out = {}
-    for name, block in zip(LAYER_NAMES, net.blocks()):
-        neuron = block.neuron
-        if not isinstance(neuron, StreamingLIF2d):
-            continue
-        with torch.no_grad():
-            tau = neuron.tau().double().cpu()
-            beta = neuron.beta().double().cpu()
-        margin = 0.02 * (neuron.tau_max_ms - neuron.tau_min_ms)
-        out[name] = {"tau_min": float(tau.min()), "tau_mean": float(tau.mean()), "tau_max": float(tau.max()),
-                     "beta_min": float(beta.min()), "beta_mean": float(beta.mean()),
-                     "beta_max": float(beta.max()),
-                     "near_min_frac": float((tau < neuron.tau_min_ms + margin).double().mean()),
-                     "near_max_frac": float((tau > neuron.tau_max_ms - margin).double().mean())}
-    return out
 
 
 def gradient_group_norms(net):

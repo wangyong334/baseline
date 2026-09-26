@@ -1,7 +1,10 @@
-# 流式 SNN V2（方案一，设计版本 v2-1）：预测—检验式证据积累
+# 流式 SNN V2（冻结版 = V2-1 基线 + 默认关闭的 V2-2 开关）：预测—检验式证据积累
 
-一句话：**网络给出一个可以被下一窗观测检验的目标强度预测；事件"如期出现"和"预测落空"都沿运动轨迹积累成证据；
-何时报警由证据决定，并在明确的背景条件下有虚警上界。**
+一句话：**网络给出一个可以被下一窗观测检验的目标强度预测；事件"如期出现"和"预测落空"都沿运动轨迹积累成证据，
+用之后几窗沿轨迹的证据修正每个事件的判断；同一套证据累积成位置级告警时，在明确的背景条件下有虚警上界（可选扩展）。**
+
+**09-26 冻结**：`configs/evisseg_stream_v2.yaml` 的默认值就是冻结基线（LIF 膜电位下界 −4、判决层稀疏执行 ε = 0.03、
+不算告警、eval 只跑 carry、V2-2 关闭），训练与评估命令不必再加这些参数。见文末"V2 冻结状态与 V2-2 开关"。
 
 ```text
 事件 ─► 证据前端（无参数）──► 脉冲 U-Net 骨干（V1 电流合并解码器）──► 逐像素两个头
@@ -11,7 +14,7 @@
                         上一窗 g 按 49 个速度假设平移 + 管道自身的强度记忆 ─► 漂移 CUSUM（无参数）
                              │
                              ├─► 输出 A  逐事件分割：net（零额外等待）、fused_d（mark + w·之后 d 窗的管道证据）
-                             └─► 输出 B  位置级告警：M >= theta 即告警（带复位），告警时刻由证据决定
+                             └─► 输出 B  位置级告警（可选，默认不算）：M >= theta 即告警（带复位）
 ```
 
 ## v2-0 → v2-1 改了什么（针对评审意见）
@@ -33,15 +36,15 @@
 - **足迹聚合**：`l_v = log mean_{y in S} exp(e_v(y))`（默认）。
 - **判决神经元**：`C_v = max(0, C_v(x - d_v, k-1) + l_v)`，`M = logsumexp_v C_v - log V`，`M >= theta` 告警并复位。
 - **保证**（条件：网络预测只用过去；每个像素的补偿不小于其背景条件分布的累积量生成函数，泊松时即 `mu0` 不低于真实均值；
-  lme / mean 聚合对空间相关无要求）：每条管道 L 步内的期望告警次数 `<= L/(e^theta - 1)`，每位置每窗告警率 `<= V/(e^theta - 1)`，
-  对任意网络权重成立。**条件本身（背景估计足够保守）在真实数据上没有保证**，需要在纯背景片段上实测并在 val 上定阈值。
+  lme / mean 聚合对空间相关无要求）：每条管道 L 步内的期望告警次数 `<= L/(e^theta - 1)`，按位置告警（复位该位置全部假设）时
+  每位置每窗告警率 `<= (1 + 1/L)/(e^theta - 1)`，与 V 无关（早先写的 `V/(e^theta - 1)` 是对假设取并集的松界），对任意网络权重成立。**条件本身（背景估计足够保守）在真实数据上没有保证**，需要在纯背景片段上实测并在 val 上定阈值。
 - **融合分数**：`score_i(d) = mark_i + w * F_i(d)`，`F_i(d) = logsumexp_v sum_{m=k+1..k+d} l_v(沿管道) - log V`。
 
 ## 服务器运行顺序
 
 ```bash
 cd /media/stephen/nvme0n1/wy_data/EV-UAV && conda activate evuav && mkdir -p run log
-python -m unittest discover -s tests -p "test_stream*.py" 2>&1 | tail -3        # 应为 96 个测试 OK
+python -m unittest discover -s tests -p "test_stream*.py" 2>&1 | tail -3        # 应为 231 个测试 OK（09-26）
 CFG=configs/evisseg_stream_v2.yaml; RUN=stream_v2; S=37; GPU=0
 
 # 1. 虚警保证核对（含空间相关背景 poisson_sync：sum 应超标、lme 应满足；poisson_under 为条件不成立的反例）
@@ -50,10 +53,10 @@ python tools/check_cusum_guarantee.py --size 64 --steps 1000 --device cuda:0 \
 # 2. 冒烟 / 3. 单序列过拟合（net IoU 应升到 0.9 左右，权重存为 overfit_last.pt）
 CUDA_VISIBLE_DEVICES=$GPU python train_stream_v2.py --config $CFG --mode smoke --save-root log/${RUN}_smoke > run/${RUN}_smoke.log 2>&1
 CUDA_VISIBLE_DEVICES=$GPU python train_stream_v2.py --config $CFG --mode overfit --steps 300 --save-root log/${RUN}_overfit > run/${RUN}_overfit.log 2>&1
-# 4. 正式训练
+# 4. 正式训练（YAML 默认即冻结基线：下界 -4；无下界对照加 --neuron-u-floor none）
 nohup env CUDA_VISIBLE_DEVICES=$GPU python train_stream_v2.py --config $CFG --mode train --seed $S \
     --save-root log/${RUN}_seed$S > run/${RUN}_seed$S.log 2>&1 &
-# 5. 评估（两类输出：逐事件读出 net/fused_d 与位置级告警 alarms）
+# 5. 评估（逐事件读出 net/fused_d；位置级告警只在加 --alarm-thetas 8 12 16 时计算）
 for split in val test; do
   CUDA_VISIBLE_DEVICES=$GPU python train_stream_v2.py --config $CFG --mode eval --split $split \
       --checkpoint log/${RUN}_seed$S/best_val_iou_seed$S.pt --dump-dir log/verify/${RUN}_s${S}_$split
@@ -113,16 +116,16 @@ eval 结果 `eval_<split>_<ckpt>.json`：`<carry|reset_each_window>.readouts.<ne
 
 lme 温度、预测加权 mean、胞体漏电、告警溯源已删除。原因分别是：被上面的开关压过；方向被取代；从主线撤出。
 
-**开关**（YAML 的 CUSUM 段与命令行；默认值 = 原实现，逐位相同，有测试守着）：
+**开关**（YAML 的 CUSUM 段与命令行；"默认"为 09-26 冻结后的 YAML 值，括号里是原实现的取值，用它可逐位复现冻结前的结果）：
 
 | 开关 | 默认 | 作用 |
 |---|---|---|
 | `--cusum-memory-gain λ` | 1 | 0 = 完全非对称 |
-| `--cusum-gate-eps ε` | 0 | 低于 ε 的强度与记忆置 0 |
+| `--cusum-gate-eps ε` | 0.03（原 0） | 低于 ε 的强度与记忆置 0（稀疏执行） |
 | `--cusum-reset-radius r` | 0 | 复位告警邻域内全部假设 |
 | `--cusum-footprint f` | 3 | 1 = 逐像素不聚合 |
-| `--alarm-thetas ...` | 8 12 16 | 覆盖告警阈值 |
-| `--eval-state-modes carry` | 两种都跑 | 只比判决层时省一半时间 |
+| `--alarm-thetas ...` | 不算（原 8 12 16） | 打开位置级告警并给出阈值 |
+| `--eval-state-modes ...` | carry（原两种都跑） | 加 reset_each_window 看骨干跨窗记忆的作用 |
 | `--eval-sequences N` | 0（全部） | 只评估前 N 条序列，冒烟用 |
 
 **新增输出**（eval JSON）：
@@ -144,12 +147,15 @@ lme 温度、预测加权 mean、胞体漏电、告警溯源已删除。原因�
 
 ## V2 冻结状态与 V2-2 开关（09-26）
 
-**V2-1 冻结基线**：训练时加 `--neuron-u-floor -4`；YAML 默认值即冻结设置——判决层稀疏执行 `cusum_gate_eps: 0.03`、
-不算告警 `alarm_thetas: []`、评估只跑 carry `eval_state_modes: [carry]`。三种子 test（阈值 0.9）fused_d2 IoU 0.8884 ± 0.007，
+**V2-1 冻结基线**：YAML 默认值即冻结设置——膜电位下界 `neuron_u_floor: -4`（09-26 起写进 YAML，训练命令不必再加
+`--neuron-u-floor -4`；无下界对照用 `--neuron-u-floor none`，relu / reset_each_window 自动置 null）、判决层稀疏执行
+`cusum_gate_eps: 0.03`、不算告警 `alarm_thetas: []`、评估只跑 carry `eval_state_modes: [carry]`。代码基线为提交 b5c9dcd
+（与 V2-1 baseline 85cda8f 相比只多默认关闭的开关，读出逐位相同），V3 在分支 `v3` 上开发。三种子 test（阈值 0.9）fused_d2 IoU 0.8884 ± 0.007，
 整机约 92 mJ/8s。汇总页：https://claude.ai/artifact/PVVgn4eijfJueYVPvmG23k
 
 **V2-2 事件归属回溯修正（默认关闭，`attr: false`）**：稀疏目标假设库（`model/target_hypotheses.py`）+ 回溯分布修正读出
-（`model/attribution_readout.py`），评估时运行、无可学习参数，关掉时 V2-1 读出逐位不变。设计页：
+（`model/attribution_readout.py`），在训练入口里的接线集中在 `utils/attribution_eval.py`；评估时运行、无可学习参数，
+关掉时 V2-1 读出逐位不变。设计页：
 https://claude.ai/artifact/UqE8gG3SjbyCr5hBBfDRSU ；审计与修复：`outputs/audits/v22_readout_audit.md`。
 
 | 开关 | 默认 | 作用 |
@@ -170,9 +176,18 @@ EV-UAV 上的结论（s37）：审计修复后 attr_fused_d2 在 val 选定阈�
 相关离线工具：`tools/error_breakdown.py`（错误分类、逐序列、目标漏检画像）、`tools/persistence_gate.py`（持续性门控，负结果）、
 `tools/audit_v22_readout.py`（V2-2 审计探针）。
 
+## 代码组织（09-26 V3 开发前整理，数值不变）
+
+- `train_stream_v2.py`：配置、构造、训练、评估的编排；不再导入 V1 的训练脚本。
+- `utils/stream_run.py`：各版本共用的运行工具（随机种子、JSON、显存、逐层监控、时间常数统计、源码哈希），
+  从 `train_stream_v1.py` 原样移出，V1 仍以原名导出。
+- `utils/attribution_eval.py`：V2-2 开关在入口里的全部接线（参数、配置检查、每条序列的运行、统计与打印）。
+- 核对方法：在合成数据上，整理前（b5c9dcd）与整理后的代码同种子各训练、各评估一遍，权重、每轮日志与逐事件导出逐位相同。
+
 ## 本地已核对的内容（CPU，无真实数据）
 
-- **96 个单元测试全部通过**（原 77 + V2 的 19 个）。V2 部分包括：证据的期望（泊松/负二项解析求和）、管道强度记忆递推、
+- **单元测试**：09-26 共 231 个（V1、V2、V2-2 与离线工具），在与服务器同版本的 Python 3.8 + torch 1.9.1 下全部通过。
+  v2-1 时的 96 个（原 77 + V2 的 19 个）中，V2 部分包括：证据的期望（泊松/负二项解析求和）、管道强度记忆递推、
   三种聚合公式、CUSUM 与暴力计算一致、延迟读出与暴力计算一致（含实际发布窗）、独立背景下告警率不超界、背景低估时超界、
   **完全相关背景下 sum 超界而 lme / mean 满足**、告警评估（真告警/虚警连通域/首次告警延迟）、按发布窗的检出延迟、
   前端递推与直接求和一致、网络逐窗与片段等价、训练使全部参数更新、各读出覆盖全部事件。
