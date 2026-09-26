@@ -67,5 +67,31 @@ class ErrorBreakdownTests(unittest.TestCase):
         self.assertEqual(res["fn"]["start"]["n"], 1)
 
 
+    def test_logit_sum_filter_and_per_sequence(self):
+        n = 21
+        rng = np.random.default_rng(0)
+        a, b = rng.normal(size=n).astype(np.float32), rng.normal(size=n).astype(np.float32)
+        write_dump(self.tmp, "other.npz", np.arange(n, dtype=np.float64), np.zeros(n), np.full(n, 900.0),
+                   np.zeros(n), np.zeros(n), probabilities=np.zeros(n, np.float32), prob_fix=np.zeros(n, np.float32),
+                   la=a, lb=b)
+        args = eb.parse_args(["--dump-dir", self.tmp + ":la+lb", "--names", "other", "--per-sequence"])
+        seqs, names = eb.load_sequences(args.dump_dir, 0, args.names)
+        self.assertEqual([s["name"] for s in seqs], ["other.npz"])
+        want = 1.0 / (1.0 + np.exp(-(a.astype(np.float64) + b)))
+        self.assertLess(float(np.abs(seqs[0]["probs"][names[0]] - want).max()), 1e-6)
+        rows = eb.per_sequence(seqs, names, 0.5, args)
+        self.assertEqual(rows[0]["readouts"][names[0]]["fp"], int((want >= 0.5).sum()))
+
+    def test_select_eval_names(self):
+        import train_stream_v2 as tv2
+        self.assertEqual(tv2.select_eval_names(self.tmp, 0, ["seq"]), ["seq.npz"])
+        self.assertEqual(tv2.select_eval_names(self.tmp, 1, None), ["seq.npz"])
+        self.assertIsNone(tv2.select_eval_names(self.tmp, 0, None))
+        with self.assertRaises(ValueError):
+            tv2.select_eval_names(self.tmp, 0, ["missing"])
+        with self.assertRaises(ValueError):
+            tv2.select_eval_names(self.tmp, 2, ["seq"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -143,6 +143,8 @@ def parse_args():
     parser.add_argument("--readout-delays", type=int, nargs="+", default=None, help="逐事件延迟读出的窗数")
     parser.add_argument("--eval-sequences", type=int, default=0,
                         help="eval 模式只用该划分按文件名排序的前 N 条序列（冒烟用；0 = 全部）。结果不能当正式数字")
+    parser.add_argument("--eval-names", nargs="+", default=None,
+                        help="eval 模式只评估这些序列（文件名，可省略 .npz），例如 --eval-names test_022 test_023")
     parser.add_argument("--fe-features", nargs="+", choices=FEATURE_GROUPS, default=None,
                         help="前端输出哪几组特征（消融；改变输入通道数，需要重新训练）")
     parser.add_argument("--bg-mode", choices=("adaptive", "constant"), default=None,
@@ -1009,6 +1011,22 @@ def mode_train(args, cfg):
     print("TRAINING FINISHED:", root, flush=True)
 
 
+def select_eval_names(directory, first_n=0, names=None):
+    """eval 只评估的序列：names 给出文件名（可省略 .npz）时按给出的顺序；否则 first_n > 0 时取按文件名排序的前 N 条；
+    都没有时返回 None（整个划分）。给出的名字不存在时报错。"""
+    if names:
+        if first_n:
+            raise ValueError("--eval-names 与 --eval-sequences 只能给一个")
+        wanted = [n if n.endswith(".npz") else n + ".npz" for n in names]
+        missing = [n for n in wanted if not os.path.isfile(os.path.join(directory, n))]
+        if missing:
+            raise ValueError("找不到序列: %s（目录 %s）" % (missing, directory))
+        return wanted
+    if first_n:
+        return sorted(n for n in os.listdir(directory) if n.endswith(".npz"))[:int(first_n)]
+    return None
+
+
 def mode_eval(args, cfg):
     """评估 checkpoint：骨干 carry 与 reset_each_window 各一遍，全部读出；结果写到 checkpoint 同目录。
 
@@ -1058,12 +1076,10 @@ def mode_eval(args, cfg):
                "neuron_u_floor": train_cfg.get("neuron_u_floor"), "neuron_u_ceil": train_cfg.get("neuron_u_ceil"),
                "config": train_cfg}
     modes = tuple(args.eval_state_modes or cfg.get("eval_state_modes") or ("carry", "reset_each_window"))
-    names = None
-    if args.eval_sequences:
-        directory = os.path.join(train_cfg["root"], args.split)
-        names = sorted(n for n in os.listdir(directory) if n.endswith(".npz"))[:int(args.eval_sequences)]
+    names = select_eval_names(os.path.join(train_cfg["root"], args.split), args.eval_sequences, args.eval_names)
+    if names is not None:
         results["eval_sequences"] = names
-        print("冒烟：只评估 %d 条序列 %s（结果不能当正式数字）" % (len(names), names), flush=True)
+        print("只评估 %d 条序列 %s（子集结果，不能当整个划分的正式数字）" % (len(names), names), flush=True)
     for mode in modes:
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
