@@ -19,6 +19,10 @@
     生成      式 (12)：初判 >= birth_conf 且不在任何门内的事件按切比雪夫距离 birth_link 成簇（>= birth_min_events 个）；
               运动管道膜电位 max_v C_v >= candidate_theta 且不在任何门内的位置（按膜电位从高到低，每窗至多 max_tube_births 个）
 窗末对已确认假设保存快照（位置、不确定度、结构），供回溯读出（model/attribution_readout.py）做冻结参照（式 13）。
+历史与身份（09-26 修复，见 outputs/audits/v22_readout_audit.md）：
+    结束    已确认的假设结束后移入 retired，保留测量，keep_windows 窗后才释放，等待输出的旧事件仍能回溯
+    合并    被合并掉的假设记下身份映射 alias[被删] = 保留；resolve(hid) 沿映射找到当前身份（存活或已结束）。
+            合并只改变身份映射，不改任何事件已登记的冻结参照
 
 拟合窗口：式 (5) 对第 j 窗的估计只用 [max(b_h, j-lag), min(截止窗, j+lag)] 内的测量（前后各 lag 窗的局部直线），
 预测（截止 j-1）、窗末快照（截止 j）和回溯平滑（截止 j+d）是同一个过程，只是信息截止不同。
@@ -180,8 +184,10 @@ class HypothesisBank(object):
 
     # ------------------------------------------------------------------ 状态
     def reset(self):
-        """新序列开始：清空全部假设、快照与统计。"""
+        """新序列开始：清空全部假设、快照、身份映射与统计。"""
         self.alive = []
+        self.retired = []              # 已结束的已确认假设：[(结束窗号, 假设)]，keep_windows 窗后释放
+        self.alias = {}                # 被合并掉的 hid -> 保留下来的 hid
         self.next_id = 0
         self.snapshots = {}            # k -> {hid: (center [2], sigma, S)}
         self.overlap_run = {}          # (hid_a, hid_b) -> 连续重叠窗数
@@ -192,11 +198,28 @@ class HypothesisBank(object):
     def confirmed_hypotheses(self):
         return [h for h in self.alive if h.confirmed]
 
+    def readout_hypotheses(self):
+        """回溯读出可用的假设：存活的已确认假设 + 尚未释放的已结束假设。"""
+        return self.confirmed_hypotheses() + [h for _, h in self.retired]
+
     def find(self, hid):
+        """按编号找假设（存活或已结束）；找不到返回 None。"""
+        hid = int(hid)
         for h in self.alive:
-            if h.hid == int(hid):
+            if h.hid == hid:
+                return h
+        for _, h in self.retired:
+            if h.hid == hid:
                 return h
         return None
+
+    def resolve(self, hid):
+        """沿合并的身份映射找到 hid 当前对应的假设（存活或已结束）；已释放或不存在时返回 None。"""
+        hid, seen = int(hid), set()
+        while hid in self.alias and hid not in seen:
+            seen.add(hid)
+            hid = self.alias[hid]
+        return self.find(hid)
 
     def activity_at(self, h, j):
         """第 j 窗的活动量 A_h(j)；该窗没有记录时取 j 之前最近一窗的值（都没有时为 0）。"""
@@ -261,18 +284,27 @@ class HypothesisBank(object):
 
     def density(self, h, j, cutoff, ys, xs):
         """事件 (ys, xs) 处的 q_h(x; j | cutoff) 与 phi（相对峰值；方框外为 0）。ys、xs 为 CPU long。"""
+        center, sigma = self.estimate(h, j, cutoff)
+        return self.density_from_state(center, self._sigma_for(sigma), h.S, ys, xs)
+
+    def density_from_state(self, center, sigma, S, ys, xs):
+        """给定 (center, sigma, S) 时事件处的 q 与 phi（相对该分布在方框内的峰值；方框外为 0）。"""
         n = int(ys.numel())
         q, phi = torch.zeros(n, dtype=F64), torch.zeros(n, dtype=F64)
-        fld = self.field(h, j, cutoff)
-        if fld is None or fld["qmax"] <= 0 or n == 0:
+        box = self._box(center, sigma)
+        if box is None or n == 0:
             return q, phi
-        y0, y1, x0, x1 = fld["box"][2]
+        qbox = distribution(S, center, sigma, box[0], box[1])
+        qmax = float(qbox.max()) if qbox.numel() else 0.0
+        if qmax <= 0:
+            return q, phi
+        y0, y1, x0, x1 = box[2]
         inside = (ys >= y0) & (ys <= y1) & (xs >= x0) & (xs <= x1)
         idx = inside.nonzero().view(-1)
         if idx.numel():
-            qe = distribution(h.S, fld["center"], fld["sigma"], ys[idx], xs[idx])
+            qe = distribution(S, center, sigma, ys[idx], xs[idx])
             q[idx] = qe
-            phi[idx] = qe / fld["qmax"]
+            phi[idx] = qe / qmax
         return q, phi
 
     def state(self, h, j, cutoff):
@@ -415,12 +447,14 @@ class HypothesisBank(object):
                 else:
                     h.zero_run = h.zero_run + 1 if h.C <= 0 else 0
 
-        # 式 (10)：结束
+        # 式 (10)：结束（已确认的移入 retired，等待输出的旧事件仍能回溯）
         patience = int(p["miss_patience"])
         keep = []
         for h in self.alive:
             if h.miss >= patience or (not h.confirmed and h.zero_run >= patience):
                 self.stats["ended"] += 1
+                if h.confirmed:
+                    self.retired.append((k, h))
             else:
                 keep.append(h)
         self.alive = keep
@@ -442,6 +476,7 @@ class HypothesisBank(object):
         horizon = k - int(p["keep_windows"])
         for old in [kk for kk in self.snapshots if kk <= horizon]:
             del self.snapshots[old]
+        self.retired = [(ended, h) for ended, h in self.retired if ended > horizon]
         for h in self.alive:
             for old in [jj for jj in h.meas if jj <= horizon]:
                 del h.meas[old]
@@ -458,7 +493,7 @@ class HypothesisBank(object):
             self.overlap_run = {}
             return
         fields = {h.hid: self.field(h, k, k) for h in self.alive}
-        runs, dropped = {}, set()
+        runs, dropped = {}, {}
         for i, a in enumerate(self.alive):
             for b in self.alive[i + 1:]:
                 fa, fb = fields[a.hid], fields[b.hid]
@@ -478,10 +513,15 @@ class HypothesisBank(object):
                 if float(torch.minimum(qa, qb).sum()) >= float(self.p["merge_overlap"]):
                     runs[key] = self.overlap_run.get(key, 0) + 1
                     if runs[key] >= 2:
-                        dropped.add(min(a, b, key=self._rank).hid)
+                        lose = min(a, b, key=self._rank)
+                        dropped.setdefault(lose.hid, (b if lose is a else a).hid)
         self.overlap_run = runs
         if dropped:
             self.stats["merged"] += len(dropped)
+            for lost, kept in dropped.items():
+                while kept in dropped and dropped[kept] != lost:   # 保留者本窗也被合并掉时，映射到最终保留者
+                    kept = dropped[kept]
+                self.alias[lost] = kept
             self.alive = [h for h in self.alive if h.hid not in dropped]
 
     def _cover_box(self, cover, h):

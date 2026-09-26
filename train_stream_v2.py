@@ -333,6 +333,8 @@ def readout_names(cfg):
     if cfg.get("attr"):
         delays = [int(d) for d in cfg["attr_delays"]]
         names += ["attr_d%d" % d for d in delays]
+        # V2-1 融合读出 + V2-2 修正（两者都要有这个等待窗数）：V2-2 是否能在 V2-1 上再改进的主比较
+        names += ["attr_fused_d%d" % d for d in delays if d in [int(x) for x in cfg["readout_delays"]]]
         names += ["attr_%s_d%d" % (v, d) for v in ATTR_VARIANTS if v in (cfg.get("attr_variants") or [])
                   for d in delays]
     return names
@@ -344,8 +346,8 @@ def readout_delay(name):
 
 
 def is_variant_readout(name):
-    """V2-2 的对照读出（只算 IoU/ACC）：attr_<对照>_d{d}，不含主读出 attr_d{d}。"""
-    return name.startswith("attr_") and not name[len("attr_d"):].isdigit()
+    """V2-2 的对照读出（只算 IoU/ACC）：attr_<对照>_d{d}；主读出 attr_d{d} 与 attr_fused_d{d} 不算。"""
+    return name.startswith("attr_") and name.split("_")[1] in ATTR_VARIANTS
 
 
 def publish_field(name):
@@ -471,8 +473,9 @@ class AttributionStats(object):
 
     def __init__(self, delays):
         self.delays = list(delays)
-        self.per = {d: {"target": 0, "background": 0, "target_case1": 0, "target_case2": 0, "background_case1": 0,
-                        "background_case2": 0, "target_up": 0, "background_down": 0, "background_up": 0,
+        self.per = {d: {"target": 0, "background": 0, "target_case1": 0, "target_case2": 0, "target_case3": 0,
+                        "background_case1": 0, "background_case2": 0, "background_case3": 0,
+                        "target_up": 0, "background_down": 0, "background_up": 0,
                         "target_delta_sum": 0.0, "background_delta_sum": 0.0} for d in self.delays}
         self.bank = {"seconds": 0.0, "windows": 0, "alive": 0, "confirmed": 0, "births_snn": 0, "births_tube": 0,
                      "confirmed_total": 0, "merged": 0, "ended": 0}
@@ -487,6 +490,7 @@ class AttributionStats(object):
                 p[tag] += int(mask.sum())
                 p[tag + "_case1"] += int((mask & (case == 1)).sum())
                 p[tag + "_case2"] += int((mask & (case == 2)).sum())
+                p[tag + "_case3"] += int((mask & (case == 3)).sum())
                 p[tag + "_delta_sum"] += float(delta[mask & cov].sum())
             p["target_up"] += int((target & cov & (delta > 0)).sum())
             p["background_down"] += int((~target & cov & (delta < 0)).sum())
@@ -504,7 +508,8 @@ class AttributionStats(object):
     def summary(self):
         out = {}
         for d, p in self.per.items():
-            cov_t, cov_b = p["target_case1"] + p["target_case2"], p["background_case1"] + p["background_case2"]
+            cov_t = p["target_case1"] + p["target_case2"] + p["target_case3"]
+            cov_b = p["background_case1"] + p["background_case2"] + p["background_case3"]
             out["d%d" % d] = dict(p, target_covered_frac=cov_t / float(max(p["target"], 1)),
                                   background_covered_frac=cov_b / float(max(p["background"], 1)),
                                   target_delta_mean=p["target_delta_sum"] / float(max(cov_t, 1)),
@@ -571,8 +576,9 @@ def run_sequence(model, frontend, cusum, seq, cfg, device, state_mode, monitor=N
         extra      {"logit_net": mark 的 logit，"evidence_d{d}": F(d)，"publish_d{d}": 每窗实际发布的窗号 [n_windows]}
                    （序列末尾不足 d 窗时在最后一窗发布，延迟被截断）
                    V2-2 打开时（cfg["attr"]）另有：probs 里的 attr_d{d} = sigmoid(mark + w*Delta) 与对照读出
-                   attr_<对照>_d{d}（direct 直接是概率）；extra 里的 delta_attr_d{d}（修正量）、case_attr_d{d}
-                   （0 无修正 / 1 快照参照 / 2 固定参考）、publish_attr_d{d}，以及 attr_bank（假设库统计，非数组）
+                   attr_<对照>_d{d}（direct 直接是概率）、attr_fused_d{d} = sigmoid(mark + w*F(d) + w_A*Delta(d))；
+                   extra 里的 delta_attr_d{d}（修正量）、case_attr_d{d}（0 无修正 / 1 冻结参照 / 2 固定参考 /
+                   3 冻结参照且原关联已不覆盖）、publish_attr_d{d}，以及 attr_bank（假设库统计，非数组）
         confusion  [n_windows, 4] net 读出每窗 TP/FP/FN/正事件数
     alarm_eval 不为空时，另外按 alarm_thetas 各维护一份带复位的膜电位，把每窗的位置级告警图交给它（utils/alarm_metrics.py）。
     feature_probe 不为空时，每个片段调用一次 feature_probe(feats, mu0)（诊断用钩子，见 tools/diagnose_membrane.py）。
@@ -691,6 +697,12 @@ def run_sequence(model, frontend, cusum, seq, cfg, device, state_mode, monitor=N
         alarm_eval.end_sequence()
     refilled = {name: refill_by_index(seq.n_events, idx_parts, val_parts)
                 for name, (idx_parts, val_parts) in parts.items()}
+    for d in attr_delays:                            # attr_fused_d{d} = sigmoid(mark + w_F * F(d) + w_A * Delta(d))
+        if d in delays:
+            z = (refilled["logit_net"].astype(np.float64) + weight * refilled["evidence_d%d" % d].astype(np.float64)
+                 + attr_weight * refilled["delta_attr_d%d" % d].astype(np.float64))
+            refilled["attr_fused_d%d" % d] = (1.0 / (1.0 + np.exp(-z))).astype(np.float32)
+            attr_prob_names.append("attr_fused_d%d" % d)
     prob_names = [PRIMARY] + ["fused_d%d" % d for d in delays] + attr_prob_names
     probs = {name: refilled[name] for name in prob_names}
     extra = {name: refilled[name] for name in refilled if name not in probs}
@@ -1117,10 +1129,11 @@ def mode_eval(args, cfg):
                 if key == "bank":
                     continue
                 print("[%s] V2-2 %s：修正覆盖 目标 %.1f%% / 背景 %.3f%%；平均修正 目标 %+.3f / 背景 %+.3f；"
-                      "目标上调 %.1f%%，背景下调 %.1f%%（固定参考的目标事件 %d）" % (
+                      "目标上调 %.1f%%，背景下调 %.1f%%；情形 1/2/3 目标 %d/%d/%d，背景 %d/%d/%d" % (
                           mode, key, 100 * p["target_covered_frac"], 100 * p["background_covered_frac"],
                           p["target_delta_mean"], p["background_delta_mean"], 100 * p["target_up_frac"],
-                          100 * p["background_down_frac"], p["target_case2"]), flush=True)
+                          100 * p["background_down_frac"], p["target_case1"], p["target_case2"], p["target_case3"],
+                          p["background_case1"], p["background_case2"], p["background_case3"]), flush=True)
         print("[%s] 分段 IoU (net) %s" % (mode, {k: round(v, 4) for k, v in r["segment_iou"].items()}), flush=True)
         for theta, a in r.get("alarms", {}).items():
             print("[%s] 告警 theta=%s  检出率 %.3f  首次告警延迟中位数 %s ms  虚警率 %.3e（紧界 %.3e）"

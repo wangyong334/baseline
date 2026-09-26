@@ -295,6 +295,126 @@ class ReadoutPropositions(unittest.TestCase):
         self.assertAlmostEqual(rho_reference(7), 1.0 / 225.0)
 
 
+def controlled_hypothesis(bank, support=4, radius=1.5, anchor=(20.0, 30.0)):
+    """直接放进假设库的已确认假设：锚点固定、第 0-2 窗各有一个有效测量（审计探针同款）。"""
+    h = bank._new(0, torch.tensor(anchor, dtype=F64), torch.zeros(2, dtype=F64), "test")
+    h.status, h.confirmed_at, h.support = "confirmed", 0, support
+    h.S = gaussian_template(7, radius)
+    h.meas = {j: (h.anchor.clone(), 10.0) for j in (0, 1, 2)}
+    bank.alive.append(h)
+    return h
+
+
+def set_snapshot(bank, h, sigma, k=0):
+    bank.snapshots.setdefault(k, {})[h.hid] = (h.anchor.clone(), float(sigma), h.S.clone())
+
+
+class AuditRegression(unittest.TestCase):
+    """09-26 审计（outputs/audits/v22_readout_audit.md）发现的四个问题的回归测试，以及三种情形的规则。"""
+
+    def event(self, readout, x=30, y=20, k=0):
+        return readout._register(k, k, torch.tensor([y]), torch.tensor([x]), None, None)
+
+    def test_previously_associated_event_gets_negative_correction(self):
+        """登记时在原关联的门内（phi 0.20），平滑后被排除（phi 0.0015）：情形 3，按冻结参照给负修正。"""
+        bank = HypothesisBank(H, W)
+        h = controlled_hypothesis(bank)
+        set_snapshot(bank, h, 3.0)
+        readout = AttributionReadout(bank, [2], variants=())
+        entry = self.event(readout, x=36)
+        self.assertEqual(int(entry["orig"][0]), h.hid)
+        res = readout._readout(entry, 2)
+        qd, _ = bank.density(h, 0, 2, entry["ys"], entry["xs"])
+        q0 = bank.snapshot_density(0, h.hid, entry["ys"], entry["xs"])
+        want = math.log((float(qd) + 1e-3) / (float(q0) + 1e-3))
+        self.assertEqual(int(res["case"][0]), 3)
+        self.assertAlmostEqual(float(res["attr"][0]), want, places=9)
+        self.assertLess(float(res["attr"][0]), -1.0)
+
+    def test_never_associated_and_uncovered_event_is_not_corrected(self):
+        bank = HypothesisBank(H, W)
+        h = controlled_hypothesis(bank)
+        set_snapshot(bank, h, 1.0)
+        readout = AttributionReadout(bank, [2], variants=())
+        entry = self.event(readout, x=50)
+        self.assertEqual(int(entry["orig"][0]), -1)
+        res = readout._readout(entry, 2)
+        self.assertEqual((int(res["case"][0]), float(res["attr"][0])), (0, 0.0))
+
+    def test_unsupported_hypothesis_does_not_block_reliable_one(self):
+        bank = HypothesisBank(H, W)
+        reliable = controlled_hypothesis(bank, support=4, radius=2.0)
+        set_snapshot(bank, reliable, 3.0)
+        readout = AttributionReadout(bank, [2], variants=())
+        entry = self.event(readout)
+        alone = readout._readout(entry, 2)
+        weak = controlled_hypothesis(bank, support=1, radius=0.5)
+        set_snapshot(bank, weak, 3.0)
+        both = readout._readout(entry, 2)
+        self.assertEqual(int(both["case"][0]), 1)
+        self.assertEqual(float(both["attr"][0]), float(alone["attr"][0]))
+        self.assertGreater(float(both["attr"][0]), 0.5)
+
+    def test_ended_hypothesis_still_supports_pending_events_then_is_released(self):
+        rng = np.random.default_rng(4)
+        windows = [make_window(rng, track(k)) for k in range(8)]
+        bank = HypothesisBank(H, W)
+        run(bank, windows)
+        readout = AttributionReadout(bank, [5], variants=())
+        ys, xs, _, _, g, mu = windows[6]
+        entry = readout._register(6, 6, ys, xs, mu, g)
+        for k in range(8, 12):                                   # 目标消失：第 11 窗结束
+            ys, xs, ps, _, g, mu = make_window(rng, None, n_bg=0)
+            bank.step(k, ys, xs, ps, g, mu)
+        self.assertEqual(len(bank.alive), 0)
+        self.assertEqual(len(bank.retired), 1)
+        res = readout._readout(entry, 11)
+        self.assertGreater(int((res["attr"] != 0).sum()), 0)
+        for k in range(12, 12 + int(bank.p["keep_windows"]) + 1):
+            ys, xs, ps, _, g, mu = make_window(rng, None, n_bg=0)
+            bank.step(k, ys, xs, ps, g, mu)
+        self.assertEqual(bank.retired, [])
+
+    def merged_pair(self, sigma_a, sigma_b):
+        """两个当前分布完全相同的可靠假设；a 支持更少（合并时被删掉），各自带第 0 窗快照（sigma 可为 None）。"""
+        bank = HypothesisBank(H, W)
+        a = controlled_hypothesis(bank, support=4)
+        b = controlled_hypothesis(bank, support=5)
+        for h, sigma in ((a, sigma_a), (b, sigma_b)):
+            if sigma is not None:
+                set_snapshot(bank, h, sigma)
+        return bank, a, b
+
+    def test_merge_keeps_frozen_reference_when_only_dropped_hypothesis_has_history(self):
+        bank, a, b = self.merged_pair(1.0, None)
+        readout = AttributionReadout(bank, [2], variants=())
+        entry = self.event(readout)
+        self.assertEqual(int(entry["orig"][0]), a.hid)
+        before = readout._readout(entry, 2)
+        bank._merge(1)
+        bank._merge(2)
+        self.assertEqual([h.hid for h in bank.alive], [b.hid])
+        self.assertIs(bank.resolve(a.hid), b)
+        after = readout._readout(entry, 2)
+        self.assertEqual((int(after["case"][0]), float(after["attr"][0])),
+                         (int(before["case"][0]), float(before["attr"][0])))
+
+    def test_merge_keeps_each_events_own_reference_when_both_have_history(self):
+        """a、b 各有不同的快照：离中心 4 px 的事件原关联 a（宽快照），中心事件原关联 b（窄快照）。
+        合并前后每个事件都用自己登记时的参照，修正不因合并改变，两者的修正也不同。"""
+        bank, a, b = self.merged_pair(3.0, 0.8)
+        readout = AttributionReadout(bank, [2], variants=())
+        entry = readout._register(0, 0, torch.tensor([20, 20]), torch.tensor([34, 30]), None, None)
+        self.assertEqual(entry["orig"].tolist(), [a.hid, b.hid])
+        before = readout._readout(entry, 2)
+        bank._merge(1)
+        bank._merge(2)
+        after = readout._readout(entry, 2)
+        self.assertTrue(torch.equal(before["attr"], after["attr"]))
+        self.assertTrue(torch.equal(before["case"], after["case"]))
+        self.assertNotEqual(float(after["attr"][0]), float(after["attr"][1]))
+
+
 class EvalIntegration(unittest.TestCase):
     """U3：接入 train_stream_v2 的评估流程（命令行、读出名称、run_sequence）。"""
 
@@ -312,7 +432,8 @@ class EvalIntegration(unittest.TestCase):
         self.assertEqual(tv2.readout_names(cfg), ["net", "fused_d1", "fused_d2", "fused_d5"])
         with mock.patch.object(sys, "argv", argv + ["--attr", "on"]):
             self.assertEqual(tv2.readout_names(tv2.build_config(tv2.parse_args())),
-                             ["net", "fused_d1", "fused_d2", "fused_d5", "attr_d1", "attr_d2", "attr_d5"])
+                             ["net", "fused_d1", "fused_d2", "fused_d5", "attr_d1", "attr_d2", "attr_d5",
+                              "attr_fused_d1", "attr_fused_d2", "attr_fused_d5"])
         extra = ["--attr", "on", "--attr-delays", "2", "10", "--attr-variants", "backfill", "direct", "--attr-update", "generic",
                  "--attr-tube-birth", "off", "--hyp", "lag=3", "confirm_theta=5.5", "--no-alarms",
                  "--alarm-thetas", "8"]
@@ -324,8 +445,11 @@ class EvalIntegration(unittest.TestCase):
         self.assertFalse(cfg["attr_tube_birth"])
         names = tv2.readout_names(cfg)
         self.assertIn("attr_direct_d10", names)
-        self.assertEqual([tv2.is_variant_readout(n) for n in ("attr_d2", "attr_direct_d2", "attr_backfill_d10")],
-                         [False, True, True])
+        self.assertIn("attr_fused_d2", names)
+        self.assertNotIn("attr_fused_d10", names)                   # d=10 没有对应的 V2-1 融合读出
+        self.assertEqual([tv2.is_variant_readout(n) for n in ("attr_d2", "attr_fused_d2", "attr_direct_d2",
+                                                              "attr_backfill_d10")], [False, False, True, True])
+        self.assertEqual(tv2.publish_field("attr_fused_d2"), "publish_attr_d2")
         self.assertEqual([tv2.readout_delay(n) for n in ("net", "fused_d5", "attr_direct_d10")], [0, 5, 10])
         self.assertEqual(tv2.publish_field("attr_direct_d10"), "publish_attr_d10")
         self.assertEqual(tv2.publish_field("fused_d2"), "publish_d2")
@@ -372,11 +496,16 @@ class EvalIntegration(unittest.TestCase):
                 self.assertTrue(np.all((p_on[name] >= 0) & (p_on[name] <= 1)), name)
             delta, case = x_on["delta_attr_d%d" % d], x_on["case_attr_d%d" % d]
             self.assertTrue(np.all(delta[case == 0] == 0))
-            self.assertTrue(set(np.unique(case).tolist()) <= {0.0, 1.0, 2.0})
+            self.assertTrue(set(np.unique(case).tolist()) <= {0.0, 1.0, 2.0, 3.0})
             self.assertEqual(x_on["publish_attr_d%d" % d].tolist(), [min(k + d, ev.WINDOWS - 1)
                                                                      for k in range(ev.WINDOWS)])
             z = x_on["logit_net"].astype(np.float64) + delta.astype(np.float64)
             self.assertLess(float(np.abs(1.0 / (1.0 + np.exp(-z)) - p_on["attr_d%d" % d]).max()), 1e-5)
+        # attr_fused_d1 = sigmoid(mark + F(1) + Delta(1))（ev.CFG 的融合延迟是 1、3，只有 d=1 两者都有）
+        self.assertNotIn("attr_fused_d2", p_on)
+        z = (x_on["logit_net"].astype(np.float64) + x_on["evidence_d1"].astype(np.float64)
+             + x_on["delta_attr_d1"].astype(np.float64))
+        self.assertLess(float(np.abs(1.0 / (1.0 + np.exp(-z)) - p_on["attr_fused_d1"]).max()), 1e-5)
 
 
 if __name__ == "__main__":
