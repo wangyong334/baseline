@@ -6,11 +6,14 @@
               CUSUM 把上一窗的 g 按各速度假设平移，作为本窗"可预测"的目标强度
     CUSUM     只在评估时运行：把上一窗的强度场按速度假设平移作为本窗预测，得到各管道的逐窗证据；
               延迟 d 窗的逐事件读出 = 网络 log-odds（先验）+ 之后 d 窗沿各速度管道的似然比（TubeReadout）
+    V2-2      只在评估时运行（--attr on，默认）：稀疏目标假设库（model/target_hypotheses.py）+ 回溯分布修正读出
+              （model/attribution_readout.py）；attr_d{d} = sigmoid(mark + w * Delta)，设计页式 (13)-(17)
 模式（--mode）：
     smoke    校准增益 + 1 个训练序列前 32 窗的一次更新，打印损失、梯度、发放率、显存、耗时
     overfit  单序列过拟合诊断
     train    正式训练：每个序列一次参数更新；每轮在 val 上评估 net 读出（mark 头）并据此保存最优
-    eval     评估 checkpoint：骨干 carry 与 reset_each_window 各一遍；读出 net（零延迟）与 fused_d{d}（延迟 d 窗）
+    eval     评估 checkpoint（默认只跑 carry，见 eval_state_modes）；读出 net（零延迟）、fused_d{d}（V2-1）
+             与 attr_d{d}（V2-2），都在第 k+d 窗末发布
 训练与评估都按片段执行（骨干逐层时间并行、事件常驻设备），没有逐窗计时；主指标调用原 utils/eval.py。
 """
 import os
@@ -32,10 +35,12 @@ import torch.nn.functional as F  # noqa: E402
 from dataset.ev_uav_stream import EvUAVStream, make_sequence_loader  # noqa: E402
 from dataset.stream_features import FEATURE_GROUPS, EventChunkSource, EvidenceFrontEnd  # noqa: E402
 from dataset.stream_windows import refill_by_index  # noqa: E402
+from model.attribution_readout import VARIANTS as ATTR_VARIANTS, AttributionReadout  # noqa: E402
 from model.evidence_neuron import DriftCUSUM, TubeReadout, velocity_grid  # noqa: E402
 from model.evidence_snn import EvidenceSNN  # noqa: E402
 from model.evspsegnet_stream import calibrate_gains, count_parameters, estimate_operations  # noqa: E402
 from model.lif2d_stream import detach_states  # noqa: E402
+from model.target_hypotheses import DEFAULT_PARAMS as HYP_DEFAULTS, UPDATES as HYP_UPDATES, HypothesisBank  # noqa: E402
 from train_stream_v1 import (LayerMonitor, peak_memory_gib, seed_everything, tau_statistics,  # noqa: E402
                              train_file_names, write_json)
 from utils.alarm_metrics import AlarmEvaluator  # noqa: E402
@@ -45,14 +50,17 @@ from utils.stream_common import (health_warnings, linear_epoch_lr, load_flat_con
 from utils.stream_metrics import (first_detection_latencies_published, rolling_iou, segment_iou,  # noqa: E402
                                   summarize_latencies, window_confusion)
 
-DESIGN_VERSION = "v2-1"
+DESIGN_VERSION = "v2-2"
 SOURCE_FILES = ("train_stream_v2.py", "dataset/stream_features.py", "dataset/stream_windows.py",
                 "dataset/ev_uav_stream.py", "model/evidence_neuron.py", "model/evidence_snn.py",
+                "model/target_hypotheses.py", "model/attribution_readout.py",
                 "model/evspsegnet_stream.py", "model/lif2d_stream.py", "utils/evidence_loss.py",
                 "utils/alarm_metrics.py", "utils/stream_common.py", "utils/stream_metrics.py", "utils/eval.py")
 PRIMARY = "net"
 # 判决层活跃比例统计的门控档位：门控后的 G 恰好是未门控 G 按 ε 截断，所以一次 ε=0 的运行就能读出各档
 ACTIVITY_EPS = (1e-3, 3e-3, 1e-2, 3e-2, 1e-1)
+# 每个读出另报这些阈值下的 IoU / ACC（只统计计数，几乎不花时间）：val 上选阈值、冻结到 test 不必再跑 Pd/Fa 扫描
+IOU_THRESHOLDS = (0.5, 0.6, 0.7, 0.8, 0.9, 0.95)
 # 决定前端输入、网络结构与神经元动力学的配置项。膜电位上下界、bg_mode 不在 state_dict 里，
 # 续训或评估时 load_state_dict 查不出它们不一致，只能按配置核对（见 config_drift）
 MODEL_KEYS = ("window_ms", "fe_taus_ms", "fe_dipole_taus_ms", "fe_dipole_radius", "bg_fast_ms", "bg_slow_ms",
@@ -111,9 +119,27 @@ def parse_args():
                         help="预测门控 ε：低于 ε 的强度与记忆置 0（稀疏执行的前提）；0 = 原实现")
     parser.add_argument("--cusum-reset-radius", type=int, default=None,
                         help="告警时复位邻域半径 r 内的全部假设（清掉共享过目标证据的兄弟管道）；0 = 原实现")
-    parser.add_argument("--alarm-thetas", type=float, nargs="+", default=None, help="覆盖位置级告警的阈值列表")
+    parser.add_argument("--alarm-thetas", type=float, nargs="+", default=None,
+                        help="打开位置级告警（可选扩展）并给出阈值列表；YAML 默认不算告警")
+    parser.add_argument("--no-alarms", action="store_true", help="不算位置级告警（覆盖 YAML）")
     parser.add_argument("--eval-state-modes", nargs="+", choices=("carry", "reset_each_window"), default=None,
-                        help="eval 模式跑哪几种骨干状态（默认两种都跑；只比判决层时给 carry 省一半时间）")
+                        help="eval 模式跑哪几种骨干状态（默认取 YAML 的 eval_state_modes，即只跑 carry）")
+    parser.add_argument("--attr", choices=("on", "off"), default=None,
+                        help="V2-2 回溯分布修正读出；off 时与 V2-1 baseline 的读出逐位相同")
+    parser.add_argument("--attr-delays", type=int, nargs="+", default=None, help="V2-2 固定等待的窗数，例如 1 2 5 10")
+    parser.add_argument("--attr-weight", type=float, default=None, help="式 (17) 的修正权重 w（在验证集上校准）")
+    parser.add_argument("--attr-variants", nargs="*", choices=ATTR_VARIANTS, default=None,
+                        help="额外导出的对照读出（只算 IoU/ACC，不算 Pd/Fa）")
+    parser.add_argument("--attr-update", choices=HYP_UPDATES, default=None,
+                        help="假设库的更新方式：separate（默认）/ generic / confident")
+    parser.add_argument("--attr-cap", type=float, default=None, help="修正上限 c")
+    parser.add_argument("--attr-eps", type=float, default=None, help="比值下限 epsilon")
+    parser.add_argument("--attr-ref-radius", type=int, default=None, help="固定参考半径 r_ref")
+    parser.add_argument("--attr-min-support", type=int, default=None, help="参与修正所需的有效测量窗数 n_min")
+    parser.add_argument("--attr-tube-birth", choices=("on", "off"), default=None,
+                        help="是否用运动管道生成候选（off = 只用 SNN 高置信簇，检验判决层是否还有必要）")
+    parser.add_argument("--hyp", nargs="+", default=None, metavar="KEY=VALUE",
+                        help="覆盖假设库参数（model/target_hypotheses.py 的 DEFAULT_PARAMS），例如 --hyp lag=3 confirm_theta=5")
     parser.add_argument("--readout-delays", type=int, nargs="+", default=None, help="逐事件延迟读出的窗数")
     parser.add_argument("--eval-sequences", type=int, default=0,
                         help="eval 模式只用该划分按文件名排序的前 N 条序列（冒烟用；0 = 全部）。结果不能当正式数字")
@@ -150,12 +176,43 @@ def build_config(args):
                  "readout_delays": args.readout_delays, "fe_features": args.fe_features, "bg_mode": args.bg_mode,
                  "fe_taus_ms": args.fe_taus_ms, "fe_dipole_taus_ms": args.fe_dipole_taus_ms,
                  "loss_mark_weight": args.loss_mark_weight, "loss_intensity_weight": args.loss_intensity_weight,
-                 "neuron_u_floor": args.neuron_u_floor, "neuron_u_ceil": args.neuron_u_ceil}
+                 "neuron_u_floor": args.neuron_u_floor, "neuron_u_ceil": args.neuron_u_ceil,
+                 "attr_delays": args.attr_delays, "attr_weight": args.attr_weight, "attr_variants": args.attr_variants,
+                 "hyp_update": args.attr_update, "attr_cap": args.attr_cap, "attr_eps": args.attr_eps,
+                 "attr_ref_radius": args.attr_ref_radius, "attr_min_support": args.attr_min_support}
     for key, value in overrides.items():
         if value is not None:
             cfg[key] = value
+    if args.no_alarms:
+        cfg["alarm_thetas"] = []
+    if args.attr is not None:
+        cfg["attr"] = args.attr == "on"
+    if args.attr_tube_birth is not None:
+        cfg["attr_tube_birth"] = args.attr_tube_birth == "on"
+    if args.hyp:
+        cfg["hyp_params"] = dict(cfg.get("hyp_params") or {}, **parse_hyp_overrides(args.hyp))
     validate_config(cfg)
     return cfg
+
+
+def parse_hyp_overrides(items):
+    """把 ["lag=3", "update=generic"] 解析成假设库参数字典，数值按 DEFAULT_PARAMS 中的类型转换。"""
+    out = {}
+    for item in items:
+        if "=" not in item:
+            raise ValueError("--hyp 的格式是 KEY=VALUE，收到 %r" % item)
+        key, value = item.split("=", 1)
+        key = key.strip().replace("-", "_")
+        if key not in HYP_DEFAULTS:
+            raise ValueError("未知的假设库参数 %r（可选：%s）" % (key, ", ".join(sorted(HYP_DEFAULTS))))
+        default = HYP_DEFAULTS[key]
+        if isinstance(default, str):
+            out[key] = value
+        elif isinstance(default, int):
+            out[key] = int(float(value))
+        else:
+            out[key] = float(value)
+    return out
 
 
 def validate_config(cfg):
@@ -170,6 +227,18 @@ def validate_config(cfg):
             raise ValueError("ReLU 对照没有膜电位，neuron_u_floor / neuron_u_ceil 对它无效")
         if cfg["state_mode"] == "reset_each_window":
             raise ValueError("reset_each_window 不携带跨窗膜电位，neuron_u_floor / neuron_u_ceil 对它无效")
+    if cfg.get("attr"):
+        delays = [int(d) for d in cfg.get("attr_delays") or []]
+        if not delays or min(delays) < 1:
+            raise ValueError("attr_delays 至少一个且都 >= 1")
+        unknown = set(cfg.get("attr_variants") or []) - set(ATTR_VARIANTS)
+        if unknown:
+            raise ValueError("未知的对照读出: %s" % sorted(unknown))
+        bad = set(cfg.get("hyp_params") or {}) - set(HYP_DEFAULTS)
+        if bad:
+            raise ValueError("未知的假设库参数: %s" % sorted(bad))
+        if cfg.get("hyp_update", "separate") not in HYP_UPDATES:
+            raise ValueError("hyp_update 必须是 %s 之一" % (HYP_UPDATES,))
 
 
 def normalized(value):
@@ -256,8 +325,46 @@ def gradient_group_norms(model):
 
 
 def readout_names(cfg):
-    """全部读出的名称：net（mark 头，零延迟）与 fused_d{d}（网络先验 + 之后 d 窗的管道证据）。"""
-    return [PRIMARY] + ["fused_d%d" % int(d) for d in cfg["readout_delays"]]
+    """全部读出的名称：net（mark 头，零延迟）、fused_d{d}（V2-1：网络先验 + 之后 d 窗的管道证据）、
+    attr_d{d}（V2-2 回溯分布修正）与 attr_<对照>_d{d}（对照读出，只算 IoU/ACC）。"""
+    names = [PRIMARY] + ["fused_d%d" % int(d) for d in cfg["readout_delays"]]
+    if cfg.get("attr"):
+        delays = [int(d) for d in cfg["attr_delays"]]
+        names += ["attr_d%d" % d for d in delays]
+        names += ["attr_%s_d%d" % (v, d) for v in ATTR_VARIANTS if v in (cfg.get("attr_variants") or [])
+                  for d in delays]
+    return names
+
+
+def readout_delay(name):
+    """读出名里的等待窗数（net 为 0）。"""
+    return 0 if name == PRIMARY else int(name.rsplit("_d", 1)[1])
+
+
+def is_variant_readout(name):
+    """V2-2 的对照读出（只算 IoU/ACC）：attr_<对照>_d{d}，不含主读出 attr_d{d}。"""
+    return name.startswith("attr_") and not name[len("attr_d"):].isdigit()
+
+
+def publish_field(name):
+    """读出对应的发布窗号字段名。"""
+    return ("publish_attr_d%d" if name.startswith("attr_") else "publish_d%d") % readout_delay(name)
+
+
+def build_attribution(cfg, cusum):
+    """按配置构造 V2-2 的假设库与回溯读出（无可学习参数）。保留窗数自动覆盖 lag + 最大等待。"""
+    params = dict(cfg.get("hyp_params") or {})
+    params.setdefault("update", cfg.get("hyp_update", "separate"))
+    delays = [int(d) for d in cfg["attr_delays"]]
+    lag = int(params.get("lag", HYP_DEFAULTS["lag"]))
+    params["keep_windows"] = max(int(params.get("keep_windows", HYP_DEFAULTS["keep_windows"])), lag + max(delays) + 2)
+    velocities = cusum.velocities if cfg.get("attr_tube_birth", True) else ()
+    bank = HypothesisBank(int(cfg["pad_height"]), int(cfg["pad_width"]), velocities, **params)
+    readout = AttributionReadout(bank, delays, cap=float(cfg.get("attr_cap", 3.0)),
+                                 eps=float(cfg.get("attr_eps", 1e-3)), ref_radius=int(cfg.get("attr_ref_radius", 7)),
+                                 min_support=int(cfg.get("attr_min_support", 3)),
+                                 variants=tuple(cfg.get("attr_variants") or ()))
+    return bank, readout
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +463,61 @@ def train_sequence(model, frontend, seq, optimizer, cfg, device, rng, max_window
     return sums
 
 
+class AttributionStats(object):
+    """V2-2 的诊断统计（按等待窗数，跨序列累加）：修正覆盖了多少目标 / 背景事件、平均修正量与方向，
+    以及假设库的生成、确认、合并、结束次数、平均存活数与耗时。只读 run_sequence 的导出，不影响任何读出。"""
+
+    def __init__(self, delays):
+        self.delays = list(delays)
+        self.per = {d: {"target": 0, "background": 0, "target_case1": 0, "target_case2": 0, "background_case1": 0,
+                        "background_case2": 0, "target_up": 0, "background_down": 0, "background_up": 0,
+                        "target_delta_sum": 0.0, "background_delta_sum": 0.0} for d in self.delays}
+        self.bank = {"seconds": 0.0, "windows": 0, "alive": 0, "confirmed": 0, "births_snn": 0, "births_tube": 0,
+                     "confirmed_total": 0, "merged": 0, "ended": 0}
+        self.confirm_delays = []
+
+    def update(self, labels, extra, bank_info):
+        target = np.asarray(labels) > 0.5
+        for d in self.delays:
+            delta, case = extra["delta_attr_d%d" % d], extra["case_attr_d%d" % d]
+            p, cov = self.per[d], case > 0
+            for tag, mask in (("target", target), ("background", ~target)):
+                p[tag] += int(mask.sum())
+                p[tag + "_case1"] += int((mask & (case == 1)).sum())
+                p[tag + "_case2"] += int((mask & (case == 2)).sum())
+                p[tag + "_delta_sum"] += float(delta[mask & cov].sum())
+            p["target_up"] += int((target & cov & (delta > 0)).sum())
+            p["background_down"] += int((~target & cov & (delta < 0)).sum())
+            p["background_up"] += int((~target & cov & (delta > 0)).sum())
+        if bank_info:
+            b = self.bank
+            for key in ("seconds", "windows", "alive", "confirmed"):
+                b[key] += bank_info[key]
+            st = bank_info["stats"]
+            for key in ("births_snn", "births_tube", "merged", "ended"):
+                b[key] += st[key]
+            b["confirmed_total"] += st["confirmed"]
+            self.confirm_delays += list(st["confirm_delays"])
+
+    def summary(self):
+        out = {}
+        for d, p in self.per.items():
+            cov_t, cov_b = p["target_case1"] + p["target_case2"], p["background_case1"] + p["background_case2"]
+            out["d%d" % d] = dict(p, target_covered_frac=cov_t / float(max(p["target"], 1)),
+                                  background_covered_frac=cov_b / float(max(p["background"], 1)),
+                                  target_delta_mean=p["target_delta_sum"] / float(max(cov_t, 1)),
+                                  background_delta_mean=p["background_delta_sum"] / float(max(cov_b, 1)),
+                                  target_up_frac=p["target_up"] / float(max(cov_t, 1)),
+                                  background_down_frac=p["background_down"] / float(max(cov_b, 1)))
+        b = dict(self.bank)
+        w = float(max(b["windows"], 1))
+        b.update(ms_per_window=1000.0 * b["seconds"] / w, alive_per_window=b["alive"] / w,
+                 confirmed_per_window=b["confirmed"] / w,
+                 confirm_delay_median=float(np.median(self.confirm_delays)) if self.confirm_delays else None)
+        out["bank"] = b
+        return out
+
+
 class DecisionActivity(object):
     """判决层的活跃比例：稀疏同步执行时每窗需要计算的 (假设, 像素) 占比。
 
@@ -406,6 +568,9 @@ def run_sequence(model, frontend, cusum, seq, cfg, device, state_mode, monitor=N
                              （TubeReadout），w = fusion_weight（在验证集上校准，见 tools/calibrate_fusion.py）
         extra      {"logit_net": mark 的 logit，"evidence_d{d}": F(d)，"publish_d{d}": 每窗实际发布的窗号 [n_windows]}
                    （序列末尾不足 d 窗时在最后一窗发布，延迟被截断）
+                   V2-2 打开时（cfg["attr"]）另有：probs 里的 attr_d{d} = sigmoid(mark + w*Delta) 与对照读出
+                   attr_<对照>_d{d}（direct 直接是概率）；extra 里的 delta_attr_d{d}（修正量）、case_attr_d{d}
+                   （0 无修正 / 1 快照参照 / 2 固定参考）、publish_attr_d{d}，以及 attr_bank（假设库统计，非数组）
         confusion  [n_windows, 4] net 读出每窗 TP/FP/FN/正事件数
     alarm_eval 不为空时，另外按 alarm_thetas 各维护一份带复位的膜电位，把每窗的位置级告警图交给它（utils/alarm_metrics.py）。
     feature_probe 不为空时，每个片段调用一次 feature_probe(feats, mu0)（诊断用钩子，见 tools/diagnose_membrane.py）。
@@ -427,6 +592,17 @@ def run_sequence(model, frontend, cusum, seq, cfg, device, state_mode, monitor=N
         alarm_C = {theta: c_state["C"].clone() for theta in alarm_eval.thetas}
     prev_log_g = None
     names = [PRIMARY, "logit_net"] + ["fused_d%d" % d for d in delays] + ["evidence_d%d" % d for d in delays]
+    bank = attr_readout = None
+    attr_delays, attr_variants, attr_weight = [], [], float(cfg.get("attr_weight", 1.0))
+    if with_cusum and cfg.get("attr"):
+        bank, attr_readout = build_attribution(cfg, cusum)
+        attr_delays, attr_variants = list(attr_readout.delays), list(attr_readout.variants)
+        for d in attr_delays:
+            names += ["attr_d%d" % d, "delta_attr_d%d" % d, "case_attr_d%d" % d]
+            names += ["attr_%s_d%d" % (v, d) for v in attr_variants]
+    attr_prob_names = [n for n in names if n.startswith("attr_")]
+    attr_publish = {d: np.zeros(seq.n_windows, dtype=np.int64) for d in attr_delays}
+    attr_time = {"seconds": 0.0, "alive": 0, "confirmed": 0}
     parts = {name: ([], []) for name in names}
     publish = {d: np.zeros(seq.n_windows, dtype=np.int64) for d in delays}
     window_info = {}                                 # 窗号 -> (原始事件下标, 网络 logit)，延迟读出用
@@ -443,6 +619,19 @@ def run_sequence(model, frontend, cusum, seq, cfg, device, state_mode, monitor=N
             parts["evidence_d%d" % delay][0].append(idx)
             parts["evidence_d%d" % delay][1].append(scores.float().cpu().numpy())
             publish[delay][key] = published
+
+    def collect_attr(results):
+        for key, delay, res, published in results:
+            idx, logit = window_info[key]
+            z = logit.detach().to("cpu", torch.float64)
+            outputs = {"attr_d%d" % delay: torch.sigmoid(z + attr_weight * res["attr"]),
+                       "delta_attr_d%d" % delay: res["attr"], "case_attr_d%d" % delay: res["case"].to(torch.float64)}
+            for v in attr_variants:
+                outputs["attr_%s_d%d" % (v, delay)] = res[v] if v == "direct" else torch.sigmoid(z + attr_weight * res[v])
+            for name, value in outputs.items():
+                parts[name][0].append(idx)
+                parts[name][1].append(value.float().numpy())
+            attr_publish[delay][key] = published
 
     for start in range(0, n, size):
         end = min(start + size, n)
@@ -478,6 +667,14 @@ def run_sequence(model, frontend, cusum, seq, cfg, device, state_mode, monitor=N
                 sl = slice(offset, offset + count)
                 window_info[k] = (part_idx, logits[sl])
                 collect(readout.step(c_state, k, ev["b"][sl], ev["y"][sl], ev["x"][sl], k))
+                if bank is not None:                  # V2-2：假设库处理第 k 窗，再读出到期的旧窗事件
+                    t_attr = time.perf_counter()
+                    g_k, mu_k = torch.exp(log_g[t, 0, 0]), mu0[t, 0, 0]
+                    info_k = bank.step(k, ev["y"][sl], ev["x"][sl], torch.sigmoid(logits[sl]), g_k, mu_k, c_state["C"])
+                    collect_attr(attr_readout.step(k, k, ev["y"][sl], ev["x"][sl], mu_k, g_k))
+                    attr_time["seconds"] += time.perf_counter() - t_attr
+                    attr_time["alive"] += info_k["alive"]
+                    attr_time["confirmed"] += info_k["confirmed"]
                 for theta in alarm_C:
                     alarm_C[theta], _, _, alarm = cusum.accumulate(alarm_C[theta], c_state["shifts"], c_state["ell"],
                                                                    theta, reset=True)
@@ -486,13 +683,19 @@ def run_sequence(model, frontend, cusum, seq, cfg, device, state_mode, monitor=N
             offset += count
     if with_cusum:
         collect(readout.flush())
+    if bank is not None:
+        collect_attr(attr_readout.flush())
     if alarm_C:
         alarm_eval.end_sequence()
     refilled = {name: refill_by_index(seq.n_events, idx_parts, val_parts)
                 for name, (idx_parts, val_parts) in parts.items()}
-    probs = {name: refilled[name] for name in [PRIMARY] + ["fused_d%d" % d for d in delays]}
+    prob_names = [PRIMARY] + ["fused_d%d" % d for d in delays] + attr_prob_names
+    probs = {name: refilled[name] for name in prob_names}
     extra = {name: refilled[name] for name in refilled if name not in probs}
     extra.update({"publish_d%d" % d: publish[d] for d in delays})
+    if bank is not None:
+        extra.update({"publish_attr_d%d" % d: attr_publish[d] for d in attr_delays})
+        extra["attr_bank"] = dict(attr_time, windows=n, stats=dict(bank.stats))
     return probs, extra, confusion
 
 
@@ -510,8 +713,11 @@ def evaluate_split(model, frontend, cusum, cfg, device, split, state_mode, names
 
     dataset = EvUAVStream(cfg["root"], split, cfg, names)
     readouts = readout_names(cfg) if full else [PRIMARY]
-    evaluators = {name: evalute(SimpleNamespace(roc=full, pd_detT=cfg["pd_detT"], correct_thresh=cfg["correct_thresh"]))
+    roc_readouts = [name for name in readouts if full and not is_variant_readout(name)]
+    evaluators = {name: evalute(SimpleNamespace(roc=name in roc_readouts, pd_detT=cfg["pd_detT"],
+                                                correct_thresh=cfg["correct_thresh"]))
                   for name in readouts}
+    attr = AttributionStats([int(d) for d in cfg.get("attr_delays") or []]) if (full and cfg.get("attr")) else None
     monitor = LayerMonitor(model.v_threshold) if (collect_layers or full) else None
     input_stats = {"nonzero": 0, "elements": 0} if full else None
     alarm_eval = None
@@ -529,6 +735,9 @@ def evaluate_split(model, frontend, cusum, cfg, device, split, state_mode, names
             probs, extra, confusion = run_sequence(model, frontend, cusum, seq, cfg, device, state_mode, monitor,
                                                    with_cusum=full, input_stats=input_stats, alarm_eval=alarm_eval,
                                                    activity=activity)
+            bank_info = extra.pop("attr_bank", None)
+            if attr is not None:
+                attr.update(seq.label, extra, bank_info)
             confusion_sum += confusion
             total_events += seq.n_events
             for name in readouts:
@@ -544,32 +753,36 @@ def evaluate_split(model, frontend, cusum, cfg, device, split, state_mode, names
             if full:
                 zeros = np.zeros(seq.n_events, dtype=np.float32)
                 ev_locs = torch.from_numpy(np.stack([zeros, seq.x, seq.y, seq.t], 1).astype(np.float32))
-                for name in readouts:
+                for name in roc_readouts:
                     evaluators[name].roc_update(ev_locs[:, 3], torch.from_numpy(probs[name]), seq.target_id,
                                                 torch.from_numpy(seq.label), ev_locs, thresh=float(cfg["threshold"]))
                 publish = {PRIMARY: np.arange(seq.n_windows)}
-                publish.update({name: extra["publish_d%s" % name.split("_d")[1]] for name in readouts if name != PRIMARY})
+                publish.update({name: extra[publish_field(name)] for name in roc_readouts if name != PRIMARY})
                 kept.append((seq.t, seq.label, seq.target_id, probs, publish))
     model.train(was_training)
     result = {"split": split, "state_mode": state_mode, "n_sequences": len(dataset), "readouts": {}}
     for name in readouts:
         iou, acc = evaluators[name].evaluate_iou_and_accuracy(thresh=float(cfg["threshold"]))
-        result["readouts"][name] = {"iou": float(iou), "acc": float(acc)}
+        result["readouts"][name] = {"iou": float(iou), "acc": float(acc), "delay_windows": readout_delay(name)}
+        if full:
+            result["readouts"][name]["iou_acc_by_threshold"] = {
+                "%g" % th: [float(v) for v in evaluators[name].evaluate_iou_and_accuracy(thresh=th)]
+                for th in IOU_THRESHOLDS}
     result["iou"], result["acc"] = result["readouts"][PRIMARY]["iou"], result["readouts"][PRIMARY]["acc"]
     if monitor is not None:
         result["layers"] = monitor.summary()
     if full:
-        for name in readouts:
+        for name in roc_readouts:
             pd, fa = evaluators[name].cal_roc()
             records = []
             for t, label, target_id, probs, publish in kept:
                 records += first_detection_latencies_published(t, label, target_id, probs[name], cfg["window_ms"],
                                                                cfg["threshold"], cfg["correct_thresh"], publish[name])
-            result["readouts"][name].update({"pd": float(pd), "fa": float(fa),
-                                             "delay_windows": 0 if name == PRIMARY else int(name.split("_d")[1]),
-                                             "latency": summarize_latencies(records)})
+            result["readouts"][name].update({"pd": float(pd), "fa": float(fa), "latency": summarize_latencies(records)})
         if alarm_eval is not None:
             result["alarms"] = alarm_eval.summary()
+        if attr is not None:
+            result["attribution"] = attr.summary()
         tp, fp, fn, npos = (confusion_sum[:, j] for j in range(4))
         rates = {name: s["firing_rate"] for name, s in result["layers"].items()}
         density = float(input_stats["nonzero"]) / float(max(input_stats["elements"], 1))
@@ -816,7 +1029,8 @@ def mode_eval(args, cfg):
                 "readout_delays", "eval_chunk", "fusion_weight", "alarm_thetas", "alarm_radius",
                 "cusum_axis_velocities", "cusum_footprint", "cusum_compensator", "cusum_nb_kappa",
                 "cusum_aggregate", "cusum_track_tau_ms", "cusum_memory_gain", "cusum_gate_eps", "cusum_reset_radius",
-                "activity_eps"):
+                "activity_eps", "attr", "attr_delays", "attr_weight", "attr_variants", "attr_cap", "attr_eps",
+                "attr_ref_radius", "attr_min_support", "attr_tube_birth", "hyp_update", "hyp_params"):
         if key in cfg:
             train_cfg[key] = cfg[key]
     train_cfg.setdefault("readout_delays", [1, 2, 5])
@@ -835,11 +1049,15 @@ def mode_eval(args, cfg):
                          "track_tau_ms": train_cfg.get("cusum_track_tau_ms"), "footprint": train_cfg["cusum_footprint"],
                          "memory_gain": cusum.memory_gain, "gate_eps": cusum.gate_eps,
                          "reset_radius": cusum.reset_radius, "alarm_thetas": train_cfg.get("alarm_thetas")},
+               "attr": {key: train_cfg.get(key) for key in ("attr", "attr_delays", "attr_weight", "attr_variants",
+                                                            "attr_cap", "attr_eps", "attr_ref_radius",
+                                                            "attr_min_support", "attr_tube_birth", "hyp_update",
+                                                            "hyp_params")},
                "parameters": count_parameters(model), "trained_state_mode": train_cfg["state_mode"],
                "neuron": train_cfg["neuron"], "readout_delays": train_cfg["readout_delays"],
                "neuron_u_floor": train_cfg.get("neuron_u_floor"), "neuron_u_ceil": train_cfg.get("neuron_u_ceil"),
                "config": train_cfg}
-    modes = tuple(args.eval_state_modes) if args.eval_state_modes else ("carry", "reset_each_window")
+    modes = tuple(args.eval_state_modes or cfg.get("eval_state_modes") or ("carry", "reset_each_window"))
     names = None
     if args.eval_sequences:
         directory = os.path.join(train_cfg["root"], args.split)
@@ -862,8 +1080,31 @@ def mode_eval(args, cfg):
         r["warnings"] = health_warnings(r["layers"], r["tau"], {})
         results[mode] = r
         for name, m in r["readouts"].items():
-            print("[%s] %-10s IoU %.4f ACC %.4f Pd %.4f Fa %.3e | 延迟中位数 %s ms" % (
-                mode, name, m["iou"], m["acc"], m["pd"], m["fa"], m["latency"].get("latency_median_ms")), flush=True)
+            if "pd" in m:
+                print("[%s] %-18s IoU %.4f ACC %.4f Pd %.4f Fa %.3e | 延迟中位数 %s ms" % (
+                    mode, name, m["iou"], m["acc"], m["pd"], m["fa"], m["latency"].get("latency_median_ms")), flush=True)
+            else:
+                print("[%s] %-18s IoU %.4f ACC %.4f（对照读出，只算 IoU/ACC）" % (mode, name, m["iou"], m["acc"]), flush=True)
+        best = {name: max(m["iou_acc_by_threshold"].items(), key=lambda kv: kv[1][0])
+                for name, m in r["readouts"].items()}
+        print("[%s] 各读出 IoU 最高的阈值：%s" % (mode, "，".join(
+            "%s %s→%.4f" % (name, th, v[0]) for name, (th, v) in best.items())), flush=True)
+        if "attribution" in r:
+            a = r["attribution"]
+            b = a["bank"]
+            print("[%s] V2-2 假设库：每窗存活 %.1f / 已确认 %.1f，生成 SNN %d + 管道 %d，确认 %d（中位延迟 %s 窗），"
+                  "合并 %d，结束 %d，耗时 %.1f ms/窗" % (
+                      mode, b["alive_per_window"], b["confirmed_per_window"], b["births_snn"], b["births_tube"],
+                      b["confirmed_total"], b["confirm_delay_median"], b["merged"], b["ended"], b["ms_per_window"]),
+                  flush=True)
+            for key, p in a.items():
+                if key == "bank":
+                    continue
+                print("[%s] V2-2 %s：修正覆盖 目标 %.1f%% / 背景 %.3f%%；平均修正 目标 %+.3f / 背景 %+.3f；"
+                      "目标上调 %.1f%%，背景下调 %.1f%%（固定参考的目标事件 %d）" % (
+                          mode, key, 100 * p["target_covered_frac"], 100 * p["background_covered_frac"],
+                          p["target_delta_mean"], p["background_delta_mean"], 100 * p["target_up_frac"],
+                          100 * p["background_down_frac"], p["target_case2"]), flush=True)
         print("[%s] 分段 IoU (net) %s" % (mode, {k: round(v, 4) for k, v in r["segment_iou"].items()}), flush=True)
         for theta, a in r.get("alarms", {}).items():
             print("[%s] 告警 theta=%s  检出率 %.3f  首次告警延迟中位数 %s ms  虚警率 %.3e（紧界 %.3e）"

@@ -295,5 +295,87 @@ class ReadoutPropositions(unittest.TestCase):
         self.assertAlmostEqual(rho_reference(7), 1.0 / 225.0)
 
 
+class EvalIntegration(unittest.TestCase):
+    """U3：接入 train_stream_v2 的评估流程（命令行、读出名称、run_sequence）。"""
+
+    def test_command_line_flags_reach_the_config(self):
+        import os
+        import sys
+        from unittest import mock
+        import train_stream_v2 as tv2
+        config = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "configs",
+                              "evisseg_stream_v2.yaml")
+        argv = ["train_stream_v2.py", "--config", config, "--mode", "eval"]
+        with mock.patch.object(sys, "argv", argv):
+            cfg = tv2.build_config(tv2.parse_args())
+        self.assertTrue(cfg["attr"])
+        self.assertEqual(tv2.readout_names(cfg), ["net", "fused_d1", "fused_d2", "fused_d5",
+                                                  "attr_d1", "attr_d2", "attr_d5"])
+        extra = ["--attr-delays", "2", "10", "--attr-variants", "backfill", "direct", "--attr-update", "generic",
+                 "--attr-tube-birth", "off", "--hyp", "lag=3", "confirm_theta=5.5", "--no-alarms",
+                 "--alarm-thetas", "8"]
+        with mock.patch.object(sys, "argv", argv + extra):
+            cfg = tv2.build_config(tv2.parse_args())
+        self.assertEqual(cfg["attr_delays"], [2, 10])
+        self.assertEqual(cfg["hyp_params"], {"lag": 3, "confirm_theta": 5.5})
+        self.assertEqual(cfg["alarm_thetas"], [])                  # --no-alarms 优先
+        self.assertFalse(cfg["attr_tube_birth"])
+        names = tv2.readout_names(cfg)
+        self.assertIn("attr_direct_d10", names)
+        self.assertEqual([tv2.is_variant_readout(n) for n in ("attr_d2", "attr_direct_d2", "attr_backfill_d10")],
+                         [False, True, True])
+        self.assertEqual([tv2.readout_delay(n) for n in ("net", "fused_d5", "attr_direct_d10")], [0, 5, 10])
+        self.assertEqual(tv2.publish_field("attr_direct_d10"), "publish_attr_d10")
+        self.assertEqual(tv2.publish_field("fused_d2"), "publish_d2")
+        bank, readout = tv2.build_attribution(cfg, tv2.build_cusum(cfg))
+        self.assertEqual((bank.p["update"], bank.p["lag"], int(bank.velocities.shape[0])), ("generic", 3, 0))
+        self.assertGreaterEqual(bank.p["keep_windows"], 3 + 10 + 2)
+        self.assertEqual(readout.delays, [2, 10])
+        with mock.patch.object(sys, "argv", argv + ["--hyp", "no_such=1"]):
+            with self.assertRaises(ValueError):
+                tv2.build_config(tv2.parse_args())
+        with mock.patch.object(sys, "argv", argv + ["--attr", "off"]):
+            self.assertEqual(tv2.readout_names(tv2.build_config(tv2.parse_args())),
+                             ["net", "fused_d1", "fused_d2", "fused_d5"])
+
+    def test_run_sequence_attr_leaves_v21_readouts_unchanged(self):
+        try:
+            from tests import test_stream_v2_evidence as ev
+        except ImportError:
+            import test_stream_v2_evidence as ev
+        from model.evidence_neuron import DriftCUSUM, velocity_grid
+        from train_stream_v2 import run_sequence
+        seq = ev.synthetic_sequence(seed=2)
+        frontend = ev.make_frontend()
+        model = ev.make_model(frontend).eval()
+        cusum = DriftCUSUM(velocity_grid([-1.0, 0.0, 1.0]), footprint=3, track_decay=0.8)
+        cfg_off = dict(ev.CFG)
+        cfg_on = dict(ev.CFG, attr=True, attr_delays=[1, 2], attr_variants=list(VARIANTS),
+                      hyp_params={"birth_conf": 0.0, "min_effective": 1.0, "confirm_theta": 0.5})
+        with torch.no_grad():
+            p_off, x_off, c_off = run_sequence(model, frontend, cusum, seq, cfg_off, torch.device("cpu"), "carry")
+            p_on, x_on, c_on = run_sequence(model, frontend, cusum, seq, cfg_on, torch.device("cpu"), "carry")
+        for name in p_off:                                         # V2-1 的读出逐位不变
+            self.assertTrue(np.array_equal(p_off[name], p_on[name]), name)
+        for name in x_off:
+            self.assertTrue(np.array_equal(x_off[name], x_on[name]), name)
+        self.assertTrue(np.array_equal(c_off, c_on))
+        n = seq.n_events
+        bank = x_on.pop("attr_bank")
+        self.assertGreater(bank["stats"]["births_snn"], 0)
+        self.assertEqual(bank["windows"], ev.WINDOWS)
+        for d in (1, 2):
+            for name in ["attr_d%d" % d] + ["attr_%s_d%d" % (v, d) for v in VARIANTS]:
+                self.assertEqual(p_on[name].shape[0], n)
+                self.assertTrue(np.all((p_on[name] >= 0) & (p_on[name] <= 1)), name)
+            delta, case = x_on["delta_attr_d%d" % d], x_on["case_attr_d%d" % d]
+            self.assertTrue(np.all(delta[case == 0] == 0))
+            self.assertTrue(set(np.unique(case).tolist()) <= {0.0, 1.0, 2.0})
+            self.assertEqual(x_on["publish_attr_d%d" % d].tolist(), [min(k + d, ev.WINDOWS - 1)
+                                                                     for k in range(ev.WINDOWS)])
+            z = x_on["logit_net"].astype(np.float64) + delta.astype(np.float64)
+            self.assertLess(float(np.abs(1.0 / (1.0 + np.exp(-z)) - p_on["attr_d%d" % d]).max()), 1e-5)
+
+
 if __name__ == "__main__":
     unittest.main()

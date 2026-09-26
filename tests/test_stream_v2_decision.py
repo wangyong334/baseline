@@ -334,15 +334,21 @@ class CommandLineTests(unittest.TestCase):
         self.assertEqual(args.eval_state_modes, ["carry"])
         self.assertEqual(args.eval_sequences, 2)
 
-    def test_yaml_defaults_are_the_original_decision_layer(self):
+    def test_yaml_defaults_are_the_final_v2_decision_layer(self):
+        """V2 定稿（09-26）：判决层默认稀疏执行 ε = 0.03、不算告警、只跑 carry；--cusum-gate-eps 0 回到原实现。"""
         import train_stream_v2 as tv2
         argv = ["train_stream_v2.py", "--config", CONFIG, "--mode", "eval"]
         with mock.patch.object(sys, "argv", argv):
             args = tv2.parse_args()
-        cusum = tv2.build_cusum(tv2.build_config(args))
-        self.assertEqual((cusum.memory_gain, cusum.gate_eps, cusum.reset_radius, cusum.aggregate), (1.0, 0.0, 0, "lme"))
+        cfg = tv2.build_config(args)
+        cusum = tv2.build_cusum(cfg)
+        self.assertEqual((cusum.memory_gain, cusum.gate_eps, cusum.reset_radius, cusum.aggregate), (1.0, 0.03, 0, "lme"))
+        self.assertEqual(cfg["alarm_thetas"], [])
+        self.assertEqual(cfg["eval_state_modes"], ["carry"])
         self.assertIsNone(args.eval_state_modes)
         self.assertEqual(args.eval_sequences, 0)
+        with mock.patch.object(sys, "argv", argv + ["--cusum-gate-eps", "0"]):
+            self.assertEqual(tv2.build_cusum(tv2.build_config(tv2.parse_args())).gate_eps, 0.0)
 
 
 if __name__ == "__main__":

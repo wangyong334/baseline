@@ -50,13 +50,13 @@ CUSUM:
   cusum_nb_kappa: null                 # negbin 的离散参数
   cusum_aggregate: lme                 # 足迹内证据聚合：lme / mean 对像素间任意相关都成立；sum 要求像素条件独立
   cusum_track_tau_ms: 250              # 管道强度记忆的时间常数（离开目标的管道持续产生负证据）；0 关闭
-  # 判决层的评估时开关（09-24 阶段 0 实测有效，见 model/evidence_neuron.py 模块说明）；下面的取值 = 原实现，逐位相同
+  # 判决层的评估时开关（09-24 阶段 0 实测有效，见 model/evidence_neuron.py 模块说明）
   cusum_memory_gain: 1.0               # 非对称记忆 λ：加分用 max(新鲜强度, λ·rho·旧 G)，扣分用带记忆的 G
-  cusum_gate_eps: 0.0                  # 预测门控 ε：低于 ε 的强度与记忆置 0（稀疏执行的前提）
+  cusum_gate_eps: 0.03                 # 预测门控 ε（V2 定稿默认稀疏执行；09-26 三种子实测读出不变）；0 = 原实现
   cusum_reset_radius: 0                # 告警时复位邻域半径 r 内的全部假设；0 = 只复位告警位置
   readout_delays: [1, 2, 5]            # 逐事件延迟读出的窗数（50/100/250 ms）
   fusion_weight: 1.0                   # 轨迹证据融合分数 = mark + w * F(d)；w 用 tools/calibrate_fusion.py 在 val 上校准
-  alarm_thetas: [8, 12, 16]            # 位置级告警阈值（带复位）；每位置每窗虚警率紧界 (1+1/L)/(e^theta-1)，与 V 无关
+  alarm_thetas: []                     # 位置级告警（可选扩展，V2 定稿移出主线）；要算时 --alarm-thetas 8 12 16
   alarm_radius: 4                      # 告警离目标事件 <= 4 像素（切比雪夫距离）算真告警
 
 CALIB:
@@ -85,7 +85,21 @@ TRAIN:
   deterministic: true
   save_root: log/stream_v2_seed37
 
+ATTR:                                  # V2-2 回溯分布修正（评估时运行，无可学习参数；设计页第 7-8 节）
+  attr: true                           # false = 只有 V2-1 的读出（与 V2-1 baseline 逐位相同）
+  attr_delays: [1, 2, 5]               # 固定等待的窗数（与 fused_d 同口径；要看起始段回溯再加 10）
+  attr_weight: 1.0                     # 式 (17) 的修正权重 w
+  attr_cap: 3.0                        # 修正上限 c
+  attr_eps: 0.001                      # 比值下限 epsilon
+  attr_ref_radius: 7                   # 固定参考半径（rho_ref = 1/225）
+  attr_min_support: 3                  # 参与修正所需的有效测量窗数
+  attr_tube_birth: true                # 运动管道是否作为候选入口（false = 只用 SNN 高置信簇）
+  attr_variants: []                    # 对照读出 backfill / abs / direct / snnref（只算 IoU/ACC）
+  hyp_update: separate                 # separate / generic / confident
+  hyp_params: {}                       # 覆盖假设库参数，例如 {lag: 3, confirm_theta: 5}
+
 EVAL:
+  eval_state_modes: [carry]            # eval 模式默认只跑 carry（reset_each_window 只作诊断）
   threshold: 0.9
   pd_detT: 50
   correct_thresh: 0.0001
