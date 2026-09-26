@@ -142,6 +142,34 @@ lme 温度、预测加权 mean、胞体漏电、告警溯源已删除。原因�
 - `tools/check_cusum_guarantee.py`：紧界与三个开关的合成核对。
 - `tools/sliding_baseline.py` 与 `tools/plot_pareto.py`：同延迟的 ANN 对照（K5 因果滑窗）与精度—能耗帕累托图。
 
+## V2 冻结状态与 V2-2 开关（09-26）
+
+**V2-1 冻结基线**：训练时加 `--neuron-u-floor -4`；YAML 默认值即冻结设置——判决层稀疏执行 `cusum_gate_eps: 0.03`、
+不算告警 `alarm_thetas: []`、评估只跑 carry `eval_state_modes: [carry]`。三种子 test（阈值 0.9）fused_d2 IoU 0.8884 ± 0.007，
+整机约 92 mJ/8s。汇总页：https://claude.ai/artifact/PVVgn4eijfJueYVPvmG23k
+
+**V2-2 事件归属回溯修正（默认关闭，`attr: false`）**：稀疏目标假设库（`model/target_hypotheses.py`）+ 回溯分布修正读出
+（`model/attribution_readout.py`），评估时运行、无可学习参数，关掉时 V2-1 读出逐位不变。设计页：
+https://claude.ai/artifact/UqE8gG3SjbyCr5hBBfDRSU ；审计与修复：`outputs/audits/v22_readout_audit.md`。
+
+| 开关 | 默认 | 作用 |
+|---|---|---|
+| `--attr on\|off` | off | 打开 V2-2；新增读出 `attr_d{d}`（诊断）与 `attr_fused_d{d}` = σ(mark + F(d) + Δ(d))（主比较） |
+| `--attr-delays` | 1 2 5 | 固定等待窗数 |
+| `--attr-weight` | 1.0 | 修正权重 w |
+| `--attr-variants` | 无 | 对照读出 backfill / abs / direct / snnref（只算 IoU/ACC） |
+| `--attr-update` | separate | 假设库更新方式 separate / generic / confident |
+| `--attr-tube-birth` | on | 运动管道是否作为候选入口 |
+| `--attr-cap` / `--attr-eps` / `--attr-ref-radius` / `--attr-min-support` | 3 / 1e-3 / 7 / 3 | 修正上限、比值下限、固定参考半径、参与修正的最少有效测量窗数 |
+| `--hyp KEY=VALUE` | — | 假设库参数（`DEFAULT_PARAMS`），例如 `--hyp lag=3 confirm_theta=5` |
+
+EV-UAV 上的结论（s37）：审计修复后 attr_fused_d2 在 val 选定阈值下 test 0.8987，对 fused_d2 0.9000，未达 +0.005 的预定标准；
+假设库 247 ms/窗。**该修复版本在 EV-UAV 上未显示值得保留的收益**。设计预测"目标附近杂波越密收益越大"，
+换到背景更杂的数据集（如 ES-UAV）时用 `--attr on --eval-names ...` 复验。
+
+相关离线工具：`tools/error_breakdown.py`（错误分类、逐序列、目标漏检画像）、`tools/persistence_gate.py`（持续性门控，负结果）、
+`tools/audit_v22_readout.py`（V2-2 审计探针）。
+
 ## 本地已核对的内容（CPU，无真实数据）
 
 - **96 个单元测试全部通过**（原 77 + V2 的 19 个）。V2 部分包括：证据的期望（泊松/负二项解析求和）、管道强度记忆递推、
