@@ -22,6 +22,12 @@
 目录写法与 tools/sweep_threshold.py 相同（目录:字段，默认 probabilities）。
 字段可以写成几个 logit 字段相加（目录:logit_net+evidence_d2+delta_attr_d2），概率取 sigmoid(和)，
 用来离线试组合读出（例如 V2-1 融合 + V2-2 修正），不用 GPU。--names 只看指定序列，--per-sequence 另报逐序列结果。
+--target-profile 另报目标事件的漏检率随"目标尺寸"与"局部事件支持度"的变化（V3 前置诊断：漏检是分辨率问题
+还是证据稀少问题）：
+    目标尺寸  该目标本窗事件到质心的均方根半径（像素）：<1.5 / 1.5–3 / >=3；本窗只有 1–3 个事件的单列为"极少"
+    局部支持  同一窗 3x3 邻域内其他事件（不分标签，网络能看到的量）的个数：0 / 1–2 / 3–8 / >=9
+    另报边缘事件的漏检率与"到质心的绝对距离"（<1 / 1–2 / 2–3 / 3–5 / >=5 像素）的关系：分辨率造成的模糊按
+    绝对像素衰减，与目标大小无关。
 """
 import argparse
 import json
@@ -46,6 +52,8 @@ def parse_args(argv=None):
     parser.add_argument("--max-sequences", type=int, default=0)
     parser.add_argument("--names", nargs="+", default=None, help="只看这些序列（文件名，可省略 .npz）")
     parser.add_argument("--per-sequence", action="store_true", help="另报每条序列在第一个阈值下的结果")
+    parser.add_argument("--target-profile", action="store_true",
+                        help="另报目标事件的漏检率随目标尺寸、局部事件支持度、到质心距离的变化（第一个阈值）")
     parser.add_argument("--out", default=None)
     return parser.parse_args(argv)
 
@@ -260,6 +268,89 @@ def print_per_sequence(rows, names, threshold):
         print("%-14s" % row["name"][:-4] + "".join("%-30s" % c for c in cells))
 
 
+SIZE_BINS = (("极少(1-3)", None), ("<1.5px", 1.5), ("1.5-3px", 3.0), (">=3px", float("inf")))
+SUPPORT_BINS = ((0, 0), (1, 2), (3, 8), (9, 10 ** 9))
+DIST_BINS = (0.0, 1.0, 2.0, 3.0, 5.0, float("inf"))
+
+
+def target_geometry(seq, window_ms):
+    """每个目标事件的：所属 (目标, 窗) 的事件数与均方根半径、到质心的距离、同窗 3x3 邻域内其他事件数（不分标签）。"""
+    locs, lab, tid = seq["locs"], seq["labels"], seq["target_id"]
+    x, y, t = locs[:, 1].astype(np.int64), locs[:, 2].astype(np.int64), locs[:, 3].astype(np.float64)
+    window = np.floor(t / window_ms).astype(np.int64)
+    idx = np.nonzero(lab)[0]
+    out = {"idx": idx}
+    if idx.size == 0:
+        for key in ("count", "rms", "dist", "support"):
+            out[key] = np.zeros(0)
+        return out
+    _, group = np.unique(tid[idx] * 1000003 + window[idx], return_inverse=True)
+    count = np.bincount(group)
+    cx = np.bincount(group, x[idx]) / count
+    cy = np.bincount(group, y[idx]) / count
+    d2 = (x[idx] - cx[group]) ** 2 + (y[idx] - cy[group]) ** 2
+    out["count"] = count[group]
+    out["rms"] = np.sqrt(np.bincount(group, d2) / count)[group]
+    out["dist"] = np.sqrt(d2)
+    # 同窗 3x3 邻域的全部事件数（按 (窗, 像素) 计数后做 3x3 求和，再减去自己）
+    key = (window * 1000 + y) * 1000 + x
+    uniq, inv, cnt = np.unique(key, return_inverse=True, return_counts=True)
+    lookup = dict(zip(uniq.tolist(), cnt.tolist()))
+    support = np.zeros(idx.size, dtype=np.int64)
+    base = (window[idx] * 1000 + y[idx]) * 1000 + x[idx]
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            nb = base + dy * 1000 + dx
+            support += np.array([lookup.get(v, 0) for v in nb.tolist()], dtype=np.int64)
+    out["support"] = support - 1
+    return out
+
+
+def target_profile(sequences, names, threshold, args):
+    """目标事件漏检率按目标尺寸、局部支持、边缘事件到质心距离分组（跨序列累加）。"""
+    geo = [target_geometry(s, args.window_ms) for s in sequences]
+    result = OrderedDict()
+    for name in names:
+        size = OrderedDict((label, [0, 0]) for label, _ in SIZE_BINS)
+        supp = OrderedDict(("%d-%s" % (lo, hi if hi < 10 ** 9 else "") if lo != hi else "%d" % lo, [0, 0])
+                           for lo, hi in SUPPORT_BINS)
+        dist = OrderedDict(("%g-%g" % (lo, hi) if hi != float("inf") else ">=%g" % lo, [0, 0])
+                           for lo, hi in zip(DIST_BINS[:-1], DIST_BINS[1:]))
+        for seq, g in zip(sequences, geo):
+            if g["idx"].size == 0:
+                continue
+            miss = seq["probs"][name][g["idx"]] < threshold
+            few = g["count"] <= 3
+            prev = 0.0
+            for label, hi in SIZE_BINS:
+                m = few if hi is None else (~few & (g["rms"] >= prev) & (g["rms"] < hi))
+                if hi is not None:
+                    prev = hi
+                size[label][0] += int(m.sum())
+                size[label][1] += int((m & miss).sum())
+            for (lo, hi), key in zip(SUPPORT_BINS, supp):
+                m = (g["support"] >= lo) & (g["support"] <= hi)
+                supp[key][0] += int(m.sum())
+                supp[key][1] += int((m & miss).sum())
+            edge = (g["count"] >= 4) & (g["dist"] > g["rms"])
+            for (lo, hi), key in zip(zip(DIST_BINS[:-1], DIST_BINS[1:]), dist):
+                m = edge & (g["dist"] >= lo) & (g["dist"] < hi)
+                dist[key][0] += int(m.sum())
+                dist[key][1] += int((m & miss).sum())
+        result[name] = {"size": size, "support": supp, "edge_distance": dist}
+    return result
+
+
+def print_profile(profile, threshold):
+    print("\n=== 目标事件漏检率（阈值 %g）：目标事件数 / 漏检率 ===" % threshold)
+    for name, p in profile.items():
+        print("\n%s" % name)
+        for title, key in (("目标尺寸", "size"), ("局部支持（3x3 内其他事件数）", "support"),
+                           ("边缘事件到质心距离（像素）", "edge_distance")):
+            print("  %s：" % title + "  ".join("%s %d / %.1f%%" % (k, v[0], 100.0 * v[1] / max(v[0], 1))
+                                             for k, v in p[key].items()))
+
+
 def print_report(result, names):
     for th, per in result.items():
         print("\n=== 阈值 %s ===" % th)
@@ -286,14 +377,18 @@ def main(argv=None):
     print("%d 条序列，%d 个事件，读出：%s" % (len(sequences), sum(s["labels"].shape[0] for s in sequences), names))
     result = breakdown(sequences, names, args.thresholds, args)
     print_report(result, names)
-    rows = None
+    rows = profile = None
+    if args.target_profile:
+        profile = target_profile(sequences, names, args.thresholds[0], args)
+        print_profile(profile, args.thresholds[0])
     if args.per_sequence:
         rows = per_sequence(sequences, names, args.thresholds[0], args)
         print_per_sequence(rows, names, args.thresholds[0])
     if args.out:
         os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
         with open(args.out, "w", encoding="utf-8") as stream:
-            json.dump({"args": vars(args), "readouts": names, "result": result, "per_sequence": rows}, stream,
+            json.dump({"args": vars(args), "readouts": names, "result": result, "per_sequence": rows,
+                       "target_profile": profile}, stream,
                       indent=2, ensure_ascii=False)
         print("\n报告:", args.out)
     return result

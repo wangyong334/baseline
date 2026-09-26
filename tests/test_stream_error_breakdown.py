@@ -67,6 +67,20 @@ class ErrorBreakdownTests(unittest.TestCase):
         self.assertEqual(res["fn"]["start"]["n"], 1)
 
 
+    def test_target_profile(self):
+        """setUp 的目标：第 2 窗 1 个事件（极少，漏检）；第 30 窗 6 个事件（均方根半径 2.12 px），其中外圈 (46,40)
+        离质心 4.5 px、3x3 内没有别的事件（漏检），(41,41) 的第二个事件漏检；核心事件的 3x3 支持都是 4。"""
+        args = eb.parse_args(["--dump-dir", self.tmp, "--target-profile"])
+        seqs, names = eb.load_sequences(args.dump_dir)
+        p = eb.target_profile(seqs, names, 0.9, args)[names[0]]
+        self.assertEqual(p["size"]["极少(1-3)"], [1, 1])
+        self.assertEqual(p["size"]["1.5-3px"], [6, 2])
+        self.assertEqual(p["size"]["<1.5px"], [0, 0])
+        self.assertEqual(p["support"]["0"], [2, 2])
+        self.assertEqual(p["support"]["3-8"], [5, 1])
+        self.assertEqual(p["edge_distance"]["3-5"], [1, 1])
+        self.assertEqual(sum(v[0] for v in p["edge_distance"].values()), 1)
+
     def test_repeat_counts_distinct_windows(self):
         """同一像素、同一窗里的 6 个误检（一次突发）不算重复像素；分布在 5 个不同窗才算。"""
         n = 11

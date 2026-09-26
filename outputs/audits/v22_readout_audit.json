@@ -1,0 +1,34 @@
+{
+  "python": "3.8.20",
+  "torch": "1.9.1+cpu",
+  "scope": "Controlled readout probes, not real-data efficacy tests",
+  "future_gate": {
+    "past_phi": 0.20429061040396176,
+    "future_phi": 0.0015028919531074952,
+    "gate_rel": 0.05,
+    "q0": 0.0028688251939208223,
+    "qd": 8.634984561091726e-05,
+    "ungated_ratio": -1.270127582411596,
+    "actual_delta": -0.0,
+    "actual_case": 0
+  },
+  "unsupported_winner": {
+    "eligible_only_delta": 0.9809220411984335,
+    "with_ineligible_hyp_delta": 0.0,
+    "actual_case": 0
+  },
+  "ended_history": {
+    "alive_before": 1,
+    "alive_after": 0,
+    "retained_history_nonzero": 11,
+    "retained_history_maxabs": 0.10973208080692422,
+    "actual_nonzero": 0
+  },
+  "merge_reference": {
+    "before_delta": 0.0,
+    "before_case": 1,
+    "after_delta": 2.3736750344718702,
+    "after_case": 2,
+    "surviving_id": 1
+  }
+}
