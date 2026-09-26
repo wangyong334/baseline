@@ -12,7 +12,7 @@
         near      <= near_px[1] 像素
         far       更远
         no_target 本窗没有目标事件（纯背景窗）
-      另报 far / no_target 中"同一像素在该序列里误检 >= repeat_min 次"的数量（热像素 / 静态闪烁）。
+      另报 far / no_target 中"同一像素在该序列里有误检的不同窗数 >= repeat_min"的数量（热像素 / 静态闪烁；一次突发只算一窗）。
 每一类给出：事件数、占该类错误的比例、"只修好这一类时的 IoU"（IoU = TP/(TP+FP+FN) 的逐事件口径，与原评估一致）。
 多个读出时，另报相对第一个读出每一类被修好 / 新增的数量（例如 net -> fused_d2 修掉了哪类漏检）。
 
@@ -142,9 +142,11 @@ def fp_classes(seq, window, fp_mask, near_px, repeat_min):
     repeat = np.zeros(lab.shape[0], dtype=bool)
     if fp_idx.size == 0:
         return cls, repeat
+    # 重复像素按"该像素有误检的不同窗数"计（一次突发在同一窗里产生多个事件只算一窗）
     pix = (y[fp_idx] * 100000 + x[fp_idx]).astype(np.int64)
-    uniq, inv, cnt = np.unique(pix, return_inverse=True, return_counts=True)
-    repeat[fp_idx] = cnt[inv] >= int(repeat_min)
+    pix_windows = np.unique(pix * 4096 + window[fp_idx])
+    uniq_pix, n_windows = np.unique(pix_windows // 4096, return_counts=True)
+    repeat[fp_idx] = n_windows[np.searchsorted(uniq_pix, pix)] >= int(repeat_min)
     tgt = np.nonzero(lab)[0]
     order = np.argsort(window[tgt], kind="stable")
     tw = window[tgt][order]
@@ -270,7 +272,7 @@ def print_report(result, names):
                 k, v["n"], 100 * v["share"], 100 * v["miss_rate"], v["iou_if_fixed"]) for k, v in r["fn"].items()))
             print("  误检  " + "  ".join("%s %d（占 %.0f%%，修好后 IoU %.4f）" % (
                 k, v["n"], 100 * v["share"], v["iou_if_fixed"]) for k, v in r["fp"].items()))
-            print("  误检中的重复像素（>= repeat_min 次）：far %d，no_target %d" % (
+            print("  误检中的重复像素（>= repeat_min 个不同窗）：far %d，no_target %d" % (
                 r["fp_repeat_pixels"]["far"], r["fp_repeat_pixels"]["no_target"]))
             if "vs_first" in r:
                 f, n = r["vs_first"]["fixed"], r["vs_first"]["new"]

@@ -67,6 +67,19 @@ class ErrorBreakdownTests(unittest.TestCase):
         self.assertEqual(res["fn"]["start"]["n"], 1)
 
 
+    def test_repeat_counts_distinct_windows(self):
+        """同一像素、同一窗里的 6 个误检（一次突发）不算重复像素；分布在 5 个不同窗才算。"""
+        n = 11
+        x = np.array([7.0] * 6 + [9.0] * 5)
+        t = np.array([2000.0] * 6 + [2000.0 + 50 * k for k in range(5)])
+        write_dump(self.tmp, "burst.npz", x, np.full(n, 3.0), t, np.zeros(n), np.zeros(n),
+                   probabilities=np.ones(n, np.float32), prob_fix=np.ones(n, np.float32))
+        args = eb.parse_args(["--dump-dir", self.tmp, "--names", "burst"])
+        seqs, names = eb.load_sequences(args.dump_dir, 0, args.names)
+        res = eb.breakdown(seqs, names, [0.9], args)["0.9"][names[0]]
+        self.assertEqual(res["fp"]["no_target"]["n"], 11)
+        self.assertEqual(res["fp_repeat_pixels"]["no_target"], 5)
+
     def test_logit_sum_filter_and_per_sequence(self):
         n = 21
         rng = np.random.default_rng(0)
