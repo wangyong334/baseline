@@ -45,6 +45,9 @@ V2 冻结配置在 YAML 里把 gate_eps 设为 0.03，即默认稀疏执行）�
 用"追着上一窗事件跑"的对手预测做压力测试时，高 θ 下会越界；用实际网络预测时纯背景窗没有告警。
 论文里保证要写成有条件的形式。
 逐事件的延迟读出见 TubeReadout。本模块不含可学习参数，训练时不参与反向传播。
+执行方式（09-27，数值与原实现逐位相同）：V 个假设的平移用"补边 + 一次按下标取数"完成（下标按平移组合缓存）；
+延迟读出的累计位移表放在设备上，所有待读的窗每窗合并成一次取数（gather_along_many）。判决层每窗的底层计算操作从 444 次降到 72 次（本地性能记录器计数）；
+改之前 RTX 4090 上判决层约 9 ms/窗，其中平移约占 6 成、延迟读出约占 3 成。
 """
 import math
 
@@ -56,6 +59,8 @@ COMPENSATORS = ("poisson", "negbin")
 AGGREGATES = ("sum", "mean", "lme")
 LOG_ZERO = -30.0          # 没有预测的位置取 log g = -30（g 约 1e-13，相当于"那里没有目标"）
 EXP_CLIP = 80.0           # lme 里 exp 前把证据截断在 80 以下（截断只会让证据变小，保证仍成立）
+SHIFT_CACHE_SIZE = 8      # 平移下标的缓存条数（整数速度网格只用到 2 种：第 0 窗全为 0、之后每窗恒定）
+OFFSET_TABLE_MIN = 256    # 设备上累计位移表的最小窗数（一条序列 160 窗，一次建好；更长时按需翻倍）
 
 
 def shift2d(x, sy, sx, fill=0.0):
@@ -149,6 +154,8 @@ class DriftCUSUM(nn.Module):
         self.memory_gain = float(memory_gain)
         self.gate_eps = float(gate_eps)
         self.reset_radius = int(reset_radius)
+        self._shift_cache = {}        # (平移组合, H, W, 设备) -> (补边宽度, 下标 [V, H*W])，只是执行加速，不是状态
+        self._offset_cache = {}       # 设备 -> 累计位移表 [K, V, 2]
 
     @property
     def n_hypotheses(self):
@@ -172,11 +179,53 @@ class DriftCUSUM(nn.Module):
         return {"G": zeros, "Gp": zeros, "C": zeros, "C_pre": zeros, "ell": zeros, "shifts": self.step_shifts(0),
                 "k": 0}
 
+    def _shift_index(self, shifts, height, width, device):
+        """把 V 个平移写成一次取数的下标，返回 (补边宽度 P, 下标 [V, H*W] long)，按平移组合缓存。
+
+        第 v 个假设 out[y, x] = in[y - sy, x - sx]，补边后的平面坐标是 (y - sy + P, x - sx + P)；
+        平移超出画面（|sy| >= H 或 |sx| >= W）的假设整幅取补边左上角，即填充值——与 shift2d 相同。
+        """
+        h, w = int(height), int(width)
+        key = (tuple(shifts), h, w, str(device))
+        hit = self._shift_cache.get(key)
+        if hit is not None:
+            return hit
+        inside = [(sy, sx) for sy, sx in shifts if abs(sy) < h and abs(sx) < w]
+        pad = max([abs(s) for pair in inside for s in pair] + [1])
+        wp = w + 2 * pad
+        ys = torch.arange(h, device=device, dtype=torch.long).view(h, 1)
+        xs = torch.arange(w, device=device, dtype=torch.long).view(1, w)
+        rows = []
+        for sy, sx in shifts:
+            if abs(sy) >= h or abs(sx) >= w:
+                rows.append(torch.zeros(h * w, device=device, dtype=torch.long))
+            else:
+                rows.append(((ys - sy + pad) * wp + (xs - sx + pad)).reshape(-1))
+        entry = (pad, torch.stack(rows))
+        if len(self._shift_cache) >= SHIFT_CACHE_SIZE:
+            self._shift_cache.pop(next(iter(self._shift_cache)))
+        self._shift_cache[key] = entry
+        return entry
+
     def _shift_each(self, tensor, shifts, fill=0.0):
-        """tensor [B,V,H,W] 的第 v 个通道平移 shifts[v]；tensor 为 [B,1,H,W] 时对每个假设各平移一份。"""
-        if tensor.shape[1] == 1:
-            return torch.stack([shift2d(tensor[:, 0], sy, sx, fill) for sy, sx in shifts], 1)
-        return torch.stack([shift2d(tensor[:, v], sy, sx, fill) for v, (sy, sx) in enumerate(shifts)], 1)
+        """tensor [B,V,H,W] 的第 v 个通道平移 shifts[v]；tensor 为 [B,1,H,W] 时对每个假设各平移一份。
+
+        一次补边 + 一次按下标取数完成全部 V 个平移；纯数据搬运，与逐个 shift2d 再 stack 逐位相同
+        （tests/test_stream_v2_decision.py 的 BatchedShiftTests 对照）。返回新张量，不与输入共享内存。
+        """
+        batch, channels, h, w = (int(n) for n in tensor.shape)
+        V = len(shifts)
+        if channels not in (1, V):
+            raise ValueError("通道数 %d 既不是 1 也不等于假设数 %d" % (channels, V))
+        if all(pair == (0, 0) for pair in shifts):
+            return tensor.expand(batch, V, h, w).clone(memory_format=torch.contiguous_format)
+        pad, index = self._shift_index(shifts, h, w, tensor.device)
+        padded = F.pad(tensor, (pad, pad, pad, pad), value=float(fill))
+        if channels == 1:                             # 同一幅图按 V 个平移各取一份：[B, L][:, [V, H*W]]
+            out = padded.reshape(batch, -1)[:, index]
+        else:                                         # 第 v 个通道按第 v 行下标取
+            out = torch.gather(padded.reshape(batch, V, -1), 2, index.unsqueeze(0).expand(batch, V, h * w))
+        return out.view(batch, V, h, w)
 
     def _gate(self, G):
         """预测门控：低于 gate_eps 的强度置 0（gate_eps = 0 时原样返回）。"""
@@ -352,6 +401,17 @@ class DriftCUSUM(nn.Module):
                              "要让它随事件稀疏度下降，需要块稀疏执行（方案三），当前实现没有。")
         return total
 
+    def offset_table(self, k_max, device):
+        """第 0..K-1 窗各假设的累计整数位移 [K, V, 2]（long，K > k_max），放在 device 上并缓存，不够长时翻倍重建。
+        与 offsets(k) 逐项相同；延迟读出用它在设备上直接相减，不必每窗从 CPU 传位移。"""
+        key = str(device)
+        table = self._offset_cache.get(key)
+        if table is None or int(table.shape[0]) <= int(k_max):
+            size = max(int(k_max) + 1, OFFSET_TABLE_MIN, 0 if table is None else 2 * int(table.shape[0]))
+            table = torch.tensor([self.offsets(k) for k in range(size)], dtype=torch.long, device=device)
+            self._offset_cache[key] = table
+        return table
+
     def gather_along(self, tensor, k_from, k_to, b, y, x):
         """取 tensor [B,V,H,W] 在"第 k_from 窗经过 (y,x) 的各假设管道"于第 k_to 窗所在位置的值。
 
@@ -359,15 +419,28 @@ class DriftCUSUM(nn.Module):
         """
         V, H, W = self.n_hypotheses, int(tensor.shape[2]), int(tensor.shape[3])
         n = int(y.shape[0])
-        start, now = self.offsets(int(k_from)), self.offsets(int(k_to))
-        dy = torch.tensor([now[v][0] - start[v][0] for v in range(V)], device=y.device, dtype=torch.long)
-        dx = torch.tensor([now[v][1] - start[v][1] for v in range(V)], device=y.device, dtype=torch.long)
-        yy = y.view(1, n) + dy.view(V, 1)
-        xx = x.view(1, n) + dx.view(V, 1)
+        table = self.offset_table(max(int(k_from), int(k_to)), y.device)
+        delta = table[int(k_to)] - table[int(k_from)]           # [V, 2]，第 k_from 窗到第 k_to 窗的累计位移
+        yy = y.view(1, n) + delta[:, 0].view(V, 1)
+        xx = x.view(1, n) + delta[:, 1].view(V, 1)
         inside = (yy >= 0) & (yy < H) & (xx >= 0) & (xx < W)
         vv = torch.arange(V, device=y.device).view(V, 1).expand(V, n)
         values = tensor[b.view(1, n).expand(V, n), vv, yy.clamp(0, H - 1), xx.clamp(0, W - 1)]
         return torch.where(inside, values, torch.zeros_like(values)), inside
+
+    def gather_along_many(self, tensor, k_to, b, y, x, k_from):
+        """gather_along 的批量版：每个事件带自己的起始窗 k_from（long [N]，与 y 同设备），一次取完全部事件。
+        逐元素与"按起始窗分组、各调用一次 gather_along"相同（整数位移 + 取数，没有浮点运算）。返回 values [V, N]。"""
+        V, H, W = self.n_hypotheses, int(tensor.shape[2]), int(tensor.shape[3])
+        n = int(y.shape[0])
+        table = self.offset_table(int(k_to), y.device)
+        delta = table[int(k_to)].unsqueeze(0) - table[k_from]    # [N, V, 2]，各事件起始窗到第 k_to 窗的累计位移
+        yy = y.view(1, n) + delta[:, :, 0].t()
+        xx = x.view(1, n) + delta[:, :, 1].t()
+        inside = (yy >= 0) & (yy < H) & (xx >= 0) & (xx < W)
+        vv = torch.arange(V, device=y.device).view(V, 1).expand(V, n)
+        values = tensor[b.view(1, n).expand(V, n), vv, yy.clamp(0, H - 1), xx.clamp(0, W - 1)]
+        return torch.where(inside, values, torch.zeros_like(values))
 
 
 class TubeReadout(object):
@@ -394,18 +467,30 @@ class TubeReadout(object):
     def _score(self, run):
         return torch.logsumexp(run, dim=0) - math.log(self.cusum.n_hypotheses)
 
+    def _pending(self, name):
+        """所有待读窗的某个逐事件字段按登记顺序拼起来（只有一个窗时不拷贝）。"""
+        parts = [entry[name] for entry in self.pending]
+        return parts[0] if len(parts) == 1 else torch.cat(parts)
+
     def step(self, state, k, b, y, x, key):
         out = []
         k = int(k)
-        for entry in self.pending:
-            values, _ = self.cusum.gather_along(state["ell"], entry["k"], k, entry["b"], entry["y"], entry["x"])
-            entry["run"] = entry["run"] + values
-            if (k - entry["k"]) in self.delays:
-                out.append((entry["key"], k - entry["k"], self._score(entry["run"]), k))
+        if self.pending:
+            # 所有待读窗一次取完，再按登记顺序切回各窗；各窗的累加与打分仍在各自的张量上做（与原实现逐位相同）
+            values = self.cusum.gather_along_many(state["ell"], k, self._pending("b"), self._pending("y"),
+                                                  self._pending("x"), self._pending("k_from"))
+            start = 0
+            for entry in self.pending:
+                n = int(entry["y"].shape[0])
+                entry["run"] = entry["run"] + values[:, start:start + n]
+                start += n
+                if (k - entry["k"]) in self.delays:
+                    out.append((entry["key"], k - entry["k"], self._score(entry["run"]), k))
         self.pending = [e for e in self.pending if k - e["k"] < self.max_delay]
         if self.max_delay > 0:
             run = state["ell"].new_zeros(self.cusum.n_hypotheses, int(y.shape[0]))
-            self.pending.append({"k": k, "b": b, "y": y, "x": x, "key": key, "run": run})
+            self.pending.append({"k": k, "b": b, "y": y, "x": x, "key": key, "run": run,
+                                 "k_from": torch.full_like(y, k)})
         self.last_k = k
         return out
 

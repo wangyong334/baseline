@@ -351,5 +351,151 @@ class CommandLineTests(unittest.TestCase):
             self.assertEqual(tv2.build_cusum(tv2.build_config(tv2.parse_args())).gate_eps, 0.0)
 
 
+def reference_shift_each(tensor, shifts, fill=0.0):
+    """09-27 之前的实现：逐个 shift2d 再 stack（新实现必须与它逐位相同）。"""
+    if tensor.shape[1] == 1:
+        return torch.stack([shift2d(tensor[:, 0], sy, sx, fill) for sy, sx in shifts], 1)
+    return torch.stack([shift2d(tensor[:, v], sy, sx, fill) for v, (sy, sx) in enumerate(shifts)], 1)
+
+
+def reference_gather_along(cusum, tensor, k_from, k_to, b, y, x):
+    """09-27 之前的 gather_along：每次在 CPU 上算位移再传到设备。"""
+    V, H, W = cusum.n_hypotheses, int(tensor.shape[2]), int(tensor.shape[3])
+    n = int(y.shape[0])
+    start, now = cusum.offsets(int(k_from)), cusum.offsets(int(k_to))
+    dy = torch.tensor([now[v][0] - start[v][0] for v in range(V)], dtype=torch.long)
+    dx = torch.tensor([now[v][1] - start[v][1] for v in range(V)], dtype=torch.long)
+    yy, xx = y.view(1, n) + dy.view(V, 1), x.view(1, n) + dx.view(V, 1)
+    inside = (yy >= 0) & (yy < H) & (xx >= 0) & (xx < W)
+    vv = torch.arange(V).view(V, 1).expand(V, n)
+    values = tensor[b.view(1, n).expand(V, n), vv, yy.clamp(0, H - 1), xx.clamp(0, W - 1)]
+    return torch.where(inside, values, torch.zeros_like(values)), inside
+
+
+class BatchedShiftTests(unittest.TestCase):
+    """09-27 判决层提速：49 路平移合并成一次取数、读出位移表放到设备上——都必须与原实现逐位相同。"""
+
+    def test_batched_shift_matches_stacked_shift2d(self):
+        gen = torch.Generator().manual_seed(0)
+        for dtype in (torch.float32, torch.float64):
+            for H, W in ((7, 9), (12, 5)):
+                shifts_list = [
+                    [(0, 0), (1, -2), (-3, 4), (2, 2)],
+                    [(0, 0)] * 4,
+                    [(H, 0), (0, -W), (H + 3, W + 5), (-1, 1)],        # 超出画面：整幅是填充值
+                    [(-H + 1, W - 1), (5, -6), (0, 1), (1, 0)],
+                ]
+                for shifts in shifts_list:
+                    cusum = DriftCUSUM([(0.0, float(v)) for v in range(len(shifts))])
+                    for channels in (1, len(shifts)):
+                        for fill in (0.0, 1.5):
+                            x = torch.randn(2, channels, H, W, generator=gen, dtype=dtype)
+                            got = cusum._shift_each(x, shifts, fill)
+                            want = reference_shift_each(x, shifts, fill)
+                            self.assertEqual(got.dtype, want.dtype)
+                            self.assertTrue(torch.equal(got, want), (dtype, H, W, shifts, channels, fill))
+                            self.assertNotEqual(got.data_ptr(), x.data_ptr())   # 返回新张量
+
+    def test_cache_is_bounded_and_reused(self):
+        cusum = DriftCUSUM(velocity_grid([-1, 0, 1]))
+        x = torch.randn(1, 9, 6, 6)
+        for s in range(1, 13):                                # 12 种平移组合，缓存最多留 8 种
+            shifts = [(s % 3 - 1, (s + v) % 3 - 1) for v in range(9)]
+            self.assertTrue(torch.equal(cusum._shift_each(x, shifts), reference_shift_each(x, shifts)))
+            self.assertTrue(torch.equal(cusum._shift_each(x, shifts), reference_shift_each(x, shifts)))
+        self.assertLessEqual(len(cusum._shift_cache), 8)
+
+    def test_gather_along_matches_reference(self):
+        cusum = DriftCUSUM(velocity_grid([-4, -2, -1, 0, 1, 2, 4]))
+        gen = torch.Generator().manual_seed(1)
+        tensor = torch.randn(1, cusum.n_hypotheses, 20, 24, generator=gen)
+        y = torch.randint(0, 20, (30,), generator=gen)
+        x = torch.randint(0, 24, (30,), generator=gen)
+        b = torch.zeros(30, dtype=torch.long)
+        for k_from, k_to in ((0, 1), (3, 5), (10, 18), (100, 104), (250, 300), (600, 603)):   # 含位移表扩展
+            got = cusum.gather_along(tensor, k_from, k_to, b, y, x)
+            want = reference_gather_along(cusum, tensor, k_from, k_to, b, y, x)
+            self.assertTrue(torch.equal(got[0], want[0]) and torch.equal(got[1], want[1]), (k_from, k_to))
+        table = cusum.offset_table(603, torch.device("cpu"))
+        for k in (0, 1, 7, 159, 603):
+            self.assertEqual(table[k].tolist(), [list(p) for p in cusum.offsets(k)])
+
+    def test_gather_along_many_matches_grouped_calls(self):
+        cusum = DriftCUSUM(velocity_grid([-4, -1, 0, 2]))
+        gen = torch.Generator().manual_seed(3)
+        tensor = torch.randn(1, cusum.n_hypotheses, 15, 17, generator=gen)
+        groups = [(k0, torch.randint(0, 15, (n,), generator=gen), torch.randint(0, 17, (n,), generator=gen))
+                  for k0, n in ((3, 5), (4, 0), (6, 9), (7, 1))]           # 含没有事件的窗
+        k_to = 8
+        want = torch.cat([reference_gather_along(cusum, tensor, k0, k_to, torch.zeros_like(yy), yy, xx)[0]
+                          for k0, yy, xx in groups], 1)
+        y = torch.cat([g[1] for g in groups])
+        x = torch.cat([g[2] for g in groups])
+        k_from = torch.cat([torch.full_like(g[1], g[0]) for g in groups])
+        got = cusum.gather_along_many(tensor, k_to, torch.zeros_like(y), y, x, k_from)
+        self.assertTrue(torch.equal(got, want))
+
+    def test_batched_readout_matches_original(self):
+        """延迟读出：所有待读窗合并成一次取数后，到期顺序、分数、实际发布窗与原实现逐位相同（含序列末尾截断）。"""
+        from model.evidence_neuron import TubeReadout
+
+        class OriginalReadout(TubeReadout):
+            def step(self, state, k, b, y, x, key):
+                out = []
+                k = int(k)
+                for entry in self.pending:
+                    values, _ = reference_gather_along(self.cusum, state["ell"], entry["k"], k, entry["b"],
+                                                       entry["y"], entry["x"])
+                    entry["run"] = entry["run"] + values
+                    if (k - entry["k"]) in self.delays:
+                        out.append((entry["key"], k - entry["k"], self._score(entry["run"]), k))
+                self.pending = [e for e in self.pending if k - e["k"] < self.max_delay]
+                if self.max_delay > 0:
+                    run = state["ell"].new_zeros(self.cusum.n_hypotheses, int(y.shape[0]))
+                    self.pending.append({"k": k, "b": b, "y": y, "x": x, "key": key, "run": run})
+                self.last_k = k
+                return out
+
+        cusum = DriftCUSUM(velocity_grid([-4, -2, -1, 0, 1, 2, 4]))
+        gen = torch.Generator().manual_seed(4)
+        H, W = 12, 14
+        for dtype in (torch.float32, torch.float64):
+            new, old = TubeReadout(cusum, [1, 2, 5]), OriginalReadout(cusum, [1, 2, 5])
+            outs_new, outs_old = [], []
+            for k in range(11):
+                ell = torch.randn(1, cusum.n_hypotheses, H, W, generator=gen, dtype=dtype)
+                n = 0 if k in (2, 7) else int(torch.randint(1, 8, (1,), generator=gen))
+                y = torch.randint(0, H, (n,), generator=gen)
+                x = torch.randint(0, W, (n,), generator=gen)
+                if n:
+                    y[0], x[0] = 0, W - 1                                  # 贴边：很快移出画面
+                b = torch.zeros(n, dtype=torch.long)
+                state = {"ell": ell}
+                outs_new += new.step(state, k, b, y, x, k)
+                outs_old += old.step(state, k, b, y, x, k)
+                for entry in new.pending:
+                    self.assertTrue(entry["run"].is_contiguous())
+            outs_new += new.flush()
+            outs_old += old.flush()
+            self.assertEqual([(o[0], o[1], o[3]) for o in outs_new], [(o[0], o[1], o[3]) for o in outs_old])
+            for a, c in zip(outs_new, outs_old):
+                self.assertTrue(torch.equal(a[2], c[2]), (a[0], a[1]))
+
+    def test_non_integer_velocities(self):
+        """非整数速度时每窗平移在两种取整之间变化，缓存要按组合区分。"""
+        cusum = DriftCUSUM(velocity_grid([-1.5, 0.5, 2.5]), track_decay=0.8)
+        gen = torch.Generator().manual_seed(2)
+        state = cusum.init_state(1, 10, 11, "cpu", torch.float64)
+        ref = dict(state)
+        for k in range(12):
+            counts = torch.poisson(torch.full((1, 1, 10, 11), 0.3, dtype=torch.float64), generator=gen)
+            mu0 = torch.full((1, 1, 10, 11), 0.2, dtype=torch.float64)
+            log_g = torch.randn(1, 1, 10, 11, generator=gen, dtype=torch.float64) - 2.0
+            state, _, _ = cusum.step(state, counts, mu0, log_g if k else None)
+            ref = reference_step(cusum, ref, counts, mu0, log_g if k else None)
+            for key in ("G", "C", "ell"):
+                self.assertTrue(torch.equal(state[key], ref[key]), (k, key))
+
+
 if __name__ == "__main__":
     unittest.main()
