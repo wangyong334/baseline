@@ -401,6 +401,12 @@ class DriftCUSUM(nn.Module):
                              "要让它随事件稀疏度下降，需要块稀疏执行（方案三），当前实现没有。")
         return total
 
+    def support_field(self, counts):
+        """V3 锚定证据链用的支持场：本窗每个位置的足迹（与证据聚合同一足迹）内是否有事件，[B,1,H,W] 0/1。"""
+        present = (counts > 0).to(counts.dtype)
+        f = self.footprint
+        return present if f == 1 else F.max_pool2d(present, f, stride=1, padding=f // 2)
+
     def offset_table(self, k_max, device):
         """第 0..K-1 窗各假设的累计整数位移 [K, V, 2]（long，K > k_max），放在 device 上并缓存，不够长时翻倍重建。
         与 offsets(k) 逐项相同；延迟读出用它在设备上直接相减，不必每窗从 CPU 传位移。"""
@@ -443,6 +449,19 @@ class DriftCUSUM(nn.Module):
         return torch.where(inside, values, torch.zeros_like(values))
 
 
+def anchored_accumulate(run, alive, values, support):
+    """V3 锚定证据链（证据链从事件出发）的一步累加。
+
+    每个事件、每条速度管道记一个"链是否还连着"：出生时连着；某一窗管道位置的足迹里没有任何事件，链就断开。
+    链连着时这一窗的证据全额计入；断开之后只计入负证据（预测落空仍然扣分），后来路过的目标不能再给它加分——
+    "这里后来有目标活动"不等于"这个事件是目标的"。
+    输入: run / values [V,N] 浮点（累计证据与本窗证据），alive / support [V,N] 布尔（上一窗为止链是否连着、本窗是否有支持）。
+    输出: (新 run, 新 alive)。
+    """
+    run = run + torch.where(alive, values, torch.clamp(values, max=0.0))
+    return run, alive & support
+
+
 class TubeReadout(object):
     """逐事件的延迟读出（轨迹证据融合分数）：第 k 窗的事件在第 k+d 窗得到"之后 d 窗沿各速度管道的证据"。
 
@@ -453,14 +472,17 @@ class TubeReadout(object):
     目标沿真实速度继续出现时 F 为正；网络不预测目标处 F 约为 0；预测落空时 F 为负。管道移出画面后不再累加证据。
     用法：每处理完一个窗口 k 调用 step(state, k, b, y, x, key)，返回本步到期的 [(key, d, F [N], 实际发布窗号)]；
     序列结束调用 flush()，尚未到期的延迟在最后一窗读出（实际发布窗号 < k+d，延迟被截断）。本类不修改 CUSUM 状态。
+    anchor=True（V3 锚定证据链）时每步还要给出本窗的支持场 support [B,1,H,W]（足迹内有事件为 1），
+    累加改用 anchored_accumulate；anchor=False 时与原实现逐位相同。
     """
 
-    def __init__(self, cusum, delays):
+    def __init__(self, cusum, delays, anchor=False):
         self.cusum = cusum
         self.delays = sorted(set(int(d) for d in delays))
         if any(d < 1 for d in self.delays):
             raise ValueError("延迟必须 >= 1（延迟 0 就是网络输出本身）")
         self.max_delay = max(self.delays) if self.delays else 0
+        self.anchor = bool(anchor)
         self.pending = []
         self.last_k = -1
 
@@ -472,25 +494,37 @@ class TubeReadout(object):
         parts = [entry[name] for entry in self.pending]
         return parts[0] if len(parts) == 1 else torch.cat(parts)
 
-    def step(self, state, k, b, y, x, key):
+    def step(self, state, k, b, y, x, key, support=None):
         out = []
         k = int(k)
+        if self.anchor and support is None:
+            raise ValueError("anchor=True 时每步都要给出本窗的支持场 support")
         if self.pending:
             # 所有待读窗一次取完，再按登记顺序切回各窗；各窗的累加与打分仍在各自的张量上做（与原实现逐位相同）
-            values = self.cusum.gather_along_many(state["ell"], k, self._pending("b"), self._pending("y"),
-                                                  self._pending("x"), self._pending("k_from"))
+            where = (self._pending("b"), self._pending("y"), self._pending("x"))
+            values = self.cusum.gather_along_many(state["ell"], k, *where, self._pending("k_from"))
+            if self.anchor:
+                V = self.cusum.n_hypotheses
+                held = self.cusum.gather_along_many(support.expand(-1, V, -1, -1), k, *where,
+                                                    self._pending("k_from")) > 0
             start = 0
             for entry in self.pending:
                 n = int(entry["y"].shape[0])
-                entry["run"] = entry["run"] + values[:, start:start + n]
+                if self.anchor:
+                    entry["run"], entry["alive"] = anchored_accumulate(entry["run"], entry["alive"],
+                                                                       values[:, start:start + n], held[:, start:start + n])
+                else:
+                    entry["run"] = entry["run"] + values[:, start:start + n]
                 start += n
                 if (k - entry["k"]) in self.delays:
                     out.append((entry["key"], k - entry["k"], self._score(entry["run"]), k))
         self.pending = [e for e in self.pending if k - e["k"] < self.max_delay]
         if self.max_delay > 0:
             run = state["ell"].new_zeros(self.cusum.n_hypotheses, int(y.shape[0]))
-            self.pending.append({"k": k, "b": b, "y": y, "x": x, "key": key, "run": run,
-                                 "k_from": torch.full_like(y, k)})
+            entry = {"k": k, "b": b, "y": y, "x": x, "key": key, "run": run, "k_from": torch.full_like(y, k)}
+            if self.anchor:
+                entry["alive"] = torch.ones(self.cusum.n_hypotheses, int(y.shape[0]), dtype=torch.bool, device=y.device)
+            self.pending.append(entry)
         self.last_k = k
         return out
 

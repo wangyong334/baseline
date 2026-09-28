@@ -1,7 +1,8 @@
 """V3 阶段 1（等待安全的逐事件发布，默认关闭）在训练 / 评估入口里的接线。
 
 --publish on 时 run_sequence 多一个读出 pub：每个事件在出生后 0..D 窗之间按证据是否充分择机发布
-（规则见 model/publish_readout.py）；关闭时本模块的任何代码都不运行，V2 的读出逐位不变。
+（规则见 model/publish_readout.py）；--publish-anchor on 时证据改用事件证据缓存（锚定证据链），并另外导出
+evidence_anchor_d1..D（锚定后的 F(d)，供 tools/publish_replay.py 回放）。关闭时本模块的任何代码都不运行，V2 的读出逐位不变。
     add_arguments / apply_overrides / validate_config / EVAL_KEYS   命令行与配置
     build_rule            按配置构造发布规则（θ 缺省 = logit(threshold)，与其他读出同一工作点）
     readout_names         打开时新增的读出名 ["pub"]
@@ -17,11 +18,12 @@ import numpy as np
 import torch
 
 from dataset.stream_windows import refill_by_index
+from model.evidence_neuron import TubeReadout
 from model.publish_readout import COLLAPSES, REASONS, PublishRule, PublishUnits
 
 NAME = "pub"
 EVAL_KEYS = ("publish", "publish_deadline", "publish_theta", "publish_upper", "publish_lower", "publish_collapse",
-             "publish_gate")
+             "publish_gate", "publish_anchor")
 NONE = "none"
 
 
@@ -43,6 +45,8 @@ def add_arguments(parser):
                         help="边界随年龄的收拢方式：linear（线性收到 θ）/ step（期限前不收）")
     parser.add_argument("--publish-gate", type=gate_value, default=None,
                         help="归属门槛（logit）：mark 低于它的事件只能被未来证据减分；none = 不门控")
+    parser.add_argument("--publish-anchor", choices=("on", "off"), default=None,
+                        help="事件证据缓存：证据链从事件出发（管道断开后只计负证据）；off = V2 的延迟证据")
 
 
 def apply_overrides(cfg, args):
@@ -54,6 +58,8 @@ def apply_overrides(cfg, args):
             cfg[key] = None if value == NONE else value
     if args.publish is not None:
         cfg["publish"] = args.publish == "on"
+    if args.publish_anchor is not None:
+        cfg["publish_anchor"] = args.publish_anchor == "on"
 
 
 def enabled(cfg):
@@ -88,7 +94,7 @@ def describe(cfg):
         return None
     rule = build_rule(cfg)
     return {"deadline": rule.deadline, "theta": rule.theta, "upper": rule.upper, "lower": rule.lower,
-            "collapse": rule.collapse, "gate": rule.gate, "weight": rule.weight}
+            "collapse": rule.collapse, "gate": rule.gate, "weight": rule.weight, "anchor": bool(cfg.get("publish_anchor"))}
 
 
 def validate_config(cfg):
@@ -123,9 +129,16 @@ class PublishRun(object):
 
     def __init__(self, cfg, cusum, window_info):
         self.rule = build_rule(cfg)
-        self.units = PublishUnits(cusum, self.rule)
+        self.anchor = bool(cfg.get("publish_anchor"))
+        self.cusum = cusum
+        self.units = PublishUnits(cusum, self.rule, anchor=self.anchor)
         self.window_info = window_info
         self.parts = {name: ([], []) for name in ("z", "label", "window", "reason", "age")}
+        # 锚定证据的逐延迟读出（所有事件都读满 D 窗，与发布无关）：导出后供离线回放扫阈值
+        delays = list(range(1, self.rule.deadline + 1))
+        self.anchored = TubeReadout(cusum, delays, anchor=True) if (self.anchor and delays) else None
+        if self.anchored is not None:
+            self.parts.update({"evidence_anchor_d%d" % d: ([], []) for d in delays})
 
     def _collect(self, records):
         for key, pos, label, z, published, reason, age in records:
@@ -138,13 +151,24 @@ class PublishRun(object):
                 self.parts[name][0].append(idx)
                 self.parts[name][1].append(value)
 
-    def step(self, state, k, b, y, x, logits):
-        """第 k 窗（判决层本窗之后）：推进待发布事件并登记本窗新事件。"""
-        self._collect(self.units.step(state, k, b, y, x, k, logits))
+    def _collect_anchored(self, results):
+        for key, delay, scores, _ in results:
+            name = "evidence_anchor_d%d" % delay
+            self.parts[name][0].append(self.window_info[key][0])
+            self.parts[name][1].append(scores.float().cpu().numpy())
+
+    def step(self, state, k, b, y, x, logits, counts):
+        """第 k 窗（判决层本窗之后）：推进待发布事件并登记本窗新事件。counts [B,1,H,W] 为本窗事件数（锚定时算支持场）。"""
+        support = self.cusum.support_field(counts) if self.anchor else None
+        self._collect(self.units.step(state, k, b, y, x, k, logits, support))
+        if self.anchored is not None:
+            self._collect_anchored(self.anchored.step(state, k, b, y, x, k, support))
 
     def flush(self):
         """真实序列结束：尚未发布的事件按最终阈值发布。"""
         self._collect(self.units.flush())
+        if self.anchored is not None:
+            self._collect_anchored(self.anchored.flush())
 
     def outputs(self, n_events, threshold):
         """回填到原始事件顺序。返回 (probs {"pub": 概率}, extra {z_pub, label_pub, age_pub, reason_pub, publish_pub})。
@@ -156,6 +180,9 @@ class PublishRun(object):
                  "age_pub": refill_by_index(n_events, *self.parts["age"], dtype=np.float32),
                  "reason_pub": refill_by_index(n_events, *self.parts["reason"], dtype=np.float32),
                  "publish_pub": refill_by_index(n_events, *self.parts["window"], dtype=np.int64)}
+        for name in self.parts:
+            if name.startswith("evidence_anchor_d"):
+                extra[name] = refill_by_index(n_events, *self.parts[name])
         return probs, extra
 
 
@@ -169,6 +196,8 @@ class PublishStats(object):
         self.reason_target = np.zeros(len(REASONS), np.int64)
         self.reason_all = np.zeros(len(REASONS), np.int64)
         self.early = {"upper_true": 0, "upper_false": 0, "lower_true_target": 0, "lower_background": 0}
+        self.unit_windows = 0            # 待发布单元占用的"事件·窗"数（资源：只有尚未发布的事件在算）
+        self.events = 0
 
     def update(self, labels, extra):
         lab = np.asarray(labels) > 0.5
@@ -183,6 +212,8 @@ class PublishStats(object):
         self.early["upper_false"] += int(np.count_nonzero(up & ~lab))
         self.early["lower_true_target"] += int(np.count_nonzero(low & lab))
         self.early["lower_background"] += int(np.count_nonzero(low & ~lab))
+        self.unit_windows += int(age.sum())
+        self.events += int(age.size)
 
     def summary(self, window_ms):
         nt, na = max(int(self.age_target.sum()), 1), max(int(self.age_all.sum()), 1)
@@ -194,7 +225,10 @@ class PublishStats(object):
                 "mean_delay_all_ms": float(window_ms) * float((ages * self.age_all).sum()) / na,
                 "reason_target": dict(zip(REASONS, (self.reason_target / float(nt)).tolist())),
                 "reason_all": dict(zip(REASONS, (self.reason_all / float(na)).tolist())),
-                "early": dict(self.early)}
+                "early": dict(self.early),
+                # 资源：每个事件平均占用发布单元的窗数；V2 固定读出（最长 D 窗）每个事件都要读满 D 窗
+                "mean_unit_windows_per_event": self.unit_windows / float(max(self.events, 1)),
+                "unit_windows_vs_fixed_readout": self.unit_windows / float(max(self.events * max(self.deadline, 1), 1))}
 
 
 def report_lines(summary, mode):
@@ -206,4 +240,6 @@ def report_lines(summary, mode):
     return ["[%s] pub 目标事件发布年龄：%s | 平均 %.1f ms（全部事件 %.1f ms）" % (
                 mode, hist, s["mean_delay_target_ms"], s["mean_delay_all_ms"]),
             "[%s] pub 目标事件发布原因：%s | 提前发布目标 %d（其中真目标 %d）、提前发布背景里的真目标 %d" % (
-                mode, reason, e["upper_true"] + e["upper_false"], e["upper_true"], e["lower_true_target"])]
+                mode, reason, e["upper_true"] + e["upper_false"], e["upper_true"], e["lower_true_target"]),
+            "[%s] pub 资源：每个事件平均占用发布单元 %.3f 窗，是固定读出（每个事件读满 %d 窗）的 %.1f%%" % (
+                mode, s["mean_unit_windows_per_event"], s["deadline"], 100 * s["unit_windows_vs_fixed_readout"])]

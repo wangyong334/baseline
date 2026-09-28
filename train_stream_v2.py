@@ -47,7 +47,7 @@ from utils import publish_eval  # noqa: E402
 from utils.alarm_metrics import AlarmEvaluator  # noqa: E402
 # V2-2 的接线移到 utils/attribution_eval.py 之后，旧的导入路径（tv2.build_attribution 等）仍然可用
 from utils.attribution_eval import AttributionStats, build_attribution, parse_hyp_overrides  # noqa: E402,F401
-from utils.evidence_loss import intensity_loss, mark_loss  # noqa: E402
+from utils.evidence_loss import boundary_mark_loss, intensity_loss, mark_loss, near_target_field  # noqa: E402
 from utils.stream_common import (health_warnings, linear_epoch_lr, load_flat_config, make_chunks,  # noqa: E402
                                  select_subset, subset_due, summarize_history)
 from utils.stream_metrics import (first_detection_latencies_by_event, first_detection_latencies_published,  # noqa: E402
@@ -77,9 +77,11 @@ MODEL_KEYS = ("window_ms", "fe_taus_ms", "fe_dipole_taus_ms", "fe_dipole_radius"
               "intensity_prior", "log_g_max")
 # 续训还要求优化过程一致（epochs 除外：延长训练是合理操作，只提示不拦截）
 TRAINING_KEYS = MODEL_KEYS + ("seed", "lr", "lr_end", "tbptt_k", "grad_clip", "loss_mark_weight",
-                              "loss_intensity_weight", "loss_intensity_smooth")
+                              "loss_intensity_weight", "loss_intensity_smooth", "loss_mark_boundary_weight",
+                              "loss_mark_boundary_radius")
 # 旧 checkpoint 里没有、后来才加的键，缺省值 = 加入之前的行为
 CONFIG_DEFAULTS = {"fe_features": list(FEATURE_GROUPS), "bg_mode": "adaptive", "loss_intensity_smooth": 3,
+                   "loss_mark_boundary_weight": 0.0, "loss_mark_boundary_radius": 5,
                    "neuron_u_floor": None, "neuron_u_ceil": None}
 # 膜电位上下界命令行里写 none 表示显式不设界（覆盖 YAML 的冻结默认值 -4，做无下界对照时用）
 NO_BOUND = "none"
@@ -87,7 +89,9 @@ NO_BOUND = "none"
 RETRAIN_FLAGS = (("neuron", "neuron"), ("state_mode", "state_mode"), ("fe_features", "fe_features"),
                  ("bg_mode", "bg_mode"), ("fe_taus_ms", "fe_taus_ms"), ("fe_dipole_taus_ms", "fe_dipole_taus_ms"),
                  ("neuron_u_floor", "neuron_u_floor"), ("neuron_u_ceil", "neuron_u_ceil"),
-                 ("loss_mark_weight", "loss_mark_weight"), ("loss_intensity_weight", "loss_intensity_weight"))
+                 ("loss_mark_weight", "loss_mark_weight"), ("loss_intensity_weight", "loss_intensity_weight"),
+                 ("loss_mark_boundary_weight", "loss_mark_boundary_weight"),
+                 ("loss_mark_boundary_radius", "loss_mark_boundary_radius"))
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +155,10 @@ def parse_args():
     parser.add_argument("--loss-mark-weight", type=float, default=None, help="逐事件 BCE 的权重")
     parser.add_argument("--loss-intensity-weight", type=float, default=None,
                         help="强度场泊松似然的权重（设 0 = 只留 mark 头的单头消融；需要重新训练）")
+    parser.add_argument("--loss-mark-boundary-weight", type=float, default=None,
+                        help="V3 归属训练：目标附近背景事件的边界负样本项权重（0 = V2；需要重新训练）")
+    parser.add_argument("--loss-mark-boundary-radius", type=int, default=None,
+                        help="V3 归属训练：'目标附近'的半径（像素，切比雪夫距离；需要重新训练）")
     parser.add_argument("--neuron-u-floor", type=bound_value, default=None,
                         help="跨窗携带的膜电位下界（以 v_th 为单位）。不给 = 取 YAML（冻结基线 -4）；none = 不设界"
                              "（v2-1 原实现，做无下界对照）；需要重新训练。动机见 09-23 的膜电位诊断")
@@ -181,6 +189,8 @@ def build_config(args):
                  "readout_delays": args.readout_delays, "fe_features": args.fe_features, "bg_mode": args.bg_mode,
                  "fe_taus_ms": args.fe_taus_ms, "fe_dipole_taus_ms": args.fe_dipole_taus_ms,
                  "loss_mark_weight": args.loss_mark_weight, "loss_intensity_weight": args.loss_intensity_weight,
+                 "loss_mark_boundary_weight": args.loss_mark_boundary_weight,
+                 "loss_mark_boundary_radius": args.loss_mark_boundary_radius,
                  "neuron_u_floor": args.neuron_u_floor, "neuron_u_ceil": args.neuron_u_ceil}
     for key, value in overrides.items():
         if value is not None:
@@ -215,6 +225,8 @@ def validate_config(cfg):
     w_mark, w_int = float(cfg["loss_mark_weight"]), float(cfg["loss_intensity_weight"])
     if w_mark < 0 or w_int < 0 or (w_mark == 0 and w_int == 0):
         raise ValueError("损失权重必须非负且不能同时为 0（mark %g，intensity %g）" % (w_mark, w_int))
+    if float(cfg.get("loss_mark_boundary_weight", 0.0)) < 0 or int(cfg.get("loss_mark_boundary_radius", 5)) < 0:
+        raise ValueError("loss_mark_boundary_weight 与 loss_mark_boundary_radius 必须非负")
     if cfg.get("neuron_u_floor") is not None or cfg.get("neuron_u_ceil") is not None:
         if cfg["neuron"] == "relu":
             raise ValueError("ReLU 对照没有膜电位，neuron_u_floor / neuron_u_ceil 对它无效")
@@ -382,8 +394,9 @@ def train_sequence(model, frontend, seq, optimizer, cfg, device, rng, max_window
     """用一个序列训练一次（stateful TBPTT，梯度跨片段累加，序列结束时裁剪并更新一次）。
 
     每个片段：前端（no_grad）-> 骨干 + 头（逐层时间并行）-> 两项损失 -> backward -> 截断骨干状态。
+    V3 归属训练（loss_mark_boundary_weight > 0）另加边界负样本项（utils/evidence_loss.boundary_mark_loss）；为 0 时与 V2 逐位相同。
     损失除以整条序列的事件数（没有事件时除以 1）。
-    返回: {"loss_sum", "mark_sum", "intensity_sum", "events", "grad_norms", "missing_grads"}
+    返回: {"loss_sum", "mark_sum", "intensity_sum", "boundary_sum", "events", "grad_norms", "missing_grads"}
     """
     k = int(cfg["tbptt_k"])
     n_windows = seq.n_windows if max_windows is None else min(int(max_windows), seq.n_windows)
@@ -391,11 +404,13 @@ def train_sequence(model, frontend, seq, optimizer, cfg, device, rng, max_window
     total_events = int(seq.bounds[n_windows] - seq.bounds[0])
     denominator = float(max(total_events, 1))
     w_mark, w_int = float(cfg["loss_mark_weight"]), float(cfg["loss_intensity_weight"])
+    w_bd = float(cfg.get("loss_mark_boundary_weight", 0.0))
+    r_bd = int(cfg.get("loss_mark_boundary_radius", 5))
     dtype = next(model.parameters()).dtype
     source = EventChunkSource(seq, cfg, device, dtype)
     fe_state = frontend.init_state(1, int(cfg["pad_height"]), int(cfg["pad_width"]), device, dtype)
     states = None
-    sums = {"loss_sum": 0.0, "mark_sum": 0.0, "intensity_sum": 0.0}
+    sums = {"loss_sum": 0.0, "mark_sum": 0.0, "intensity_sum": 0.0, "boundary_sum": 0.0}
     optimizer.zero_grad(set_to_none=True)
     for start, end in chunks:
         chunk = source.chunk(start, end)
@@ -404,16 +419,25 @@ def train_sequence(model, frontend, seq, optimizer, cfg, device, rng, max_window
         mark, log_g, states, _ = model.forward_chunk(feats, states)
         ev = chunk["events"]
         terms = []
-        lm = mark_loss(mark[ev["t"], ev["b"], 0, ev["y"], ev["x"]], chunk["labels"])
+        event_logits = mark[ev["t"], ev["b"], 0, ev["y"], ev["x"]]
+        lm = mark_loss(event_logits, chunk["labels"])
         if lm is not None and w_mark > 0:
             terms.append(w_mark * lm)
             sums["mark_sum"] += float(lm.detach())
+        if w_bd > 0 and chunk["labels"].numel():
+            near = near_target_field(chunk["target_counts"], r_bd)[ev["t"], ev["b"], 0, ev["y"], ev["x"]] > 0
+            lb = boundary_mark_loss(event_logits, chunk["labels"], near)
+            if lb is not None:
+                terms.append(w_bd * lb)
+                sums["boundary_sum"] += float(lb.detach())
         li = intensity_loss(log_g, chunk["target_counts"], int(cfg.get("loss_intensity_smooth", 3)))
         if w_int > 0:
             terms.append(w_int * li)
             sums["intensity_sum"] += float(li.detach())
         if terms:
-            loss = terms[0] if len(terms) == 1 else terms[0] + terms[1]
+            loss = terms[0]
+            for term in terms[1:]:
+                loss = loss + term
             (loss / denominator).backward()
             value = float(loss.detach())
             if not math.isfinite(value):
@@ -557,7 +581,7 @@ def run_sequence(model, frontend, cusum, seq, cfg, device, state_mode, monitor=N
                 window_info[k] = (part_idx, logits[sl])
                 collect(readout.step(c_state, k, ev["b"][sl], ev["y"][sl], ev["x"][sl], k))
                 if pub is not None:                   # V3：推进待发布事件，登记本窗新事件
-                    pub.step(c_state, k, ev["b"][sl], ev["y"][sl], ev["x"][sl], logits[sl])
+                    pub.step(c_state, k, ev["b"][sl], ev["y"][sl], ev["x"][sl], logits[sl], total[t])
                 if attr is not None:                  # V2-2：假设库处理第 k 窗，再读出到期的旧窗事件
                     attr.step(k, ev["y"][sl], ev["x"][sl], logits[sl], log_g[t, 0, 0], mu0[t, 0, 0], c_state["C"])
                 for theta in alarm_C:
@@ -871,7 +895,8 @@ def mode_train(args, cfg):
             torch.cuda.reset_peak_memory_stats(device)
         t0 = time.perf_counter()
         model.train()
-        sums, event_sum, grad_acc, n_seq = {"loss_sum": 0.0, "mark_sum": 0.0, "intensity_sum": 0.0}, 0, {}, 0
+        sums, event_sum, grad_acc, n_seq = {"loss_sum": 0.0, "mark_sum": 0.0, "intensity_sum": 0.0,
+                                            "boundary_sum": 0.0}, 0, {}, 0
         for seq in loader:
             out = train_sequence(model, frontend, seq, optimizer, cfg, device, rng)
             for key in sums:
@@ -891,6 +916,7 @@ def mode_train(args, cfg):
                   "loss_per_event": sums["loss_sum"] / max(event_sum, 1),
                   "mark_per_event": sums["mark_sum"] / max(event_sum, 1),
                   "intensity_per_event": sums["intensity_sum"] / max(event_sum, 1),
+                  "boundary_per_event": sums["boundary_sum"] / max(event_sum, 1),
                   "val_iou": val["iou"], "val_acc": val["acc"],
                   "train_subset_iou": sub["iou"] if sub else None, "train_subset_acc": sub["acc"] if sub else None,
                   "train_seconds": train_seconds, "epoch_seconds": time.perf_counter() - t0,

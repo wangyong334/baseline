@@ -8,6 +8,9 @@
     F_i(d)  出生后 d 窗沿各速度管道的存在证据 = logsumexp_v R_i,v(d) - log V，R 为判决层逐窗证据 ell 沿管道的累加，
             与 V2 的延迟读出（TubeReadout）逐位相同；F_i(0) = 0
     w       V2 的融合权重（fusion_weight）
+事件证据缓存 = 锚定证据链（可选，anchor）：每个待发布事件、每条管道另记"链是否还连着"——出生时连着，某窗管道位置的
+    足迹里没有事件就断开；断开后只计入负证据。这样事件分到的未来证据只来自以它为起点、每窗连续的活动，
+    目标后来路过这里不能再给它加分（model/evidence_neuron.anchored_accumulate）。
 归属门控（可选，gate = g）：m_i < g 的事件只能被未来证据减分，不能被"等成"目标（存在与归属分开）：
     z_i(d) = m_i + w * min(F_i(d), 0)   当 m_i < g                                          (2)
 发布规则（截断的双边序贯检验；θ 为最终阈值，a >= 0、b > 0 为提前发布所需的裕量）：
@@ -26,6 +29,8 @@ import math
 
 import numpy as np
 import torch
+
+from model.evidence_neuron import anchored_accumulate
 
 UPPER, LOWER, DEADLINE, EOS = 0, 1, 2, 3
 REASONS = ("upper", "lower", "deadline", "eos")
@@ -111,16 +116,19 @@ class PublishRule(object):
 class PublishUnits(object):
     """在线发布层（一条序列一个实例）。每处理完第 k 窗调用 step，序列结束调用 flush。
 
-    step(state, k, b, y, x, key, logit)：state 为判决层本窗之后的状态（用 state["ell"]）；b/y/x/logit 为第 k 窗
+    step(state, k, b, y, x, key, logit, support)：state 为判决层本窗之后的状态（用 state["ell"]）；b/y/x/logit 为第 k 窗
     新事件（与 TubeReadout 的调用约定相同）。先用第 k 窗的 ell 推进已登记的待发布事件，再登记新事件并做年龄 0 的决定。
+    anchor=True（事件证据缓存 = 锚定证据链）时 support 为本窗的支持场 [B,1,H,W]，每个待发布事件、每条管道另记
+    "链是否还连着"，累加用 model/evidence_neuron.anchored_accumulate（与 TubeReadout(anchor=True) 同一规则）。
     返回本步发布的记录列表，每条 (key, pos, label, z, publish_window, reason, age)：pos 为这些事件在其出生窗
     事件列表中的位置（long），label 布尔，z 为发布时的证据分数（与 logit 同设备同 dtype）。
     不修改判决层状态；只有尚未发布的事件占用计算。
     """
 
-    def __init__(self, cusum, rule):
+    def __init__(self, cusum, rule, anchor=False):
         self.cusum = cusum
         self.rule = rule
+        self.anchor = bool(anchor)
         self.pending = []
         self.last_k = -1
 
@@ -147,19 +155,31 @@ class PublishUnits(object):
             return records, None
         kept = {name: entry[name][rest] for name in ("b", "y", "x", "pos", "logit")}
         kept.update(k=entry["k"], key=entry["key"], run=entry["run"][:, rest])
+        if self.anchor:
+            kept["alive"] = entry["alive"][:, rest]
         return records, kept
 
-    def step(self, state, k, b, y, x, key, logit):
+    def step(self, state, k, b, y, x, key, logit, support=None):
         out = []
         k = int(k)
+        if self.anchor and support is None:
+            raise ValueError("anchor=True 时每步都要给出本窗的支持场 support")
         if self.pending:
             cat = lambda name: torch.cat([e[name] for e in self.pending]) if len(self.pending) > 1 else self.pending[0][name]
             k_from = torch.cat([torch.full_like(e["y"], e["k"]) for e in self.pending])
-            values = self.cusum.gather_along_many(state["ell"], k, cat("b"), cat("y"), cat("x"), k_from)
+            where = (cat("b"), cat("y"), cat("x"))
+            values = self.cusum.gather_along_many(state["ell"], k, *where, k_from)
+            if self.anchor:
+                V = self.cusum.n_hypotheses
+                held = self.cusum.gather_along_many(support.expand(-1, V, -1, -1), k, *where, k_from) > 0
             start, kept = 0, []
             for entry in self.pending:
                 n = int(entry["y"].shape[0])
-                entry["run"] = entry["run"] + values[:, start:start + n]
+                if self.anchor:
+                    entry["run"], entry["alive"] = anchored_accumulate(entry["run"], entry["alive"],
+                                                                       values[:, start:start + n], held[:, start:start + n])
+                else:
+                    entry["run"] = entry["run"] + values[:, start:start + n]
                 start += n
                 records, rest = self._decide(entry, self._score(entry), k - entry["k"], k)
                 out += records
@@ -170,6 +190,8 @@ class PublishUnits(object):
         if n:
             entry = {"k": k, "key": key, "b": b, "y": y, "x": x, "logit": logit,
                      "pos": torch.arange(n, device=y.device), "run": logit.new_zeros(self.cusum.n_hypotheses, n)}
+            if self.anchor:
+                entry["alive"] = torch.ones(self.cusum.n_hypotheses, n, dtype=torch.bool, device=y.device)
             records, rest = self._decide(entry, self._score(entry, fresh=True), 0, k)
             out += records
             if rest is not None:

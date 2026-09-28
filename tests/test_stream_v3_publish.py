@@ -308,7 +308,7 @@ class CommandLineTests(unittest.TestCase):
         self.assertIsNone(publish_eval.build_rule(self.parse("--publish", "on", "--publish-gate", "none")).gate)
         self.assertIsNone(publish_eval.describe(self.parse()))
         self.assertEqual(publish_eval.describe(cfg), {"deadline": 4, "theta": 1.5, "upper": 0.5, "lower": 3.0,
-                                                      "collapse": "step", "gate": 0.2, "weight": 1.0})
+                                                      "collapse": "step", "gate": 0.2, "weight": 1.0, "anchor": False})
         bare = {"publish": True, "threshold": 0.9}                 # 配置里没写的项：记录的是实际生效的缺省值
         self.assertEqual(publish_eval.describe(bare)["deadline"], 5)
         self.assertAlmostEqual(publish_eval.describe(bare)["theta"], math.log(9.0), places=12)

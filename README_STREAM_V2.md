@@ -176,6 +176,20 @@ EV-UAV 上的结论（s37）：审计修复后 attr_fused_d2 在 val 选定阈�
 相关离线工具：`tools/error_breakdown.py`（错误分类、逐序列、目标漏检画像）、`tools/persistence_gate.py`（持续性门控，负结果）、
 `tools/audit_v22_readout.py`（V2-2 审计探针）。
 
+## V3 完整方案：等待安全的逐事件发布（Wait-Safe Evidence Publishing，09-28）
+
+结构 = **持续感知网络 + 事件证据缓存 + 双边界发布单元**，每一部分对着一个实测的问题：
+
+| 部分 | 解决的问题（实测） | 做法 | 开关 | 需重训 |
+|---|---|---|---|---|
+| 双边界发布单元 | 固定延迟：一律等同样的窗数 | 证据够就发布、不够就等，边界随年龄收拢，期限强制发布 | `publish` | 否 |
+| 事件证据缓存（锚定证据链） | 等待新增虚警的 62% 来自"目标后来经过的位置" | 每个待发布事件、每条速度管道记"链是否还连着"：管道位置的足迹里没有事件就断开，断开后只计负证据 | `publish_anchor` | 否 |
+| 持续感知网络的归属训练 | 等待新增虚警的 34% 与零等待误检的大半都在目标附近 | 目标 5 像素内的背景事件单列一项：平均 BCE × 目标事件数（与正样本等总权重） | `loss_mark_boundary_weight` | 是 |
+
+完整方案的配置 `configs/evisseg_stream_v3.yaml` = V2 冻结配置 + 上面三项打开（与 V2 配置只差标了 [V3] 的几行）。
+消融阶梯（同一套代码）：V2 权重 + 发布单元 → V2 权重 + 发布单元 + 锚定证据链 → V3 训练权重 + 两者（完整 V3）。
+发布层结果另报资源：每个事件平均占用发布单元的窗数（固定读出每个事件都要读满 D 窗）。
+
 ## V3 阶段 1：等待安全的逐事件发布（09-28，默认关闭 `publish: false`）
 
 **问题**：固定延迟发布（net 当窗发布、fused_d 一律等 d 窗）对所有事件用同一个延迟；同虚警率下固定等 5 窗反而崩溃，
@@ -194,6 +208,8 @@ mark < g 的事件只能被未来证据减分。任何发布都满足 标签 = 1
 | `--publish-upper` / `--publish-lower` | 1.0 / 2.0 | 提前发布目标 / 背景所需的裕量 a / b（nat） |
 | `--publish-collapse` | linear | 边界随年龄线性收拢；step 为消融 |
 | `--publish-gate` | none | 归属门槛（logit） |
+| `--publish-anchor on\|off` | off | 事件证据缓存（锚定证据链）；打开时另导出 `evidence_anchor_d1..D` 供回放 |
+| `--loss-mark-boundary-weight` / `--loss-mark-boundary-radius` | 0 / 5 | 训练：边界负样本项的权重与"目标附近"半径（需要重新训练） |
 
 `pub` 的概率 = σ(z − θ + logit(threshold)) 并夹到发布标签一侧，所以原 `utils/eval.py` 的 IoU/ACC/Pd/Fa 就是发布标签的指标；
 首次检出延迟按逐事件的实际发布窗计（`first_detection_latencies_by_event`，后出生的事件可能先发布）。
