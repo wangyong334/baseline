@@ -3,6 +3,8 @@
 主指标 IoU/ACC/Pd/Fa 不在这里实现：必须回填后调用原仓库 utils/eval.py 的函数，
 保证与基线 0.6188 口径一致。本文件只负责逐窗诊断与首次检出延迟。
 """
+import math
+
 import numpy as np
 
 
@@ -143,6 +145,44 @@ def first_detection_latencies_published(t, label, target_id, pred_prob, window_m
         if detect is not None:
             published = int(publish_window[detect])
             latency = float((published + 1) * int(window_ms) - t_first)
+        results.append({"target_id": float(tid), "t_first_ms": t_first, "detect_window": detect,
+                        "publish_window": published, "latency_ms": latency})
+    return results
+
+
+def first_detection_latencies_by_event(t, label, target_id, pred_prob, window_ms, threshold, correct_thresh,
+                                       publish_event):
+    """首次检出延迟（V3 逐事件发布用）：同一窗的事件可能在不同时刻发布，所以按实际发布顺序计。
+
+    检出条件与 first_detection_latencies 相同：目标在第 k 窗的正事件中，被判为目标的至少占 correct_thresh 且至少 1 个。
+    第 k 窗满足条件的时刻 = 该窗被判为目标的事件里，第 need 个发布的发布窗（need = max(1, ceil(correct_thresh·n_k))）；
+    目标的检出时刻 = 各出生窗满足条件时刻的最小值（后出生的事件可能先发布，不能按出生窗顺序找到第一个就停）。
+    latency = (检出发布窗 + 1) * window_ms - t_first。同一窗的事件都在同一时刻发布时，与 first_detection_latencies_published
+    的结果相同。输出格式同上（detect_window 为达到最早检出的出生窗）。
+    """
+    results = []
+    positive = label == 1
+    publish_event = np.asarray(publish_event)
+    for tid in np.unique(target_id[positive]):
+        if tid == 0:
+            continue
+        mask = positive & (target_id == tid)
+        times = t[mask]
+        t_first = int(times.min())
+        windows = times // int(window_ms)
+        hit = pred_prob[mask] >= float(threshold)
+        pub = publish_event[mask]
+        detect, published = None, None
+        for k in np.unique(windows):
+            in_k = windows == k
+            n_k = int(np.count_nonzero(in_k))
+            need = max(1, int(math.ceil(float(correct_thresh) * n_k - 1e-12)))
+            times_k = np.sort(pub[in_k & hit])
+            if times_k.size >= need and float(times_k.size) / float(n_k) >= float(correct_thresh):
+                when = int(times_k[need - 1])
+                if published is None or when < published:
+                    detect, published = int(k), when
+        latency = None if published is None else float((published + 1) * int(window_ms) - t_first)
         results.append({"target_id": float(tid), "t_first_ms": t_first, "detect_window": detect,
                         "publish_window": published, "latency_ms": latency})
     return results

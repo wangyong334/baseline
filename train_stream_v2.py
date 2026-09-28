@@ -8,6 +8,8 @@
               CUSUM 把上一窗的 g 按各速度假设平移，作为本窗"可预测"的目标强度
     CUSUM     只在评估时运行：把上一窗的强度场按速度假设平移作为本窗预测，得到各管道的逐窗证据；
               延迟 d 窗的逐事件读出 = 网络 log-odds（先验）+ 之后 d 窗沿各速度管道的似然比（TubeReadout）
+    V3-1      默认关闭，--publish on 时只在评估时运行：逐事件自适应发布（读出 pub）——每个事件在出生后 0..D 窗之间
+              按证据是否充分择机发布（model/publish_readout.py，接线在 utils/publish_eval.py）
     V2-2      默认关闭，--attr on 时只在评估时运行：稀疏目标假设库（model/target_hypotheses.py）+ 回溯分布修正读出
               （model/attribution_readout.py），接线在 utils/attribution_eval.py；attr_d{d} = sigmoid(mark + w * Delta)
 模式（--mode）：
@@ -41,22 +43,24 @@ from model.evidence_snn import EvidenceSNN  # noqa: E402
 from model.evspsegnet_stream import calibrate_gains, count_parameters, estimate_operations  # noqa: E402
 from model.lif2d_stream import detach_states  # noqa: E402
 from utils import attribution_eval as attr_eval  # noqa: E402
+from utils import publish_eval  # noqa: E402
 from utils.alarm_metrics import AlarmEvaluator  # noqa: E402
 # V2-2 的接线移到 utils/attribution_eval.py 之后，旧的导入路径（tv2.build_attribution 等）仍然可用
 from utils.attribution_eval import AttributionStats, build_attribution, parse_hyp_overrides  # noqa: E402,F401
 from utils.evidence_loss import intensity_loss, mark_loss  # noqa: E402
 from utils.stream_common import (health_warnings, linear_epoch_lr, load_flat_config, make_chunks,  # noqa: E402
                                  select_subset, subset_due, summarize_history)
-from utils.stream_metrics import (first_detection_latencies_published, rolling_iou, segment_iou,  # noqa: E402
-                                  summarize_latencies, window_confusion)
+from utils.stream_metrics import (first_detection_latencies_by_event, first_detection_latencies_published,  # noqa: E402
+                                  rolling_iou, segment_iou, summarize_latencies, window_confusion)
 from utils.stream_run import (LayerMonitor, file_hashes, peak_memory_gib, seed_everything,  # noqa: E402
                               tau_statistics, train_file_names, write_json)
 
-DESIGN_VERSION = "v2"                 # V2 冻结版：V2-1 基线 + V2-2 开关（默认关闭）
+DESIGN_VERSION = "v3-1"               # V2 冻结版 + V3 阶段 1 发布层开关（默认关闭，关闭时与 V2 逐位相同）
 SOURCE_FILES = ("train_stream_v2.py", "dataset/stream_features.py", "dataset/stream_windows.py",
                 "dataset/ev_uav_stream.py", "model/evidence_neuron.py", "model/evidence_snn.py",
                 "model/target_hypotheses.py", "model/attribution_readout.py",
                 "model/evspsegnet_stream.py", "model/lif2d_stream.py", "utils/evidence_loss.py",
+                "model/publish_readout.py", "utils/publish_eval.py",
                 "utils/alarm_metrics.py", "utils/attribution_eval.py", "utils/stream_common.py",
                 "utils/stream_metrics.py", "utils/stream_run.py", "utils/eval.py")
 PRIMARY = "net"
@@ -130,6 +134,7 @@ def parse_args():
     parser.add_argument("--eval-state-modes", nargs="+", choices=("carry", "reset_each_window"), default=None,
                         help="eval 模式跑哪几种骨干状态（默认取 YAML 的 eval_state_modes，即只跑 carry）")
     attr_eval.add_arguments(parser)                  # V2-2 的评估时开关（--attr、--attr-*、--hyp）
+    publish_eval.add_arguments(parser)               # V3 发布层的评估时开关（--publish、--publish-*）
     parser.add_argument("--readout-delays", type=int, nargs="+", default=None, help="逐事件延迟读出的窗数")
     parser.add_argument("--eval-sequences", type=int, default=0,
                         help="eval 模式只用该划分按文件名排序的前 N 条序列（冒烟用；0 = 全部）。结果不能当正式数字")
@@ -183,6 +188,7 @@ def build_config(args):
     if args.no_alarms:
         cfg["alarm_thetas"] = []
     attr_eval.apply_overrides(cfg, args)
+    publish_eval.apply_overrides(cfg, args)
     drop_inapplicable_bounds(cfg, args)
     validate_config(cfg)
     return cfg
@@ -215,6 +221,7 @@ def validate_config(cfg):
         if cfg["state_mode"] == "reset_each_window":
             raise ValueError("reset_each_window 不携带跨窗膜电位，neuron_u_floor / neuron_u_ceil 对它无效")
     attr_eval.validate_config(cfg)
+    publish_eval.validate_config(cfg)
 
 
 def normalized(value):
@@ -300,12 +307,16 @@ def gradient_group_norms(model):
 
 def readout_names(cfg):
     """全部读出的名称：net（mark 头，零延迟）、fused_d{d}（V2-1：网络先验 + 之后 d 窗的管道证据），
-    V2-2 打开时再加 attr_d{d} / attr_fused_d{d} / attr_<对照>_d{d}（见 utils/attribution_eval.readout_names）。"""
-    return [PRIMARY] + ["fused_d%d" % int(d) for d in cfg["readout_delays"]] + attr_eval.readout_names(cfg)
+    V2-2 打开时再加 attr_d{d} / attr_fused_d{d} / attr_<对照>_d{d}（见 utils/attribution_eval.readout_names），
+    V3 发布层打开时再加 pub（逐事件自适应发布）。"""
+    return ([PRIMARY] + ["fused_d%d" % int(d) for d in cfg["readout_delays"]] + attr_eval.readout_names(cfg)
+            + publish_eval.readout_names(cfg))
 
 
 def readout_delay(name):
-    """读出名里的等待窗数（net 为 0）。"""
+    """读出名里的等待窗数（net 为 0；pub 的等待因事件而异，记为 None）。"""
+    if publish_eval.is_publish_readout(name):
+        return None
     return 0 if name == PRIMARY else int(name.rsplit("_d", 1)[1])
 
 
@@ -315,7 +326,9 @@ def is_variant_readout(name):
 
 
 def publish_field(name):
-    """读出对应的发布窗号字段名。"""
+    """读出对应的发布窗号字段名（pub 为逐事件的发布窗号 publish_pub，其余为每窗的发布窗号）。"""
+    if publish_eval.is_publish_readout(name):
+        return "publish_" + name
     return ("publish_attr_d%d" if name.startswith("attr_") else "publish_d%d") % readout_delay(name)
 
 
@@ -466,7 +479,9 @@ def run_sequence(model, frontend, cusum, seq, cfg, device, state_mode, monitor=N
         extra      {"logit_net": mark 的 logit，"evidence_d{d}": F(d)，"publish_d{d}": 每窗实际发布的窗号 [n_windows]}
                    （序列末尾不足 d 窗时在最后一窗发布，延迟被截断）
                    V2-2 打开时（cfg["attr"]）另有 attr_* 读出与 delta_attr_d{d} / case_attr_d{d} /
-                   publish_attr_d{d} / attr_bank，见 utils/attribution_eval.AttributionRun
+                   publish_attr_d{d} / attr_bank，见 utils/attribution_eval.AttributionRun；
+                   V3 发布层打开时（cfg["publish"]）另有读出 pub 与 z_pub / label_pub / age_pub / reason_pub /
+                   publish_pub（逐事件发布窗号），见 utils/publish_eval.PublishRun
         confusion  [n_windows, 4] net 读出每窗 TP/FP/FN/正事件数
     alarm_eval 不为空时，另外按 alarm_thetas 各维护一份带复位的膜电位，把每窗的位置级告警图交给它（utils/alarm_metrics.py）。
     feature_probe 不为空时，每个片段调用一次 feature_probe(feats, mu0)（诊断用钩子，见 tools/diagnose_membrane.py）。
@@ -492,6 +507,7 @@ def run_sequence(model, frontend, cusum, seq, cfg, device, state_mode, monitor=N
     publish = {d: np.zeros(seq.n_windows, dtype=np.int64) for d in delays}
     window_info = {}                                 # 窗号 -> (原始事件下标, 网络 logit)，延迟读出用
     attr = attr_eval.AttributionRun(cfg, cusum, seq.n_windows, window_info) if (with_cusum and cfg.get("attr")) else None
+    pub = publish_eval.PublishRun(cfg, cusum, window_info) if (with_cusum and publish_eval.enabled(cfg)) else None
     confusion = np.zeros((seq.n_windows, 4), dtype=np.int64)
     states = None
     size = int(cfg["eval_chunk"])
@@ -540,6 +556,8 @@ def run_sequence(model, frontend, cusum, seq, cfg, device, state_mode, monitor=N
                 sl = slice(offset, offset + count)
                 window_info[k] = (part_idx, logits[sl])
                 collect(readout.step(c_state, k, ev["b"][sl], ev["y"][sl], ev["x"][sl], k))
+                if pub is not None:                   # V3：推进待发布事件，登记本窗新事件
+                    pub.step(c_state, k, ev["b"][sl], ev["y"][sl], ev["x"][sl], logits[sl])
                 if attr is not None:                  # V2-2：假设库处理第 k 窗，再读出到期的旧窗事件
                     attr.step(k, ev["y"][sl], ev["x"][sl], logits[sl], log_g[t, 0, 0], mu0[t, 0, 0], c_state["C"])
                 for theta in alarm_C:
@@ -550,6 +568,8 @@ def run_sequence(model, frontend, cusum, seq, cfg, device, state_mode, monitor=N
             offset += count
     if with_cusum:
         collect(readout.flush())
+    if pub is not None:
+        pub.flush()
     if attr is not None:
         attr.flush()
     if alarm_C:
@@ -564,6 +584,10 @@ def run_sequence(model, frontend, cusum, seq, cfg, device, state_mode, monitor=N
         probs.update(attr_probs)
         extra.update(attr_extra)
     extra.update({"publish_d%d" % d: publish[d] for d in delays})
+    if pub is not None:
+        pub_probs, pub_extra = pub.outputs(seq.n_events, threshold)
+        probs.update(pub_probs)
+        extra.update(pub_extra)
     if attr is not None:
         extra.update(attr.publish_fields())
         extra["attr_bank"] = attr.bank_info()
@@ -590,6 +614,8 @@ def evaluate_split(model, frontend, cusum, cfg, device, split, state_mode, names
                                                 correct_thresh=cfg["correct_thresh"]))
                   for name in readouts}
     attr = attr_eval.AttributionStats([int(d) for d in cfg.get("attr_delays") or []]) if (full and cfg.get("attr")) else None
+    pub_stats = publish_eval.PublishStats(publish_eval.build_rule(cfg).deadline) if (
+        full and publish_eval.enabled(cfg)) else None
     monitor = LayerMonitor(model.v_threshold) if (collect_layers or full) else None
     input_stats = {"nonzero": 0, "elements": 0} if full else None
     alarm_eval = None
@@ -610,6 +636,8 @@ def evaluate_split(model, frontend, cusum, cfg, device, split, state_mode, names
             bank_info = extra.pop("attr_bank", None)
             if attr is not None:
                 attr.update(seq.label, extra, bank_info)
+            if pub_stats is not None:
+                pub_stats.update(seq.label, extra)
             confusion_sum += confusion
             total_events += seq.n_events
             for name in readouts:
@@ -647,14 +675,18 @@ def evaluate_split(model, frontend, cusum, cfg, device, split, state_mode, names
         for name in roc_readouts:
             pd, fa = evaluators[name].cal_roc()
             records = []
+            latencies = (first_detection_latencies_by_event if publish_eval.is_publish_readout(name)
+                         else first_detection_latencies_published)
             for t, label, target_id, probs, publish in kept:
-                records += first_detection_latencies_published(t, label, target_id, probs[name], cfg["window_ms"],
-                                                               cfg["threshold"], cfg["correct_thresh"], publish[name])
+                records += latencies(t, label, target_id, probs[name], cfg["window_ms"], cfg["threshold"],
+                                     cfg["correct_thresh"], publish[name])
             result["readouts"][name].update({"pd": float(pd), "fa": float(fa), "latency": summarize_latencies(records)})
         if alarm_eval is not None:
             result["alarms"] = alarm_eval.summary()
         if attr is not None:
             result["attribution"] = attr.summary()
+        if pub_stats is not None:
+            result["publish"] = pub_stats.summary(cfg["window_ms"])
         tp, fp, fn, npos = (confusion_sum[:, j] for j in range(4))
         rates = {name: s["firing_rate"] for name, s in result["layers"].items()}
         density = float(input_stats["nonzero"]) / float(max(input_stats["elements"], 1))
@@ -920,7 +952,7 @@ def mode_eval(args, cfg):
                 "readout_delays", "eval_chunk", "fusion_weight", "alarm_thetas", "alarm_radius",
                 "cusum_axis_velocities", "cusum_footprint", "cusum_compensator", "cusum_nb_kappa",
                 "cusum_aggregate", "cusum_track_tau_ms", "cusum_memory_gain", "cusum_gate_eps", "cusum_reset_radius",
-                "activity_eps") + attr_eval.EVAL_KEYS:
+                "activity_eps") + attr_eval.EVAL_KEYS + publish_eval.EVAL_KEYS:
         if key in cfg:
             train_cfg[key] = cfg[key]
     train_cfg.setdefault("readout_delays", [1, 2, 5])
@@ -940,6 +972,7 @@ def mode_eval(args, cfg):
                          "memory_gain": cusum.memory_gain, "gate_eps": cusum.gate_eps,
                          "reset_radius": cusum.reset_radius, "alarm_thetas": train_cfg.get("alarm_thetas")},
                "attr": {key: train_cfg.get(key) for key in attr_eval.EVAL_KEYS},
+               "publish_cfg": publish_eval.describe(train_cfg),
                "parameters": count_parameters(model), "trained_state_mode": train_cfg["state_mode"],
                "neuron": train_cfg["neuron"], "readout_delays": train_cfg["readout_delays"],
                "neuron_u_floor": train_cfg.get("neuron_u_floor"), "neuron_u_ceil": train_cfg.get("neuron_u_ceil"),
@@ -976,6 +1009,9 @@ def mode_eval(args, cfg):
             "%s %s→%.4f" % (name, th, v[0]) for name, (th, v) in best.items())), flush=True)
         if "attribution" in r:
             for line in attr_eval.report_lines(r["attribution"], mode):
+                print(line, flush=True)
+        if "publish" in r:
+            for line in publish_eval.report_lines(r["publish"], mode):
                 print(line, flush=True)
         print("[%s] 分段 IoU (net) %s" % (mode, {k: round(v, 4) for k, v in r["segment_iou"].items()}), flush=True)
         for theta, a in r.get("alarms", {}).items():

@@ -176,6 +176,35 @@ EV-UAV 上的结论（s37）：审计修复后 attr_fused_d2 在 val 选定阈�
 相关离线工具：`tools/error_breakdown.py`（错误分类、逐序列、目标漏检画像）、`tools/persistence_gate.py`（持续性门控，负结果）、
 `tools/audit_v22_readout.py`（V2-2 审计探针）。
 
+## V3 阶段 1：等待安全的逐事件发布（09-28，默认关闭 `publish: false`）
+
+**问题**：固定延迟发布（net 当窗发布、fused_d 一律等 d 窗）对所有事件用同一个延迟；同虚警率下固定等 5 窗反而崩溃，
+机理是"目标存在"的证据被分给了目标周边、目标前方的非目标事件（等待新增虚警约 96% 与目标相关）。
+**做法**：处理节拍不变（每 50 ms 一窗，发布不回写任何共享状态）；每个事件的标签在出生后 0..D 窗之间择机发布，发布即最终。
+证据分数 z(d) = mark + w·F(d)（F 与 V2 延迟读出逐位相同，F(0) = 0）；年龄 d < D 时 z >= θ + a·s(d) 发布目标、
+z <= θ − b·s(d) 发布背景、否则等；d = D 时按 θ 强制发布；s(d) = 1 − d/D（linear）或 1（step）。可选归属门控：
+mark < g 的事件只能被未来证据减分。任何发布都满足 标签 = 1[z_pub >= θ]。规则与在线发布层：`model/publish_readout.py`；
+入口接线：`utils/publish_eval.py`；离线回放与曲线：`tools/publish_replay.py`（与在线同一决策函数）。
+
+| 开关 | 默认 | 作用 |
+|---|---|---|
+| `--publish on\|off` | off | 打开发布层，新增读出 `pub`（其余读出逐位不变） |
+| `--publish-deadline` | 5 | 最长等待 D（窗） |
+| `--publish-theta` | logit(threshold) | 最终阈值 θ（logit）；按虚警率选定时用 `tools/publish_replay.py` 在 val 上求 |
+| `--publish-upper` / `--publish-lower` | 1.0 / 2.0 | 提前发布目标 / 背景所需的裕量 a / b（nat） |
+| `--publish-collapse` | linear | 边界随年龄线性收拢；step 为消融 |
+| `--publish-gate` | none | 归属门槛（logit） |
+
+`pub` 的概率 = σ(z − θ + logit(threshold)) 并夹到发布标签一侧，所以原 `utils/eval.py` 的 IoU/ACC/Pd/Fa 就是发布标签的指标；
+首次检出延迟按逐事件的实际发布窗计（`first_detection_latencies_by_event`，后出生的事件可能先发布）。
+评估结果另有 `publish`：目标事件（与全部事件）的发布年龄分布、发布原因（upper / lower / deadline / eos）、提前发布的对错。
+导出里另有 `z_pub / label_pub / age_pub / reason_pub`。
+
+回放用法（评估时 `--readout-delays 1 2 3 4 5 --dump-dir ...` 导出 val 与 test）：
+`python tools/publish_replay.py --val <val 导出> --test <test 导出> --deadline 5 --out <json> [--check-json <在线评估 json>]`。
+它在 val 上按同虚警率选 θ 与配置，test 上报告部署口径（θ 取 val 的值）与同虚警率口径，前沿用固定延迟与相邻固定延迟的
+**实际随机混合**（不做线性插值），另报等待安全曲线 Fa(d)/Fa(0) 与首次检出延迟；给出在线评估 JSON 时逐事件比对在线与回放。
+
 ## 代码组织（09-26 V3 开发前整理，数值不变）
 
 - `train_stream_v2.py`：配置、构造、训练、评估的编排；不再导入 V1 的训练脚本。
