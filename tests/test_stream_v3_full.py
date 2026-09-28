@@ -1,13 +1,12 @@
-"""V3 完整方案（等待安全的逐事件发布）中阶段 1 之外部分的测试：事件证据缓存（锚定证据链）与归属训练（边界负样本项）。
-全部在 CPU 上运行。
+"""V3（等待安全的逐事件发布）中阶段 1 之外部分的测试：事件证据缓存（锚定证据链）与 V3 配置。全部在 CPU 上运行。
 
-守住五件事：
+V3 只在推理期起作用（09-28 深度分析后撤掉了归属训练：它只是给已有标签重新加权，不带新信息，同虚警率下只会打平或变差），
+所以训练与 V2 逐位相同。守住四件事：
     1. 锚定证据链：链连着时证据全额计入、断开后只计负证据；TubeReadout(anchor=True) 与暴力逐步计算一致；
        anchor=False 时 TubeReadout 与原实现一致（其余测试守着）；"目标后来路过"时 V2 证据加分而锚定证据不加
     2. 在线发布层打开锚定时与离线回放逐事件相同（回放用锚定延迟读出的 F(d)）
-    3. 边界负样本项：数值 = 目标附近背景事件的平均 BCE × 目标事件数；只有这些事件有梯度；near_target_field 与定义一致
-    4. 训练：权重 0 时参数更新与 V2 逐位相同；权重 > 0 时照常训练且该项非零
-    5. 配置：命令行进入配置；V3 配置文件与 V2 只差标了 [V3] 的几项；eval 时给出与 checkpoint 不同的边界权重会报错
+    3. 训练：打开 V3 的评估时开关，参数更新与 V2 逐位相同
+    4. 配置：命令行进入配置；V3 配置文件与 V2 只差标了 [V3] 的三项评估时开关
 """
 import math
 import os
@@ -17,11 +16,9 @@ from unittest import mock
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from model.evidence_neuron import DriftCUSUM, TubeReadout, anchored_accumulate, velocity_grid
 from model.publish_readout import PublishRule, PublishUnits
-from utils.evidence_loss import boundary_mark_loss, near_target_field
 
 try:
     from tests import test_stream_v2_evidence as ev
@@ -152,29 +149,6 @@ class AnchoredChainTests(unittest.TestCase):
         self.assertEqual(float(s[0, 0, 0, 0]), 0.0)
 
 
-class BoundaryLossTests(unittest.TestCase):
-    def test_near_target_field(self):
-        tc = torch.zeros(2, 1, 1, 9, 9)
-        tc[0, 0, 0, 4, 4] = 1.0
-        near = near_target_field(tc, 2)
-        self.assertEqual(int(near[0].sum()), 25)
-        self.assertEqual(int(near[1].sum()), 0)
-        self.assertTrue(torch.equal(near_target_field(tc, 0), (tc > 0).float()))
-
-    def test_value_and_gradient(self):
-        logits = torch.tensor([2.0, -1.0, 0.5, 1.5, -2.0], requires_grad=True)
-        labels = torch.tensor([1.0, 0.0, 0.0, 1.0, 0.0])
-        near = torch.tensor([True, True, False, True, True])
-        loss = boundary_mark_loss(logits, labels, near)
-        sel = torch.tensor([1, 4])
-        want = F.binary_cross_entropy_with_logits(logits.detach()[sel], labels[sel], reduction="mean") * 2
-        self.assertAlmostEqual(float(loss), float(want), places=6)
-        loss.backward()
-        self.assertEqual([i for i in range(5) if float(logits.grad[i]) != 0.0], [1, 4])
-        self.assertIsNone(boundary_mark_loss(logits.detach(), torch.zeros(5), near))           # 没有目标事件
-        self.assertIsNone(boundary_mark_loss(logits.detach(), labels, torch.zeros(5, dtype=torch.bool)))
-
-
 class TrainingTests(unittest.TestCase):
     def run_once(self, **kw):
         from train_stream_v2 import train_sequence
@@ -186,16 +160,14 @@ class TrainingTests(unittest.TestCase):
                              np.random.RandomState(0))
         return out, [p.detach().clone() for p in model.parameters()]
 
-    def test_zero_weight_is_v2_and_positive_weight_trains(self):
+    def test_v3_switches_do_not_touch_training(self):
         base, p0 = self.run_once()
-        zero, p1 = self.run_once(loss_mark_boundary_weight=0.0, loss_mark_boundary_radius=5)
+        v3, p1 = self.run_once(publish=True, publish_anchor=True, publish_deadline=5)
         self.assertTrue(all(torch.equal(a, b) for a, b in zip(p0, p1)))
-        self.assertEqual((base["loss_sum"], zero["boundary_sum"]), (zero["loss_sum"], 0.0))
-        on, p2 = self.run_once(loss_mark_boundary_weight=1.0, loss_mark_boundary_radius=5)
-        self.assertGreater(on["boundary_sum"], 0.0)
-        self.assertEqual(on["missing_grads"], [])
-        self.assertTrue(math.isfinite(on["loss_sum"]))
-        self.assertFalse(all(torch.equal(a, b) for a, b in zip(p0, p2)))
+        self.assertEqual(base["loss_sum"], v3["loss_sum"])
+        self.assertEqual(set(v3), {"loss_sum", "mark_sum", "intensity_sum", "events", "grad_norms", "missing_grads"})
+        self.assertEqual(v3["missing_grads"], [])
+        self.assertTrue(math.isfinite(v3["loss_sum"]))
 
 
 class ConfigTests(unittest.TestCase):
@@ -207,26 +179,14 @@ class ConfigTests(unittest.TestCase):
 
     def test_flags_and_v3_config(self):
         from utils import publish_eval
-        cfg = self.parse(CONFIG_V2, "--loss-mark-boundary-weight", "0.5", "--loss-mark-boundary-radius", "3",
-                         "--publish", "on", "--publish-anchor", "on")
-        self.assertEqual((cfg["loss_mark_boundary_weight"], cfg["loss_mark_boundary_radius"]), (0.5, 3))
+        cfg = self.parse(CONFIG_V2, "--publish", "on", "--publish-anchor", "on")
         self.assertTrue(publish_eval.describe(cfg)["anchor"])
         v2, v3 = self.parse(CONFIG_V2), self.parse(CONFIG_V3)
         diff = sorted(k for k in set(v2) | set(v3) if v2.get(k) != v3.get(k))
-        self.assertEqual(diff, ["loss_mark_boundary_weight", "publish", "publish_anchor", "readout_delays", "save_root"])
-        self.assertEqual((v3["loss_mark_boundary_weight"], v3["publish"], v3["publish_anchor"]), (1.0, True, True))
-        self.assertFalse(v2["publish"] or v2["publish_anchor"] or v2["loss_mark_boundary_weight"])
-        with self.assertRaises(ValueError):
-            self.parse(CONFIG_V2, "--loss-mark-boundary-weight", "-1")
-
-    def test_eval_rejects_boundary_weight_that_needs_retraining(self):
-        import train_stream_v2 as tv2
-        argv = ["train_stream_v2.py", "--config", CONFIG_V2, "--mode", "eval", "--loss-mark-boundary-weight", "1"]
-        with mock.patch.object(sys, "argv", argv):
-            args = tv2.parse_args()
-        cfg = tv2.build_config(args)
-        self.assertTrue(tv2.eval_conflicts(args, cfg, dict(cfg, loss_mark_boundary_weight=0.0)))
-        self.assertFalse(tv2.eval_conflicts(args, cfg, dict(cfg)))
+        self.assertEqual(diff, ["publish", "publish_anchor", "readout_delays"])
+        self.assertTrue(v3["publish"] and v3["publish_anchor"])
+        self.assertFalse(v2["publish"] or v2["publish_anchor"])
+        self.assertFalse(any(k.startswith("loss_mark_boundary") for k in list(v2) + list(v3)))
 
 
 class RunSequenceAnchorTests(unittest.TestCase):

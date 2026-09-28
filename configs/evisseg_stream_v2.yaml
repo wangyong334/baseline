@@ -80,8 +80,6 @@ TRAIN:
   loss_mark_weight: 1.0                # 逐事件 BCE（无 pos_weight）
   loss_intensity_weight: 1.0           # 当前窗目标强度场的泊松负对数似然
   loss_intensity_smooth: 3             # 目标计数先在 3x3 邻域内平均成强度场
-  loss_mark_boundary_weight: 0.0       # V3 归属训练：目标附近背景事件的边界负样本项（0 = V2；V3 配置里为 1）
-  loss_mark_boundary_radius: 5         # "目标附近" = 同窗离目标事件 <= 5 像素（下一窗目标位置的误差范围）
   train_subset_size: 24
   train_subset_every: 5
   num_workers: 2

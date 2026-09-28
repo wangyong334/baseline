@@ -1,6 +1,7 @@
-# 流式 SNN V3 完整方案：等待安全的逐事件发布（Wait-Safe Evidence Publishing）
-# = V2 冻结配置 + 持续感知网络的归属训练（边界负样本项）+ 事件证据缓存（锚定证据链）+ 双边界发布单元。
-# 与 configs/evisseg_stream_v2.yaml 只差下面标了 [V3] 的几项；说明见 README_STREAM_V2.md 的 V3 一节。
+# 流式 SNN V3：等待安全的逐事件发布（Wait-Safe Evidence Publishing）
+# = V2 冻结配置 + 事件证据缓存（锚定证据链）+ 双边界发布单元。V3 只在推理期起作用，不重新训练：
+# 训练、网络、权重都与 V2 相同，评估时用 --checkpoint 指向 V2 的权重即可。
+# 与 configs/evisseg_stream_v2.yaml 只差下面标了 [V3] 的三项（都是评估时开关）；说明见 README_STREAM_V2.md 的 V3 一节。
 DATA:
   root: /media/stephen/nvme0n1/wy_data/datasets/EV-UAV-dataset
   window_ms: 50
@@ -80,14 +81,12 @@ TRAIN:
   loss_mark_weight: 1.0                # 逐事件 BCE（无 pos_weight）
   loss_intensity_weight: 1.0           # 当前窗目标强度场的泊松负对数似然
   loss_intensity_smooth: 3             # 目标计数先在 3x3 邻域内平均成强度场
-  loss_mark_boundary_weight: 1.0       # [V3] 归属训练：目标附近背景事件的边界负样本项（与正样本等总权重）
-  loss_mark_boundary_radius: 5         # "目标附近" = 同窗离目标事件 <= 5 像素（下一窗目标位置的误差范围）
   train_subset_size: 24
   train_subset_every: 5
   num_workers: 2
   eval_chunk: 32
   deterministic: true
-  save_root: log/stream_v3_seed37      # [V3]
+  save_root: log/stream_v2_seed37      # 与 V2 相同（V3 不训练，没有自己的权重目录）
 
 ATTR:                                  # V2-2 回溯分布修正（评估时运行，无可学习参数；设计页第 7-8 节）
   attr: false                          # 09-26 s37 实测无收益且评估慢 4 倍，默认关闭；要评估时 --attr on
@@ -102,7 +101,7 @@ ATTR:                                  # V2-2 回溯分布修正（评估时运�
   hyp_update: separate                 # separate / generic / confident
   hyp_params: {}                       # 覆盖假设库参数，例如 {lag: 3, confirm_theta: 5}
 
-PUBLISH:                               # V3 阶段 1：逐事件自适应发布（评估时开关，不训练；model/publish_readout.py）
+PUBLISH:                               # V3：逐事件自适应发布（评估时开关，不训练；model/publish_readout.py）
   publish: true                        # [V3] 逐事件自适应发布（读出 pub）
   publish_deadline: 5                  # 最长等待 D（窗）
   publish_theta: null                  # 最终阈值 θ（logit）；null = logit(threshold)。按虚警率选定用 tools/publish_replay.py
