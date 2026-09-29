@@ -15,6 +15,10 @@
     3 等待安全曲线：固定边界 logit(threshold) 下，Fa(d) / Fa(0)，两种证据各一条
     4 首次检出延迟：按逐事件发布时刻（utils/stream_metrics.first_detection_latencies_by_event）
     5 一致性（可选）：导出里有在线运行的 label_pub / age_pub 时，与同参数的回放逐事件比对（--check-json 给出该次评估的结果 JSON）
+    6 V3.1 对称出生判定（可选，--birth-lambda）：导出里有 existence_birth（出生窗的存在统计 M，需新代码导出）时，
+      每个 λ 一个配置：年龄 0 发布目标还要 M >= λ、发布背景还要 M < λ，不一致就等（model/publish_readout 式 (5)）。
+      给了数值 λ 时只在这些配置里选（val 上选，原 V3 = none 作为参照行照样列出）；--report-test-all 另把每个配置在 test 上
+      的同虚警率结果都列出来，只看敏感性，不参与选择。
 Pd / Fa 与原仓库 utils/eval.py 口径逐位相同（向量化实现；tests/test_stream_v3_publish.py 对照）。
 
 用法（服务器，先导出 val 与 test）：
@@ -53,6 +57,9 @@ def parse_args():
     p.add_argument("--upper", type=float, nargs="+", default=[0.5, 1.0, 2.0])
     p.add_argument("--lower", type=float, nargs="+", default=[1.0, 2.0, 4.0])
     p.add_argument("--gate", nargs="+", default=["none"], help="归属门槛（logit）列表，none = 不门控")
+    p.add_argument("--birth-lambda", nargs="+", default=["none"],
+                   help="V3.1 出生判定的存在门槛 λ（nat）列表；none = V3 原规则。给了数值时只在这些配置里选")
+    p.add_argument("--report-test-all", action="store_true", help="把每个配置在 test 上的同虚警率结果都列出来（只看敏感性）")
     p.add_argument("--weight", type=float, default=1.0, help="融合权重 w（与评估时的 fusion_weight 相同）")
     p.add_argument("--threshold", type=float, default=0.9)
     p.add_argument("--window-ms", type=int, default=50)
@@ -82,7 +89,7 @@ class EventSet(object):
         kinds = ["plain"] + [k for k in getattr(args, "evidence", ["plain"]) if k != "plain"]
         cols = {k: [] for k in ("label", "logit", "prob", "k", "t", "tid", "avail", "seq")}
         F = {kind: [[] for _ in range(D + 1)] for kind in kinds}
-        online = {k: [] for k in ("label_pub", "age_pub", "reason_pub")}
+        online = {k: [] for k in ("label_pub", "age_pub", "reason_pub", "existence_birth")}
         fid_all, pix_all, valid_all = [], [], []
         frame_base, frames = 0, 0
         self.seq_slices = []
@@ -131,6 +138,8 @@ class EventSet(object):
         self.F = {kind: np.stack([np.concatenate(v) if len(v) == len(files) else np.zeros(n) for v in rows])
                   for kind, rows in F.items() if all(len(v) == len(files) for v in rows)}   # {种类: [D+1, N]}
         self.online = {key: np.concatenate(v) if all(a is not None for a in v) else None for key, v in online.items()}
+        exist = self.online.pop("existence_birth")
+        self.exist = None if exist is None else exist.astype(np.float64)       # 出生窗的存在统计 M（V3.1 回放用）
         self.n_seqs, self.frames, self.D = len(files), frames, D
         valid = np.concatenate(valid_all)
         fid, pix = np.concatenate(fid_all), np.concatenate(pix_all)
@@ -213,11 +222,18 @@ def mixed_policy(es, d_lo, d_hi, q, weight, seed=0):
 
 
 def publish_policy(es, spec, weight):
-    kind, D, collapse, a, b, gate = spec
+    """spec = (证据种类, D, 收拢, a, b, 归属门槛, λ)；λ 为 None 时是 V3 原规则，否则按式 (5) 做对称出生判定。"""
+    kind, D, collapse, a, b, gate, lam = spec
+    birth = None
+    if lam is not None:
+        if es.exist is None:
+            raise SystemExit("导出里没有 existence_birth：需要用新代码（带 --dump-dir）重新导出才能回放 V3.1")
+        present = es.exist >= float(lam)
+        birth = (present, ~present)
 
     def run(theta):
         rule = PublishRule(theta, a, b, D, collapse, gate, weight)
-        label, age, _, _ = rule.replay(z_by_age(es, rule, kind), es.avail)
+        label, age, _, _ = rule.replay(z_by_age(es, rule, kind), es.avail, birth)
         return label, age.astype(np.float64)
     return run
 
@@ -254,7 +270,9 @@ def line(tag, m, pts=None):
 
 
 def spec_key(spec):
-    return "%s_D%d_%s_a%g_b%g_g%s" % spec
+    """配置名；λ 为 None（V3 原规则）时与旧版名字相同，否则加 _e{λ}。"""
+    key = "%s_D%d_%s_a%g_b%g_g%s" % spec[:6]
+    return key if spec[6] is None else key + "_e%g" % spec[6]
 
 
 def main():
@@ -265,7 +283,9 @@ def main():
     report = {"args": vars(args), "evidence": kinds}
     thr_logit = math.log(args.threshold / (1.0 - args.threshold))
     gates = [None if str(g).lower() in ("none", "null") else float(g) for g in args.gate]
-    specs = list(itertools.product(kinds, [args.deadline], args.collapse, args.upper, args.lower, gates))
+    lams = [None if str(v).lower() in ("none", "null") else float(v) for v in args.birth_lambda]
+    specs = list(itertools.product(kinds, [args.deadline], args.collapse, args.upper, args.lower, gates, lams))
+    candidates = [s for s in specs if s[6] is not None] or specs      # 给了 λ 时只在 V3.1 配置里选，V3 作参照
     targets = {name: es.fa(es.prob >= np.float32(args.threshold)) for name, es in sets.items()}
     if args.target_fa is not None:                  # 跨权重比较：两边对齐到同一个虚警率
         targets = {"val": float(args.target_fa[0]), "test": float(args.target_fa[1])}
@@ -289,13 +309,16 @@ def main():
         m["margin_iou"] = m["iou"] - front_at(pts_val, m["delay_target_ms"], "iou")
         rows[spec_key(spec)] = m
         print(line(spec_key(spec), m, pts_val), flush=True)
-        if best is None or m["margin_iou"] > rows[spec_key(best)]["margin_iou"]:
+        if spec in candidates and (best is None or m["margin_iou"] > rows[spec_key(best)]["margin_iou"]):
             best = spec
-    print("  val 选出：%s（θ = %.4f，超出前沿 IoU %+.4f）" % (spec_key(best), rows[spec_key(best)]["theta"],
-                                                        rows[spec_key(best)]["margin_iou"]))
+    print("  val 选出：%s（θ = %.4f，超出前沿 IoU %+.4f）%s" % (
+        spec_key(best), rows[spec_key(best)]["theta"], rows[spec_key(best)]["margin_iou"],
+        "（只在 V3.1 的 λ 配置里选；不带 _e 的是 V3 原规则，作参照）" if len(candidates) < len(specs) else ""))
     for kind in kinds:                     # 每种证据各自最好的配置，便于对比锚定的作用
-        own = max((s for s in specs if s[0] == kind), key=lambda s: rows[spec_key(s)]["margin_iou"])
-        print("  %s 最好：%s（超出前沿 IoU %+.4f）" % (NAMES[kind], spec_key(own), rows[spec_key(own)]["margin_iou"]))
+        own = [s for s in candidates if s[0] == kind]
+        if own:
+            own = max(own, key=lambda s: rows[spec_key(s)]["margin_iou"])
+            print("  %s 最好：%s（超出前沿 IoU %+.4f）" % (NAMES[kind], spec_key(own), rows[spec_key(own)]["margin_iou"]))
     report["val"] = {"target_fa": targets["val"], "frontier": pts_val, "rows": rows, "chosen": spec_key(best)}
 
     # 2 test：部署口径与同虚警率口径
@@ -323,6 +346,15 @@ def main():
         equal["delay_target_ms"], best_fixed["delay_target_ms"]))
     report["test"] = {"target_fa": targets["test"], "frontier": pts_test, "equal_fa": equal, "deploy": deploy,
                       "best_fixed": best_fixed, "anchored_fixed": anchored_fixed}
+    if args.report_test_all:               # 只看敏感性：每个配置在 test 上各自二分到同虚警率，不参与选择
+        print("  -- 各配置在 test 上的同虚警率结果（只看敏感性，不参与选择）")
+        report["test"]["all_specs"] = {}
+        for spec in specs:
+            pol_s = publish_policy(et, spec, args.weight)
+            th = bisect(et, pol_s, targets["test"])
+            m = dict(et.metrics(*pol_s(th), args), theta=th)
+            report["test"]["all_specs"][spec_key(spec)] = m
+            print(line(spec_key(spec), m, pts_test), flush=True)
 
     # 3 等待安全曲线
     print("\n== 等待安全：固定边界 logit(%.2f) 下 Fa(d) / Fa(0)" % args.threshold)
