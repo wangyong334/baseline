@@ -19,6 +19,10 @@
       每个 λ 一个配置：年龄 0 发布目标还要 M >= λ、发布背景还要 M < λ，不一致就等（model/publish_readout 式 (5)）。
       给了数值 λ 时只在这些配置里选（val 上选，原 V3 = none 作为参照行照样列出）；--report-test-all 另把每个配置在 test 上
       的同虚警率结果都列出来，只看敏感性，不参与选择。
+      单侧消融（--birth-side）：background = 只要求"出生判背景时此处没有目标活动"，target = 只要求"出生判目标时此处有
+      目标活动"（镜像那一半），both = 对称（默认）。单侧配置只作参照，有对称配置时只在对称配置里选。
+      选择规则（--select-fd-tol）：不给 = 超出前沿的 IoU 最大；给 tol = 先留下 IoU 余量与最好的差 <= tol 的配置，
+      再选首次检出延迟中位最小的（并列看平均）。
 Pd / Fa 与原仓库 utils/eval.py 口径逐位相同（向量化实现；tests/test_stream_v3_publish.py 对照）。
 
 用法（服务器，先导出 val 与 test）：
@@ -44,6 +48,7 @@ from utils.stream_metrics import first_detection_latencies_by_event, summarize_l
 H, W = 260, 346
 FIELDS = {"plain": "evidence_d%d", "anchor": "evidence_anchor_d%d"}
 NAMES = {"plain": "V2 延迟证据", "anchor": "锚定证据链"}
+SIDES = {"both": "", "background": "_bgonly", "target": "_tgonly"}      # 出生判定的一侧 -> 配置名后缀
 
 
 def parse_args():
@@ -59,6 +64,10 @@ def parse_args():
     p.add_argument("--gate", nargs="+", default=["none"], help="归属门槛（logit）列表，none = 不门控")
     p.add_argument("--birth-lambda", nargs="+", default=["none"],
                    help="V3.1 出生判定的存在门槛 λ（nat）列表；none = V3 原规则。给了数值时只在这些配置里选")
+    p.add_argument("--birth-side", nargs="+", choices=tuple(SIDES), default=["both"],
+                   help="出生判定管哪一侧：both = 对称；background / target = 单侧消融（只作参照，不参与选择）")
+    p.add_argument("--select-fd-tol", type=float, default=None,
+                   help="给值时：val 上 IoU 余量与最好的差 <= 该值的配置里选首次检出延迟最快的；不给 = 只按 IoU 余量选")
     p.add_argument("--report-test-all", action="store_true", help="把每个配置在 test 上的同虚警率结果都列出来（只看敏感性）")
     p.add_argument("--weight", type=float, default=1.0, help="融合权重 w（与评估时的 fusion_weight 相同）")
     p.add_argument("--threshold", type=float, default=0.9)
@@ -221,15 +230,22 @@ def mixed_policy(es, d_lo, d_hi, q, weight, seed=0):
     return lambda theta: (z >= theta, delay)
 
 
+def birth_side(spec):
+    """出生判定的一侧；7 元组（旧写法）与 None 都按对称处理。"""
+    return spec[7] if len(spec) > 7 and spec[7] is not None else "both"
+
+
 def publish_policy(es, spec, weight):
-    """spec = (证据种类, D, 收拢, a, b, 归属门槛, λ)；λ 为 None 时是 V3 原规则，否则按式 (5) 做对称出生判定。"""
-    kind, D, collapse, a, b, gate, lam = spec
+    """spec = (证据种类, D, 收拢, a, b, 归属门槛, λ[, 一侧])；λ 为 None 时是 V3 原规则，否则按式 (5) 做出生判定。
+    一侧：both = 对称；background = 只有出生判背景要求此处没有目标活动；target = 只有出生判目标要求此处有目标活动。"""
+    kind, D, collapse, a, b, gate, lam = spec[:7]
     birth = None
     if lam is not None:
         if es.exist is None:
             raise SystemExit("导出里没有 existence_birth：需要用新代码（带 --dump-dir）重新导出才能回放 V3.1")
         present = es.exist >= float(lam)
-        birth = (present, ~present)
+        free = np.ones_like(present)
+        birth = {"both": (present, ~present), "background": (free, ~present), "target": (present, free)}[birth_side(spec)]
 
     def run(theta):
         rule = PublishRule(theta, a, b, D, collapse, gate, weight)
@@ -270,9 +286,24 @@ def line(tag, m, pts=None):
 
 
 def spec_key(spec):
-    """配置名；λ 为 None（V3 原规则）时与旧版名字相同，否则加 _e{λ}。"""
+    """配置名；λ 为 None（V3 原规则）时与旧版名字相同，否则加 _e{λ}；单侧出生判定再加 _bgonly / _tgonly。"""
     key = "%s_D%d_%s_a%g_b%g_g%s" % spec[:6]
-    return key if spec[6] is None else key + "_e%g" % spec[6]
+    return key if spec[6] is None else key + "_e%g" % spec[6] + SIDES[birth_side(spec)]
+
+
+def select_spec(candidates, rows, fd_tol=None):
+    """val 上选配置，返回 (选中的配置, 进入第二步的配置)。fd_tol 为 None：超出可实现前沿的 IoU 最大（原规则，并列取靠前的）；
+    否则先留下 IoU 余量与最好的差 <= fd_tol 的配置，再选首次检出延迟中位最小的，并列看平均，再并列看 IoU 余量。"""
+    margin = [rows[spec_key(s)]["margin_iou"] for s in candidates]
+    if fd_tol is None:
+        return candidates[int(np.argmax(margin))], list(candidates)
+    near = [s for s, m in zip(candidates, margin) if m >= max(margin) - float(fd_tol)]
+
+    def speed(s):
+        m = rows[spec_key(s)]
+        return tuple(float("inf") if m[k] is None else m[k]
+                     for k in ("first_detection_median_ms", "first_detection_mean_ms")) + (-m["margin_iou"],)
+    return min(near, key=speed), near
 
 
 def main():
@@ -283,9 +314,14 @@ def main():
     report = {"args": vars(args), "evidence": kinds}
     thr_logit = math.log(args.threshold / (1.0 - args.threshold))
     gates = [None if str(g).lower() in ("none", "null") else float(g) for g in args.gate]
-    lams = [None if str(v).lower() in ("none", "null") else float(v) for v in args.birth_lambda]
-    specs = list(itertools.product(kinds, [args.deadline], args.collapse, args.upper, args.lower, gates, lams))
-    candidates = [s for s in specs if s[6] is not None] or specs      # 给了 λ 时只在 V3.1 配置里选，V3 作参照
+    births = []                            # (λ, 一侧)；V3 原规则没有一侧之分，只出一行
+    for v in args.birth_lambda:
+        births += [(None, None)] if str(v).lower() in ("none", "null") else [(float(v), s) for s in args.birth_side]
+    specs = [base + birth for base in itertools.product(kinds, [args.deadline], args.collapse, args.upper, args.lower,
+                                                        gates) for birth in births]
+    lam_specs = [s for s in specs if s[6] is not None]
+    # 给了 λ 时只在 V3.1 配置里选、有对称配置时只在对称配置里选；V3 原规则与单侧消融都只作参照
+    candidates = [s for s in lam_specs if s[7] == "both"] or lam_specs or specs
     targets = {name: es.fa(es.prob >= np.float32(args.threshold)) for name, es in sets.items()}
     if args.target_fa is not None:                  # 跨权重比较：两边对齐到同一个虚警率
         targets = {"val": float(args.target_fa[0]), "test": float(args.target_fa[1])}
@@ -301,7 +337,7 @@ def main():
     for p in pts_val:
         if "/" not in p["name"]:
             print(line("固定 " + p["name"], p))
-    rows, best = {}, None
+    rows = {}
     for spec in specs:
         pol = publish_policy(ev, spec, args.weight)
         theta = bisect(ev, pol, targets["val"])
@@ -309,17 +345,24 @@ def main():
         m["margin_iou"] = m["iou"] - front_at(pts_val, m["delay_target_ms"], "iou")
         rows[spec_key(spec)] = m
         print(line(spec_key(spec), m, pts_val), flush=True)
-        if spec in candidates and (best is None or m["margin_iou"] > rows[spec_key(best)]["margin_iou"]):
-            best = spec
-    print("  val 选出：%s（θ = %.4f，超出前沿 IoU %+.4f）%s" % (
+    best, near = select_spec(candidates, rows, args.select_fd_tol)
+    if args.select_fd_tol is not None:
+        print("  选择规则：IoU 余量与最好的差 <= %g 的 %d 个配置（%s）里选首次检出延迟最快的" % (
+            args.select_fd_tol, len(near), "、".join(spec_key(s) for s in near)))
+    print("  val 选出：%s（θ = %.4f，超出前沿 IoU %+.4f，首次检出延迟中位 %s ms）%s" % (
         spec_key(best), rows[spec_key(best)]["theta"], rows[spec_key(best)]["margin_iou"],
-        "（只在 V3.1 的 λ 配置里选；不带 _e 的是 V3 原规则，作参照）" if len(candidates) < len(specs) else ""))
+        rows[spec_key(best)]["first_detection_median_ms"],
+        "（只在 V3.1 的对称 λ 配置里选；不带 _e 的是 V3 原规则，_bgonly / _tgonly 是单侧消融，都只作参照）"
+        if len(candidates) < len(specs) else ""))
     for kind in kinds:                     # 每种证据各自最好的配置，便于对比锚定的作用
         own = [s for s in candidates if s[0] == kind]
         if own:
             own = max(own, key=lambda s: rows[spec_key(s)]["margin_iou"])
             print("  %s 最好：%s（超出前沿 IoU %+.4f）" % (NAMES[kind], spec_key(own), rows[spec_key(own)]["margin_iou"]))
-    report["val"] = {"target_fa": targets["val"], "frontier": pts_val, "rows": rows, "chosen": spec_key(best)}
+    report["val"] = {"target_fa": targets["val"], "frontier": pts_val, "rows": rows, "chosen": spec_key(best),
+                     "select": {"rule": "iou" if args.select_fd_tol is None else "iou_then_first_detection",
+                                "fd_tol": args.select_fd_tol, "candidates": [spec_key(s) for s in candidates],
+                                "near": [spec_key(s) for s in near]}}
 
     # 2 test：部署口径与同虚警率口径
     et = sets["test"]

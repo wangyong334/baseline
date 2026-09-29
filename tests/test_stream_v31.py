@@ -1,18 +1,25 @@
 """V3.1 对称出生判定（model/publish_readout 式 (5)）目前只在离线回放里：PublishRule.replay 的 birth_allow、
 run_sequence 导出的 existence_birth、tools/publish_replay.py 的 --birth-lambda。全部在 CPU 上运行。
 
-守住四件事：
+守住五件事：
     1 birth_allow 全为 True 时与 V3 原规则逐事件相同；给定的出生判定按式 (5) 生效，且只作用于年龄 0
     2 手算例子：出生即判被挡下的事件在下一年龄按收拢后的边界发布
     3 run_sequence：只有 export=True 时才导出 existence_birth（>= 0、长度 = 事件数），各读出逐位不变
     4 publish_replay：EventSet 读到 existence_birth；λ = None 时与原规则相同，给 λ 时等于手工调用 replay(birth_allow)；
       导出里没有该字段却给了 λ 时报错
+    5 单侧消融与选择规则：background / target 各自等于手工给的 birth_allow；背景侧不改变出生即判目标的事件、目标侧不改变
+      出生即判背景的事件（所以首次检出只会被目标侧推迟）；--select-fd-tol 先按 IoU 余量留下、再按首次检出选；main 端到端
 """
+import contextlib
+import io
+import json
 import os
+import sys
 import shutil
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import torch
@@ -133,6 +140,68 @@ class ReplayToolTests(unittest.TestCase):
         self.assertIsNone(es.exist)
         with self.assertRaises(SystemExit):
             pr.publish_policy(es, ("plain", 2, "linear", 0.5, 1.0, None, 1.0), 1.0)
+
+    def test_one_sided_birth_rules(self):
+        from tools import publish_replay as pr
+        es = pr.EventSet(self.make_dump(True), self.args())
+        theta, lam = 0.4, 1.5
+        rule = PublishRule(theta, 0.5, 1.0, 2, "linear", None, 1.0)
+        z = pr.z_by_age(es, rule, "plain")
+        present = es.exist >= lam
+        ones = np.ones_like(present)
+        base = ("plain", 2, "linear", 0.5, 1.0, None, lam)
+        allow = {"both": (present, ~present), "background": (ones, ~present), "target": (present, ones)}
+        got = {}
+        for side, birth in allow.items():
+            got[side] = pr.publish_policy(es, base + (side,), 1.0)(theta)
+            want = rule.replay(z, es.avail, birth)
+            self.assertTrue(np.array_equal(got[side][0], want[0]) and np.array_equal(got[side][1], want[1]), side)
+        old = pr.publish_policy(es, base, 1.0)(theta)                 # 7 元组（旧写法）= 对称
+        self.assertTrue(np.array_equal(old[0], got["both"][0]) and np.array_equal(old[1], got["both"][1]))
+        self.assertEqual(pr.spec_key(base + ("both",)), pr.spec_key(base))
+        self.assertEqual(pr.spec_key(base + ("background",)), pr.spec_key(base) + "_bgonly")
+        self.assertEqual(pr.spec_key(base + ("target",)), pr.spec_key(base) + "_tgonly")
+        self.assertEqual(pr.spec_key(base[:6] + (None, None)), "plain_D2_linear_a0.5_b1_gNone")
+        # 同一 θ 下：背景侧不动出生即判目标的事件，目标侧不动出生即判背景的事件 -> 首次检出只会被目标侧推迟
+        v3 = rule.replay(z, es.avail)
+        up0, down0 = v3[0] & (v3[1] == 0), ~v3[0] & (v3[1] == 0)
+        self.assertTrue(np.all(got["background"][0][up0]) and np.all(got["background"][1][up0] == 0))
+        self.assertTrue(np.all(~got["target"][0][down0]) and np.all(got["target"][1][down0] == 0))
+        self.assertTrue(np.any(got["target"][1][up0] > 0))           # 目标侧确实让一部分出生即判目标的事件去等
+        self.assertTrue(np.any(got["background"][1][down0] > 0))     # 背景侧确实让一部分出生即判背景的事件去等
+
+    def test_select_rule(self):
+        from tools import publish_replay as pr
+        specs = [("plain", 2, "linear", 0.5, 1.0, None, lam, "both") for lam in (1.0, 2.0, 4.0, 8.0)]
+        vals = [(0.0174, 183.0, 244.8), (0.0174, 183.0, 245.4), (0.0177, 189.0, 248.0), (0.0160, 150.0, 200.0)]
+        rows = {pr.spec_key(s): {"margin_iou": m, "first_detection_median_ms": med, "first_detection_mean_ms": mean}
+                for s, (m, med, mean) in zip(specs, vals)}
+        self.assertEqual(pr.select_spec(specs, rows)[0], specs[2])   # 原规则：IoU 余量最大
+        best, near = pr.select_spec(specs, rows, 0.001)             # λ=8 的余量差 0.0017，进不了第二步
+        self.assertEqual(near, specs[:3])
+        self.assertEqual(best, specs[0])                             # 中位并列 183 ms，平均 244.8 更快
+        rows[pr.spec_key(specs[0])]["first_detection_median_ms"] = None   # 没有检出 = 无穷慢
+        self.assertEqual(pr.select_spec(specs, rows, 0.001)[0], specs[1])
+
+    def test_main_end_to_end(self):
+        from tools import publish_replay as pr
+        d = self.make_dump(True)
+        out = os.path.join(d, "replay.json")
+        argv = ["publish_replay.py", "--val", d, "--test", d, "--deadline", "2", "--n-windows", "12", "--evidence", "plain",
+                "--collapse", "linear", "--upper", "0.5", "--lower", "1", "--birth-lambda", "none", "1", "2",
+                "--birth-side", "both", "background", "target", "--select-fd-tol", "0.001", "--report-test-all",
+                "--mix", "0.5", "--out", out]
+        with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()):
+            pr.main()
+        with open(out, encoding="utf-8") as stream:
+            report = json.load(stream)
+        base = "plain_D2_linear_a0.5_b1_gNone"
+        want = [base] + [base + "_e%d%s" % (lam, suf) for lam in (1, 2) for suf in ("", "_bgonly", "_tgonly")]
+        self.assertEqual(list(report["val"]["rows"]), want)
+        self.assertEqual(list(report["test"]["all_specs"]), want)
+        select = report["val"]["select"]
+        self.assertEqual((select["rule"], select["candidates"]), ("iou_then_first_detection", [base + "_e1", base + "_e2"]))
+        self.assertIn(report["val"]["chosen"], select["near"])
 
 
 if __name__ == "__main__":
