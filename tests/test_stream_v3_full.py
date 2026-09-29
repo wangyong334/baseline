@@ -1,4 +1,4 @@
-"""V3（等待安全的逐事件发布）中阶段 1 之外部分的测试：事件证据缓存（锚定证据链）与 V3 配置。全部在 CPU 上运行。
+"""V3（等待安全的逐事件发布）中发布层之外部分的测试：事件证据缓存（锚定证据链）与 V3 配置。全部在 CPU 上运行。
 
 V3 只在推理期起作用（09-28 深度分析后撤掉了归属训练：它只是给已有标签重新加权，不带新信息，同虚警率下只会打平或变差），
 所以训练与 V2 逐位相同。守住四件事：
@@ -200,7 +200,8 @@ class RunSequenceAnchorTests(unittest.TestCase):
                    publish_collapse="step", publish_gate=None)
         with torch.no_grad():
             p0, x0, _ = run_sequence(model, frontend, cusum, seq, dict(ev.CFG), torch.device("cpu"), "carry")
-            p1, x1, _ = run_sequence(model, frontend, cusum, seq, cfg, torch.device("cpu"), "carry")
+            p1, x1, _ = run_sequence(model, frontend, cusum, seq, cfg, torch.device("cpu"), "carry", export=True)
+            p2, x2, _ = run_sequence(model, frontend, cusum, seq, cfg, torch.device("cpu"), "carry")
         for name in p0:
             self.assertTrue(np.array_equal(p0[name], p1[name]), name)
         for d in (1, 2, 3):
@@ -209,6 +210,13 @@ class RunSequenceAnchorTests(unittest.TestCase):
         self.assertLess(float(np.abs(x1["z_pub"] - fused).max()), 1e-5)
         # 锚定证据不会比 V2 证据更正：断开的链只少计正证据
         self.assertTrue(np.all(x1["evidence_anchor_d3"] <= x1["evidence_d3"] + 1e-5))
+        # 不导出时不算锚定的逐延迟读出，发布结果逐位不变
+        self.assertFalse(any(name.startswith("evidence_anchor_d") for name in x2))
+        self.assertEqual(set(p1), set(p2))
+        for name in p1:
+            self.assertTrue(np.array_equal(p1[name], p2[name]), name)
+        for name in ("z_pub", "label_pub", "age_pub", "reason_pub", "publish_pub"):
+            self.assertTrue(np.array_equal(x1[name], x2[name]), name)
 
 
 if __name__ == "__main__":

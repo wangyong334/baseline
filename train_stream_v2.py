@@ -8,8 +8,9 @@
               CUSUM 把上一窗的 g 按各速度假设平移，作为本窗"可预测"的目标强度
     CUSUM     只在评估时运行：把上一窗的强度场按速度假设平移作为本窗预测，得到各管道的逐窗证据；
               延迟 d 窗的逐事件读出 = 网络 log-odds（先验）+ 之后 d 窗沿各速度管道的似然比（TubeReadout）
-    V3-1      默认关闭，--publish on 时只在评估时运行：逐事件自适应发布（读出 pub）——每个事件在出生后 0..D 窗之间
-              按证据是否充分择机发布（model/publish_readout.py，接线在 utils/publish_eval.py）
+    V3        默认关闭，--publish on 时只在评估时运行，不改训练：逐事件自适应发布（读出 pub）——每个事件在出生后
+              0..D 窗之间按证据是否充分择机发布；--publish-anchor on 时证据链从事件出发（锚定证据链）
+              （model/publish_readout.py、model/evidence_neuron.anchored_accumulate，接线在 utils/publish_eval.py）
     V2-2      默认关闭，--attr on 时只在评估时运行：稀疏目标假设库（model/target_hypotheses.py）+ 回溯分布修正读出
               （model/attribution_readout.py），接线在 utils/attribution_eval.py；attr_d{d} = sigmoid(mark + w * Delta)
 模式（--mode）：
@@ -17,7 +18,7 @@
     overfit  单序列过拟合诊断
     train    正式训练：每个序列一次参数更新；每轮在 val 上评估 net 读出（mark 头）并据此保存最优
     eval     评估 checkpoint（默认只跑 carry，见 eval_state_modes）；读出 net（零延迟）、fused_d{d}（V2-1）
-             与 attr_d{d}（V2-2），都在第 k+d 窗末发布
+             与 attr_d{d}（V2-2）都在第 k+d 窗末发布，pub（V3）逐事件在 k..k+D 窗之间发布
 训练与评估都按片段执行（骨干逐层时间并行、事件常驻设备），没有逐窗计时；主指标调用原 utils/eval.py。
 """
 import os
@@ -468,7 +469,7 @@ class DecisionActivity(object):
 
 
 def run_sequence(model, frontend, cusum, seq, cfg, device, state_mode, monitor=None, with_cusum=True,
-                 input_stats=None, alarm_eval=None, feature_probe=None, activity=None):
+                 input_stats=None, alarm_eval=None, feature_probe=None, activity=None, export=False):
     """推理一个完整序列（全部窗口，按时间顺序，按 eval_chunk 分片段执行）。
 
     返回: (probs, extra, confusion)
@@ -481,7 +482,8 @@ def run_sequence(model, frontend, cusum, seq, cfg, device, state_mode, monitor=N
                    V2-2 打开时（cfg["attr"]）另有 attr_* 读出与 delta_attr_d{d} / case_attr_d{d} /
                    publish_attr_d{d} / attr_bank，见 utils/attribution_eval.AttributionRun；
                    V3 发布层打开时（cfg["publish"]）另有读出 pub 与 z_pub / label_pub / age_pub / reason_pub /
-                   publish_pub（逐事件发布窗号），见 utils/publish_eval.PublishRun
+                   publish_pub（逐事件发布窗号），见 utils/publish_eval.PublishRun；export=True（评估导出）且打开锚定时
+                   再加 evidence_anchor_d1..D（只供离线回放，不导出时不算）
         confusion  [n_windows, 4] net 读出每窗 TP/FP/FN/正事件数
     alarm_eval 不为空时，另外按 alarm_thetas 各维护一份带复位的膜电位，把每窗的位置级告警图交给它（utils/alarm_metrics.py）。
     feature_probe 不为空时，每个片段调用一次 feature_probe(feats, mu0)（诊断用钩子，见 tools/diagnose_membrane.py）。
@@ -507,7 +509,7 @@ def run_sequence(model, frontend, cusum, seq, cfg, device, state_mode, monitor=N
     publish = {d: np.zeros(seq.n_windows, dtype=np.int64) for d in delays}
     window_info = {}                                 # 窗号 -> (原始事件下标, 网络 logit)，延迟读出用
     attr = attr_eval.AttributionRun(cfg, cusum, seq.n_windows, window_info) if (with_cusum and cfg.get("attr")) else None
-    pub = publish_eval.PublishRun(cfg, cusum, window_info) if (with_cusum and publish_eval.enabled(cfg)) else None
+    pub = publish_eval.PublishRun(cfg, cusum, window_info, export) if (with_cusum and publish_eval.enabled(cfg)) else None
     confusion = np.zeros((seq.n_windows, 4), dtype=np.int64)
     states = None
     size = int(cfg["eval_chunk"])
@@ -632,7 +634,7 @@ def evaluate_split(model, frontend, cusum, cfg, device, split, state_mode, names
             seq = dataset[i]
             probs, extra, confusion = run_sequence(model, frontend, cusum, seq, cfg, device, state_mode, monitor,
                                                    with_cusum=full, input_stats=input_stats, alarm_eval=alarm_eval,
-                                                   activity=activity)
+                                                   activity=activity, export=dump_dir is not None)
             bank_info = extra.pop("attr_bank", None)
             if attr is not None:
                 attr.update(seq.label, extra, bank_info)

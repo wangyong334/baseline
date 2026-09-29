@@ -1,4 +1,4 @@
-"""V3 阶段 1（等待安全的逐事件发布，model/publish_readout.py + utils/publish_eval.py）的测试。全部在 CPU 上运行。
+"""V3 发布层（等待安全的逐事件发布，model/publish_readout.py + utils/publish_eval.py）的测试。全部在 CPU 上运行。
 
 守住六件事：
     1. 发布规则：上下界、线性/阶梯收拢、期限强制、归属门控逐位精确；任何发布都满足 标签 = 1[z_pub >= θ]；非法参数报错

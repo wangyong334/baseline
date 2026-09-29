@@ -100,7 +100,7 @@ ATTR:                                  # V2-2 回溯分布修正（评估时运�
   hyp_update: separate                 # separate / generic / confident
   hyp_params: {}                       # 覆盖假设库参数，例如 {lag: 3, confirm_theta: 5}
 
-PUBLISH:                               # V3 阶段 1：逐事件自适应发布（评估时开关，不训练；model/publish_readout.py）
+PUBLISH:                               # V3：逐事件自适应发布（评估时开关，不训练；model/publish_readout.py）
   publish: false                       # --publish on 打开，多一个读出 pub；关闭时与 V2 逐位相同
   publish_deadline: 5                  # 最长等待 D（窗）
   publish_theta: null                  # 最终阈值 θ（logit）；null = logit(threshold)。按虚警率选定用 tools/publish_replay.py

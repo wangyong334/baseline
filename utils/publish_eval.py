@@ -1,8 +1,9 @@
-"""V3 阶段 1（等待安全的逐事件发布，默认关闭）在训练 / 评估入口里的接线。
+"""V3（等待安全的逐事件发布，推理期，默认关闭）在训练 / 评估入口里的接线。
 
 --publish on 时 run_sequence 多一个读出 pub：每个事件在出生后 0..D 窗之间按证据是否充分择机发布
-（规则见 model/publish_readout.py）；--publish-anchor on 时证据改用事件证据缓存（锚定证据链），并另外导出
-evidence_anchor_d1..D（锚定后的 F(d)，供 tools/publish_replay.py 回放）。关闭时本模块的任何代码都不运行，V2 的读出逐位不变。
+（规则见 model/publish_readout.py）；--publish-anchor on 时证据改用事件证据缓存（锚定证据链）。评估带 --dump-dir 时
+另外导出 evidence_anchor_d1..D（所有事件读满 D 窗的锚定 F(d)，供 tools/publish_replay.py 回放；只为导出而算，
+不导出时不算，发布本身只用待发布事件的证据）。关闭时本模块的任何代码都不运行，V2 的读出逐位不变。
     add_arguments / apply_overrides / validate_config / EVAL_KEYS   命令行与配置
     build_rule            按配置构造发布规则（θ 缺省 = logit(threshold)，与其他读出同一工作点）
     readout_names         打开时新增的读出名 ["pub"]
@@ -125,18 +126,19 @@ class PublishRun(object):
     """V3 发布层在一条序列上的运行（train_stream_v2.run_sequence 在 cfg["publish"] 打开时构造）。
 
     window_info 是 run_sequence 维护的 {窗号: (原始事件下标, 网络 logit)}；发布记录按出生窗号取回原始事件下标。
+    export=True（评估要导出逐事件结果）且打开锚定时，另跑一个锚定证据的逐延迟读出（所有事件读满 D 窗），
+    导出 evidence_anchor_d1..D 供离线回放扫阈值；它不影响发布，不导出时不算。
     """
 
-    def __init__(self, cfg, cusum, window_info):
+    def __init__(self, cfg, cusum, window_info, export=False):
         self.rule = build_rule(cfg)
         self.anchor = bool(cfg.get("publish_anchor"))
         self.cusum = cusum
         self.units = PublishUnits(cusum, self.rule, anchor=self.anchor)
         self.window_info = window_info
         self.parts = {name: ([], []) for name in ("z", "label", "window", "reason", "age")}
-        # 锚定证据的逐延迟读出（所有事件都读满 D 窗，与发布无关）：导出后供离线回放扫阈值
         delays = list(range(1, self.rule.deadline + 1))
-        self.anchored = TubeReadout(cusum, delays, anchor=True) if (self.anchor and delays) else None
+        self.anchored = TubeReadout(cusum, delays, anchor=True) if (export and self.anchor and delays) else None
         if self.anchored is not None:
             self.parts.update({"evidence_anchor_d%d" % d: ([], []) for d in delays})
 
