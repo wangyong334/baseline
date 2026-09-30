@@ -484,8 +484,6 @@ def run_sequence(model, frontend, cusum, seq, cfg, device, state_mode, monitor=N
                    V3 发布层打开时（cfg["publish"]）另有读出 pub 与 z_pub / label_pub / age_pub / reason_pub /
                    publish_pub（逐事件发布窗号），见 utils/publish_eval.PublishRun；export=True（评估导出）且打开锚定时
                    再加 evidence_anchor_d1..D（只供离线回放，不导出时不算）
-                   export=True 时另有 existence_birth：事件出生那一窗（计入本窗证据之后）判决层在该像素的存在统计
-                   M = logmeanexp_v C_v（>= 0，与告警输出同一个量），供 V3.1 对称出生判定的离线回放（model/publish_readout 式 (5)）
         confusion  [n_windows, 4] net 读出每窗 TP/FP/FN/正事件数
     alarm_eval 不为空时，另外按 alarm_thetas 各维护一份带复位的膜电位，把每窗的位置级告警图交给它（utils/alarm_metrics.py）。
     feature_probe 不为空时，每个片段调用一次 feature_probe(feats, mu0)（诊断用钩子，见 tools/diagnose_membrane.py）。
@@ -507,9 +505,6 @@ def run_sequence(model, frontend, cusum, seq, cfg, device, state_mode, monitor=N
         alarm_C = {theta: c_state["C"].clone() for theta in alarm_eval.thetas}
     prev_log_g = None
     names = [PRIMARY, "logit_net"] + ["fused_d%d" % d for d in delays] + ["evidence_d%d" % d for d in delays]
-    export_existence = bool(export and with_cusum)
-    if export_existence:
-        names.append("existence_birth")
     parts = {name: ([], []) for name in names}
     publish = {d: np.zeros(seq.n_windows, dtype=np.int64) for d in delays}
     window_info = {}                                 # 窗号 -> (原始事件下标, 网络 logit)，延迟读出用
@@ -557,14 +552,10 @@ def run_sequence(model, frontend, cusum, seq, cfg, device, state_mode, monitor=N
             parts["logit_net"][1].append(logit_np[offset:offset + count])
             confusion[k] = window_confusion(part_prob, seq.label[part_idx], threshold)
             if with_cusum:
-                c_state, existence, _ = cusum.step(c_state, total[t], mu0[t], prev_log_g)
+                c_state, _, _ = cusum.step(c_state, total[t], mu0[t], prev_log_g)
                 if activity is not None:
                     activity.update(c_state)
                 sl = slice(offset, offset + count)
-                if export_existence:                  # V3.1 回放：出生窗、出生像素上的存在统计 M
-                    parts["existence_birth"][0].append(part_idx)
-                    parts["existence_birth"][1].append(
-                        existence[ev["b"][sl], 0, ev["y"][sl], ev["x"][sl]].float().cpu().numpy())
                 window_info[k] = (part_idx, logits[sl])
                 collect(readout.step(c_state, k, ev["b"][sl], ev["y"][sl], ev["x"][sl], k))
                 if pub is not None:                   # V3：推进待发布事件，登记本窗新事件

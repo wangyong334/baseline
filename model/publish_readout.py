@@ -19,10 +19,6 @@
     s(d) = 1 - d/D（linear，边界随年龄线性收拢到 θ）或 1（step，期限前不收）
     序列提前结束（真实序列末尾）时，尚未发布的事件按 1[z >= θ] 发布（eos）。
 由 a >= 0、b > 0 可知任何发布都满足 标签 = 1[z_pub >= θ]，所以发布分数与标签一致。
-V3.1 对称的出生判定（目前只在离线回放里，PublishRule.replay 的 birth_allow）：年龄 0 时 z = m，只凭网络分数 m 就做不可撤回的
-    决定，隐含"m 已校准"的假设，换数据集时会失效（EDDS 试点：26% 的目标事件在出生时被判成背景）。所以年龄 0 只有 m 与判决层的
-    存在统计 M（按在线背景模型自校准）一致时才发布：发布目标还要 M >= λ（此处有目标活动），发布背景还要 M < λ（此处没有），
-    不一致就等证据；年龄 >= 1 的规则不变。                                                   (5)
 一个待发布事件就是一个脉冲发布单元：膜电位 = 累积的存在证据（兴奋受归属门控、抑制不受），两个阈值随年龄收拢，
 越过任一阈值即发放（发布），期限到时强制发放；只有尚未发布的事件占计算。
 
@@ -85,12 +81,11 @@ class PublishRule(object):
         up = z >= self.theta + a
         return up, (z <= self.theta - b) & ~up
 
-    def replay(self, z_by_age, available=None, birth_allow=None):
-        """离线逐年龄回放（birth_allow 为 None 时与 PublishUnits 的在线决定逐事件相同）。
+    def replay(self, z_by_age, available=None):
+        """离线逐年龄回放（与 PublishUnits 的在线决定逐事件相同）。
 
         输入: z_by_age [D+1, N]（年龄 0..D 的证据分数，numpy）；available [N] 每个事件最后可观察的年龄
-              （序列末尾截断时 < D；None 表示都到 D）；birth_allow 为 (允许出生即判目标 [N], 允许出生即判背景 [N])
-              两个布尔数组，只作用于年龄 0（且 D > 0）的提前发布，对应式 (5)；None = V3 原规则。
+              （序列末尾截断时 < D；None 表示都到 D）。
         输出: (label bool [N], age int64 [N], reason int8 [N], z_pub float64 [N])
         """
         z_by_age = np.asarray(z_by_age, dtype=np.float64)
@@ -105,8 +100,6 @@ class PublishRule(object):
             z = z_by_age[d]
             if d < self.deadline:
                 up, down = self.decide(z, d)
-                if d == 0 and birth_allow is not None:
-                    up, down = up & birth_allow[0], down & birth_allow[1]
                 for mask, lab, why in ((open_ & up, True, UPPER), (open_ & down, False, LOWER)):
                     label[mask], age[mask], reason[mask], z_pub[mask] = lab, d, why, z[mask]
                 open_ &= ~(up | down)
