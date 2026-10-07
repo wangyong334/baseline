@@ -12,3 +12,9 @@ not part of the SPEED release.
   sparse decision layer (full-system energy of V2-1)
 - `check_frozen.py` – stage-1 regression gate: frozen V2-1 / V3 dumps -> SPEED results -> SPEED evaluator must equal the
   frozen evaluation JSON for every readout; also reports the event publish latency (new definition)
+- `convert_checkpoint.py` – legacy V2-1 checkpoint -> SPEED checkpoint (base variants; evaluation settings from the
+  frozen V3 YAML, as legacy `--mode eval` merged them)
+- `test_system_equivalence.py` – SPEED base system vs legacy pipeline: inference (all readouts, float32 / float64),
+  one training update, gain calibration, both network execution paths
+- `compare_results.py` – two result directories event by event (probabilities and publish times)
+- `compare_training.py` – SPEED vs legacy training logs epoch by epoch

@@ -1,0 +1,98 @@
+# Base variant of every slot = frozen V2-1 network and training + V2-1 fixed-delay and V3 publishing readouts.
+# Values are the legacy ones (EV-UAV); units are in the key names (px, ms, per px per step).
+dataset: evuav
+
+clock:
+  kind: fixed
+  step_ms: 50
+
+canvas:
+  multiple: 8                      # total downsampling of the backbone; sensor size padded bottom / right
+
+representation:
+  kind: evidence
+  taus_ms: [20, 100, 500, 2000]
+  dipole_taus_ms: [100, 500]
+  dipole_radius_px: 3
+  bg_fast_ms: 500
+  bg_slow_ms: 5000
+  bg_prior_per_px_step: 0.01
+  bg_prior_steps: 2
+  bg_floor_per_px_step: 0.001
+  bg_smooth_radius_px: 7
+  features: [count, ratio, age, dipole]
+
+network:
+  neuron:
+    kind: lif
+    v_threshold: 1.0
+    tau_init_ms: 200.0
+    tau_min_ms: 50.0
+    tau_max_ms: 2000.0
+    u_floor: -4                    # carried membrane floor, units of v_th
+    u_ceil: null
+  backbone:
+    kind: merged_unet
+    channels: [12, 24, 48, 48]
+  heads:
+    kind: mark_intensity
+    hidden: 16
+    mark_prior: 0.03
+    intensity_prior_per_px_step: 0.0002
+    log_g_max: 8.0
+  transport:
+    kind: none
+
+verifier:
+  kind: drift_evidence
+  velocities_px_per_step: [-4, -2, -1, 0, 1, 2, 4]
+  footprint_px: 3
+  track_tau_ms: 250
+  gate_eps: 0.03
+
+readouts:
+  - kind: net
+  - kind: fixed_delay
+    delays_steps: [1, 2, 3, 4, 5]
+    fusion_weight: 1.0
+  - kind: publish
+    deadline_steps: 5
+    theta: null                    # null = logit(evaluation.threshold)
+    upper: 1.0
+    lower: 2.0
+    collapse: linear
+    gate: null
+    anchor: true
+    fusion_weight: 1.0
+
+loss:
+  kind: mark_intensity
+  mark_weight: 1.0
+  intensity_weight: 1.0
+  intensity_smooth_px: 3
+
+training:
+  kind: tbptt
+  seed: 37
+  epochs: 50
+  lr: 0.001
+  lr_end: 0.0001
+  tbptt_steps: 16
+  grad_clip: 1.0
+  num_workers: 2
+  deterministic: true
+  carry: true
+  calibration:
+    sequences: 8
+    steps: 32
+    samples_per_channel: 2048
+    min_positive: 1024
+    quantile: 0.99
+    gain_min: 0.05
+    gain_max: 20.0
+
+evaluation:
+  threshold: 0.9
+  chunk_steps: 32
+  frame_ms: 50
+  correct_thresh: 0.0001

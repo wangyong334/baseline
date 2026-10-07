@@ -41,6 +41,13 @@ def list_recordings(card, root, split):
     return items
 
 
-def iter_split(card, root, split):
-    for name, path in list_recordings(card, root, split):
+def iter_split(card, root, split, names=None):
+    items = list_recordings(card, root, split)
+    if names is not None:
+        known = dict(items)
+        missing = [n for n in names if n not in known]
+        if missing:
+            raise KeyError("not in split %s: %s" % (split, missing))
+        items = [(n, known[n]) for n in names]
+    for name, path in items:
         yield read_recording(card, path, name)
