@@ -5,6 +5,8 @@ run_stream(stream) processes one recording causally, chunk by chunk:
 and returns ({readout name: (prob float32 [N], publish_us int64 [N])} in file order, steps); publish_us is the end
 of the step at which the readout published the event. The verifier only runs when a readout needs it.
 """
+import torch
+
 from speed.core.clock import EventBlocks, canvas_size
 
 
@@ -60,6 +62,9 @@ class System(object):
                 monitor.update(info)
             ev = blk["events"]
             logits = outputs["mark"][ev["t"], ev["b"], 0, ev["y"], ev["x"]]
+            # One sigmoid per chunk, then sliced: on CPU the vectorised and scalar-tail paths of exp can differ
+            # in the last bit, so the result must not depend on where a step's events start in the array.
+            net_prob = torch.sigmoid(logits).float().cpu().numpy()
             offset = 0
             for t, k in enumerate(range(start, end)):
                 count = int(steps.bounds[k + 1] - steps.bounds[k])
@@ -67,7 +72,8 @@ class System(object):
                 if verify:
                     ver_state = self.verifier.step(ver_state, aux["total"][t], aux["mu0"][t], prev_log_g)
                 ctx = {"k": k, "idx": blk["idx"][offset:offset + count], "b": ev["b"][sl], "y": ev["y"][sl],
-                       "x": ev["x"][sl], "logits": logits[sl], "total": aux["total"][t], "verifier": ver_state}
+                       "x": ev["x"][sl], "logits": logits[sl], "prob": net_prob[sl], "total": aux["total"][t],
+                       "verifier": ver_state}
                 for r in readouts:
                     r.step(ctx)
                 prev_log_g = outputs["log_g"][t]

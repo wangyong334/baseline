@@ -2,7 +2,8 @@
 
 Every readout follows the same per-stream protocol, driven by the system once per step k:
     begin(n_events)
-    step(ctx)            ctx: k, idx (file indices of step-k events), b/y/x, logits (mark), total (event counts),
+    step(ctx)            ctx: k, idx (file indices of step-k events), b/y/x, logits (mark), prob = sigmoid(logits)
+                         as float32 numpy (computed once per chunk), total (event counts),
                          verifier state after step k (None without a verifier)
     flush()              end of the stream
     results(threshold) -> {name: (prob float32 [N], publish_step int64 [N])}
@@ -50,7 +51,7 @@ class NetReadout(object):
 
     def step(self, ctx):
         self.idx.append(ctx["idx"])
-        self.prob.append(torch.sigmoid(ctx["logits"]).float().cpu().numpy())
+        self.prob.append(ctx["prob"])
         self.when.append(np.full(ctx["idx"].shape[0], ctx["k"], np.int64))
 
     def flush(self):
