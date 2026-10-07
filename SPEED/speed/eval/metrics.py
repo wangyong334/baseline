@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 
 
-def _decide(prob, decision, threshold):
+def decide(prob, decision, threshold):
     if decision is not None:
         return np.asarray(decision).astype(bool)
     prob = np.asarray(prob)
@@ -45,7 +45,7 @@ class BenchmarkMetrics(object):
         return self.per_class.setdefault(int(c), {"positives": 0, "tp": 0, "objects": 0, "detected": 0})
 
     def update(self, stream, prob=None, decision=None, publish_us=None):
-        pred = _decide(prob, decision, self.threshold)
+        pred = decide(prob, decision, self.threshold)
         if pred.shape != (stream.n_events,):
             raise ValueError("%s: prediction length mismatch" % stream.name)
         target = stream.label == 1
