@@ -1,0 +1,68 @@
+{
+  "name": "EV-Flying",
+  "format": "evflying_npy",
+  "sensor": {
+    "width": 1280,
+    "height": 720,
+    "model": "Prophesee EVK2"
+  },
+  "time_scale_us": 1,
+  "clip_duration_us": null,
+  "splits": {
+    "train": {
+      "files": [
+        "Train/0/0.npy",
+        "Train/1/1.npy",
+        "Train/2/2.npy",
+        "Train/4/4.npy",
+        "Train/6/6.npy",
+        "Train/7/7.npy",
+        "Train/8/8.npy",
+        "Train/11/11.npy",
+        "Train/12/12.npy",
+        "Train/14/14.npy",
+        "Train/15/15.npy",
+        "Train/18/18.npy",
+        "Train/19/19.npy",
+        "Train/20/20.npy",
+        "Train/22/22.npy",
+        "Train/25/25.npy",
+        "Train/27/27.npy"
+      ]
+    },
+    "val": {
+      "files": [
+        "Train/3/3.npy",
+        "Train/10/10.npy",
+        "Train/17/17.npy",
+        "Train/21/21.npy"
+      ]
+    },
+    "test": {
+      "files": [
+        "Test/5/5.npy",
+        "Test/9/9.npy",
+        "Test/13/13.npy",
+        "Test/23/23.npy",
+        "Test/24/24.npy",
+        "Test/26/26.npy"
+      ]
+    },
+    "extra_drone": {
+      "files": [
+        "Train/29/29.npy",
+        "Test/28/28.npy"
+      ]
+    }
+  },
+  "val_rule": "official train split stratified by recording duration (120/180/300 s); within each stratum ids sorted, about 20% taken at evenly spaced positions; 300 s recordings kept for training; fixed before any model result",
+  "classes": {
+    "1": "bird",
+    "2": "insect",
+    "3": "drone"
+  },
+  "source": "Magrini et al., EV-Flying, CVPRW 2025 (arXiv 2506.04048); HuggingFace GabrieleMagrini/Ev-Flying",
+  "labels": "per-event, derived from manual 30 Hz boxes; id -1 / class 0 = background; tracks shorter than 99 ms unlabelled",
+  "camera": "static",
+  "notes": "extra_drone = FRED extract distributed separately by the authors; not part of the main protocol"
+}

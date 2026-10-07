@@ -1,0 +1,287 @@
+{
+ "analysis_window_us": 50000,
+ "n_recordings": 17,
+ "duration_s": 2520.061948,
+ "n_events": 65706180,
+ "target_event_share": 0.10344529236062726,
+ "n_targets": 2208,
+ "target_size_px": {
+  "p10": 3.0,
+  "p50": 16.0,
+  "p90": 61.0
+ },
+ "target_events_per_s": {
+  "p10": 40.0,
+  "p50": 540.0,
+  "p90": 7530.000000000001
+ },
+ "target_speed_px_s": {
+  "p10": 103.39961255003442,
+  "p50": 378.4945892126698,
+  "p90": 1374.3975831574185
+ },
+ "target_rel_speed_per_s": {
+  "p10": 9.741706720000693,
+  "p50": 19.622245894685694,
+  "p90": 49.01117246944763
+ },
+ "target_duration_s": {
+  "p10": 0.09999999999999999,
+  "p50": 0.24999999999999997,
+  "p90": 1.15
+ },
+ "bg_rate_per_px_s": {
+  "p10": 0.010885911571229452,
+  "p50": 0.020664000181052366,
+  "p90": 0.036206264121667955
+ },
+ "bg_rate_p99_per_px_s": {
+  "p10": 0.013999925943828446,
+  "p50": 0.041666359030049165,
+  "p90": 0.23999823292967956
+ },
+ "hot_pixels_max": 0,
+ "per_class": {
+  "1": {
+   "targets": 115,
+   "size_px": {
+    "p10": 9.0,
+    "p50": 27.0,
+    "p90": 63.0
+   }
+  },
+  "2": {
+   "targets": 2093,
+   "size_px": {
+    "p10": 2.0,
+    "p50": 14.0,
+    "p90": 61.0
+   }
+  }
+ },
+ "recordings": [
+  {
+   "bg_rate_per_px_s": 0.010648319498304002,
+   "bg_rate_p99_per_px_s": 0.016666651805568807,
+   "hot_pixels": 0,
+   "duration_s": 120.000107,
+   "name": "Train/0/0.npy",
+   "n_events": 1364127,
+   "n_target_events": 186507,
+   "n_targets": 118,
+   "span_us": 120000107,
+   "width": 1280,
+   "height": 720
+  },
+  {
+   "bg_rate_per_px_s": 0.03252821620477933,
+   "bg_rate_p99_per_px_s": 0.6999956191940833,
+   "hot_pixels": 0,
+   "duration_s": 120.000751,
+   "name": "Train/1/1.npy",
+   "n_events": 3678752,
+   "n_target_events": 81369,
+   "n_targets": 63,
+   "span_us": 120000751,
+   "width": 1280,
+   "height": 720
+  },
+  {
+   "bg_rate_per_px_s": 0.010551656120727304,
+   "bg_rate_p99_per_px_s": 0.09999929333832708,
+   "hot_pixels": 0,
+   "duration_s": 120.00084799999999,
+   "name": "Train/2/2.npy",
+   "n_events": 1359384,
+   "n_target_events": 192447,
+   "n_targets": 91,
+   "span_us": 120000848,
+   "width": 1280,
+   "height": 720
+  },
+  {
+   "bg_rate_per_px_s": 0.011044306286513086,
+   "bg_rate_p99_per_px_s": 0.05833289972544538,
+   "hot_pixels": 0,
+   "duration_s": 120.000892,
+   "name": "Train/4/4.npy",
+   "n_events": 2054874,
+   "n_target_events": 833453,
+   "n_targets": 48,
+   "span_us": 120000892,
+   "width": 1280,
+   "height": 720
+  },
+  {
+   "bg_rate_per_px_s": 0.011715740232217197,
+   "bg_rate_p99_per_px_s": 0.016666578472688917,
+   "hot_pixels": 0,
+   "duration_s": 120.00063499999999,
+   "name": "Train/6/6.npy",
+   "n_events": 1398129,
+   "n_target_events": 102455,
+   "n_targets": 65,
+   "span_us": 120000635,
+   "width": 1280,
+   "height": 720
+  },
+  {
+   "bg_rate_per_px_s": 0.02300935872340857,
+   "bg_rate_p99_per_px_s": 0.2749979466819981,
+   "hot_pixels": 0,
+   "duration_s": 120.000896,
+   "name": "Train/7/7.npy",
+   "n_events": 2959618,
+   "n_target_events": 414948,
+   "n_targets": 65,
+   "span_us": 120000896,
+   "width": 1280,
+   "height": 720
+  },
+  {
+   "bg_rate_per_px_s": 0.021734017955621226,
+   "bg_rate_p99_per_px_s": 0.2166650904281338,
+   "hot_pixels": 0,
+   "duration_s": 120.000873,
+   "name": "Train/8/8.npy",
+   "n_events": 2461688,
+   "n_target_events": 58062,
+   "n_targets": 33,
+   "span_us": 120000873,
+   "width": 1280,
+   "height": 720
+  },
+  {
+   "bg_rate_per_px_s": 0.015051607114593288,
+   "bg_rate_p99_per_px_s": 0.016666549861929718,
+   "hot_pixels": 0,
+   "duration_s": 120.000841,
+   "name": "Train/11/11.npy",
+   "n_events": 1716933,
+   "n_target_events": 52334,
+   "n_targets": 81,
+   "span_us": 120000841,
+   "width": 1280,
+   "height": 720
+  },
+  {
+   "bg_rate_per_px_s": 0.017903504065468676,
+   "bg_rate_p99_per_px_s": 0.07499948187857935,
+   "hot_pixels": 0,
+   "duration_s": 120.000829,
+   "name": "Train/12/12.npy",
+   "n_events": 2017609,
+   "n_target_events": 37611,
+   "n_targets": 84,
+   "span_us": 120000829,
+   "width": 1280,
+   "height": 720
+  },
+  {
+   "bg_rate_per_px_s": 0.01677269878888876,
+   "bg_rate_p99_per_px_s": 0.041666359030049165,
+   "hot_pixels": 0,
+   "duration_s": 120.000886,
+   "name": "Train/14/14.npy",
+   "n_events": 1912726,
+   "n_target_events": 57786,
+   "n_targets": 165,
+   "span_us": 120000886,
+   "width": 1280,
+   "height": 720
+  },
+  {
+   "bg_rate_per_px_s": 0.02648626599456113,
+   "bg_rate_p99_per_px_s": 0.1916652355662411,
+   "hot_pixels": 0,
+   "duration_s": 120.000896,
+   "name": "Train/15/15.npy",
+   "n_events": 3155846,
+   "n_target_events": 226655,
+   "n_targets": 349,
+   "span_us": 120000896,
+   "width": 1280,
+   "height": 720
+  },
+  {
+   "bg_rate_per_px_s": 0.020664000181052366,
+   "bg_rate_p99_per_px_s": 0.024999815209699242,
+   "hot_pixels": 0,
+   "duration_s": 120.00088699999999,
+   "name": "Train/18/18.npy",
+   "n_events": 2432564,
+   "n_target_events": 147274,
+   "n_targets": 94,
+   "span_us": 120000887,
+   "width": 1280,
+   "height": 720
+  },
+  {
+   "bg_rate_per_px_s": 0.020463364641525237,
+   "bg_rate_p99_per_px_s": 0.008333275972617056,
+   "hot_pixels": 0,
+   "duration_s": 120.00082599999999,
+   "name": "Train/19/19.npy",
+   "n_events": 2322048,
+   "n_target_events": 58948,
+   "n_targets": 97,
+   "span_us": 120000826,
+   "width": 1280,
+   "height": 720
+  },
+  {
+   "bg_rate_per_px_s": 0.023365303623126825,
+   "bg_rate_p99_per_px_s": 0.016666642962996678,
+   "hot_pixels": 0,
+   "duration_s": 180.00025599999998,
+   "name": "Train/20/20.npy",
+   "n_events": 4106792,
+   "n_target_events": 230763,
+   "n_targets": 155,
+   "span_us": 180000256,
+   "width": 1280,
+   "height": 720
+  },
+  {
+   "bg_rate_per_px_s": 0.030626793937938265,
+   "bg_rate_p99_per_px_s": 0.016666645648174654,
+   "hot_pixels": 0,
+   "duration_s": 180.000227,
+   "name": "Train/22/22.npy",
+   "n_events": 5227303,
+   "n_target_events": 146679,
+   "n_targets": 173,
+   "span_us": 180000227,
+   "width": 1280,
+   "height": 720
+  },
+  {
+   "bg_rate_per_px_s": 0.043512883571183804,
+   "bg_rate_p99_per_px_s": 0.009999990066676534,
+   "hot_pixels": 0,
+   "duration_s": 300.000298,
+   "name": "Train/25/25.npy",
+   "n_events": 12226410,
+   "n_target_events": 195956,
+   "n_targets": 391,
+   "span_us": 300000298,
+   "width": 1280,
+   "height": 720
+  },
+  {
+   "bg_rate_per_px_s": 0.041723335997000885,
+   "bg_rate_p99_per_px_s": 0.05998980173370527,
+   "hot_pixels": 0,
+   "duration_s": 300.051,
+   "name": "Train/27/27.npy",
+   "n_events": 15311377,
+   "n_target_events": 3773748,
+   "n_targets": 136,
+   "span_us": 300051000,
+   "width": 1280,
+   "height": 720
+  }
+ ],
+ "card": "EV-Flying",
+ "split": "train"
+}

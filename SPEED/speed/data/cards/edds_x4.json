@@ -1,0 +1,24 @@
+{
+  "name": "EDDS-x4",
+  "format": "evuav_npz",
+  "sensor": {
+    "width": 320,
+    "height": 180,
+    "model": "Prophesee EVK4, 1280x720 binned 4x4"
+  },
+  "time_scale_us": 1000,
+  "clip_duration_us": 8000000,
+  "splits": {
+    "test": {
+      "dir": "test",
+      "pattern": "*.npz"
+    }
+  },
+  "classes": {
+    "1": "uav"
+  },
+  "single_class": 1,
+  "source": "EDDS, Zenodo 10.5281/zenodo.18629643 (CC-BY-4.0); converted by tools/edds_convert.py",
+  "labels": "per-event semi-automatic; zero-shot only (no training split)",
+  "camera": "static"
+}

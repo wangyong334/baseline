@@ -1,0 +1,32 @@
+{
+  "name": "EV-UAV",
+  "format": "evuav_npz",
+  "sensor": {
+    "width": 346,
+    "height": 260,
+    "model": "DAVIS346"
+  },
+  "time_scale_us": 1000,
+  "clip_duration_us": 8000000,
+  "splits": {
+    "train": {
+      "dir": "train",
+      "pattern": "*.npz"
+    },
+    "val": {
+      "dir": "val",
+      "pattern": "*.npz"
+    },
+    "test": {
+      "dir": "test",
+      "pattern": "*.npz"
+    }
+  },
+  "classes": {
+    "1": "uav"
+  },
+  "single_class": 1,
+  "source": "Chen et al., Event-based Tiny Object Detection: A Benchmark Dataset and Baseline, ICCV 2025 (arXiv 2506.23575)",
+  "labels": "per-event, events inside spatiotemporal boxes; label == 1 iff target_id != 0",
+  "camera": "static"
+}
