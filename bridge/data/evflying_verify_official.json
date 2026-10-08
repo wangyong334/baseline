@@ -1,0 +1,2709 @@
+{
+ "files": {
+  "n_expected": 81,
+  "missing": [],
+  "size_bad": [],
+  "hash_bad": [],
+  "hash_ok": 81,
+  "extra": [
+   "Test/28/28.npy",
+   "Test/28/coordinates.txt",
+   "Train/29/29.npy",
+   "Train/29/coordinates.txt",
+   "Train/29/tracks.txt"
+  ]
+ },
+ "sequences": [
+  {
+   "split": "Train",
+   "id": "0",
+   "shape": [
+    1364127,
+    6
+   ],
+   "dtype": "float64",
+   "int_cols_ok": true,
+   "x_range": [
+    0.0,
+    1279.0
+   ],
+   "y_range": [
+    0.0,
+    719.0
+   ],
+   "p_values": [
+    0.0,
+    1.0
+   ],
+   "class_counts": {
+    "0": 1177620,
+    "1": 30097,
+    "2": 156410
+   },
+   "id_min": -1.0,
+   "t_monotonic": true,
+   "t_backsteps": 0,
+   "t_start_us": 215.0,
+   "duration_s": 119.999891,
+   "max_gap_ms": 1.106,
+   "n_events": 1364127,
+   "events_per_win_mean": 568.386766284646,
+   "label_share": 0.1367226072059273,
+   "id_class_mismatch": 0,
+   "ids_with_multiple_classes": [],
+   "exact_duplicates": 0,
+   "bg_events_per_win_p10_50_90_max": [
+    404.0,
+    449.0,
+    597.0999999999999,
+    2584.0
+   ],
+   "pixels_over_1kHz": 0,
+   "pixels_over_100Hz": 15,
+   "max_pixel_rate_hz": 880.2924662656568,
+   "bg_spatial_corr_halves": 0.9179253912849529,
+   "n_objects": 118,
+   "objects_per_class": {
+    "1": 5,
+    "2": 113
+   },
+   "obj_events_per_win_p10_50_90": [
+    2.0,
+    18.0,
+    214.80000000000018
+   ],
+   "obj_size_px_p10_50_90": [
+    2.0,
+    13.0,
+    67.0
+   ],
+   "obj_speed_px_per_win_p10_50_90": [
+    5.001962417017044,
+    17.211634034498893,
+    89.57893255819292
+   ],
+   "obj_rel_speed_bodylen_per_win_p10_50_90": [
+    0.6460807249802338,
+    1.037506814610105,
+    2.720389996866481
+   ],
+   "obj_duration_win_p10_50_90": [
+    4.0,
+    12.5,
+    41.89999999999999
+   ],
+   "windows_with_targets_share": 0.48291666666666666,
+   "n_boxes": 2416,
+   "n_box_ids": 118,
+   "box_classes": {
+    "1": 199,
+    "2": 2217
+   },
+   "ids_events_not_boxes": [],
+   "ids_boxes_not_events": [],
+   "box_event_class_mismatch": 0,
+   "inbox_labelled_[t-33,t)": 0.9923009740074806,
+   "inbox_labelled_[t-16.7,t+16.7)": 0.9981055842453108,
+   "inbox_labelled_[t,t+33)": 0.8664302490307187,
+   "best_box_alignment": "[t-16.7,t+16.7)",
+   "labelled_inside_nearest_own_box": 1.0,
+   "labelled_to_box_dt_ms_p1_50_99": [
+    -15.952,
+    2.263,
+    16.37
+   ]
+  },
+  {
+   "split": "Train",
+   "id": "1",
+   "shape": [
+    3678752,
+    6
+   ],
+   "dtype": "float64",
+   "int_cols_ok": true,
+   "x_range": [
+    0.0,
+    1279.0
+   ],
+   "y_range": [
+    0.0,
+    719.0
+   ],
+   "p_values": [
+    0.0,
+    1.0
+   ],
+   "class_counts": {
+    "0": 3597383,
+    "1": 29018,
+    "2": 52351
+   },
+   "id_min": -1.0,
+   "t_monotonic": true,
+   "t_backsteps": 0,
+   "t_start_us": 43.0,
+   "duration_s": 120.000707,
+   "max_gap_ms": 0.744,
+   "n_events": 3678752,
+   "events_per_win_mean": 1532.8043025613172,
+   "label_share": 0.02211864240916485,
+   "id_class_mismatch": 0,
+   "ids_with_multiple_classes": [],
+   "exact_duplicates": 0,
+   "bg_events_per_win_p10_50_90_max": [
+    748.0,
+    1281.0,
+    2698.0,
+    4455.0
+   ],
+   "pixels_over_1kHz": 0,
+   "pixels_over_100Hz": 9,
+   "max_pixel_rate_hz": 833.0784251129453,
+   "bg_spatial_corr_halves": 0.9612827078851159,
+   "n_objects": 63,
+   "objects_per_class": {
+    "1": 3,
+    "2": 60
+   },
+   "obj_events_per_win_p10_50_90": [
+    2.0,
+    22.0,
+    198.0
+   ],
+   "obj_size_px_p10_50_90": [
+    3.0,
+    14.0,
+    48.0
+   ],
+   "obj_speed_px_per_win_p10_50_90": [
+    4.637124613948382,
+    15.332628957865982,
+    55.215379153436885
+   ],
+   "obj_rel_speed_bodylen_per_win_p10_50_90": [
+    0.5277165982739228,
+    1.0026142536133849,
+    2.173349156208874
+   ],
+   "obj_duration_win_p10_50_90": [
+    4.2,
+    13.0,
+    44.40000000000001
+   ],
+   "windows_with_targets_share": 0.360683048729696,
+   "n_boxes": 1550,
+   "n_box_ids": 63,
+   "box_classes": {
+    "1": 173,
+    "2": 1377
+   },
+   "ids_events_not_boxes": [],
+   "ids_boxes_not_events": [],
+   "box_event_class_mismatch": 0,
+   "inbox_labelled_[t-33,t)": 0.9784939302584275,
+   "inbox_labelled_[t-16.7,t+16.7)": 0.986960846150114,
+   "inbox_labelled_[t,t+33)": 0.9082679337484377,
+   "best_box_alignment": "[t-16.7,t+16.7)",
+   "labelled_inside_nearest_own_box": 1.0,
+   "labelled_to_box_dt_ms_p1_50_99": [
+    -16.201,
+    1.221,
+    16.351
+   ]
+  },
+  {
+   "split": "Train",
+   "id": "2",
+   "shape": [
+    1359384,
+    6
+   ],
+   "dtype": "float64",
+   "int_cols_ok": true,
+   "x_range": [
+    0.0,
+    1279.0
+   ],
+   "y_range": [
+    0.0,
+    719.0
+   ],
+   "p_values": [
+    0.0,
+    1.0
+   ],
+   "class_counts": {
+    "0": 1166937,
+    "1": 110759,
+    "2": 81688
+   },
+   "id_min": -1.0,
+   "t_monotonic": true,
+   "t_backsteps": 0,
+   "t_start_us": 91.0,
+   "duration_s": 120.000756,
+   "max_gap_ms": 1.073,
+   "n_events": 1359384,
+   "events_per_win_mean": 566.4064316394806,
+   "label_share": 0.14156926961035293,
+   "id_class_mismatch": 0,
+   "ids_with_multiple_classes": [],
+   "exact_duplicates": 0,
+   "bg_events_per_win_p10_50_90_max": [
+    344.0,
+    397.0,
+    749.0,
+    2059.0
+   ],
+   "pixels_over_1kHz": 0,
+   "pixels_over_100Hz": 10,
+   "max_pixel_rate_hz": 855.0529464997704,
+   "bg_spatial_corr_halves": 0.9420890847569734,
+   "n_objects": 91,
+   "objects_per_class": {
+    "1": 10,
+    "2": 81
+   },
+   "obj_events_per_win_p10_50_90": [
+    3.0,
+    28.0,
+    329.70000000000095
+   ],
+   "obj_size_px_p10_50_90": [
+    3.0,
+    14.0,
+    38.100000000000136
+   ],
+   "obj_speed_px_per_win_p10_50_90": [
+    5.514123845037951,
+    16.378788624660103,
+    41.60771811585569
+   ],
+   "obj_rel_speed_bodylen_per_win_p10_50_90": [
+    0.6533630652558088,
+    0.9160456510393289,
+    2.0439849264385823
+   ],
+   "obj_duration_win_p10_50_90": [
+    3.0,
+    12.0,
+    47.0
+   ],
+   "windows_with_targets_share": 0.392753019575177,
+   "n_boxes": 2093,
+   "n_box_ids": 91,
+   "box_classes": {
+    "1": 365,
+    "2": 1728
+   },
+   "ids_events_not_boxes": [],
+   "ids_boxes_not_events": [],
+   "box_event_class_mismatch": 0,
+   "inbox_labelled_[t-33,t)": 0.968956848785621,
+   "inbox_labelled_[t-16.7,t+16.7)": 0.9876880282882818,
+   "inbox_labelled_[t,t+33)": 0.9502297128218823,
+   "best_box_alignment": "[t-16.7,t+16.7)",
+   "labelled_inside_nearest_own_box": 1.0,
+   "labelled_to_box_dt_ms_p1_50_99": [
+    -16.279,
+    0.703,
+    16.342540000000007
+   ]
+  },
+  {
+   "split": "Train",
+   "id": "3",
+   "shape": [
+    1301641,
+    6
+   ],
+   "dtype": "float64",
+   "int_cols_ok": true,
+   "x_range": [
+    0.0,
+    1279.0
+   ],
+   "y_range": [
+    0.0,
+    719.0
+   ],
+   "p_values": [
+    0.0,
+    1.0
+   ],
+   "class_counts": {
+    "0": 1155896,
+    "1": 116521,
+    "2": 29224
+   },
+   "id_min": -1.0,
+   "t_monotonic": true,
+   "t_backsteps": 0,
+   "t_start_us": 171.0,
+   "duration_s": 120.000638,
+   "max_gap_ms": 1.06,
+   "n_events": 1301641,
+   "events_per_win_mean": 542.3475331856152,
+   "label_share": 0.11197019761977381,
+   "id_class_mismatch": 0,
+   "ids_with_multiple_classes": [],
+   "exact_duplicates": 0,
+   "bg_events_per_win_p10_50_90_max": [
+    382.0,
+    445.0,
+    582.0,
+    1355.0
+   ],
+   "pixels_over_1kHz": 0,
+   "pixels_over_100Hz": 11,
+   "max_pixel_rate_hz": 866.7287252256109,
+   "bg_spatial_corr_halves": 0.989953077160287,
+   "n_objects": 68,
+   "objects_per_class": {
+    "1": 11,
+    "2": 57
+   },
+   "obj_events_per_win_p10_50_90": [
+    3.0,
+    29.0,
+    295.1
+   ],
+   "obj_size_px_p10_50_90": [
+    3.0,
+    13.0,
+    29.100000000000023
+   ],
+   "obj_speed_px_per_win_p10_50_90": [
+    5.385492153640336,
+    12.789509387938482,
+    34.91256664868577
+   ],
+   "obj_rel_speed_bodylen_per_win_p10_50_90": [
+    0.6238972327082107,
+    0.9089353274514833,
+    2.0142790770124277
+   ],
+   "obj_duration_win_p10_50_90": [
+    4.0,
+    13.5,
+    38.20000000000002
+   ],
+   "windows_with_targets_share": 0.3331945022907122,
+   "n_boxes": 1624,
+   "n_box_ids": 68,
+   "box_classes": {
+    "1": 615,
+    "2": 1009
+   },
+   "ids_events_not_boxes": [],
+   "ids_boxes_not_events": [],
+   "box_event_class_mismatch": 0,
+   "inbox_labelled_[t-33,t)": 0.9180528789943476,
+   "inbox_labelled_[t-16.7,t+16.7)": 0.9697407202879555,
+   "inbox_labelled_[t,t+33)": 0.959500752318267,
+   "best_box_alignment": "[t-16.7,t+16.7)",
+   "labelled_inside_nearest_own_box": 1.0,
+   "labelled_to_box_dt_ms_p1_50_99": [
+    -16.294,
+    0.266,
+    16.319
+   ]
+  },
+  {
+   "split": "Train",
+   "id": "4",
+   "shape": [
+    2054874,
+    6
+   ],
+   "dtype": "float64",
+   "int_cols_ok": true,
+   "x_range": [
+    0.0,
+    1279.0
+   ],
+   "y_range": [
+    0.0,
+    719.0
+   ],
+   "p_values": [
+    0.0,
+    1.0
+   ],
+   "class_counts": {
+    "0": 1221421,
+    "1": 810425,
+    "2": 23028
+   },
+   "id_min": -1.0,
+   "t_monotonic": true,
+   "t_backsteps": 0,
+   "t_start_us": 32.0,
+   "duration_s": 120.000859,
+   "max_gap_ms": 0.962,
+   "n_events": 2054874,
+   "events_per_win_mean": 856.1913710967686,
+   "label_share": 0.4055981047986397,
+   "id_class_mismatch": 0,
+   "ids_with_multiple_classes": [],
+   "exact_duplicates": 0,
+   "bg_events_per_win_p10_50_90_max": [
+    414.0,
+    457.0,
+    664.0,
+    5119.0
+   ],
+   "pixels_over_1kHz": 0,
+   "pixels_over_100Hz": 13,
+   "max_pixel_rate_hz": 875.685398218691,
+   "bg_spatial_corr_halves": 0.9786049737799258,
+   "n_objects": 48,
+   "objects_per_class": {
+    "1": 13,
+    "2": 35
+   },
+   "obj_events_per_win_p10_50_90": [
+    3.0,
+    72.0,
+    3010.000000000001
+   ],
+   "obj_size_px_p10_50_90": [
+    3.0,
+    21.0,
+    45.0
+   ],
+   "obj_speed_px_per_win_p10_50_90": [
+    4.0946250611775685,
+    16.155326885484516,
+    36.37786868817929
+   ],
+   "obj_rel_speed_bodylen_per_win_p10_50_90": [
+    0.35131072906962063,
+    0.6479453380853737,
+    1.671927734448344
+   ],
+   "obj_duration_win_p10_50_90": [
+    4.7,
+    16.0,
+    43.0
+   ],
+   "windows_with_targets_share": 0.3044564764681383,
+   "n_boxes": 1456,
+   "n_box_ids": 48,
+   "box_classes": {
+    "1": 654,
+    "2": 802
+   },
+   "ids_events_not_boxes": [],
+   "ids_boxes_not_events": [],
+   "box_event_class_mismatch": 0,
+   "inbox_labelled_[t-33,t)": 0.9868036138943891,
+   "inbox_labelled_[t-16.7,t+16.7)": 0.9879651317161985,
+   "inbox_labelled_[t,t+33)": 0.9813147949467743,
+   "best_box_alignment": "[t-16.7,t+16.7)",
+   "labelled_inside_nearest_own_box": 1.0,
+   "labelled_to_box_dt_ms_p1_50_99": [
+    -16.324,
+    0.097,
+    16.333
+   ]
+  },
+  {
+   "split": "Train",
+   "id": "6",
+   "shape": [
+    1398129,
+    6
+   ],
+   "dtype": "float64",
+   "int_cols_ok": true,
+   "x_range": [
+    2.0,
+    1279.0
+   ],
+   "y_range": [
+    0.0,
+    719.0
+   ],
+   "p_values": [
+    0.0,
+    1.0
+   ],
+   "class_counts": {
+    "0": 1295674,
+    "1": 68966,
+    "2": 33489
+   },
+   "id_min": -1.0,
+   "t_monotonic": true,
+   "t_backsteps": 0,
+   "t_start_us": 72.0,
+   "duration_s": 120.000562,
+   "max_gap_ms": 0.929,
+   "n_events": 1398129,
+   "events_per_win_mean": 582.5510217193817,
+   "label_share": 0.07328007644502045,
+   "id_class_mismatch": 0,
+   "ids_with_multiple_classes": [],
+   "exact_duplicates": 0,
+   "bg_events_per_win_p10_50_90_max": [
+    508.0,
+    536.0,
+    569.0,
+    1527.0
+   ],
+   "pixels_over_1kHz": 0,
+   "pixels_over_100Hz": 18,
+   "max_pixel_rate_hz": 893.9624799423856,
+   "bg_spatial_corr_halves": 0.997566159269724,
+   "n_objects": 65,
+   "objects_per_class": {
+    "1": 2,
+    "2": 63
+   },
+   "obj_events_per_win_p10_50_90": [
+    2.0,
+    18.0,
+    189.79999999999995
+   ],
+   "obj_size_px_p10_50_90": [
+    3.0,
+    14.0,
+    43.89999999999998
+   ],
+   "obj_speed_px_per_win_p10_50_90": [
+    5.057159473828843,
+    17.898283466745937,
+    56.03585915531438
+   ],
+   "obj_rel_speed_bodylen_per_win_p10_50_90": [
+    0.6398200117829467,
+    1.05588010986708,
+    2.3418785262458277
+   ],
+   "obj_duration_win_p10_50_90": [
+    3.0,
+    9.0,
+    37.2
+   ],
+   "windows_with_targets_share": 0.307371928363182,
+   "n_boxes": 1258,
+   "n_box_ids": 65,
+   "box_classes": {
+    "1": 118,
+    "2": 1140
+   },
+   "ids_events_not_boxes": [],
+   "ids_boxes_not_events": [],
+   "box_event_class_mismatch": 0,
+   "inbox_labelled_[t-33,t)": 0.9933423993377875,
+   "inbox_labelled_[t-16.7,t+16.7)": 0.997517281666829,
+   "inbox_labelled_[t,t+33)": 0.9376840984794956,
+   "best_box_alignment": "[t-16.7,t+16.7)",
+   "labelled_inside_nearest_own_box": 1.0,
+   "labelled_to_box_dt_ms_p1_50_99": [
+    -16.24146,
+    0.888,
+    16.351
+   ]
+  },
+  {
+   "split": "Train",
+   "id": "7",
+   "shape": [
+    2959618,
+    6
+   ],
+   "dtype": "float64",
+   "int_cols_ok": true,
+   "x_range": [
+    0.0,
+    1279.0
+   ],
+   "y_range": [
+    0.0,
+    719.0
+   ],
+   "p_values": [
+    0.0,
+    1.0
+   ],
+   "class_counts": {
+    "0": 2544670,
+    "1": 388282,
+    "2": 26666
+   },
+   "id_min": -1.0,
+   "t_monotonic": true,
+   "t_backsteps": 0,
+   "t_start_us": 128.0,
+   "duration_s": 120.000767,
+   "max_gap_ms": 0.771,
+   "n_events": 2959618,
+   "events_per_win_mean": 1233.1662846788304,
+   "label_share": 0.14020322893022005,
+   "id_class_mismatch": 0,
+   "ids_with_multiple_classes": [],
+   "exact_duplicates": 0,
+   "bg_events_per_win_p10_50_90_max": [
+    631.0,
+    960.0,
+    1648.0,
+    6519.0
+   ],
+   "pixels_over_1kHz": 0,
+   "pixels_over_100Hz": 19,
+   "max_pixel_rate_hz": 897.3692643147856,
+   "bg_spatial_corr_halves": 0.8270006201838362,
+   "n_objects": 65,
+   "objects_per_class": {
+    "1": 2,
+    "2": 63
+   },
+   "obj_events_per_win_p10_50_90": [
+    2.0,
+    22.0,
+    624.1999999999998
+   ],
+   "obj_size_px_p10_50_90": [
+    2.0,
+    12.0,
+    43.0
+   ],
+   "obj_speed_px_per_win_p10_50_90": [
+    2.2265764401556103,
+    13.593026931748941,
+    38.688305760589714
+   ],
+   "obj_rel_speed_bodylen_per_win_p10_50_90": [
+    0.27306222556334037,
+    0.9267401748920195,
+    1.968726278257666
+   ],
+   "obj_duration_win_p10_50_90": [
+    2.0,
+    10.0,
+    32.20000000000001
+   ],
+   "windows_with_targets_share": 0.32986255726780506,
+   "n_boxes": 1326,
+   "n_box_ids": 65,
+   "box_classes": {
+    "1": 263,
+    "2": 1063
+   },
+   "ids_events_not_boxes": [],
+   "ids_boxes_not_events": [],
+   "box_event_class_mismatch": 0,
+   "inbox_labelled_[t-33,t)": 0.9992337544208981,
+   "inbox_labelled_[t-16.7,t+16.7)": 0.999790383670165,
+   "inbox_labelled_[t,t+33)": 0.9883662451883544,
+   "best_box_alignment": "[t-16.7,t+16.7)",
+   "labelled_inside_nearest_own_box": 1.0,
+   "labelled_to_box_dt_ms_p1_50_99": [
+    -16.314,
+    0.138,
+    16.341
+   ]
+  },
+  {
+   "split": "Train",
+   "id": "8",
+   "shape": [
+    2461688,
+    6
+   ],
+   "dtype": "float64",
+   "int_cols_ok": true,
+   "x_range": [
+    7.0,
+    1279.0
+   ],
+   "y_range": [
+    0.0,
+    719.0
+   ],
+   "p_values": [
+    0.0,
+    1.0
+   ],
+   "class_counts": {
+    "0": 2403626,
+    "1": 45486,
+    "2": 12576
+   },
+   "id_min": -1.0,
+   "t_monotonic": true,
+   "t_backsteps": 0,
+   "t_start_us": 26.0,
+   "duration_s": 120.000846,
+   "max_gap_ms": 0.709,
+   "n_events": 2461688,
+   "events_per_win_mean": 1025.696102175813,
+   "label_share": 0.02358625463503092,
+   "id_class_mismatch": 0,
+   "ids_with_multiple_classes": [],
+   "exact_duplicates": 0,
+   "bg_events_per_win_p10_50_90_max": [
+    656.0,
+    933.0,
+    1424.0,
+    2743.0
+   ],
+   "pixels_over_1kHz": 0,
+   "pixels_over_100Hz": 21,
+   "max_pixel_rate_hz": 901.4853111952227,
+   "bg_spatial_corr_halves": 0.9236067882261305,
+   "n_objects": 33,
+   "objects_per_class": {
+    "1": 3,
+    "2": 30
+   },
+   "obj_events_per_win_p10_50_90": [
+    2.0,
+    21.0,
+    258.6
+   ],
+   "obj_size_px_p10_50_90": [
+    2.0,
+    13.0,
+    45.0
+   ],
+   "obj_speed_px_per_win_p10_50_90": [
+    6.44365956626177,
+    16.64500155715015,
+    58.03102724675391
+   ],
+   "obj_rel_speed_bodylen_per_win_p10_50_90": [
+    0.6846484443238248,
+    1.0396221459692088,
+    2.5615024222183
+   ],
+   "obj_duration_win_p10_50_90": [
+    3.0,
+    13.0,
+    38.2
+   ],
+   "windows_with_targets_share": 0.16076634735526865,
+   "n_boxes": 647,
+   "n_box_ids": 33,
+   "box_classes": {
+    "1": 137,
+    "2": 510
+   },
+   "ids_events_not_boxes": [],
+   "ids_boxes_not_events": [],
+   "box_event_class_mismatch": 0,
+   "inbox_labelled_[t-33,t)": 0.99800663100299,
+   "inbox_labelled_[t-16.7,t+16.7)": 0.9993975592543505,
+   "inbox_labelled_[t,t+33)": 0.9655057545928479,
+   "best_box_alignment": "[t-16.7,t+16.7)",
+   "labelled_inside_nearest_own_box": 1.0,
+   "labelled_to_box_dt_ms_p1_50_99": [
+    -16.271,
+    0.6345000000000001,
+    16.36139
+   ]
+  },
+  {
+   "split": "Train",
+   "id": "10",
+   "shape": [
+    2576994,
+    6
+   ],
+   "dtype": "float64",
+   "int_cols_ok": true,
+   "x_range": [
+    0.0,
+    1279.0
+   ],
+   "y_range": [
+    0.0,
+    719.0
+   ],
+   "p_values": [
+    0.0,
+    1.0
+   ],
+   "class_counts": {
+    "0": 2470629,
+    "1": 22483,
+    "2": 83882
+   },
+   "id_min": -1.0,
+   "t_monotonic": true,
+   "t_backsteps": 0,
+   "t_start_us": 34.0,
+   "duration_s": 120.000708,
+   "max_gap_ms": 0.736,
+   "n_events": 2576994,
+   "events_per_win_mean": 1073.7411649271269,
+   "label_share": 0.04127483416725068,
+   "id_class_mismatch": 0,
+   "ids_with_multiple_classes": [],
+   "exact_duplicates": 0,
+   "bg_events_per_win_p10_50_90_max": [
+    653.0,
+    800.0,
+    1733.0,
+    6257.0
+   ],
+   "pixels_over_1kHz": 0,
+   "pixels_over_100Hz": 21,
+   "max_pixel_rate_hz": 906.9946487315725,
+   "bg_spatial_corr_halves": 0.9017384301770731,
+   "n_objects": 57,
+   "objects_per_class": {
+    "1": 1,
+    "2": 56
+   },
+   "obj_events_per_win_p10_50_90": [
+    2.0,
+    22.0,
+    593.9000000000001
+   ],
+   "obj_size_px_p10_50_90": [
+    3.0,
+    18.0,
+    72.0
+   ],
+   "obj_speed_px_per_win_p10_50_90": [
+    9.519071309057985,
+    25.67669013922349,
+    87.09980677514474
+   ],
+   "obj_rel_speed_bodylen_per_win_p10_50_90": [
+    0.6770413787991743,
+    1.1211074390649294,
+    2.572789926241776
+   ],
+   "obj_duration_win_p10_50_90": [
+    1.0,
+    4.0,
+    20.199999999999996
+   ],
+   "windows_with_targets_share": 0.15618492294877134,
+   "n_boxes": 625,
+   "n_box_ids": 57,
+   "box_classes": {
+    "1": 32,
+    "2": 593
+   },
+   "ids_events_not_boxes": [],
+   "ids_boxes_not_events": [],
+   "box_event_class_mismatch": 0,
+   "inbox_labelled_[t-33,t)": 0.9952044848198305,
+   "inbox_labelled_[t-16.7,t+16.7)": 0.9999059947169031,
+   "inbox_labelled_[t,t+33)": 0.8448310178734924,
+   "best_box_alignment": "[t-16.7,t+16.7)",
+   "labelled_inside_nearest_own_box": 1.0,
+   "labelled_to_box_dt_ms_p1_50_99": [
+    -15.899,
+    2.205,
+    16.412
+   ]
+  },
+  {
+   "split": "Train",
+   "id": "11",
+   "shape": [
+    1716933,
+    6
+   ],
+   "dtype": "float64",
+   "int_cols_ok": true,
+   "x_range": [
+    0.0,
+    1279.0
+   ],
+   "y_range": [
+    0.0,
+    719.0
+   ],
+   "p_values": [
+    0.0,
+    1.0
+   ],
+   "class_counts": {
+    "0": 1664599,
+    "1": 22346,
+    "2": 29988
+   },
+   "id_min": -1.0,
+   "t_monotonic": true,
+   "t_backsteps": 0,
+   "t_start_us": 186.0,
+   "duration_s": 120.000654,
+   "max_gap_ms": 0.809,
+   "n_events": 1716933,
+   "events_per_win_mean": 715.3848511525612,
+   "label_share": 0.030481096233807608,
+   "id_class_mismatch": 0,
+   "ids_with_multiple_classes": [],
+   "exact_duplicates": 0,
+   "bg_events_per_win_p10_50_90_max": [
+    655.0,
+    687.0,
+    740.0,
+    1119.0
+   ],
+   "pixels_over_1kHz": 0,
+   "pixels_over_100Hz": 23,
+   "max_pixel_rate_hz": 908.7533806274089,
+   "bg_spatial_corr_halves": 0.9958601739276359,
+   "n_objects": 81,
+   "objects_per_class": {
+    "1": 12,
+    "2": 69
+   },
+   "obj_events_per_win_p10_50_90": [
+    2.0,
+    21.0,
+    132.0
+   ],
+   "obj_size_px_p10_50_90": [
+    2.0,
+    13.0,
+    32.80000000000007
+   ],
+   "obj_speed_px_per_win_p10_50_90": [
+    6.1089804736352455,
+    14.882734025110722,
+    42.27506689338108
+   ],
+   "obj_rel_speed_bodylen_per_win_p10_50_90": [
+    0.6777996656483035,
+    1.0106785947641446,
+    2.4663408796772344
+   ],
+   "obj_duration_win_p10_50_90": [
+    2.0,
+    6.0,
+    30.0
+   ],
+   "windows_with_targets_share": 0.3023740108288213,
+   "n_boxes": 1271,
+   "n_box_ids": 81,
+   "box_classes": {
+    "1": 532,
+    "2": 739
+   },
+   "ids_events_not_boxes": [],
+   "ids_boxes_not_events": [],
+   "box_event_class_mismatch": 0,
+   "inbox_labelled_[t-33,t)": 0.9746155996645234,
+   "inbox_labelled_[t-16.7,t+16.7)": 0.9764356878988022,
+   "inbox_labelled_[t,t+33)": 0.9110959884136872,
+   "best_box_alignment": "[t-16.7,t+16.7)",
+   "labelled_inside_nearest_own_box": 1.0,
+   "labelled_to_box_dt_ms_p1_50_99": [
+    -16.166,
+    1.176,
+    16.34967
+   ]
+  },
+  {
+   "split": "Train",
+   "id": "12",
+   "shape": [
+    2017609,
+    6
+   ],
+   "dtype": "float64",
+   "int_cols_ok": true,
+   "x_range": [
+    0.0,
+    1279.0
+   ],
+   "y_range": [
+    0.0,
+    719.0
+   ],
+   "p_values": [
+    0.0,
+    1.0
+   ],
+   "class_counts": {
+    "0": 1979998,
+    "1": 5376,
+    "2": 32235
+   },
+   "id_min": -1.0,
+   "t_monotonic": true,
+   "t_backsteps": 0,
+   "t_start_us": 109.0,
+   "duration_s": 120.000719,
+   "max_gap_ms": 0.763,
+   "n_events": 2017609,
+   "events_per_win_mean": 840.6653796799334,
+   "label_share": 0.018641372039874923,
+   "id_class_mismatch": 0,
+   "ids_with_multiple_classes": [],
+   "exact_duplicates": 0,
+   "bg_events_per_win_p10_50_90_max": [
+    642.0,
+    766.0,
+    1053.0,
+    4075.0
+   ],
+   "pixels_over_1kHz": 0,
+   "pixels_over_100Hz": 23,
+   "max_pixel_rate_hz": 909.5278837454299,
+   "bg_spatial_corr_halves": 0.9908578581268381,
+   "n_objects": 84,
+   "objects_per_class": {
+    "1": 2,
+    "2": 82
+   },
+   "obj_events_per_win_p10_50_90": [
+    2.0,
+    12.0,
+    132.20000000000005
+   ],
+   "obj_size_px_p10_50_90": [
+    1.0,
+    8.0,
+    39.60000000000002
+   ],
+   "obj_speed_px_per_win_p10_50_90": [
+    4.195129215459775,
+    10.403894482748425,
+    59.370249507092886
+   ],
+   "obj_rel_speed_bodylen_per_win_p10_50_90": [
+    0.6851435954620432,
+    1.0189922130789368,
+    2.9906365231781122
+   ],
+   "obj_duration_win_p10_50_90": [
+    2.0,
+    7.0,
+    19.10000000000001
+   ],
+   "windows_with_targets_share": 0.2178259058725531,
+   "n_boxes": 926,
+   "n_box_ids": 84,
+   "box_classes": {
+    "1": 67,
+    "2": 859
+   },
+   "ids_events_not_boxes": [],
+   "ids_boxes_not_events": [],
+   "box_event_class_mismatch": 0,
+   "inbox_labelled_[t-33,t)": 0.9894075497170154,
+   "inbox_labelled_[t-16.7,t+16.7)": 0.9965290657622807,
+   "inbox_labelled_[t,t+33)": 0.8159837940273149,
+   "best_box_alignment": "[t-16.7,t+16.7)",
+   "labelled_inside_nearest_own_box": 1.0,
+   "labelled_to_box_dt_ms_p1_50_99": [
+    -15.7659,
+    2.845,
+    16.386
+   ]
+  },
+  {
+   "split": "Train",
+   "id": "14",
+   "shape": [
+    1912726,
+    6
+   ],
+   "dtype": "float64",
+   "int_cols_ok": true,
+   "x_range": [
+    0.0,
+    1279.0
+   ],
+   "y_range": [
+    0.0,
+    719.0
+   ],
+   "p_values": [
+    0.0,
+    1.0
+   ],
+   "class_counts": {
+    "0": 1854940,
+    "1": 1139,
+    "2": 56647
+   },
+   "id_min": -1.0,
+   "t_monotonic": true,
+   "t_backsteps": 0,
+   "t_start_us": 95.0,
+   "duration_s": 120.00079,
+   "max_gap_ms": 0.812,
+   "n_events": 1912726,
+   "events_per_win_mean": 796.9639199875267,
+   "label_share": 0.03021133188966951,
+   "id_class_mismatch": 0,
+   "ids_with_multiple_classes": [],
+   "exact_duplicates": 0,
+   "bg_events_per_win_p10_50_90_max": [
+    667.0,
+    742.0,
+    839.0,
+    13788.0
+   ],
+   "pixels_over_1kHz": 0,
+   "pixels_over_100Hz": 24,
+   "max_pixel_rate_hz": 912.6439917603876,
+   "bg_spatial_corr_halves": 0.9924062826758058,
+   "n_objects": 165,
+   "objects_per_class": {
+    "1": 1,
+    "2": 164
+   },
+   "obj_events_per_win_p10_50_90": [
+    2.0,
+    15.0,
+    116.0
+   ],
+   "obj_size_px_p10_50_90": [
+    2.0,
+    9.0,
+    32.0
+   ],
+   "obj_speed_px_per_win_p10_50_90": [
+    3.5489603796248246,
+    11.035858199749883,
+    42.62938543039518
+   ],
+   "obj_rel_speed_bodylen_per_win_p10_50_90": [
+    0.6312847483001813,
+    0.9936701117003528,
+    2.2699199552812
+   ],
+   "obj_duration_win_p10_50_90": [
+    2.0,
+    5.0,
+    21.0
+   ],
+   "windows_with_targets_share": 0.4219075385256143,
+   "n_boxes": 1869,
+   "n_box_ids": 165,
+   "box_classes": {
+    "1": 13,
+    "2": 1856
+   },
+   "ids_events_not_boxes": [],
+   "ids_boxes_not_events": [],
+   "box_event_class_mismatch": 0,
+   "inbox_labelled_[t-33,t)": 0.9907916835582324,
+   "inbox_labelled_[t-16.7,t+16.7)": 0.996997981401287,
+   "inbox_labelled_[t,t+33)": 0.8526968804133785,
+   "best_box_alignment": "[t-16.7,t+16.7)",
+   "labelled_inside_nearest_own_box": 1.0,
+   "labelled_to_box_dt_ms_p1_50_99": [
+    -16.07015,
+    2.0735,
+    16.387
+   ]
+  },
+  {
+   "split": "Train",
+   "id": "15",
+   "shape": [
+    3155846,
+    6
+   ],
+   "dtype": "float64",
+   "int_cols_ok": true,
+   "x_range": [
+    0.0,
+    1279.0
+   ],
+   "y_range": [
+    0.0,
+    719.0
+   ],
+   "p_values": [
+    0.0,
+    1.0
+   ],
+   "class_counts": {
+    "0": 2929191,
+    "1": 79653,
+    "2": 147002
+   },
+   "id_min": -1.0,
+   "t_monotonic": true,
+   "t_backsteps": 0,
+   "t_start_us": 55.0,
+   "duration_s": 120.00084,
+   "max_gap_ms": 0.644,
+   "n_events": 3155846,
+   "events_per_win_mean": 1314.9266288469314,
+   "label_share": 0.07182067819532385,
+   "id_class_mismatch": 0,
+   "ids_with_multiple_classes": [],
+   "exact_duplicates": 0,
+   "bg_events_per_win_p10_50_90_max": [
+    866.0,
+    1066.0,
+    1663.0,
+    7479.0
+   ],
+   "pixels_over_1kHz": 0,
+   "pixels_over_100Hz": 25,
+   "max_pixel_rate_hz": 915.7769228948731,
+   "bg_spatial_corr_halves": 0.9440259996449978,
+   "n_objects": 349,
+   "objects_per_class": {
+    "1": 11,
+    "2": 338
+   },
+   "obj_events_per_win_p10_50_90": [
+    3.0,
+    25.0,
+    184.79999999999995
+   ],
+   "obj_size_px_p10_50_90": [
+    3.0,
+    16.0,
+    49.0
+   ],
+   "obj_speed_px_per_win_p10_50_90": [
+    7.904565401073959,
+    22.086201450134716,
+    60.41462281380501
+   ],
+   "obj_rel_speed_bodylen_per_win_p10_50_90": [
+    0.7166495719533795,
+    1.071475596896807,
+    2.807233657278458
+   ],
+   "obj_duration_win_p10_50_90": [
+    2.0,
+    4.0,
+    16.0
+   ],
+   "windows_with_targets_share": 0.5510204081632653,
+   "n_boxes": 3206,
+   "n_box_ids": 350,
+   "box_classes": {
+    "-1": 4,
+    "1": 391,
+    "2": 2811
+   },
+   "ids_events_not_boxes": [],
+   "ids_boxes_not_events": [
+    142
+   ],
+   "box_event_class_mismatch": 0,
+   "inbox_labelled_[t-33,t)": 0.9878661552117677,
+   "inbox_labelled_[t-16.7,t+16.7)": 0.9949693817080397,
+   "inbox_labelled_[t,t+33)": 0.867702231037717,
+   "best_box_alignment": "[t-16.7,t+16.7)",
+   "labelled_inside_nearest_own_box": 1.0,
+   "labelled_to_box_dt_ms_p1_50_99": [
+    -15.989460000000001,
+    2.271,
+    16.364
+   ]
+  },
+  {
+   "split": "Train",
+   "id": "17",
+   "shape": [
+    2668423,
+    6
+   ],
+   "dtype": "float64",
+   "int_cols_ok": true,
+   "x_range": [
+    0.0,
+    1279.0
+   ],
+   "y_range": [
+    0.0,
+    719.0
+   ],
+   "p_values": [
+    0.0,
+    1.0
+   ],
+   "class_counts": {
+    "0": 2618253,
+    "1": 5796,
+    "2": 44374
+   },
+   "id_min": -1.0,
+   "t_monotonic": true,
+   "t_backsteps": 0,
+   "t_start_us": 55.0,
+   "duration_s": 120.000755,
+   "max_gap_ms": 0.64,
+   "n_events": 2668423,
+   "events_per_win_mean": 1111.8359213656613,
+   "label_share": 0.01880136694969276,
+   "id_class_mismatch": 0,
+   "ids_with_multiple_classes": [],
+   "exact_duplicates": 0,
+   "bg_events_per_win_p10_50_90_max": [
+    850.0,
+    979.0,
+    1505.0,
+    3295.0
+   ],
+   "pixels_over_1kHz": 0,
+   "pixels_over_100Hz": 25,
+   "max_pixel_rate_hz": 920.9358724451358,
+   "bg_spatial_corr_halves": 0.9349329959960933,
+   "n_objects": 88,
+   "objects_per_class": {
+    "1": 1,
+    "2": 87
+   },
+   "obj_events_per_win_p10_50_90": [
+    2.0,
+    16.0,
+    165.4000000000001
+   ],
+   "obj_size_px_p10_50_90": [
+    2.0,
+    12.0,
+    41.0
+   ],
+   "obj_speed_px_per_win_p10_50_90": [
+    5.341671937756444,
+    18.04254831547134,
+    52.93291187385468
+   ],
+   "obj_rel_speed_bodylen_per_win_p10_50_90": [
+    0.5889386855168861,
+    1.0335274310645985,
+    2.708880649721535
+   ],
+   "obj_duration_win_p10_50_90": [
+    2.0,
+    5.0,
+    17.19999999999999
+   ],
+   "windows_with_targets_share": 0.2615576842982091,
+   "n_boxes": 1078,
+   "n_box_ids": 88,
+   "box_classes": {
+    "1": 90,
+    "2": 988
+   },
+   "ids_events_not_boxes": [],
+   "ids_boxes_not_events": [],
+   "box_event_class_mismatch": 0,
+   "inbox_labelled_[t-33,t)": 0.9872574148663493,
+   "inbox_labelled_[t-16.7,t+16.7)": 0.9978519431958311,
+   "inbox_labelled_[t,t+33)": 0.8113634145548001,
+   "best_box_alignment": "[t-16.7,t+16.7)",
+   "labelled_inside_nearest_own_box": 1.0,
+   "labelled_to_box_dt_ms_p1_50_99": [
+    -15.77931,
+    2.279,
+    16.328619999999994
+   ]
+  },
+  {
+   "split": "Train",
+   "id": "18",
+   "shape": [
+    2432564,
+    6
+   ],
+   "dtype": "float64",
+   "int_cols_ok": true,
+   "x_range": [
+    0.0,
+    1279.0
+   ],
+   "y_range": [
+    0.0,
+    719.0
+   ],
+   "p_values": [
+    0.0,
+    1.0
+   ],
+   "class_counts": {
+    "0": 2285290,
+    "1": 42154,
+    "2": 105120
+   },
+   "id_min": -1.0,
+   "t_monotonic": true,
+   "t_backsteps": 0,
+   "t_start_us": 78.0,
+   "duration_s": 120.000808,
+   "max_gap_ms": 0.664,
+   "n_events": 2432564,
+   "events_per_win_mean": 1013.5615086858414,
+   "label_share": 0.0605427030902373,
+   "id_class_mismatch": 0,
+   "ids_with_multiple_classes": [],
+   "exact_duplicates": 0,
+   "bg_events_per_win_p10_50_90_max": [
+    854.0,
+    906.0,
+    963.0,
+    65609.0
+   ],
+   "pixels_over_1kHz": 0,
+   "pixels_over_100Hz": 26,
+   "max_pixel_rate_hz": 926.8520925292436,
+   "bg_spatial_corr_halves": 0.9868717844249543,
+   "n_objects": 94,
+   "objects_per_class": {
+    "1": 4,
+    "2": 90
+   },
+   "obj_events_per_win_p10_50_90": [
+    3.0,
+    27.0,
+    247.60000000000014
+   ],
+   "obj_size_px_p10_50_90": [
+    3.0,
+    13.0,
+    38.0
+   ],
+   "obj_speed_px_per_win_p10_50_90": [
+    6.976113817012313,
+    19.797996932260904,
+    45.1972537056044
+   ],
+   "obj_rel_speed_bodylen_per_win_p10_50_90": [
+    0.7574895157442133,
+    1.0226199998502898,
+    2.6881713013893305
+   ],
+   "obj_duration_win_p10_50_90": [
+    2.0,
+    6.0,
+    24.700000000000003
+   ],
+   "windows_with_targets_share": 0.2615576842982091,
+   "n_boxes": 1093,
+   "n_box_ids": 94,
+   "box_classes": {
+    "1": 171,
+    "2": 922
+   },
+   "ids_events_not_boxes": [],
+   "ids_boxes_not_events": [],
+   "box_event_class_mismatch": 0,
+   "inbox_labelled_[t-33,t)": 0.9964364437913299,
+   "inbox_labelled_[t-16.7,t+16.7)": 0.9986641531951829,
+   "inbox_labelled_[t,t+33)": 0.8726224578759141,
+   "best_box_alignment": "[t-16.7,t+16.7)",
+   "labelled_inside_nearest_own_box": 1.0,
+   "labelled_to_box_dt_ms_p1_50_99": [
+    -15.934,
+    1.995,
+    16.414
+   ]
+  },
+  {
+   "split": "Train",
+   "id": "19",
+   "shape": [
+    2322048,
+    6
+   ],
+   "dtype": "float64",
+   "int_cols_ok": true,
+   "x_range": [
+    0.0,
+    1279.0
+   ],
+   "y_range": [
+    0.0,
+    719.0
+   ],
+   "p_values": [
+    0.0,
+    1.0
+   ],
+   "class_counts": {
+    "0": 2263100,
+    "1": 15403,
+    "2": 43545
+   },
+   "id_min": -1.0,
+   "t_monotonic": true,
+   "t_backsteps": 0,
+   "t_start_us": 26.0,
+   "duration_s": 120.000799,
+   "max_gap_ms": 0.679,
+   "n_events": 2322048,
+   "events_per_win_mean": 967.5135579722264,
+   "label_share": 0.025386210793230803,
+   "id_class_mismatch": 0,
+   "ids_with_multiple_classes": [],
+   "exact_duplicates": 0,
+   "bg_events_per_win_p10_50_90_max": [
+    868.0,
+    941.0,
+    1013.0,
+    1822.0
+   ],
+   "pixels_over_1kHz": 0,
+   "pixels_over_100Hz": 27,
+   "max_pixel_rate_hz": 929.418811619746,
+   "bg_spatial_corr_halves": 0.994794101337547,
+   "n_objects": 97,
+   "objects_per_class": {
+    "1": 7,
+    "2": 90
+   },
+   "obj_events_per_win_p10_50_90": [
+    3.0,
+    30.0,
+    203.10000000000002
+   ],
+   "obj_size_px_p10_50_90": [
+    3.0,
+    14.0,
+    43.0
+   ],
+   "obj_speed_px_per_win_p10_50_90": [
+    6.76752073881719,
+    20.56900169404415,
+    57.755333427234966
+   ],
+   "obj_rel_speed_bodylen_per_win_p10_50_90": [
+    0.6208678365985066,
+    1.0067585605367588,
+    3.049984945357967
+   ],
+   "obj_duration_win_p10_50_90": [
+    3.0,
+    7.0,
+    18.400000000000006
+   ],
+   "windows_with_targets_share": 0.2523948354852145,
+   "n_boxes": 1083,
+   "n_box_ids": 97,
+   "box_classes": {
+    "1": 193,
+    "2": 890
+   },
+   "ids_events_not_boxes": [],
+   "ids_boxes_not_events": [],
+   "box_event_class_mismatch": 0,
+   "inbox_labelled_[t-33,t)": 0.9840048143924996,
+   "inbox_labelled_[t-16.7,t+16.7)": 0.9943324618368896,
+   "inbox_labelled_[t,t+33)": 0.8321082076340203,
+   "best_box_alignment": "[t-16.7,t+16.7)",
+   "labelled_inside_nearest_own_box": 1.0,
+   "labelled_to_box_dt_ms_p1_50_99": [
+    -15.813,
+    2.839,
+    16.36053
+   ]
+  },
+  {
+   "split": "Train",
+   "id": "20",
+   "shape": [
+    4106792,
+    6
+   ],
+   "dtype": "float64",
+   "int_cols_ok": true,
+   "x_range": [
+    0.0,
+    1279.0
+   ],
+   "y_range": [
+    0.0,
+    719.0
+   ],
+   "p_values": [
+    0.0,
+    1.0
+   ],
+   "class_counts": {
+    "0": 3876029,
+    "1": 55861,
+    "2": 174902
+   },
+   "id_min": -1.0,
+   "t_monotonic": true,
+   "t_backsteps": 0,
+   "t_start_us": 68.0,
+   "duration_s": 180.000187,
+   "max_gap_ms": 0.625,
+   "n_events": 4106792,
+   "events_per_win_mean": 1140.7743704177374,
+   "label_share": 0.056190574053908746,
+   "id_class_mismatch": 0,
+   "ids_with_multiple_classes": [],
+   "exact_duplicates": 0,
+   "bg_events_per_win_p10_50_90_max": [
+    945.0,
+    1066.0,
+    1178.0,
+    2097.0
+   ],
+   "pixels_over_1kHz": 0,
+   "pixels_over_100Hz": 33,
+   "max_pixel_rate_hz": 936.4823604322144,
+   "bg_spatial_corr_halves": 0.9870292926188257,
+   "n_objects": 155,
+   "objects_per_class": {
+    "1": 7,
+    "2": 148
+   },
+   "obj_events_per_win_p10_50_90": [
+    3.0,
+    29.0,
+    223.5
+   ],
+   "obj_size_px_p10_50_90": [
+    3.0,
+    17.0,
+    51.0
+   ],
+   "obj_speed_px_per_win_p10_50_90": [
+    6.0053164108623,
+    19.448650338776723,
+    56.17270671879788
+   ],
+   "obj_rel_speed_bodylen_per_win_p10_50_90": [
+    0.5823720487091054,
+    0.9786827117051203,
+    2.407182963981165
+   ],
+   "obj_duration_win_p10_50_90": [
+    2.4000000000000004,
+    6.0,
+    19.0
+   ],
+   "windows_with_targets_share": 0.2815884476534296,
+   "n_boxes": 1890,
+   "n_box_ids": 156,
+   "box_classes": {
+    "-1": 3,
+    "1": 212,
+    "2": 1675
+   },
+   "ids_events_not_boxes": [],
+   "ids_boxes_not_events": [
+    53
+   ],
+   "box_event_class_mismatch": 0,
+   "inbox_labelled_[t-33,t)": 0.9968025623227061,
+   "inbox_labelled_[t-16.7,t+16.7)": 0.9980969516625723,
+   "inbox_labelled_[t,t+33)": 0.9496204933586337,
+   "best_box_alignment": "[t-16.7,t+16.7)",
+   "labelled_inside_nearest_own_box": 1.0,
+   "labelled_to_box_dt_ms_p1_50_99": [
+    -16.253,
+    0.828,
+    16.352
+   ]
+  },
+  {
+   "split": "Train",
+   "id": "21",
+   "shape": [
+    4534336,
+    6
+   ],
+   "dtype": "float64",
+   "int_cols_ok": true,
+   "x_range": [
+    0.0,
+    1279.0
+   ],
+   "y_range": [
+    0.0,
+    719.0
+   ],
+   "p_values": [
+    0.0,
+    1.0
+   ],
+   "class_counts": {
+    "0": 4402159,
+    "1": 18023,
+    "2": 114154
+   },
+   "id_min": -1.0,
+   "t_monotonic": true,
+   "t_backsteps": 0,
+   "t_start_us": 48.0,
+   "duration_s": 180.000234,
+   "max_gap_ms": 0.529,
+   "n_events": 4534336,
+   "events_per_win_mean": 1259.5361403807954,
+   "label_share": 0.029150243828423832,
+   "id_class_mismatch": 0,
+   "ids_with_multiple_classes": [],
+   "exact_duplicates": 0,
+   "bg_events_per_win_p10_50_90_max": [
+    1091.0,
+    1229.0,
+    1337.0,
+    4012.0
+   ],
+   "pixels_over_1kHz": 0,
+   "pixels_over_100Hz": 38,
+   "max_pixel_rate_hz": 946.1209922649323,
+   "bg_spatial_corr_halves": 0.9898081025165498,
+   "n_objects": 145,
+   "objects_per_class": {
+    "1": 2,
+    "2": 143
+   },
+   "obj_events_per_win_p10_50_90": [
+    3.0,
+    35.0,
+    242.89999999999998
+   ],
+   "obj_size_px_p10_50_90": [
+    4.0,
+    21.0,
+    67.0
+   ],
+   "obj_speed_px_per_win_p10_50_90": [
+    10.724666396484338,
+    28.470314021639354,
+    91.05415369302202
+   ],
+   "obj_rel_speed_bodylen_per_win_p10_50_90": [
+    0.7107604901643503,
+    1.0864377913598313,
+    3.0894014722689604
+   ],
+   "obj_duration_win_p10_50_90": [
+    3.0,
+    5.0,
+    21.599999999999994
+   ],
+   "windows_with_targets_share": 0.24271035823382395,
+   "n_boxes": 1554,
+   "n_box_ids": 145,
+   "box_classes": {
+    "1": 89,
+    "2": 1465
+   },
+   "ids_events_not_boxes": [],
+   "ids_boxes_not_events": [],
+   "box_event_class_mismatch": 0,
+   "inbox_labelled_[t-33,t)": 0.9659924330616997,
+   "inbox_labelled_[t-16.7,t+16.7)": 0.9855350179321041,
+   "inbox_labelled_[t,t+33)": 0.8194900750771383,
+   "best_box_alignment": "[t-16.7,t+16.7)",
+   "labelled_inside_nearest_own_box": 1.0,
+   "labelled_to_box_dt_ms_p1_50_99": [
+    -15.786719999999999,
+    2.457,
+    16.388
+   ]
+  },
+  {
+   "split": "Train",
+   "id": "22",
+   "shape": [
+    5227303,
+    6
+   ],
+   "dtype": "float64",
+   "int_cols_ok": true,
+   "x_range": [
+    0.0,
+    1279.0
+   ],
+   "y_range": [
+    0.0,
+    719.0
+   ],
+   "p_values": [
+    0.0,
+    1.0
+   ],
+   "class_counts": {
+    "0": 5080624,
+    "1": 13551,
+    "2": 133128
+   },
+   "id_min": -1.0,
+   "t_monotonic": true,
+   "t_backsteps": 0,
+   "t_start_us": 48.0,
+   "duration_s": 180.000178,
+   "max_gap_ms": 0.474,
+   "n_events": 5227303,
+   "events_per_win_mean": 1452.027175217571,
+   "label_share": 0.028060167929810077,
+   "id_class_mismatch": 0,
+   "ids_with_multiple_classes": [],
+   "exact_duplicates": 0,
+   "bg_events_per_win_p10_50_90_max": [
+    1291.0,
+    1413.0,
+    1504.0,
+    10747.0
+   ],
+   "pixels_over_1kHz": 0,
+   "pixels_over_100Hz": 42,
+   "max_pixel_rate_hz": 956.6712761806268,
+   "bg_spatial_corr_halves": 0.9804415101134261,
+   "n_objects": 173,
+   "objects_per_class": {
+    "1": 2,
+    "2": 171
+   },
+   "obj_events_per_win_p10_50_90": [
+    4.0,
+    37.0,
+    205.39999999999998
+   ],
+   "obj_size_px_p10_50_90": [
+    3.0,
+    23.0,
+    78.0
+   ],
+   "obj_speed_px_per_win_p10_50_90": [
+    8.290097752567858,
+    33.01821623816609,
+    107.68851457664213
+   ],
+   "obj_rel_speed_bodylen_per_win_p10_50_90": [
+    0.6179568984322917,
+    1.062593458224698,
+    3.3592016298501743
+   ],
+   "obj_duration_win_p10_50_90": [
+    2.0,
+    4.0,
+    11.0
+   ],
+   "windows_with_targets_share": 0.21188558733685087,
+   "n_boxes": 1341,
+   "n_box_ids": 174,
+   "box_classes": {
+    "-1": 4,
+    "1": 56,
+    "2": 1281
+   },
+   "ids_events_not_boxes": [],
+   "ids_boxes_not_events": [
+    144
+   ],
+   "box_event_class_mismatch": 0,
+   "inbox_labelled_[t-33,t)": 0.979861175957917,
+   "inbox_labelled_[t-16.7,t+16.7)": 0.9966502235449196,
+   "inbox_labelled_[t,t+33)": 0.757888643794684,
+   "best_box_alignment": "[t-16.7,t+16.7)",
+   "labelled_inside_nearest_own_box": 0.9991273461095317,
+   "labelled_to_box_dt_ms_p1_50_99": [
+    -15.22422,
+    3.55,
+    16.424220000000002
+   ]
+  },
+  {
+   "split": "Train",
+   "id": "25",
+   "shape": [
+    12226410,
+    6
+   ],
+   "dtype": "float64",
+   "int_cols_ok": true,
+   "x_range": [
+    0.0,
+    1279.0
+   ],
+   "y_range": [
+    0.0,
+    719.0
+   ],
+   "p_values": [
+    0.0,
+    1.0
+   ],
+   "class_counts": {
+    "0": 12030454,
+    "1": 24712,
+    "2": 171244
+   },
+   "id_min": -1.0,
+   "t_monotonic": true,
+   "t_backsteps": 0,
+   "t_start_us": 20.0,
+   "duration_s": 300.000277,
+   "max_gap_ms": 0.368,
+   "n_events": 12226410,
+   "events_per_win_mean": 2037.7331184930872,
+   "label_share": 0.01602727211012881,
+   "id_class_mismatch": 0,
+   "ids_with_multiple_classes": [],
+   "exact_duplicates": 0,
+   "bg_events_per_win_p10_50_90_max": [
+    1730.0,
+    2048.0,
+    2188.0,
+    4216.0
+   ],
+   "pixels_over_1kHz": 0,
+   "pixels_over_100Hz": 62,
+   "max_pixel_rate_hz": 989.7457528014216,
+   "bg_spatial_corr_halves": 0.9823454875716731,
+   "n_objects": 391,
+   "objects_per_class": {
+    "1": 5,
+    "2": 386
+   },
+   "obj_events_per_win_p10_50_90": [
+    4.0,
+    43.0,
+    226.9000000000001
+   ],
+   "obj_size_px_p10_50_90": [
+    5.0,
+    35.0,
+    124.0
+   ],
+   "obj_speed_px_per_win_p10_50_90": [
+    14.80976280364533,
+    50.16026547736295,
+    135.84140711803224
+   ],
+   "obj_rel_speed_bodylen_per_win_p10_50_90": [
+    0.56133953484708,
+    1.0516453905878584,
+    2.9422266875095375
+   ],
+   "obj_duration_win_p10_50_90": [
+    2.0,
+    4.0,
+    10.0
+   ],
+   "windows_with_targets_share": 0.24829195134144308,
+   "n_boxes": 2669,
+   "n_box_ids": 392,
+   "box_classes": {
+    "-1": 4,
+    "1": 132,
+    "2": 2533
+   },
+   "ids_events_not_boxes": [],
+   "ids_boxes_not_events": [
+    53
+   ],
+   "box_event_class_mismatch": 0,
+   "inbox_labelled_[t-33,t)": 0.936926682289923,
+   "inbox_labelled_[t-16.7,t+16.7)": 0.9870049411444718,
+   "inbox_labelled_[t,t+33)": 0.7386454275376559,
+   "best_box_alignment": "[t-16.7,t+16.7)",
+   "labelled_inside_nearest_own_box": 1.0,
+   "labelled_to_box_dt_ms_p1_50_99": [
+    -15.532,
+    3.8,
+    16.40945000000001
+   ]
+  },
+  {
+   "split": "Train",
+   "id": "27",
+   "shape": [
+    15311377,
+    6
+   ],
+   "dtype": "float64",
+   "int_cols_ok": true,
+   "x_range": [
+    0.0,
+    1279.0
+   ],
+   "y_range": [
+    0.0,
+    719.0
+   ],
+   "p_values": [
+    0.0,
+    1.0
+   ],
+   "class_counts": {
+    "0": 11537629,
+    "1": 3708746,
+    "2": 65002
+   },
+   "id_min": -1.0,
+   "t_monotonic": true,
+   "t_backsteps": 0,
+   "t_start_us": 34.0,
+   "duration_s": 300.050965,
+   "max_gap_ms": 0.396,
+   "n_events": 15311377,
+   "events_per_win_mean": 2551.462715675652,
+   "label_share": 0.24646692456204297,
+   "id_class_mismatch": 0,
+   "ids_with_multiple_classes": [],
+   "exact_duplicates": 0,
+   "bg_events_per_win_p10_50_90_max": [
+    1721.0,
+    1815.0,
+    1901.0,
+    127428.0
+   ],
+   "pixels_over_1kHz": 0,
+   "pixels_over_100Hz": 58,
+   "max_pixel_rate_hz": 982.6630619234968,
+   "bg_spatial_corr_halves": 0.9800710244501659,
+   "n_objects": 136,
+   "objects_per_class": {
+    "1": 26,
+    "2": 110
+   },
+   "obj_events_per_win_p10_50_90": [
+    7.6000000000000085,
+    427.0,
+    8488.400000000001
+   ],
+   "obj_size_px_p10_50_90": [
+    8.0,
+    47.0,
+    100.0
+   ],
+   "obj_speed_px_per_win_p10_50_90": [
+    3.4276398229054728,
+    18.571705289192188,
+    62.505449366306884
+   ],
+   "obj_rel_speed_bodylen_per_win_p10_50_90": [
+    0.11624697980896832,
+    0.36809985828431935,
+    1.4584999126802651
+   ],
+   "obj_duration_win_p10_50_90": [
+    2.0,
+    3.0,
+    34.5
+   ],
+   "windows_with_targets_share": 0.17177607464178607,
+   "n_boxes": 1852,
+   "n_box_ids": 137,
+   "box_classes": {
+    "-1": 6,
+    "1": 1330,
+    "2": 516
+   },
+   "ids_events_not_boxes": [],
+   "ids_boxes_not_events": [
+    75
+   ],
+   "box_event_class_mismatch": 0,
+   "inbox_labelled_[t-33,t)": 0.9574818985071485,
+   "inbox_labelled_[t-16.7,t+16.7)": 0.9661867027964481,
+   "inbox_labelled_[t,t+33)": 0.952672671822203,
+   "best_box_alignment": "[t-16.7,t+16.7)",
+   "labelled_inside_nearest_own_box": 1.0,
+   "labelled_to_box_dt_ms_p1_50_99": [
+    -16.309,
+    0.219,
+    16.335
+   ]
+  },
+  {
+   "split": "Test",
+   "id": "5",
+   "shape": [
+    2060805,
+    6
+   ],
+   "dtype": "float64",
+   "int_cols_ok": true,
+   "x_range": [
+    0.0,
+    1279.0
+   ],
+   "y_range": [
+    0.0,
+    719.0
+   ],
+   "p_values": [
+    0.0,
+    1.0
+   ],
+   "class_counts": {
+    "0": 1863285,
+    "1": 165557,
+    "2": 31963
+   },
+   "id_min": -1.0,
+   "t_monotonic": true,
+   "t_backsteps": 0,
+   "t_start_us": 167.0,
+   "duration_s": 120.000729,
+   "max_gap_ms": 0.995,
+   "n_events": 2060805,
+   "events_per_win_mean": 858.6635336190333,
+   "label_share": 0.09584604074621325,
+   "id_class_mismatch": 0,
+   "ids_with_multiple_classes": [],
+   "exact_duplicates": 0,
+   "bg_events_per_win_p10_50_90_max": [
+    506.0,
+    606.0,
+    1394.0,
+    3318.0
+   ],
+   "pixels_over_1kHz": 0,
+   "pixels_over_100Hz": 16,
+   "max_pixel_rate_hz": 886.4196150008388,
+   "bg_spatial_corr_halves": 0.9061781411365001,
+   "n_objects": 82,
+   "objects_per_class": {
+    "1": 4,
+    "2": 78
+   },
+   "obj_events_per_win_p10_50_90": [
+    3.0,
+    30.0,
+    743.7000000000002
+   ],
+   "obj_size_px_p10_50_90": [
+    3.0,
+    16.0,
+    37.0
+   ],
+   "obj_speed_px_per_win_p10_50_90": [
+    5.587918813359766,
+    13.803419630335252,
+    50.158375986257674
+   ],
+   "obj_rel_speed_bodylen_per_win_p10_50_90": [
+    0.3744289981505439,
+    0.8857406014748395,
+    2.3438156005548523
+   ],
+   "obj_duration_win_p10_50_90": [
+    2.0,
+    6.0,
+    22.0
+   ],
+   "windows_with_targets_share": 0.29237817576009995,
+   "n_boxes": 1234,
+   "n_box_ids": 82,
+   "box_classes": {
+    "1": 363,
+    "2": 871
+   },
+   "ids_events_not_boxes": [],
+   "ids_boxes_not_events": [],
+   "box_event_class_mismatch": 0,
+   "inbox_labelled_[t-33,t)": 0.9931618382969515,
+   "inbox_labelled_[t-16.7,t+16.7)": 0.9945670234942247,
+   "inbox_labelled_[t,t+33)": 0.9767163173949214,
+   "best_box_alignment": "[t-16.7,t+16.7)",
+   "labelled_inside_nearest_own_box": 1.0,
+   "labelled_to_box_dt_ms_p1_50_99": [
+    -16.317,
+    0.221,
+    16.345
+   ]
+  },
+  {
+   "split": "Test",
+   "id": "9",
+   "shape": [
+    1803569,
+    6
+   ],
+   "dtype": "float64",
+   "int_cols_ok": true,
+   "x_range": [
+    0.0,
+    1279.0
+   ],
+   "y_range": [
+    0.0,
+    719.0
+   ],
+   "p_values": [
+    0.0,
+    1.0
+   ],
+   "class_counts": {
+    "0": 1715335,
+    "1": 50296,
+    "2": 37938
+   },
+   "id_min": -1.0,
+   "t_monotonic": true,
+   "t_backsteps": 0,
+   "t_start_us": 256.0,
+   "duration_s": 120.000582,
+   "max_gap_ms": 0.819,
+   "n_events": 1803569,
+   "events_per_win_mean": 751.4834386386559,
+   "label_share": 0.04892188765719526,
+   "id_class_mismatch": 0,
+   "ids_with_multiple_classes": [],
+   "exact_duplicates": 0,
+   "bg_events_per_win_p10_50_90_max": [
+    616.0,
+    681.0,
+    846.0,
+    2415.0
+   ],
+   "pixels_over_1kHz": 0,
+   "pixels_over_100Hz": 21,
+   "max_pixel_rate_hz": 904.5206130750266,
+   "bg_spatial_corr_halves": 0.9930966647073944,
+   "n_objects": 90,
+   "objects_per_class": {
+    "1": 6,
+    "2": 84
+   },
+   "obj_events_per_win_p10_50_90": [
+    4.0,
+    34.0,
+    247.7000000000006
+   ],
+   "obj_size_px_p10_50_90": [
+    4.0,
+    17.0,
+    51.30000000000007
+   ],
+   "obj_speed_px_per_win_p10_50_90": [
+    7.211102550927978,
+    20.372536279110278,
+    71.0914597958598
+   ],
+   "obj_rel_speed_bodylen_per_win_p10_50_90": [
+    0.6196144069522755,
+    1.0291135677948433,
+    2.1626282182997563
+   ],
+   "obj_duration_win_p10_50_90": [
+    2.0,
+    3.0,
+    21.10000000000001
+   ],
+   "windows_with_targets_share": 0.2607246980424823,
+   "n_boxes": 1087,
+   "n_box_ids": 91,
+   "box_classes": {
+    "-1": 2,
+    "1": 214,
+    "2": 871
+   },
+   "ids_events_not_boxes": [],
+   "ids_boxes_not_events": [
+    9
+   ],
+   "box_event_class_mismatch": 0,
+   "inbox_labelled_[t-33,t)": 0.9961261936265523,
+   "inbox_labelled_[t-16.7,t+16.7)": 0.9981899428700718,
+   "inbox_labelled_[t,t+33)": 0.9020232220015154,
+   "best_box_alignment": "[t-16.7,t+16.7)",
+   "labelled_inside_nearest_own_box": 1.0,
+   "labelled_to_box_dt_ms_p1_50_99": [
+    -16.194,
+    1.491,
+    16.347669999999997
+   ]
+  },
+  {
+   "split": "Test",
+   "id": "13",
+   "shape": [
+    1776386,
+    6
+   ],
+   "dtype": "float64",
+   "int_cols_ok": true,
+   "x_range": [
+    0.0,
+    1279.0
+   ],
+   "y_range": [
+    0.0,
+    719.0
+   ],
+   "p_values": [
+    0.0,
+    1.0
+   ],
+   "class_counts": {
+    "0": 1722145,
+    "1": 16837,
+    "2": 37404
+   },
+   "id_min": -1.0,
+   "t_monotonic": true,
+   "t_backsteps": 0,
+   "t_start_us": 105.0,
+   "duration_s": 120.000778,
+   "max_gap_ms": 0.795,
+   "n_events": 1776386,
+   "events_per_win_mean": 740.156034655042,
+   "label_share": 0.030534467170986485,
+   "id_class_mismatch": 0,
+   "ids_with_multiple_classes": [],
+   "exact_duplicates": 0,
+   "bg_events_per_win_p10_50_90_max": [
+    653.0,
+    715.0,
+    772.0,
+    2593.0
+   ],
+   "pixels_over_1kHz": 0,
+   "pixels_over_100Hz": 24,
+   "max_pixel_rate_hz": 911.3024250559442,
+   "bg_spatial_corr_halves": 0.9953529976981398,
+   "n_objects": 80,
+   "objects_per_class": {
+    "1": 4,
+    "2": 76
+   },
+   "obj_events_per_win_p10_50_90": [
+    3.0,
+    22.0,
+    142.0000000000001
+   ],
+   "obj_size_px_p10_50_90": [
+    2.0,
+    11.0,
+    38.0
+   ],
+   "obj_speed_px_per_win_p10_50_90": [
+    3.939483627329856,
+    14.058604523416275,
+    43.90626379003341
+   ],
+   "obj_rel_speed_bodylen_per_win_p10_50_90": [
+    0.5994818305831142,
+    0.947176424483761,
+    1.9296260752082124
+   ],
+   "obj_duration_win_p10_50_90": [
+    2.0,
+    9.0,
+    27.200000000000017
+   ],
+   "windows_with_targets_share": 0.2832153269471054,
+   "n_boxes": 1165,
+   "n_box_ids": 80,
+   "box_classes": {
+    "1": 116,
+    "2": 1049
+   },
+   "ids_events_not_boxes": [],
+   "ids_boxes_not_events": [],
+   "box_event_class_mismatch": 0,
+   "inbox_labelled_[t-33,t)": 0.95448827613968,
+   "inbox_labelled_[t-16.7,t+16.7)": 0.9235837973131736,
+   "inbox_labelled_[t,t+33)": 0.8363338282603316,
+   "best_box_alignment": "[t-33,t)",
+   "labelled_inside_nearest_own_box": 1.0,
+   "labelled_to_box_dt_ms_p1_50_99": [
+    -16.195,
+    1.295,
+    16.369
+   ]
+  },
+  {
+   "split": "Test",
+   "id": "23",
+   "shape": [
+    5891290,
+    6
+   ],
+   "dtype": "float64",
+   "int_cols_ok": true,
+   "x_range": [
+    0.0,
+    1279.0
+   ],
+   "y_range": [
+    0.0,
+    719.0
+   ],
+   "p_values": [
+    0.0,
+    1.0
+   ],
+   "class_counts": {
+    "0": 5803260,
+    "1": 15747,
+    "2": 72283
+   },
+   "id_min": -1.0,
+   "t_monotonic": true,
+   "t_backsteps": 0,
+   "t_start_us": 64.0,
+   "duration_s": 180.00023,
+   "max_gap_ms": 0.426,
+   "n_events": 5891290,
+   "events_per_win_mean": 1636.4673534028261,
+   "label_share": 0.014942398014696273,
+   "id_class_mismatch": 0,
+   "ids_with_multiple_classes": [],
+   "exact_duplicates": 0,
+   "bg_events_per_win_p10_50_90_max": [
+    1425.0,
+    1556.0,
+    1675.0,
+    27308.0
+   ],
+   "pixels_over_1kHz": 0,
+   "pixels_over_100Hz": 50,
+   "max_pixel_rate_hz": 967.9432076281237,
+   "bg_spatial_corr_halves": 0.9724493674251001,
+   "n_objects": 119,
+   "objects_per_class": {
+    "1": 6,
+    "2": 113
+   },
+   "obj_events_per_win_p10_50_90": [
+    3.0,
+    35.0,
+    243.80000000000007
+   ],
+   "obj_size_px_p10_50_90": [
+    5.0,
+    27.0,
+    71.80000000000007
+   ],
+   "obj_speed_px_per_win_p10_50_90": [
+    12.958565569998282,
+    37.66187867011492,
+    112.01769722573604
+   ],
+   "obj_rel_speed_bodylen_per_win_p10_50_90": [
+    0.7180056157633254,
+    1.0961672883999243,
+    3.7054862903522126
+   ],
+   "obj_duration_win_p10_50_90": [
+    3.0,
+    6.0,
+    15.200000000000003
+   ],
+   "windows_with_targets_share": 0.17356289919466814,
+   "n_boxes": 1056,
+   "n_box_ids": 119,
+   "box_classes": {
+    "1": 89,
+    "2": 967
+   },
+   "ids_events_not_boxes": [],
+   "ids_boxes_not_events": [],
+   "box_event_class_mismatch": 0,
+   "inbox_labelled_[t-33,t)": 0.955234772297097,
+   "inbox_labelled_[t-16.7,t+16.7)": 0.9730620005084727,
+   "inbox_labelled_[t,t+33)": 0.7928366188986689,
+   "best_box_alignment": "[t-16.7,t+16.7)",
+   "labelled_inside_nearest_own_box": 1.0,
+   "labelled_to_box_dt_ms_p1_50_99": [
+    -15.675130000000001,
+    3.029,
+    16.405710000000006
+   ]
+  },
+  {
+   "split": "Test",
+   "id": "24",
+   "shape": [
+    6517563,
+    6
+   ],
+   "dtype": "float64",
+   "int_cols_ok": true,
+   "x_range": [
+    0.0,
+    1279.0
+   ],
+   "y_range": [
+    0.0,
+    719.0
+   ],
+   "p_values": [
+    0.0,
+    1.0
+   ],
+   "class_counts": {
+    "0": 6228374,
+    "1": 237750,
+    "2": 51439
+   },
+   "id_min": -1.0,
+   "t_monotonic": true,
+   "t_backsteps": 0,
+   "t_start_us": 29.0,
+   "duration_s": 180.000214,
+   "max_gap_ms": 0.39,
+   "n_events": 6517563,
+   "events_per_win_mean": 1810.4320142641607,
+   "label_share": 0.04437072568381771,
+   "id_class_mismatch": 0,
+   "ids_with_multiple_classes": [],
+   "exact_duplicates": 0,
+   "bg_events_per_win_p10_50_90_max": [
+    1551.0,
+    1734.0,
+    1889.0,
+    2534.0
+   ],
+   "pixels_over_1kHz": 0,
+   "pixels_over_100Hz": 55,
+   "max_pixel_rate_hz": 977.3266158450234,
+   "bg_spatial_corr_halves": 0.9747533378177813,
+   "n_objects": 100,
+   "objects_per_class": {
+    "1": 8,
+    "2": 92
+   },
+   "obj_events_per_win_p10_50_90": [
+    3.0,
+    42.0,
+    1213.6000000000004
+   ],
+   "obj_size_px_p10_50_90": [
+    4.0,
+    24.0,
+    53.80000000000007
+   ],
+   "obj_speed_px_per_win_p10_50_90": [
+    6.842935203352524,
+    22.95224510926017,
+    60.83452563336882
+   ],
+   "obj_rel_speed_bodylen_per_win_p10_50_90": [
+    0.3265567283689176,
+    0.9277015407898541,
+    2.579281924293417
+   ],
+   "obj_duration_win_p10_50_90": [
+    2.0,
+    5.0,
+    21.200000000000017
+   ],
+   "windows_with_targets_share": 0.19022493751735628,
+   "n_boxes": 1147,
+   "n_box_ids": 100,
+   "box_classes": {
+    "1": 339,
+    "2": 808
+   },
+   "ids_events_not_boxes": [],
+   "ids_boxes_not_events": [],
+   "box_event_class_mismatch": 0,
+   "inbox_labelled_[t-33,t)": 0.9962186318322448,
+   "inbox_labelled_[t-16.7,t+16.7)": 0.9957545708088007,
+   "inbox_labelled_[t,t+33)": 0.9627328985449259,
+   "best_box_alignment": "[t-33,t)",
+   "labelled_inside_nearest_own_box": 1.0,
+   "labelled_to_box_dt_ms_p1_50_99": [
+    -16.284119999999998,
+    0.511,
+    16.354
+   ]
+  },
+  {
+   "split": "Test",
+   "id": "26",
+   "shape": [
+    7992819,
+    6
+   ],
+   "dtype": "float64",
+   "int_cols_ok": true,
+   "x_range": [
+    0.0,
+    1279.0
+   ],
+   "y_range": [
+    0.0,
+    719.0
+   ],
+   "p_values": [
+    0.0,
+    1.0
+   ],
+   "class_counts": {
+    "0": 7589133,
+    "1": 11231,
+    "2": 392455
+   },
+   "id_min": -1.0,
+   "t_monotonic": true,
+   "t_backsteps": 0,
+   "t_start_us": 31.0,
+   "duration_s": 180.000242,
+   "max_gap_ms": 0.354,
+   "n_events": 7992819,
+   "events_per_win_mean": 2220.224515031485,
+   "label_share": 0.050506085525019395,
+   "id_class_mismatch": 0,
+   "ids_with_multiple_classes": [],
+   "exact_duplicates": 0,
+   "bg_events_per_win_p10_50_90_max": [
+    1919.0,
+    2113.0,
+    2218.0,
+    26422.0
+   ],
+   "pixels_over_1kHz": 0,
+   "pixels_over_100Hz": 62,
+   "max_pixel_rate_hz": 993.5486642290182,
+   "bg_spatial_corr_halves": 0.9844516813383744,
+   "n_objects": 168,
+   "objects_per_class": {
+    "1": 5,
+    "2": 163
+   },
+   "obj_events_per_win_p10_50_90": [
+    4.0,
+    45.0,
+    248.30000000000007
+   ],
+   "obj_size_px_p10_50_90": [
+    5.0,
+    31.0,
+    113.0
+   ],
+   "obj_speed_px_per_win_p10_50_90": [
+    12.022106556757556,
+    45.18995776024694,
+    136.6982074059149
+   ],
+   "obj_rel_speed_bodylen_per_win_p10_50_90": [
+    0.5263373209402823,
+    1.0190963462636196,
+    2.8974789621262325
+   ],
+   "obj_duration_win_p10_50_90": [
+    2.0,
+    4.0,
+    10.0
+   ],
+   "windows_with_targets_share": 0.2071646764787559,
+   "n_boxes": 1262,
+   "n_box_ids": 168,
+   "box_classes": {
+    "1": 165,
+    "2": 1097
+   },
+   "ids_events_not_boxes": [],
+   "ids_boxes_not_events": [],
+   "box_event_class_mismatch": 0,
+   "inbox_labelled_[t-33,t)": 0.9787884638464629,
+   "inbox_labelled_[t-16.7,t+16.7)": 0.9927894074132368,
+   "inbox_labelled_[t,t+33)": 0.8283682681011563,
+   "best_box_alignment": "[t-16.7,t+16.7)",
+   "labelled_inside_nearest_own_box": 1.0,
+   "labelled_to_box_dt_ms_p1_50_99": [
+    -15.43,
+    3.072,
+    16.366
+   ]
+  }
+ ]
+}

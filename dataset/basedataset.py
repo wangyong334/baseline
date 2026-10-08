@@ -120,7 +120,9 @@ class BaseDataLoader(torch.utils.data.Dataset):
         voxel_feats = voxel_feats.cuda()
 
 
-        spatial_shape = np.array([11*32,9*32,256*32])
+        # EV-UAV default (346x260 sensor, 8 s); other datasets set DATA.spatial_shape (x, y, t in ms) in their YAML
+        from configs.configs import cfg
+        spatial_shape = np.array(getattr(cfg, "spatial_shape", None) or [11*32,9*32,256*32])
         voxel_ev = spconv.SparseConvTensor(voxel_feats, voxel_locs.int().cuda(), spatial_shape, batch_size)
 
         output = {}

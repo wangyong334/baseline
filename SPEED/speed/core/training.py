@@ -77,46 +77,52 @@ def forward_checkpointed(network, inputs, states, carry, sub_steps):
 
 
 def train_stream(system, loss_fn, stream, optimizer, tbptt_steps, grad_clip, rng, max_steps=None, carry=True,
-                 checkpoint_steps=0):
+                 checkpoint_steps=0, update_steps=None):
+    """update_steps=None: one update per stream (EV-UAV clips). Otherwise the stream is processed continuously
+    (state never reset) with one update every update_steps steps, each normalised by its own event count."""
     network, rep = system.network, system.representation
     device, dtype = system.device, system.dtype
     H, W = system.canvas(stream)
     steps = system.clock.partition(stream)
     n = steps.n_steps if max_steps is None else min(int(max_steps), steps.n_steps)
     k = int(tbptt_steps)
-    chunks = make_chunks(n, k, int(rng.randint(1, k + 1)))
-    total_events = int(steps.bounds[n] - steps.bounds[0])
-    denominator = float(max(total_events, 1))
+    span = n if not update_steps else int(update_steps)
+    segments = [(a, min(a + span, n)) for a in range(0, n, span)]
     blocks = EventBlocks(stream, steps, H, W, device, dtype)
     rep_state = rep.init_state(1, H, W, device, dtype)
     states = None
     sums = {"loss_sum": 0.0, "mark_sum": 0.0, "intensity_sum": 0.0}
-    optimizer.zero_grad(set_to_none=True)
-    for start, end in chunks:
-        blk = blocks.block(start, end)
-        with torch.no_grad():
-            rep_state, inputs, _ = rep.encode(rep_state, blk)
-        if checkpoint_steps and int(inputs.shape[0]) > int(checkpoint_steps):
-            outputs, states = forward_checkpointed(network, inputs, states, carry, checkpoint_steps)
-        else:
-            outputs, states, _ = network.forward_chunk(inputs, states, carry)
-        ev = blk["events"]
-        logits = outputs["mark"][ev["t"], ev["b"], 0, ev["y"], ev["x"]]
-        loss, parts = loss_fn(outputs, logits, blk)
-        sums["mark_sum"] += parts["mark"]
-        sums["intensity_sum"] += parts["intensity"]
-        if loss is not None:
-            (loss / denominator).backward()
-            value = float(loss.detach())
-            if not math.isfinite(value):
-                raise RuntimeError("non-finite loss: %s steps %d-%d" % (stream.name, start, end))
-            sums["loss_sum"] += value
-        states = detach_states(states)
-    norms = gradient_group_norms(network)
-    missing = [name for name, p in network.named_parameters() if p.requires_grad and p.grad is None]
-    torch.nn.utils.clip_grad_norm_(network.parameters(), float(grad_clip))
-    optimizer.step()
-    sums.update({"events": total_events, "grad_norms": norms, "missing_grads": missing})
+    norms, missing = {}, []
+    for seg_start, seg_end in segments:
+        chunks = [(seg_start + a, seg_start + b) for a, b in make_chunks(seg_end - seg_start, k, int(rng.randint(1, k + 1)))]
+        denominator = float(max(int(steps.bounds[seg_end] - steps.bounds[seg_start]), 1))
+        optimizer.zero_grad(set_to_none=True)
+        for start, end in chunks:
+            blk = blocks.block(start, end)
+            with torch.no_grad():
+                rep_state, inputs, _ = rep.encode(rep_state, blk)
+            if checkpoint_steps and int(inputs.shape[0]) > int(checkpoint_steps):
+                outputs, states = forward_checkpointed(network, inputs, states, carry, checkpoint_steps)
+            else:
+                outputs, states, _ = network.forward_chunk(inputs, states, carry)
+            ev = blk["events"]
+            logits = outputs["mark"][ev["t"], ev["b"], 0, ev["y"], ev["x"]]
+            loss, parts = loss_fn(outputs, logits, blk)
+            sums["mark_sum"] += parts["mark"]
+            sums["intensity_sum"] += parts["intensity"]
+            if loss is not None:
+                (loss / denominator).backward()
+                value = float(loss.detach())
+                if not math.isfinite(value):
+                    raise RuntimeError("non-finite loss: %s steps %d-%d" % (stream.name, start, end))
+                sums["loss_sum"] += value
+            states = detach_states(states)
+        norms = gradient_group_norms(network)
+        missing = [name for name, p in network.named_parameters() if p.requires_grad and p.grad is None]
+        torch.nn.utils.clip_grad_norm_(network.parameters(), float(grad_clip))
+        optimizer.step()
+    sums.update({"events": int(steps.bounds[n] - steps.bounds[0]), "grad_norms": norms, "missing_grads": missing,
+                 "updates": len(segments)})
     return sums
 
 
@@ -166,14 +172,15 @@ class LayerMonitor(object):
                          "u_abs_max": torch.zeros((), device=spikes.device),
                          "big": torch.zeros((), device=spikes.device, dtype=torch.float64)}
                     self.data[name] = d
+                # Reductions written to avoid full-resolution temporaries (int64 sums / abs copies at 1280x720).
                 d["spike_sum"] += active.sum().double()
                 d["elements"] += active.numel()
                 d["windows"] += int(spikes.shape[0])
                 d["channel_spikes"] += active.sum(dim=(0, 1, 3, 4)).double()
-                d["neuron_windows"] += (active.sum(1) > 0).sum(0).float()
-                u_abs = u_pre.abs()
-                d["u_abs_max"] = torch.maximum(d["u_abs_max"], u_abs.max())
-                d["big"] += (u_abs > 10.0 * self.v_threshold).sum().double()
+                d["neuron_windows"] += active.any(1).sum(0).float()
+                big = 10.0 * self.v_threshold
+                d["u_abs_max"] = torch.maximum(d["u_abs_max"], torch.maximum(u_pre.max(), -u_pre.min()))
+                d["big"] += ((u_pre > big).sum() + (u_pre < -big).sum()).double()
 
     def summary(self):
         out = {}

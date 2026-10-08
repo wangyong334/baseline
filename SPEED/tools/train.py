@@ -8,6 +8,7 @@ Writes run_config.json, calibration.json, metrics.jsonl, best.pt (best validatio
 import os
 
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")  # limits fragmentation on large canvases
 
 import argparse  # noqa: E402
 import json  # noqa: E402
@@ -20,7 +21,7 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
 from speed.core.build import build_loss, build_system, load_config, with_overrides  # noqa: E402
-from speed.core.runtime import peak_memory_gib, seed_everything, write_json  # noqa: E402
+from speed.core.runtime import memory_line, peak_memory_gib, seed_everything, write_json  # noqa: E402
 from speed.core.training import (LayerMonitor, calibrate, linear_epoch_lr, save_checkpoint, select_subset,  # noqa: E402
                                  tau_statistics, train_stream)
 from speed.data.dataset_card import list_recordings, load_card  # noqa: E402
@@ -112,6 +113,7 @@ def main():
     reports = calibrate(system, calib_streams, tr["calibration"], seed, carry)
     write_json(os.path.join(args.out, "calibration.json"), {"recordings": sorted(calib_names), "layers": reports})
     del calib_streams
+    print(memory_line(device, "after calibration"), flush=True)
     loss_fn = build_loss(cfg["loss"])
     train_set, val_set = Recordings(card, train_items), Recordings(card, val_items)
     epochs, best = int(tr["epochs"]), -float("inf")
@@ -127,13 +129,15 @@ def main():
         sums, events = {"loss_sum": 0.0, "mark_sum": 0.0, "intensity_sum": 0.0}, 0
         for stream in loader(train_set, seed * 1000 + epoch, tr.get("num_workers", 2)):
             out = train_stream(system, loss_fn, stream, optimizer, tr["tbptt_steps"], tr["grad_clip"], rng,
-                               args.max_steps, carry, int(tr.get("checkpoint_steps", 0)))
+                               args.max_steps, carry, int(tr.get("checkpoint_steps", 0)), tr.get("update_steps"))
             for key in sums:
                 sums[key] += out[key]
             events += out["events"]
         train_seconds = time.perf_counter() - t0
+        print(memory_line(device, "after training"), flush=True)
         monitor = LayerMonitor(system.network.v_threshold)
         val = validate(system, val_set, card, ev, carry, monitor)
+        print(memory_line(device, "after validation"), flush=True)
         record = {"epoch": epoch, "seed": seed, "lr": lr, "loss_per_event": sums["loss_sum"] / max(events, 1),
                   "mark_per_event": sums["mark_sum"] / max(events, 1),
                   "intensity_per_event": sums["intensity_sum"] / max(events, 1),

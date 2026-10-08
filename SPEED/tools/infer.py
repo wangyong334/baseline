@@ -6,6 +6,7 @@
 import os
 
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")  # limits fragmentation on large canvases
 
 import argparse  # noqa: E402
 import sys  # noqa: E402
@@ -81,9 +82,10 @@ def main():
     for name, m in metrics.items():
         r = m.result()
         summary.setdefault("metrics", {})[name] = {k: v for k, v in r.items() if k != "per_recording"}
-        print("%-10s IoU %.4f ACC %.4f Pd %.4f Fa %.3e | publish mean %.1f ms | first det. median %s ms" % (
-            name, r["iou"], r["acc"], r["pd"], r["fa"], r["publish_latency"]["mean_ms"],
-            r["first_detection"]["median_ms"]), flush=True)
+        fmt = lambda v, spec: "-" if v is None else spec % v  # noqa: E731  (no detections -> no latency)
+        print("%-10s IoU %.4f ACC %.4f Pd %.4f Fa %.3e | publish mean %s ms | first det. median %s ms" % (
+            name, r["iou"], r["acc"], r["pd"], r["fa"], fmt(r["publish_latency"]["mean_ms"], "%.1f"),
+            fmt(r["first_detection"]["median_ms"], "%.1f")), flush=True)
     os.makedirs(args.out, exist_ok=True)
     write_json(os.path.join(args.out, "infer_summary.json"), summary)
     print("INFER FINISHED: %d recordings, %.0f s -> %s" % (recordings, seconds, args.out), flush=True)

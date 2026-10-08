@@ -1,0 +1,38 @@
+# K5 (EV-SpSegNet, corrected protocol, released repo LR) on EV-Flying: identical training recipe to
+# evisseg_evuav_baseline_v2_repolr.yaml; data = EV-Flying recordings cut into 8 s blocks by SPEED/tools/offline_blocks.py
+# (official train / val / test split; drone recordings excluded); only res / spatial_shape / paths differ.
+STRUCTURE:
+  model_name: evissgnet
+  width: 12
+  block_residual: True
+  block_reps: 2
+  use_coords: True
+DATA:
+  input_channel: 4
+  root: /media/stephen/nvme0n1/wy_data/datasets/evflying_k5_blocks
+  whole_t: 8000
+  res: [1280, 720]
+  spatial_shape: [1280, 736, 8192]   # x, y padded to multiples of 32; t = 8 s blocks in ms
+TRAIN:
+  epochs: 15                       # same total updates as the EV-UAV recipe (99 x 50 ~ 4950; EV-Flying 329 blocks per epoch)
+  batch_size: 1
+  train_workers: 0
+  optim: Adam
+  lr: 0.001
+  lr_schedule: linear
+  lr_end: 0.0001
+  k: 3
+  t: 5
+  stc_gamma: 1.0
+  max_events_num: 700000
+  seed: 37
+  validation_start: 0
+  model_save_root: log/k5_evflying_seed37
+TEST:
+  vis: False
+  eval: True
+  roc: True
+  pd_detT: 50
+  correct_thresh: 0.0001
+  save: True
+  model_path: log/k5_evflying_seed37/best_iou_seed37.pt

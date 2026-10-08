@@ -172,6 +172,40 @@ class TrainingTests(unittest.TestCase):
         for name, p in results[0][1].items():
             self.assertLess(float((p - results[1][1][name]).abs().max()), 1e-10, name)
 
+    def test_segment_updates(self):
+        """One segment covering the stream equals the per-stream update; shorter segments update more often."""
+        cfg = with_overrides(load_config(CONFIG), SMALL)
+        outs = []
+        for update in (None, STEPS, 5):
+            system = small_system(6)
+            system.network.train()
+            opt = torch.optim.Adam(system.network.parameters(), lr=1e-3)
+            out = train_stream(system, build_loss(cfg["loss"]), synthetic_stream(8), opt, 4, 1.0,
+                               np.random.RandomState(2), update_steps=update)
+            outs.append((out, {n: p.detach().clone() for n, p in system.network.named_parameters()}))
+        self.assertEqual([o["updates"] for o, _ in outs], [1, 1, 3])
+        self.assertEqual(outs[0][0]["loss_sum"], outs[1][0]["loss_sum"])
+        for name, p in outs[0][1].items():
+            self.assertTrue(torch.equal(p, outs[1][1][name]), name)
+        self.assertFalse(all(torch.equal(p, outs[2][1][n]) for n, p in outs[0][1].items()))
+
+    def test_layer_monitor_statistics(self):
+        """Monitor reductions equal the straightforward definitions."""
+        from speed.core.training import LayerMonitor
+        g = torch.Generator().manual_seed(0)
+        spikes = [(torch.rand(5, 1, 3, 6, 7, generator=g) < 0.3).float() for _ in range(7)]
+        u_pre = [torch.randn(5, 1, 3, 6, 7, generator=g) * 8 for _ in range(7)]
+        m = LayerMonitor(1.0)
+        m.update({"spikes": spikes, "u_pre": u_pre})
+        out = m.summary()
+        for name, s, u in zip(("enc1", "enc2", "enc3", "enc4", "dec3", "dec2", "dec1"), spikes, u_pre):
+            a = s > 0
+            self.assertAlmostEqual(out[name]["firing_rate"], float(a.double().mean()), places=12)
+            self.assertAlmostEqual(out[name]["u_abs_max"], float(u.abs().max()), places=5)
+            self.assertAlmostEqual(out[name]["big_membrane_frac"], float((u.abs() > 10).double().mean()), places=12)
+            always = float(((a.sum(1) > 0).sum(0).float() / 5 > 0.9).float().mean())
+            self.assertAlmostEqual(out[name]["always_on_frac"], always, places=12)
+
     def test_calibration_sets_gains(self):
         torch.manual_seed(0)
         system = build_system(with_overrides(load_config(CONFIG), SMALL))

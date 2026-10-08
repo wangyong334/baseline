@@ -27,6 +27,8 @@ def parse_args():
     parser.add_argument("--checkpoint", required=True, help="原基线的权重文件")
     parser.add_argument("--split", choices=("val", "test"), default="test")
     parser.add_argument("--out-dir", required=True)
+    parser.add_argument("--no-eval", action="store_true",
+                        help="只导出逐事件预测，不跑原 utils/eval.py（它把画面写死为 346x260，其他传感器会越界；指标改由 SPEED 评测）")
     return parser.parse_args()
 
 
@@ -64,10 +66,14 @@ def main():
                      labels=label.numpy().astype(np.float32),
                      probabilities=preds.numpy().astype(np.float32),
                      target_id=np.asarray(ev["idx_label"], dtype=np.float64))
-            evaluator.matches[str(i)] = {"seg_pred": preds, "seg_gt": label.cuda()}
-            ev_locs = locs.float()
-            evaluator.roc_update(ev_locs[:, 3], preds, ev["idx_label"], label, ev_locs)
+            if not args.no_eval:
+                evaluator.matches[str(i)] = {"seg_pred": preds, "seg_gt": label.cuda()}
+                ev_locs = locs.float()
+                evaluator.roc_update(ev_locs[:, 3], preds, ev["idx_label"], label, ev_locs)
             print("[%d/%d] %s  事件数 %d" % (i + 1, len(dataset), name, label.numel()), flush=True)
+    if args.no_eval:
+        print("DUMP FINISHED:", args.out_dir)
+        return
     iou = evaluator.evaluate_semantic_segmantation_miou()
     acc = evaluator.evaluate_semantic_segmantation_accuracy()
     pd, fa = evaluator.cal_roc()

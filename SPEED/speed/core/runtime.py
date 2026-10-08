@@ -26,3 +26,15 @@ def peak_memory_gib(device):
 
 def write_json(path, payload):
     Path(path).write_text(json.dumps(payload, indent=1, ensure_ascii=False), encoding="utf-8")
+
+
+def memory_line(device, label):
+    """Allocated / reserved / peak GPU memory (GiB) after releasing cached blocks; '' on CPU."""
+    if device.type != "cuda":
+        return ""
+    torch.cuda.empty_cache()
+    gib = 2 ** 30
+    return "[memory] %-18s allocated %.2f reserved %.2f peak %.2f GiB" % (
+        label, torch.cuda.memory_allocated(device) / gib, torch.cuda.memory_reserved(device) / gib,
+        torch.cuda.max_memory_allocated(device) / gib)
+
