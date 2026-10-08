@@ -77,6 +77,8 @@ def main():
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--set", nargs="*", default=[], help="config overrides section.key=value")
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--train-split", default="train")
+    parser.add_argument("--val-split", default="val")
     parser.add_argument("--max-train", type=int, default=0, help="smoke runs: first N training recordings")
     parser.add_argument("--max-val", type=int, default=0, help="smoke runs: first N validation recordings")
     parser.add_argument("--max-steps", type=int, default=None, help="smoke runs: steps per training recording")
@@ -95,8 +97,8 @@ def main():
     system = build_system(cfg)
     system.to(device)
     card = load_card(cfg["dataset"])
-    train_items = list_recordings(card, args.root, "train")
-    val_items = list_recordings(card, args.root, "val")
+    train_items = list_recordings(card, args.root, args.train_split)
+    val_items = list_recordings(card, args.root, args.val_split)
     if args.max_train:
         train_items = train_items[:args.max_train]
     if args.max_val:
@@ -115,6 +117,7 @@ def main():
     del calib_streams
     print(memory_line(device, "after calibration"), flush=True)
     loss_fn = build_loss(cfg["loss"])
+    scaler = torch.cuda.amp.GradScaler() if bool(tr.get("amp", False)) and device.type == "cuda" else None
     train_set, val_set = Recordings(card, train_items), Recordings(card, val_items)
     epochs, best = int(tr["epochs"]), -float("inf")
     for epoch in range(epochs):
@@ -129,7 +132,8 @@ def main():
         sums, events = {"loss_sum": 0.0, "mark_sum": 0.0, "intensity_sum": 0.0}, 0
         for stream in loader(train_set, seed * 1000 + epoch, tr.get("num_workers", 2)):
             out = train_stream(system, loss_fn, stream, optimizer, tr["tbptt_steps"], tr["grad_clip"], rng,
-                               args.max_steps, carry, int(tr.get("checkpoint_steps", 0)), tr.get("update_steps"))
+                               args.max_steps, carry, int(tr.get("checkpoint_steps", 0)), tr.get("update_steps"),
+                               scaler)
             for key in sums:
                 sums[key] += out[key]
             events += out["events"]

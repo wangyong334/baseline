@@ -55,7 +55,7 @@ def gradient_group_norms(network):
     return {k: math.sqrt(v) for k, v in squares.items()}
 
 
-def forward_checkpointed(network, inputs, states, carry, sub_steps):
+def forward_checkpointed(network, inputs, states, carry, sub_steps, amp=False):
     """network.forward_chunk over sub-chunks of sub_steps with activation checkpointing: same gradients (up to
     float rounding from smaller conv batches), activation memory of one sub-chunk instead of the whole chunk."""
     names = list(network.heads.outputs)
@@ -63,7 +63,8 @@ def forward_checkpointed(network, inputs, states, carry, sub_steps):
 
     def run(x, _dummy, *flat):
         st = list(flat) if flat else None
-        out, new_states, _ = network.forward_chunk(x, st, carry)
+        with torch.cuda.amp.autocast(enabled=amp):            # also active during the recomputation
+            out, new_states, _ = network.forward_chunk(x, st, carry)
         return tuple(out[n] for n in names) + tuple(new_states)
 
     parts = {n: [] for n in names}
@@ -77,9 +78,11 @@ def forward_checkpointed(network, inputs, states, carry, sub_steps):
 
 
 def train_stream(system, loss_fn, stream, optimizer, tbptt_steps, grad_clip, rng, max_steps=None, carry=True,
-                 checkpoint_steps=0, update_steps=None):
+                 checkpoint_steps=0, update_steps=None, scaler=None):
     """update_steps=None: one update per stream (EV-UAV clips). Otherwise the stream is processed continuously
-    (state never reset) with one update every update_steps steps, each normalised by its own event count."""
+    (state never reset) with one update every update_steps steps, each normalised by its own event count.
+    scaler: torch.cuda.amp.GradScaler for mixed-precision development runs (None = float32, the reference)."""
+    amp = scaler is not None and scaler.is_enabled()
     network, rep = system.network, system.representation
     device, dtype = system.device, system.dtype
     H, W = system.canvas(stream)
@@ -102,25 +105,38 @@ def train_stream(system, loss_fn, stream, optimizer, tbptt_steps, grad_clip, rng
             with torch.no_grad():
                 rep_state, inputs, _ = rep.encode(rep_state, blk)
             if checkpoint_steps and int(inputs.shape[0]) > int(checkpoint_steps):
-                outputs, states = forward_checkpointed(network, inputs, states, carry, checkpoint_steps)
+                outputs, states = forward_checkpointed(network, inputs, states, carry, checkpoint_steps, amp)
             else:
-                outputs, states, _ = network.forward_chunk(inputs, states, carry)
+                with torch.cuda.amp.autocast(enabled=amp):
+                    outputs, states, _ = network.forward_chunk(inputs, states, carry)
+            if amp:                                            # loss and carried state in float32
+                outputs = {k: v.float() for k, v in outputs.items()}
+                states = [None if st is None else st.float() for st in states]
             ev = blk["events"]
             logits = outputs["mark"][ev["t"], ev["b"], 0, ev["y"], ev["x"]]
             loss, parts = loss_fn(outputs, logits, blk)
             sums["mark_sum"] += parts["mark"]
             sums["intensity_sum"] += parts["intensity"]
             if loss is not None:
-                (loss / denominator).backward()
+                if amp:
+                    scaler.scale(loss / denominator).backward()
+                else:
+                    (loss / denominator).backward()
                 value = float(loss.detach())
                 if not math.isfinite(value):
                     raise RuntimeError("non-finite loss: %s steps %d-%d" % (stream.name, start, end))
                 sums["loss_sum"] += value
             states = detach_states(states)
+        if amp:
+            scaler.unscale_(optimizer)
         norms = gradient_group_norms(network)
         missing = [name for name, p in network.named_parameters() if p.requires_grad and p.grad is None]
         torch.nn.utils.clip_grad_norm_(network.parameters(), float(grad_clip))
-        optimizer.step()
+        if amp:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
     sums.update({"events": int(steps.bounds[n] - steps.bounds[0]), "grad_norms": norms, "missing_grads": missing,
                  "updates": len(segments)})
     return sums

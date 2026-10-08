@@ -16,10 +16,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch  # noqa: E402
 
+from speed.core.accounting import EnergyStats, energy_parts  # noqa: E402
 from speed.core.build import build_system, with_overrides  # noqa: E402
 from speed.core.runtime import peak_memory_gib, seed_everything, write_json  # noqa: E402
 from speed.core.training import LayerMonitor, load_checkpoint  # noqa: E402
 from speed.data.dataset_card import iter_split, load_card  # noqa: E402
+from speed.eval.energy import system_energy  # noqa: E402
 from speed.eval.metrics import BenchmarkMetrics  # noqa: E402
 from speed.eval.results import save_result  # noqa: E402
 
@@ -58,13 +60,16 @@ def main():
     metrics = {n: BenchmarkMetrics(card["sensor"]["width"], card["sensor"]["height"], int(ev["frame_ms"] * 1000),
                                    ev["threshold"], ev["correct_thresh"]) for n in keep} if args.evaluate else {}
     monitor = LayerMonitor(system.network.v_threshold)
+    energy = EnergyStats()
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     t0 = time.perf_counter()
     events = steps_total = recordings = 0
     with torch.no_grad():
         for stream in iter_split(card, args.root, args.split, args.recordings):
-            results, steps = system.run_stream(stream, carry=bool(cfg["training"].get("carry", True)), monitor=monitor)
+            results, steps = system.run_stream(stream, carry=bool(cfg["training"].get("carry", True)), monitor=monitor,
+                                               energy=energy)
+            canvas = system.canvas(stream)
             for name in keep:
                 prob, publish_us = results[name]
                 save_result(os.path.join(args.out, name), stream, prob, publish_us=publish_us,
@@ -79,6 +84,15 @@ def main():
                "events": events, "steps": steps_total, "events_per_step": events / float(max(steps_total, 1)),
                "seconds": seconds, "peak_memory_gib": peak_memory_gib(device), "layers": monitor.summary(),
                "readouts": keep, "overrides": args.set}
+    stats = energy.summary(summary["layers"])
+    parts = energy_parts(system, canvas[0], canvas[1], stats)
+    summary["energy"] = {"stats": stats, "canvas": list(canvas),
+                         "report": system_energy(parts, system.clock.step_us, card.get("clip_duration_us"))}
+    tot = summary["energy"]["report"]["total"]["x10"]
+    print("energy (exp/log = 10 MAC): %.3f mJ/s%s | %s" % (
+        tot["mj_per_s"], " (%.2f mJ per clip)" % tot["mj_per_clip"] if "mj_per_clip" in tot else "",
+        "  ".join("%s %.3f" % (k, v["x10"]["mj_per_s"]) for k, v in summary["energy"]["report"]["parts"].items())),
+        flush=True)
     for name, m in metrics.items():
         r = m.result()
         summary.setdefault("metrics", {})[name] = {k: v for k, v in r.items() if k != "per_recording"}

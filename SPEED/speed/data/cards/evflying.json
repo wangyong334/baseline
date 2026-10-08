@@ -53,8 +53,25 @@
         "Train/29/29.npy",
         "Test/28/28.npy"
       ]
+    },
+    "check_train": {
+      "files": [
+        "Train/0/0.npy",
+        "Train/4/4.npy",
+        "Train/8/8.npy",
+        "Train/14/14.npy",
+        "Train/19/19.npy",
+        "Train/20/20.npy"
+      ]
+    },
+    "check_val": {
+      "files": [
+        "Train/3/3.npy",
+        "Train/17/17.npy"
+      ]
     }
   },
+  "check_rule": "quick-check subset for development (fixed before any model result): train = 120 s recordings sorted by id, every third starting with the first, plus the first 180 s recording, no 300 s recording (780 s, 31% of train); val = 120 s val recordings, every other starting with the first",
   "val_rule": "official train split stratified by recording duration (120/180/300 s); within each stratum ids sorted, about 20% taken at evenly spaced positions; 300 s recordings kept for training; fixed before any model result",
   "classes": {
     "1": "bird",

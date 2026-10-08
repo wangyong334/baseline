@@ -37,4 +37,4 @@ class MarkIntensityHeads(nn.Module):
         """MACs / ACs per step when evaluated at `positions` pixels (dense = whole canvas)."""
         p = float(positions)
         return {"mac": p * (self.in_channels * self.hidden + self.hidden * 2), "ac": p * self.hidden,
-                "transcendental": 2.0 * p}
+                "transcendental": p}                                  # softplus of log_g

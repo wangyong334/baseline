@@ -133,6 +133,23 @@ class InferenceTests(unittest.TestCase):
             only, _ = self.system.run_stream(self.stream, readouts=[NetReadout()])
         self.assertTrue(np.array_equal(only["net"][0], self.results["net"][0]))
 
+    def test_energy_statistics(self):
+        from speed.core.accounting import EnergyStats, energy_parts
+        stats = EnergyStats()
+        with torch.no_grad():
+            again, _ = self.system.run_stream(self.stream, energy=stats)
+        self.assertTrue(np.array_equal(again["pub"][0], self.results["pub"][0]))      # accounting changes nothing
+        s = stats.summary({"enc1": {"firing_rate": 0.1}, "enc2": {"firing_rate": 0.1}, "enc3": {"firing_rate": 0.1},
+                           "enc4": {"firing_rate": 0.1}, "dec3": {"firing_rate": 0.1}, "dec2": {"firing_rate": 0.1},
+                           "dec1": {"firing_rate": 0.1}})
+        self.assertEqual(stats.events, self.stream.n_events)
+        self.assertTrue(0 < s["input_density"] <= 1 and 0 <= s["verifier_active_fraction"] <= 1)
+        self.assertGreater(s["publish_unit_steps_per_step"], 0)
+        parts = energy_parts(self.system, H, W, s)
+        self.assertEqual(sorted(parts), ["backbone", "heads", "readout_fixed_delay", "readout_net", "readout_pub",
+                                         "representation", "verifier"])
+        self.assertTrue(all(p["mac"] >= 0 and p["ac"] >= 0 and p["transcendental"] >= 0 for p in parts.values()))
+
     def test_execution_paths(self):
         x = torch.rand(5, 1, self.system.representation.n_features, H, W, dtype=torch.float64) * 2
         with torch.no_grad():

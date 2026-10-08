@@ -70,7 +70,7 @@ def build_system(cfg):
     ev = cfg["evaluation"]
     readouts = build_readouts(cfg["readouts"], verifier, ev["threshold"])
     return System(clock, representation, network, verifier, readouts, cfg["canvas"].get("multiple", DOWNSAMPLE),
-                  ev["chunk_steps"], ev["threshold"])
+                  ev["chunk_steps"], ev["threshold"], bool(ev.get("amp", False)))
 
 
 def build_loss(cfg):
