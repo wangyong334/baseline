@@ -157,6 +157,21 @@ class TrainingTests(unittest.TestCase):
         for n, p in system.network.named_parameters():
             self.assertFalse(torch.equal(p, before[n]), n)
 
+    def test_checkpointed_training_matches(self):
+        """Activation checkpointing (sub-chunks of 2 steps) gives the same loss and parameter update up to rounding."""
+        cfg = with_overrides(load_config(CONFIG), SMALL)
+        results = []
+        for ckpt in (0, 2):
+            system = small_system(5)
+            system.network.train()
+            opt = torch.optim.SGD(system.network.parameters(), lr=0.1)
+            out = train_stream(system, build_loss(cfg["loss"]), synthetic_stream(7), opt, 4, 1e9,
+                               np.random.RandomState(1), checkpoint_steps=ckpt)
+            results.append((out["loss_sum"], {n: p.detach().clone() for n, p in system.network.named_parameters()}))
+        self.assertAlmostEqual(results[0][0], results[1][0], delta=1e-9 * abs(results[0][0]))
+        for name, p in results[0][1].items():
+            self.assertLess(float((p - results[1][1][name]).abs().max()), 1e-10, name)
+
     def test_calibration_sets_gains(self):
         torch.manual_seed(0)
         system = build_system(with_overrides(load_config(CONFIG), SMALL))

@@ -3,12 +3,14 @@
 train_stream: chunks of tbptt_steps (first chunk length random in 1..k so no step is always a chunk start);
 representation under no_grad, network + heads + loss with gradients, states detached at chunk borders;
 loss divided by the stream's event count; gradient clipping; one optimiser step.
+checkpoint_steps > 0 recomputes activations in sub-chunks during backward (large sensors).
 Also: gain calibration driver, learning-rate schedule, layer monitor, checkpoint I/O.
 """
 import math
 
 import numpy as np
 import torch
+from torch.utils.checkpoint import checkpoint
 
 from speed.core.clock import EventBlocks
 from speed.slots.backbone.merged_unet import LAYER_NAMES, calibrate_gains
@@ -53,7 +55,29 @@ def gradient_group_norms(network):
     return {k: math.sqrt(v) for k, v in squares.items()}
 
 
-def train_stream(system, loss_fn, stream, optimizer, tbptt_steps, grad_clip, rng, max_steps=None, carry=True):
+def forward_checkpointed(network, inputs, states, carry, sub_steps):
+    """network.forward_chunk over sub-chunks of sub_steps with activation checkpointing: same gradients (up to
+    float rounding from smaller conv batches), activation memory of one sub-chunk instead of the whole chunk."""
+    names = list(network.heads.outputs)
+    dummy = torch.ones(1, requires_grad=True)          # torch 1.9 checkpoint needs an input that requires grad
+
+    def run(x, _dummy, *flat):
+        st = list(flat) if flat else None
+        out, new_states, _ = network.forward_chunk(x, st, carry)
+        return tuple(out[n] for n in names) + tuple(new_states)
+
+    parts = {n: [] for n in names}
+    for a in range(0, int(inputs.shape[0]), int(sub_steps)):
+        flat = tuple(states) if states is not None else ()
+        res = checkpoint(run, inputs[a:a + int(sub_steps)], dummy, *flat)
+        for i, n in enumerate(names):
+            parts[n].append(res[i])
+        states = list(res[len(names):])
+    return {n: torch.cat(v, 0) for n, v in parts.items()}, states
+
+
+def train_stream(system, loss_fn, stream, optimizer, tbptt_steps, grad_clip, rng, max_steps=None, carry=True,
+                 checkpoint_steps=0):
     network, rep = system.network, system.representation
     device, dtype = system.device, system.dtype
     H, W = system.canvas(stream)
@@ -72,7 +96,10 @@ def train_stream(system, loss_fn, stream, optimizer, tbptt_steps, grad_clip, rng
         blk = blocks.block(start, end)
         with torch.no_grad():
             rep_state, inputs, _ = rep.encode(rep_state, blk)
-        outputs, states, _ = network.forward_chunk(inputs, states, carry)
+        if checkpoint_steps and int(inputs.shape[0]) > int(checkpoint_steps):
+            outputs, states = forward_checkpointed(network, inputs, states, carry, checkpoint_steps)
+        else:
+            outputs, states, _ = network.forward_chunk(inputs, states, carry)
         ev = blk["events"]
         logits = outputs["mark"][ev["t"], ev["b"], 0, ev["y"], ev["x"]]
         loss, parts = loss_fn(outputs, logits, blk)

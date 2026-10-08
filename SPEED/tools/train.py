@@ -127,7 +127,7 @@ def main():
         sums, events = {"loss_sum": 0.0, "mark_sum": 0.0, "intensity_sum": 0.0}, 0
         for stream in loader(train_set, seed * 1000 + epoch, tr.get("num_workers", 2)):
             out = train_stream(system, loss_fn, stream, optimizer, tr["tbptt_steps"], tr["grad_clip"], rng,
-                               args.max_steps, carry)
+                               args.max_steps, carry, int(tr.get("checkpoint_steps", 0)))
             for key in sums:
                 sums[key] += out[key]
             events += out["events"]
