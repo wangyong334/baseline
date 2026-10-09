@@ -28,3 +28,39 @@ def bilinear_splat(values, disp_y, disp_x):
         contrib = values * w
         out = out.index_put((index[inside],), contrib[inside], accumulate=True)
     return out.view(B, C, H, W)
+
+
+def splat_points(values, b, y, x, disp_y, disp_x, shape):
+    """Sparse push: values [n] at integer pixels (b, y, x) [n] moved by (disp_y, disp_x) [n] and shared bilinearly
+    -> dense [B,1,H,W] of the given shape (B, H, W). Differentiable w.r.t. values and displacement."""
+    B, H, W = (int(n) for n in shape)
+    out = torch.zeros(B * H * W, device=values.device, dtype=values.dtype)
+    if int(values.numel()) == 0:
+        return out.view(B, 1, H, W)
+    ty, tx = y.to(disp_y.dtype) + disp_y, x.to(disp_x.dtype) + disp_x
+    y0, x0 = torch.floor(ty), torch.floor(tx)
+    fy, fx = (ty - y0).to(values.dtype), (tx - x0).to(values.dtype)
+    y0, x0 = y0.long(), x0.long()
+    for dy, dx, w in ((0, 0, (1 - fy) * (1 - fx)), (0, 1, (1 - fy) * fx), (1, 0, fy * (1 - fx)), (1, 1, fy * fx)):
+        yy, xx = y0 + dy, x0 + dx
+        inside = (yy >= 0) & (yy < H) & (xx >= 0) & (xx < W)
+        index = (b * H + yy.clamp(0, H - 1)) * W + xx.clamp(0, W - 1)
+        out = out.index_put((index[inside],), (values * w)[inside], accumulate=True)
+    return out.view(B, 1, H, W)
+
+
+def sample_bilinear(maps, b, c, y, x):
+    """maps [B,C,H,W]; integer b, c and float y, x of any common shape -> bilinear values (0 outside the canvas).
+    Differentiable w.r.t. the maps and the positions."""
+    B, C, H, W = (int(n) for n in maps.shape)
+    flat = maps.reshape(-1)
+    y0, x0 = torch.floor(y), torch.floor(x)
+    fy, fx = (y - y0).to(maps.dtype), (x - x0).to(maps.dtype)
+    y0, x0 = y0.long(), x0.long()
+    out = torch.zeros(y.shape, device=maps.device, dtype=maps.dtype)
+    for dy, dx, w in ((0, 0, (1 - fy) * (1 - fx)), (0, 1, (1 - fy) * fx), (1, 0, fy * (1 - fx)), (1, 1, fy * fx)):
+        yy, xx = y0 + dy, x0 + dx
+        inside = (yy >= 0) & (yy < H) & (xx >= 0) & (xx < W)
+        index = ((b * C + c) * H + yy.clamp(0, H - 1)) * W + xx.clamp(0, W - 1)
+        out = out + torch.where(inside, flat[index], torch.zeros_like(out)) * w
+    return out

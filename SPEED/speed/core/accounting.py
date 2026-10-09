@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from speed.eval.energy import part, pixel_head
+from speed.slots.publish.learned import LearnedDelayReadout, LearnedPublishReadout
 from speed.slots.publish.readouts import FixedDelayReadout, NetReadout, PublishReadout
 
 
@@ -28,7 +29,11 @@ class EnergyStats(object):
         self.elements += int(inputs.numel())
 
     def update_verifier(self, state, verifier):
-        self.queries += int(state.get("queried", 0))
+        self.queries += int(state.get("queried", 0)) + int(state.get("sources", 0))
+        if hasattr(verifier, "active_fraction"):
+            self.active += verifier.active_fraction(state)
+            self.active_steps += 1
+            return
         if verifier.gate_eps <= 0:
             return
         act = (state["G"] >= verifier.gate_eps).to(state["G"].dtype)
@@ -63,6 +68,9 @@ def energy_parts(system, height, width, stats):
     if hasattr(heads, "motion_hidden"):
         out["motion_head"] = pixel_head(heads.in_channels + heads.input_channels, heads.motion_hidden, 3,
                                         height * width, note="dense, as implemented")
+    if getattr(heads, "background_channel", None) is not None:
+        out["background_head"] = pixel_head(heads.in_channels + heads.input_channels, heads.background_hidden, 1,
+                                            height * width, note="dense, as implemented")
     transport = system.network.transport
     if not transport.is_identity and hasattr(transport, "operations"):
         ops = transport.operations(system.network.backbone, height, width)
@@ -85,5 +93,17 @@ def energy_parts(system, height, width, stats):
             f2 = float(v.footprint ** 2)
             out["readout_" + r.name] = part(ac=u * (3 * V if r.anchor else 2 * V) + (f2 * height * width if r.anchor else 0),
                                             transcendental=u * (V + 1))
+        elif isinstance(r, LearnedDelayReadout):
+            # per event and step of its wait: bilinear read (8 MAC) and path (2 MAC) per hypothesis, anchored sum,
+            # hypothesis mixture (V exp + 1 log); per event: its cloud at birth and one fusion per delay
+            u = e * float(r.max_delay)
+            out["readout_learned_delay"] = part(mac=u * 10 * V + e * (12 + len(r.delays)), ac=u * 4 * V + e * 10,
+                                                transcendental=u * (V + 1) + e * (2 + len(r.delays)))
+        elif isinstance(r, LearnedPublishReadout):
+            u = float(stats["publish_unit_steps_per_step"])
+            h = r.head.operations_per_unit()
+            out["readout_" + r.name] = part(mac=u * (10 * V + 1 + h["mac"]) + e * (12 + h["mac"]),
+                                            ac=u * (4 * V + h["ac"]) + e * (10 + h["ac"]),
+                                            transcendental=u * (V + 1) + e * 2)
     return out
 

@@ -4,17 +4,27 @@ transport of slot 5 applied between steps.
 forward_chunk(inputs [T,B,C,H,W], states) -> (outputs {name: [T,B,...]}, states, info)
     time-parallel path when the transport is the identity (convs batched over the chunk), step-by-step otherwise;
     both give the same result for the identity transport (force_stepwise exists for that check).
+V4-2 options: front (a learnable representation, trained and saved with the network), readout_head (the learned
+parameters of the verifier and readouts) and backbone_channels (the backbone reads only the first channels of the
+input; later dense channels such as log mu0 go to the heads only, so the event-driven input stays sparse).
 """
 import torch
 import torch.nn as nn
 
 
 class Network(nn.Module):
-    def __init__(self, backbone, heads, transport):
+    def __init__(self, backbone, heads, transport, front=None, readout_head=None, backbone_channels=None):
         super(Network, self).__init__()
         self.backbone = backbone
         self.heads = heads
         self.transport = transport
+        self.front = front
+        self.readout_head = readout_head
+        self.backbone_channels = None if backbone_channels is None else int(backbone_channels)
+
+    def backbone_input(self, x):
+        """x [..., C, H, W] -> the channels the backbone reads."""
+        return x if self.backbone_channels is None else x[..., :self.backbone_channels, :, :]
 
     @property
     def v_threshold(self):
@@ -28,14 +38,14 @@ class Network(nn.Module):
         return self.heads(u, x) if getattr(self.heads, "takes_input", False) else self.heads(u)
 
     def forward_step(self, x, states, carry=True, collect=False):
-        u, states, info = self.backbone.forward_dense(x, states, carry, collect)
+        u, states, info = self.backbone.forward_dense(self.backbone_input(x), states, carry, collect)
         outputs = self._heads(u, x)
         return outputs, self.transport.apply(states, outputs), info
 
     def forward_chunk(self, inputs, states, carry=True, collect=False, force_stepwise=False):
         steps, batch = int(inputs.shape[0]), int(inputs.shape[1])
         if self.transport.is_identity and not force_stepwise:
-            u, states, info = self.backbone.forward_dense_chunk(inputs, states, carry, collect)
+            u, states, info = self.backbone.forward_dense_chunk(self.backbone_input(inputs), states, carry, collect)
             flat = self._heads(u.reshape((steps * batch,) + tuple(u.shape[2:])),
                                inputs.reshape((steps * batch,) + tuple(inputs.shape[2:])))
             outputs = {name: value.view((steps, batch) + tuple(value.shape[1:])) for name, value in flat.items()}

@@ -1,5 +1,7 @@
 """Train a SPEED system: gain calibration, then per epoch one update per training recording (shuffled), validation
-on the zero-wait readout (net) and checkpoint selection by validation IoU.
+and checkpoint selection by the validation IoU of evaluation.select_readout (default net, the zero-wait readout;
+V4-2: pub) at the benchmark threshold, or by its mean IoU over thresholds 0.5-0.9 (select_metric mean_iou).
+Optional training.augment {keep_min, time_scale_min}: event thinning and time compression per stream and epoch.
 
     python tools/train.py --config configs/base_evuav.yaml --root /path/to/EV-UAV-dataset --out runs/base_s37 \
         [--seed 37] [--set training.epochs=2] [--device cuda:1] [--max-train 4 --max-val 2 --max-steps 32]
@@ -24,10 +26,13 @@ from speed.core.build import build_loss, build_system, load_config, with_overrid
 from speed.core.runtime import memory_line, peak_memory_gib, seed_everything, write_json  # noqa: E402
 from speed.core.training import (LayerMonitor, calibrate, linear_epoch_lr, save_checkpoint, select_subset,  # noqa: E402
                                  tau_statistics, train_stream)
+from speed.data.augment import augment_stream  # noqa: E402
 from speed.data.dataset_card import list_recordings, load_card  # noqa: E402
 from speed.data.readers import read_recording  # noqa: E402
 from speed.eval.metrics import BenchmarkMetrics  # noqa: E402
 from speed.slots.publish.readouts import NetReadout  # noqa: E402
+
+SELECT_THRESHOLDS = (0.5, 0.6, 0.7, 0.8, 0.9)
 
 
 class Recordings(torch.utils.data.Dataset):
@@ -53,20 +58,67 @@ def loader(dataset, seed, num_workers):
                                        collate_fn=first_item, generator=generator)
 
 
+def readout_producing(system, name):
+    for r in system.readouts:
+        names = [r.name] if hasattr(r, "name") else ["%s%d" % (r.prefix, d) for d in r.delays]
+        if name in names:
+            return r
+    raise ValueError("no readout produces %s (available %s)" % (name, system.readout_names()))
+
+
 def validate(system, dataset, card, ev, carry, monitor):
-    metrics = BenchmarkMetrics(card["sensor"]["width"], card["sensor"]["height"], int(ev["frame_ms"] * 1000),
-                               ev["threshold"], ev["correct_thresh"])
-    readout = NetReadout()
+    """-> (net metrics at the benchmark threshold, selection metrics of evaluation.select_readout)."""
+    select, metric = ev.get("select_readout", "net"), ev.get("select_metric", "iou")
+    if metric not in ("iou", "mean_iou"):
+        raise ValueError("select_metric must be iou or mean_iou")
+    make = lambda: BenchmarkMetrics(card["sensor"]["width"], card["sensor"]["height"],  # noqa: E731
+                                    int(ev["frame_ms"] * 1000), ev["threshold"], ev["correct_thresh"])
+    metrics = {"net": make()}
+    readouts = [NetReadout()]
+    if select != "net":
+        metrics[select] = make()
+        readouts.append(readout_producing(system, select))
+    counts = {t: [0, 0, 0] for t in SELECT_THRESHOLDS}                    # tp, fp, fn of the selected readout
     was_training = system.network.training
     system.network.eval()
     with torch.no_grad():
         for i in range(len(dataset)):
             stream = dataset[i]
-            results, _ = system.run_stream(stream, carry, monitor, readouts=[readout])
-            metrics.update(stream, results["net"][0])
+            results, _ = system.run_stream(stream, carry, monitor, readouts=readouts)
+            for name, m in metrics.items():
+                m.update(stream, results[name][0])
+            if metric == "mean_iou":
+                prob, target = results[select][0], stream.label == 1
+                for t, c in counts.items():
+                    pred = prob >= np.float32(t)
+                    c[0] += int(np.count_nonzero(pred & target))
+                    c[1] += int(np.count_nonzero(pred & ~target))
+                    c[2] += int(np.count_nonzero(~pred & target))
     system.network.train(was_training)
-    r = metrics.result()
-    return {k: r[k] for k in ("iou", "acc", "pd", "fa")}
+    out = {name: {k: r[k] for k in ("iou", "acc", "pd", "fa")} for name, r in
+           ((name, m.result()) for name, m in metrics.items())}
+    sel = dict(out[select], readout=select, metric=metric)
+    if metric == "mean_iou":
+        ious = [c[0] / float(sum(c)) if sum(c) else 0.0 for c in counts.values()]
+        sel["mean_iou"] = float(np.mean(ious))
+    sel["value"] = sel["mean_iou"] if metric == "mean_iou" else sel["iou"]
+    return out["net"], sel
+
+
+def learned_parameter_summary(network):
+    """Monitoring of the V4-2 learned constants (front end time scales, fusion and position weights)."""
+    out = {}
+    front, head = getattr(network, "front", None), getattr(network, "readout_head", None)
+    with torch.no_grad():
+        if front is not None:
+            out["front_tau_ms"] = [float(v) for v in torch.exp(front.log_tau).cpu()]
+        if head is not None:
+            pi = torch.exp(head.mix_log_weights()).cpu()
+            inner = (head.offsets.abs().max(1)[0] <= 1).cpu()
+            out["fusion"] = [float(v) for v in head.fusion.cpu()]
+            out["mixture_inner_3x3"] = float(pi[inner].sum())
+            out["mixture_centre"] = float(pi[(head.offsets.abs().sum(1) == 0).cpu()].sum())
+    return out
 
 
 def main():
@@ -116,7 +168,8 @@ def main():
     write_json(os.path.join(args.out, "calibration.json"), {"recordings": sorted(calib_names), "layers": reports})
     del calib_streams
     print(memory_line(device, "after calibration"), flush=True)
-    loss_fn = build_loss(cfg["loss"], float(cfg["clock"]["step_ms"]))
+    loss_fn = build_loss(cfg["loss"], float(cfg["clock"]["step_ms"]), system)
+    augment = tr.get("augment") or {}
     scaler = torch.cuda.amp.GradScaler() if bool(tr.get("amp", False)) and device.type == "cuda" else None
     train_set, val_set = Recordings(card, train_items), Recordings(card, val_items)
     epochs, best = int(tr["epochs"]), -float("inf")
@@ -125,12 +178,16 @@ def main():
         for group in optimizer.param_groups:
             group["lr"] = lr
         rng = np.random.RandomState(seed * 1000 + epoch + 7)
+        aug_rng = np.random.RandomState(seed * 1000 + epoch + 11)
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
         t0 = time.perf_counter()
         system.network.train()
         sums, events = {"loss_sum": 0.0, "mark_sum": 0.0, "intensity_sum": 0.0}, 0
         for stream in loader(train_set, seed * 1000 + epoch, tr.get("num_workers", 2)):
+            if augment:
+                stream = augment_stream(stream, aug_rng, augment.get("keep_min", 1.0),
+                                        augment.get("time_scale_min", 1.0))
             out = train_stream(system, loss_fn, stream, optimizer, tr["tbptt_steps"], tr["grad_clip"], rng,
                                args.max_steps, carry, int(tr.get("checkpoint_steps", 0)), tr.get("update_steps"),
                                scaler)
@@ -141,27 +198,32 @@ def main():
         train_seconds = time.perf_counter() - t0
         print(memory_line(device, "after training"), flush=True)
         monitor = LayerMonitor(system.network.v_threshold)
-        val = validate(system, val_set, card, ev, carry, monitor)
+        val, sel = validate(system, val_set, card, ev, carry, monitor)
         print(memory_line(device, "after validation"), flush=True)
-        record = {"epoch": epoch, "seed": seed, "lr": lr, "loss_per_event": sums["loss_sum"] / max(events, 1),
-                  "mark_per_event": sums["mark_sum"] / max(events, 1),
-                  "intensity_per_event": sums["intensity_sum"] / max(events, 1),
-                  **({"motion_per_event": sums["motion_sum"] / max(events, 1)} if "motion_sum" in sums else {}),
-                  "val": val, "train_seconds": train_seconds, "epoch_seconds": time.perf_counter() - t0,
-                  "peak_memory_gib": peak_memory_gib(device), "layers": monitor.summary(),
-                  "tau": tau_statistics(system.network)}
+        record = {"epoch": epoch, "seed": seed, "lr": lr, "loss_per_event": sums["loss_sum"] / max(events, 1)}
+        for key in sorted(sums):
+            if key.endswith("_sum") and key != "loss_sum":
+                record[key[:-4] + "_per_event"] = sums[key] / max(events, 1)
+        record.update({"val": val, "val_select": sel, "train_seconds": train_seconds,
+                       "epoch_seconds": time.perf_counter() - t0, "peak_memory_gib": peak_memory_gib(device),
+                       "layers": monitor.summary(), "tau": tau_statistics(system.network),
+                       "learned": learned_parameter_summary(system.network)})
         with open(os.path.join(args.out, "metrics.jsonl"), "a", encoding="utf-8") as handle:
             handle.write(json.dumps(record) + "\n")
-        if val["iou"] > best:
-            best = val["iou"]
+        if sel["value"] > best:
+            best = sel["value"]
             save_checkpoint(os.path.join(args.out, "best.pt"), system.network, optimizer, epoch, best, cfg)
         save_checkpoint(os.path.join(args.out, "last.pt"), system.network, optimizer, epoch, best, cfg)
-        motion = " motion %.5f" % record["motion_per_event"] if "motion_per_event" in record else ""
-        print("epoch %d lr %.2e loss/event %.5f (mark %.5f, intensity %.5f%s) | val IoU %.4f ACC %.4f Pd %.4f Fa %.2e"
-              " | %.0f s" % (epoch, lr, record["loss_per_event"], record["mark_per_event"],
-                             record["intensity_per_event"], motion, val["iou"], val["acc"], val["pd"], val["fa"],
-                             record["epoch_seconds"]), flush=True)
-    print("TRAINING FINISHED: best val IoU %.4f -> %s" % (best, args.out), flush=True)
+        terms = ", ".join("%s %.5f" % (key[:-len("_per_event")], record[key]) for key in sorted(record)
+                          if key.endswith("_per_event") and key != "loss_per_event")
+        chosen = "" if sel["readout"] == "net" and sel["metric"] == "iou" else \
+            " | select %s %s %.4f (IoU %.4f Fa %.2e)" % (sel["readout"], sel["metric"], sel["value"], sel["iou"],
+                                                        sel["fa"])
+        print("epoch %d lr %.2e loss/event %.5f (%s) | val IoU %.4f ACC %.4f Pd %.4f Fa %.2e%s | %.0f s" % (
+            epoch, lr, record["loss_per_event"], terms, val["iou"], val["acc"], val["pd"], val["fa"], chosen,
+            record["epoch_seconds"]), flush=True)
+    print("TRAINING FINISHED: best val %s %s %.4f -> %s" % (ev.get("select_readout", "net"),
+                                                            ev.get("select_metric", "iou"), best, args.out), flush=True)
 
 
 if __name__ == "__main__":

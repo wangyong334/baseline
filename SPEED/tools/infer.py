@@ -2,6 +2,8 @@
 
     python tools/infer.py --checkpoint runs/a/best.pt --root /path/to/EV-UAV-dataset --split test \
         --out runs/a/test [--readouts net fused_d2 pub] [--evaluate] [--device cuda:1]
+--perturb KEEP SCALE: robustness test on perturbed recordings (each event kept with probability KEEP, timestamps x SCALE;
+seeded by the recording name, so every checkpoint sees the same perturbed data).
 """
 import os
 
@@ -11,15 +13,18 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")  # lim
 import argparse  # noqa: E402
 import sys  # noqa: E402
 import time  # noqa: E402
+import zlib  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
 from speed.core.accounting import EnergyStats, energy_parts  # noqa: E402
 from speed.core.build import build_system, with_overrides, with_sections  # noqa: E402
 from speed.core.runtime import peak_memory_gib, seed_everything, write_json  # noqa: E402
 from speed.core.training import LayerMonitor, load_checkpoint  # noqa: E402
+from speed.data.augment import perturb_stream  # noqa: E402
 from speed.data.dataset_card import iter_split, load_card  # noqa: E402
 from speed.eval.breakdown import MotionAccuracy  # noqa: E402
 from speed.eval.energy import system_energy  # noqa: E402
@@ -40,6 +45,8 @@ def main():
                         help="YAML files whose top-level sections replace the checkpoint's (eval-time only)")
     parser.add_argument("--set", nargs="*", default=[], help="config overrides section.key=value (eval-time only)")
     parser.add_argument("--recordings", nargs="*", default=None, help="only these recordings (e.g. test/test_003.npz)")
+    parser.add_argument("--perturb", nargs=2, type=float, default=None, metavar=("KEEP", "SCALE"),
+                        help="robustness test: keep each event with probability KEEP, multiply timestamps by SCALE")
     parser.add_argument("--evaluate", action="store_true")
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
@@ -74,6 +81,9 @@ def main():
     events = steps_total = recordings = 0
     with torch.no_grad():
         for stream in iter_split(card, args.root, args.split, args.recordings):
+            if args.perturb is not None:
+                rng = np.random.RandomState(zlib.crc32(stream.name.encode("utf-8")) & 0x7fffffff)
+                stream = perturb_stream(stream, rng, args.perturb[0], args.perturb[1])
             results, steps = system.run_stream(stream, carry=bool(cfg["training"].get("carry", True)), monitor=monitor,
                                                energy=energy, readouts=run_readouts)
             if probe is not None:
@@ -92,7 +102,8 @@ def main():
     summary = {"checkpoint": os.path.abspath(args.checkpoint), "split": args.split, "recordings": recordings,
                "events": events, "steps": steps_total, "events_per_step": events / float(max(steps_total, 1)),
                "seconds": seconds, "peak_memory_gib": peak_memory_gib(device), "layers": monitor.summary(),
-               "readouts": keep, "overrides": args.set, "sections": args.sections, "verifier": cfg.get("verifier")}
+               "readouts": keep, "overrides": args.set, "sections": args.sections, "verifier": cfg.get("verifier"),
+               "perturb": args.perturb}
     stats = energy.summary(summary["layers"])
     parts = energy_parts(system, canvas[0], canvas[1], stats)
     summary["energy"] = {"stats": stats, "canvas": list(canvas),

@@ -52,16 +52,17 @@ class System(object):
         ver_state = self.verifier.init_state(1, H, W, device, dtype) if verify else None
         if verify and hasattr(self.verifier, "begin_stream"):
             self.verifier.begin_stream(stream)
+        takes_outputs = verify and getattr(self.verifier, "takes_outputs", False)
         for r in readouts:
             r.begin(stream.n_events)
-        states, prev_log_g, prev_motion = None, None, None
+        states, prev_log_g, prev_motion, prev_outputs = None, None, None, None
         n = steps.n_steps
         for start in range(0, n, self.chunk_steps):
             end = min(start + self.chunk_steps, n)
             blk = blocks.block(start, end)
             rep_state, inputs, aux = self.representation.encode(rep_state, blk)
             if energy is not None:
-                energy.update_inputs(inputs)
+                energy.update_inputs(self.network.backbone_input(inputs))
             with torch.cuda.amp.autocast(enabled=self.amp):
                 outputs, states, info = self.network.forward_chunk(inputs, states, carry, collect=monitor is not None)
             if self.amp:
@@ -81,8 +82,12 @@ class System(object):
                 if verify:
                     step_events = {"b": ev["b"][sl], "y": ev["y"][sl], "x": ev["x"][sl], "age_ms": ev["age_ms"][sl],
                                    "idx": blk["idx"][offset:offset + count]}
-                    ver_state = self.verifier.step(ver_state, aux["total"][t], aux["mu0"][t], prev_log_g, step_events,
-                                                   prev_motion)
+                    if takes_outputs:
+                        ver_state = self.verifier.step(ver_state, aux["total"][t], aux["mu0"][t], prev_log_g,
+                                                       step_events, prev_motion, prev_outputs)
+                    else:
+                        ver_state = self.verifier.step(ver_state, aux["total"][t], aux["mu0"][t], prev_log_g,
+                                                       step_events, prev_motion)
                     if energy is not None:
                         energy.update_verifier(ver_state, self.verifier)
                 ctx = {"k": k, "idx": blk["idx"][offset:offset + count], "b": ev["b"][sl], "y": ev["y"][sl],
@@ -92,6 +97,8 @@ class System(object):
                     r.step(ctx)
                 prev_log_g = outputs["log_g"][t]
                 prev_motion = outputs["motion"][t] if "motion" in outputs else None
+                if takes_outputs:
+                    prev_outputs = {name: value[t] for name, value in outputs.items()}
                 offset += count
         results = {}
         for r in readouts:

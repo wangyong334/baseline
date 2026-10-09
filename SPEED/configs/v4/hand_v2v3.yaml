@@ -1,0 +1,23 @@
+# Hand-written verifier and readouts on a trained V4-2 network (use with tools/infer.py --sections): the base 49-velocity
+# grid (V2) with its fixed fusion weight and the V3 publishing margins. Same weights, hand verifier vs learned verifier.
+verifier:
+  kind: drift_evidence
+  velocities_px_per_step: [-4, -2, -1, 0, 1, 2, 4]
+  footprint_px: 3
+  track_tau_ms: 250
+  gate_eps: 0.03
+
+readouts:
+  - kind: net
+  - kind: fixed_delay
+    delays_steps: [1, 2, 3, 4, 5]
+    fusion_weight: 1.0
+  - kind: publish
+    deadline_steps: 5
+    theta: null                    # null = logit(evaluation.threshold)
+    upper: 1.0
+    lower: 2.0
+    collapse: linear
+    gate: null
+    anchor: true
+    fusion_weight: 1.0

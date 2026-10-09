@@ -1,8 +1,9 @@
 """Slot 10 base variant: stateful truncated BPTT over whole streams, one parameter update per stream.
 
 train_stream: chunks of tbptt_steps (first chunk length random in 1..k so no step is always a chunk start);
-representation under no_grad, network + heads + loss with gradients, states detached at chunk borders;
-loss divided by the stream's event count; gradient clipping; one optimiser step.
+representation under no_grad (with gradients when it has learnable parameters, V4-2), network + heads + loss with
+gradients, network and representation states detached at chunk borders; loss divided by the stream's event count;
+gradient clipping; one optimiser step.
 checkpoint_steps > 0 recomputes activations in sub-chunks during backward (large sensors).
 Also: gain calibration driver, learning-rate schedule, layer monitor, checkpoint I/O.
 """
@@ -44,6 +45,10 @@ def select_subset(names, size, seed):
         return names
     picked = np.random.RandomState(int(seed)).choice(len(names), int(size), replace=False)
     return sorted(names[i] for i in picked)
+
+
+def detach_rep_state(state):
+    return {k: (v.detach() if torch.is_tensor(v) else v) for k, v in state.items()}
 
 
 def gradient_group_norms(network):
@@ -98,6 +103,8 @@ def train_stream(system, loss_fn, stream, optimizer, tbptt_steps, grad_clip, rng
         extras = {"vel": np.stack([vy, vx], 1)}                    # px/ms, nan where undefined
     blocks = EventBlocks(stream, steps, H, W, device, dtype, extras)
     rep_state = rep.init_state(1, H, W, device, dtype)
+    learnable_rep = getattr(rep, "learnable", False)
+    needs_aux = getattr(loss_fn, "needs_aux", False)
     states = None
     sums = {"loss_sum": 0.0, "mark_sum": 0.0, "intensity_sum": 0.0}
     norms, missing = {}, []
@@ -107,8 +114,8 @@ def train_stream(system, loss_fn, stream, optimizer, tbptt_steps, grad_clip, rng
         optimizer.zero_grad(set_to_none=True)
         for start, end in chunks:
             blk = blocks.block(start, end)
-            with torch.no_grad():
-                rep_state, inputs, _ = rep.encode(rep_state, blk)
+            with torch.set_grad_enabled(learnable_rep):
+                rep_state, inputs, aux = rep.encode(rep_state, blk)
             if checkpoint_steps and int(inputs.shape[0]) > int(checkpoint_steps):
                 outputs, states = forward_checkpointed(network, inputs, states, carry, checkpoint_steps, amp)
             else:
@@ -119,6 +126,8 @@ def train_stream(system, loss_fn, stream, optimizer, tbptt_steps, grad_clip, rng
                 states = [None if st is None else st.float() for st in states]
             ev = blk["events"]
             logits = outputs["mark"][ev["t"], ev["b"], 0, ev["y"], ev["x"]]
+            if needs_aux:
+                blk["aux"] = aux
             loss, parts = loss_fn(outputs, logits, blk)
             for name, value in parts.items():
                 sums[name + "_sum"] = sums.get(name + "_sum", 0.0) + value
@@ -132,6 +141,8 @@ def train_stream(system, loss_fn, stream, optimizer, tbptt_steps, grad_clip, rng
                     raise RuntimeError("non-finite loss: %s steps %d-%d" % (stream.name, start, end))
                 sums["loss_sum"] += value
             states = detach_states(states)
+            if learnable_rep:
+                rep_state = detach_rep_state(rep_state)
         if amp:
             scaler.unscale_(optimizer)
         norms = gradient_group_norms(network)
@@ -159,6 +170,7 @@ def calibrate(system, streams, cfg, seed, carry=True):
         blocks = EventBlocks(stream, steps, H, W, device, torch.float32)
         state = system.representation.init_state(1, H, W, device)
         _, feats, _ = system.representation.encode(state, blocks.block(0, min(n_steps, steps.n_steps)))
+        feats = system.network.backbone_input(feats)
         for t in range(int(feats.shape[0])):
             yield feats[t]
 

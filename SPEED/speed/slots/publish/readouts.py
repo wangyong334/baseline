@@ -12,6 +12,7 @@ Base variants:
     fixed_delay  sigmoid(mark + w F(d)) for each d in delays, published d steps later (V2-1 fused_dD;
                  truncated at the last step)
     publish      V3 wait-safe publishing units (two-sided sequential test, optional anchored evidence chain)
+V4-2 variants (speed.slots.publish.learned, with the learned_evidence verifier): learned_delay, learned_publish.
 """
 import math
 
@@ -313,6 +314,17 @@ def build_readouts(cfgs, verifier, threshold):
             rule = PublishRule(theta, cfg.get("upper", 1.0), cfg.get("lower", 2.0), cfg.get("deadline_steps", 5),
                                cfg.get("collapse", "linear"), cfg.get("gate"), cfg.get("fusion_weight", 1.0))
             out.append(PublishReadout(verifier, rule, cfg.get("anchor", True), cfg.get("name", "pub")))
+        elif kind in ("learned_delay", "learned_publish"):
+            from speed.slots.publish.learned import LearnedDelayReadout, LearnedPublishReadout
+            if not hasattr(verifier, "event_cloud"):
+                raise ValueError("readout %s needs the learned_evidence verifier" % kind)
+            if kind == "learned_delay":
+                out.append(LearnedDelayReadout(verifier, cfg["delays_steps"], cfg.get("prefix", "fused_d")))
+            else:
+                theta = cfg.get("theta")
+                if theta is None:
+                    theta = math.log(float(threshold) / (1.0 - float(threshold)))
+                out.append(LearnedPublishReadout(verifier, theta, cfg["epsilon"], cfg.get("name", "pub")))
         else:
             raise ValueError("unknown readout kind %s" % kind)
         if kind != "net" and verifier is None:
