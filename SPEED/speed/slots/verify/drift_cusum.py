@@ -187,6 +187,14 @@ class DriftEvidence(nn.Module):
                 for name, mac, el, tr in parts]
 
 
+def mixture_log_weights(verifier, entry):
+    """Per-event log mixture weights [V, n] from a weighted verifier (None: uniform weights, the V2 readout)."""
+    if entry is None or not getattr(verifier, "weighted", False):
+        return None
+    k_from = entry["k_from"] if "k_from" in entry else torch.full_like(entry["y"], int(entry["k"]))
+    return verifier.log_weights(entry["b"], entry["y"], entry["x"], k_from)
+
+
 def anchored_accumulate(run, alive, values, support):
     """V3 anchored chain: full evidence while the chain holds, only negative evidence after it broke."""
     run = run + torch.where(alive, values, torch.clamp(values, max=0.0))
@@ -206,8 +214,11 @@ class TubeReadout(object):
         self.pending = []
         self.last_k = -1
 
-    def _score(self, run):
-        return torch.logsumexp(run, dim=0) - math.log(self.verifier.n_hypotheses)
+    def _score(self, run, entry=None):
+        logw = mixture_log_weights(self.verifier, entry)
+        if logw is None:
+            return torch.logsumexp(run, dim=0) - math.log(self.verifier.n_hypotheses)
+        return torch.logsumexp(run.to(logw.dtype) + logw, dim=0).to(run.dtype)
 
     def _pending(self, name):
         parts = [entry[name] for entry in self.pending]
@@ -236,7 +247,7 @@ class TubeReadout(object):
                     entry["run"] = entry["run"] + values[:, start:start + n]
                 start += n
                 if (k - entry["k"]) in self.delays:
-                    out.append((entry["key"], k - entry["k"], self._score(entry["run"]), k))
+                    out.append((entry["key"], k - entry["k"], self._score(entry["run"], entry), k))
         self.pending = [e for e in self.pending if k - e["k"] < self.max_delay]
         if self.max_delay > 0:
             entry = {"k": k, "b": b, "y": y, "x": x, "key": key, "k_from": torch.full_like(y, k),
@@ -253,6 +264,6 @@ class TubeReadout(object):
         for entry in self.pending:
             for d in self.delays:
                 if d > self.last_k - entry["k"]:
-                    out.append((entry["key"], d, self._score(entry["run"]), self.last_k))
+                    out.append((entry["key"], d, self._score(entry["run"], entry), self.last_k))
         self.pending = []
         return out

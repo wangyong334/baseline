@@ -63,7 +63,9 @@ def build_verifier(cfg, dt_ms):
         return MeasuredEvidence(dt_ms, cfg["taus_ms"], cfg["radii_px"], float(cfg.get("min_weight", 5.0)),
                                 int(cfg["footprint_px"]), decay, float(cfg.get("gate_eps", 0.0)),
                                 bool(cfg.get("include_zero", True)), cfg.get("fixed_velocity_px_per_step"),
-                                bool(cfg.get("oracle", False)))
+                                bool(cfg.get("oracle", False)), cloud=bool(cfg.get("cloud", False)),
+                                cloud_spacing=float(cfg.get("cloud_spacing_px_per_step", 1.0)),
+                                zero_weight=cfg.get("zero_weight", "equal"))
     raise ValueError("unknown verifier kind %s" % cfg["kind"])
 
 

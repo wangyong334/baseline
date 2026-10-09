@@ -18,7 +18,7 @@ import math
 import numpy as np
 import torch
 
-from speed.slots.verify.drift_cusum import TubeReadout, anchored_accumulate
+from speed.slots.verify.drift_cusum import TubeReadout, anchored_accumulate, mixture_log_weights
 
 UPPER, LOWER, DEADLINE, EOS = 0, 1, 2, 3
 REASONS = ("upper", "lower", "deadline", "eos")
@@ -145,7 +145,11 @@ class PublishUnits(object):
         if fresh:
             evidence = torch.zeros_like(logit)
         else:
-            evidence = torch.logsumexp(entry["run"], dim=0) - math.log(self.verifier.n_hypotheses)
+            logw = mixture_log_weights(self.verifier, entry)
+            if logw is None:
+                evidence = torch.logsumexp(entry["run"], dim=0) - math.log(self.verifier.n_hypotheses)
+            else:
+                evidence = torch.logsumexp(entry["run"].to(logw.dtype) + logw, dim=0).to(logit.dtype)
         return self.rule.score(logit, evidence)
 
     def _decide(self, entry, z, age, k):

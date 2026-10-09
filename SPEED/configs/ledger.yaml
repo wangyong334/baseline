@@ -37,6 +37,7 @@ verifier.gate_eps: [evuav, "prediction gate for sparse execution (readouts uncha
 verifier.taus_ms: [design, "velocity estimator time scales (E1 A_sel, both training splits; values shared with representation.taus_ms)"]
 verifier.radii_px: [design, "velocity estimator box half-widths 4/8/16 px (E1 A_sel, powers of two)"]
 verifier.min_weight: [numerical, "minimum weight sum of a velocity fit (E1: 5)"]
+verifier.cloud_spacing_px_per_step: [physical, "1 px/step: smallest velocity difference that changes a one-step path on the pixel grid"]
 readouts.fixed_delay.delays_steps: [protocol, "reported fixed waits"]
 readouts.fixed_delay.fusion_weight: [design, "weight of the tube evidence (calibrated value 1)"]
 readouts.publish.deadline_steps: [evuav, "longest wait D in steps"]

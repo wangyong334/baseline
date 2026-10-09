@@ -276,3 +276,109 @@ class SystemTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CloudTests(unittest.TestCase):
+    """Round 2: uncertainty-shaped hypothesis cloud (sigma points) with an adaptive zero weight."""
+
+    def test_sigma_points_reproduce_mean_and_covariance(self):
+        from speed.slots.verify.measured_motion import UT_WEIGHTS, cholesky2, sigma_points
+        rng = np.random.RandomState(8)
+        a = rng.normal(size=(20, 2, 2))
+        cov_m = a @ a.transpose(0, 2, 1) + 0.1 * np.eye(2)
+        cov = torch.from_numpy(np.stack([cov_m[:, 0, 0], cov_m[:, 0, 1], cov_m[:, 1, 1]], 1))
+        chol = cholesky2(cov)
+        L = np.zeros((20, 2, 2))
+        L[:, 0, 0], L[:, 1, 0], L[:, 1, 1] = chol[:, 0].numpy(), chol[:, 1].numpy(), chol[:, 2].numpy()
+        np.testing.assert_allclose(L @ L.transpose(0, 2, 1), cov_m, atol=1e-12)
+        centre = torch.from_numpy(rng.normal(size=(20, 2)))
+        pts = sigma_points(centre, chol).numpy()
+        w = np.array(UT_WEIGHTS).reshape(5, 1, 1)
+        self.assertAlmostEqual(float(w.sum()), 1.0)
+        np.testing.assert_allclose((w * pts).sum(0), centre.numpy(), atol=1e-12)
+        d = pts - centre.numpy()[None]
+        np.testing.assert_allclose(np.einsum("j,jni,jnk->nik", w[:, 0, 0], d, d), cov_m, atol=1e-12)
+        self.assertTrue(torch.equal(cholesky2(torch.zeros(3, 3, dtype=torch.float64)), torch.zeros(3, 3, dtype=torch.float64)))
+
+    def test_fixed_cloud_matches_six_velocity_grid(self):
+        decay, gate = math.exp(-DT / 250.0), 0.01
+        v0 = (1.0, -2.0)
+        hyps = [v0, (2.0, -2.0), (0.0, -2.0), (1.0, -1.0), (1.0, -3.0), (0.0, 0.0)]
+        drift = DriftEvidence(hyps, 3, decay, gate)
+        meas = MeasuredEvidence(DT, [20.0], [2], 5.0, 3, decay, gate, fixed_velocity=v0, cloud=True)
+        rng = np.random.RandomState(9)
+        sd, sm = drift.init_state(1, 12, 14, "cpu", torch.float64), meas.init_state(1, 12, 14, "cpu", torch.float64)
+        for k, (counts, mu0, log_g) in enumerate(random_inputs(rng, 8)):
+            sd, sm = drift.step(sd, counts, mu0, log_g), meas.step(sm, counts, mu0, log_g)
+            self.assertTrue(torch.equal(sd["G"], sm["G"]), k)
+            self.assertTrue(torch.equal(sd["ell"], sm["ell"]), k)
+            if k >= 1:
+                n = 30
+                b = torch.zeros(n, dtype=torch.long)
+                y, x = torch.from_numpy(rng.randint(0, 12, n)).long(), torch.from_numpy(rng.randint(0, 14, n)).long()
+                k_from = torch.from_numpy(rng.randint(0, k, n)).long()
+                self.assertTrue(torch.equal(drift.gather_along_many(sd["ell"], k, b, y, x, k_from),
+                                            meas.gather_along_many(sm["ell"], k, b, y, x, k_from)))
+
+    def test_collapsed_cloud_equals_v4a_readouts(self):
+        base = small_system(seed=1)
+        with torch.no_grad():
+            base.network.heads.net[2].bias[1] += 8.0
+        cfg = with_overrides(load_config(CONFIG), SMALL)
+        decay = math.exp(-base.clock.step_ms / float(cfg["verifier"]["track_tau_ms"]))
+        f, gate = int(cfg["verifier"]["footprint_px"]), float(cfg["verifier"]["gate_eps"])
+        stream = synthetic_stream(seed=2)
+        a = system_with(base, MeasuredEvidence(base.clock.step_ms, [20.0], [2], 5.0, f, decay, gate,
+                                               fixed_velocity=(0.0, 1.0)), cfg)
+        b = system_with(base, MeasuredEvidence(base.clock.step_ms, [20.0], [2], 5.0, f, decay, gate,
+                                               fixed_velocity=(0.0, 1.0), cloud=True, cloud_spacing=0.0), cfg)
+        with torch.no_grad():
+            ra, _ = a.run_stream(stream)
+            rb, _ = b.run_stream(stream)
+        for name in ra:
+            np.testing.assert_allclose(ra[name][0], rb[name][0], atol=1e-6, err_msg=name)
+            self.assertGreater(float(np.mean(ra[name][1] == rb[name][1])), 0.999, name)
+
+    def test_adaptive_zero_weight(self):
+        meas = MeasuredEvidence(DT, [20.0], [2], 5.0, 3, 0.5, 0.01, fixed_velocity=(0.0, 0.0), cloud=True,
+                                zero_weight="adaptive")
+        one = torch.zeros(1, dtype=torch.long)
+        lw = meas.log_weights(one, one, one, one).exp()
+        self.assertAlmostEqual(float(lw.sum()), 1.0, places=12)
+        self.assertAlmostEqual(float(lw[-1, 0]), 0.5, places=12)            # zero inside the cloud: weight 1/2
+        fast = MeasuredEvidence(DT, [20.0], [2], 5.0, 3, 0.5, 0.01, fixed_velocity=(0.0, 20.0), cloud=True,
+                                zero_weight="adaptive")
+        lw = fast.log_weights(one, one, one, one).exp()
+        self.assertAlmostEqual(float(lw.sum()), 1.0, places=12)
+        self.assertLess(float(lw[-1, 0]), 1e-100)                            # zero far outside: no log 2 cost
+
+    def test_cloud_order_and_system(self):
+        rng = np.random.RandomState(10)
+        H, W = 12, 14
+        inputs = random_inputs(rng, 6, H, W)
+        evs = [random_events(rng, 30, H, W) for _ in range(6)]
+        meas = MeasuredEvidence(DT, [20.0, 100.0], [2, 4], 2.0, 3, math.exp(-DT / 250.0), 0.01, cloud=True,
+                                zero_weight="adaptive")
+        G4, hist3 = [], []
+        for variant in range(2):
+            s = meas.init_state(1, H, W, "cpu", torch.float64)
+            for k in range(5):
+                counts, mu0, log_g = inputs[k]
+                ev = evs[k]
+                if k == 4 and variant == 1:
+                    counts, ev = counts + 3.0, random_events(np.random.RandomState(98), 30, H, W)
+                s = meas.step(s, counts, mu0, log_g, ev)
+            G4.append(s["G"].clone())
+            hist3.append(s["hist"][3].clone())
+        self.assertTrue(torch.equal(G4[0], G4[1]))
+        self.assertTrue(torch.equal(hist3[0], hist3[1]))
+        base = small_system(seed=3)
+        cfg = with_overrides(load_config(CONFIG), SMALL)
+        decay = math.exp(-base.clock.step_ms / float(cfg["verifier"]["track_tau_ms"]))
+        v = MeasuredEvidence(base.clock.step_ms, [20.0, 100.0], [2, 4], 5.0, int(cfg["verifier"]["footprint_px"]),
+                             decay, float(cfg["verifier"]["gate_eps"]), cloud=True, zero_weight="adaptive")
+        with torch.no_grad():
+            res, _ = system_with(base, v, cfg).run_stream(synthetic_stream(seed=4))
+        for prob, when in res.values():
+            self.assertTrue(np.isfinite(prob).all())
+        self.assertEqual(v.n_hypotheses, 6)
