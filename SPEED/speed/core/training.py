@@ -13,6 +13,7 @@ import torch
 from torch.utils.checkpoint import checkpoint
 
 from speed.core.clock import EventBlocks
+from speed.eval.breakdown import target_kinematics
 from speed.slots.backbone.merged_unet import LAYER_NAMES, calibrate_gains
 from speed.slots.neuron.lif import LIF2d, detach_states
 
@@ -91,7 +92,11 @@ def train_stream(system, loss_fn, stream, optimizer, tbptt_steps, grad_clip, rng
     k = int(tbptt_steps)
     span = n if not update_steps else int(update_steps)
     segments = [(a, min(a + span, n)) for a in range(0, n, span)]
-    blocks = EventBlocks(stream, steps, H, W, device, dtype)
+    extras = None
+    if getattr(loss_fn, "needs_velocity", False):
+        vx, vy, _ = target_kinematics(stream, int(round(system.clock.step_ms * 1000)))
+        extras = {"vel": np.stack([vy, vx], 1)}                    # px/ms, nan where undefined
+    blocks = EventBlocks(stream, steps, H, W, device, dtype, extras)
     rep_state = rep.init_state(1, H, W, device, dtype)
     states = None
     sums = {"loss_sum": 0.0, "mark_sum": 0.0, "intensity_sum": 0.0}
@@ -115,8 +120,8 @@ def train_stream(system, loss_fn, stream, optimizer, tbptt_steps, grad_clip, rng
             ev = blk["events"]
             logits = outputs["mark"][ev["t"], ev["b"], 0, ev["y"], ev["x"]]
             loss, parts = loss_fn(outputs, logits, blk)
-            sums["mark_sum"] += parts["mark"]
-            sums["intensity_sum"] += parts["intensity"]
+            for name, value in parts.items():
+                sums[name + "_sum"] = sums.get(name + "_sum", 0.0) + value
             if loss is not None:
                 if amp:
                     scaler.scale(loss / denominator).backward()

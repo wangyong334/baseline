@@ -116,7 +116,7 @@ def main():
     write_json(os.path.join(args.out, "calibration.json"), {"recordings": sorted(calib_names), "layers": reports})
     del calib_streams
     print(memory_line(device, "after calibration"), flush=True)
-    loss_fn = build_loss(cfg["loss"])
+    loss_fn = build_loss(cfg["loss"], float(cfg["clock"]["step_ms"]))
     scaler = torch.cuda.amp.GradScaler() if bool(tr.get("amp", False)) and device.type == "cuda" else None
     train_set, val_set = Recordings(card, train_items), Recordings(card, val_items)
     epochs, best = int(tr["epochs"]), -float("inf")
@@ -134,8 +134,9 @@ def main():
             out = train_stream(system, loss_fn, stream, optimizer, tr["tbptt_steps"], tr["grad_clip"], rng,
                                args.max_steps, carry, int(tr.get("checkpoint_steps", 0)), tr.get("update_steps"),
                                scaler)
-            for key in sums:
-                sums[key] += out[key]
+            for key, value in out.items():
+                if key.endswith("_sum"):
+                    sums[key] = sums.get(key, 0.0) + value
             events += out["events"]
         train_seconds = time.perf_counter() - t0
         print(memory_line(device, "after training"), flush=True)
@@ -145,6 +146,7 @@ def main():
         record = {"epoch": epoch, "seed": seed, "lr": lr, "loss_per_event": sums["loss_sum"] / max(events, 1),
                   "mark_per_event": sums["mark_sum"] / max(events, 1),
                   "intensity_per_event": sums["intensity_sum"] / max(events, 1),
+                  **({"motion_per_event": sums["motion_sum"] / max(events, 1)} if "motion_sum" in sums else {}),
                   "val": val, "train_seconds": train_seconds, "epoch_seconds": time.perf_counter() - t0,
                   "peak_memory_gib": peak_memory_gib(device), "layers": monitor.summary(),
                   "tau": tau_statistics(system.network)}
@@ -154,9 +156,10 @@ def main():
             best = val["iou"]
             save_checkpoint(os.path.join(args.out, "best.pt"), system.network, optimizer, epoch, best, cfg)
         save_checkpoint(os.path.join(args.out, "last.pt"), system.network, optimizer, epoch, best, cfg)
-        print("epoch %d lr %.2e loss/event %.5f (mark %.5f, intensity %.5f) | val IoU %.4f ACC %.4f Pd %.4f Fa %.2e"
+        motion = " motion %.5f" % record["motion_per_event"] if "motion_per_event" in record else ""
+        print("epoch %d lr %.2e loss/event %.5f (mark %.5f, intensity %.5f%s) | val IoU %.4f ACC %.4f Pd %.4f Fa %.2e"
               " | %.0f s" % (epoch, lr, record["loss_per_event"], record["mark_per_event"],
-                             record["intensity_per_event"], val["iou"], val["acc"], val["pd"], val["fa"],
+                             record["intensity_per_event"], motion, val["iou"], val["acc"], val["pd"], val["fa"],
                              record["epoch_seconds"]), flush=True)
     print("TRAINING FINISHED: best val IoU %.4f -> %s" % (best, args.out), flush=True)
 

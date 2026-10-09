@@ -149,15 +149,20 @@ class MeasuredEvidence(DriftEvidence):
     Mixture weights: V4-a uniform; cloud (1 - w0) x UT weights and w0 for zero, with w0 = 1/2 (equal) or
     1/2 exp(-d^2 / 2), d = Mahalanobis distance of zero under N(v, S) (adaptive). Weights and paths are fixed by
     the past of the event's birth, so every mixture stays a test supermartingale under H0.
+    source "moments": the hand-written estimator below; "network": the velocity and sigma of the network's motion head
+    at step k-1 (V4: learned motion; the estimator constants are then unused).
     fixed_velocity (vy, vx) px/step replaces the estimator by a constant centre (equivalence tests).
     oracle uses the label velocity of target events as centre at their pixels (reference only).
     """
 
-    def __init__(self, dt_ms, taus_ms, radii_px, min_weight=5.0, footprint=3, track_decay=0.0, gate_eps=0.0,
-                 include_zero=True, fixed_velocity=None, oracle=False, history_steps=16, window_us=50000,
-                 cloud=False, cloud_spacing=1.0, zero_weight="equal"):
+    def __init__(self, dt_ms, taus_ms=(20.0,), radii_px=(4,), min_weight=5.0, footprint=3, track_decay=0.0,
+                 gate_eps=0.0, include_zero=True, fixed_velocity=None, oracle=False, history_steps=16,
+                 window_us=50000, cloud=False, cloud_spacing=1.0, zero_weight="equal", source="moments"):
         super(MeasuredEvidence, self).__init__([(0.0, 0.0)], footprint, track_decay, gate_eps)
         self.dt = float(dt_ms)
+        if source not in ("moments", "network"):
+            raise ValueError("source must be moments or network")
+        self.source = source
         self.moments = MotionMoments(dt_ms, taus_ms, radii_px, min_weight)
         self.include_zero = bool(include_zero)
         self.fixed = None if fixed_velocity is None else (float(fixed_velocity[0]), float(fixed_velocity[1]))
@@ -202,7 +207,7 @@ class MeasuredEvidence(DriftEvidence):
                  "ell": torch.zeros(batch, V, height, width, device=device, dtype=dtype), "k": 0,
                  "carried": torch.zeros(batch, self.n_moving, 2, height, width, device=device, dtype=dtype),
                  "hist": {}, "births": None, "queried": 0}
-        if self.fixed is None:
+        if self.fixed is None and self.source == "moments":
             state["moments"] = self.moments.init_state(batch, height, width, device)
         self._hist = state["hist"]
         return state
@@ -211,7 +216,7 @@ class MeasuredEvidence(DriftEvidence):
         f = (self.cloud_spacing ** 2) / UT_SCALE
         return torch.tensor([f, 0.0, f], dtype=dtype, device=device).view(1, 3).expand(n, 3)
 
-    def _propose(self, state, fresh):
+    def _propose(self, state, fresh, motion_prev=None):
         """Proposals (px/step) from the events of steps <= k-1 where needed ->
         (one dense field [B,2,H,W] per moving channel, history entry, number of queried pixels)."""
         G = state["G"]
@@ -242,8 +247,16 @@ class MeasuredEvidence(DriftEvidence):
             return fields, entry, 0
         b, rem = torch.div(flat, plane, rounding_mode="floor"), flat % plane
         y, x = torch.div(rem, W, rounding_mode="floor"), rem % W
-        est = self.moments.estimate(state["moments"], b, y, x, with_spread=self.cloud)
-        v, valid = est[0], est[1]
+        if self.source == "network":
+            if motion_prev is None:
+                raise ValueError("source=network needs the motion output of the previous step")
+            mp = motion_prev.reshape(B, 3, plane)[b, :, rem].to(torch.float64)       # (vy, vx) px/ms, log sigma
+            v, valid = mp[:, :2], torch.ones(n, dtype=torch.bool, device=G.device)
+            sig2 = torch.exp(2.0 * mp[:, 2])
+            est = (v, valid, None, torch.stack([sig2, torch.zeros_like(sig2), sig2], 1))
+        else:
+            est = self.moments.estimate(state["moments"], b, y, x, with_spread=self.cloud)
+            v, valid = est[0], est[1]
         carried = [state["carried"][:, j].reshape(B, 2, plane)[b, :, rem] for j in range(M)]
         centre = torch.where(valid.view(n, 1), (v * self.dt).to(G.dtype), carried[0])
         if births is not None and births.get("oracle") is not None:
@@ -297,11 +310,11 @@ class MeasuredEvidence(DriftEvidence):
         vel.view(B, 2, plane)[torch.div(dest, plane, rounding_mode="floor"), :, dest % plane] = v
         return out, vel
 
-    def step(self, state, counts, mu0, log_g_prev, events=None):
+    def step(self, state, counts, mu0, log_g_prev, events=None, motion_prev=None):
         k = int(state["k"])
         g_prev = None if log_g_prev is None else torch.exp(log_g_prev)
         fresh = None if g_prev is None else self._gate(g_prev)
-        fields, entry, queried = self._propose(state, fresh) if k > 0 else (None, None, 0)
+        fields, entry, queried = self._propose(state, fresh, motion_prev) if k > 0 else (None, None, 0)
         hist = state["hist"]
         self._hist = hist
         if entry is not None:
@@ -334,8 +347,9 @@ class MeasuredEvidence(DriftEvidence):
             if events is None:
                 none = torch.zeros(0, dtype=torch.long, device=G.device)
                 events = {"b": none, "y": none, "x": none, "age_ms": torch.zeros(0, device=G.device), "idx": []}
-            new["moments"] = self.moments.advance(state["moments"], events["b"], events["y"], events["x"],
-                                                  events["age_ms"])
+            if self.source == "moments":
+                new["moments"] = self.moments.advance(state["moments"], events["b"], events["y"], events["x"],
+                                                      events["age_ms"])
             new["births"] = self._births(events, G.shape)
         return new
 
@@ -421,7 +435,7 @@ class MeasuredEvidence(DriftEvidence):
         sources = float(int(height) * int(width)) * float(active_fraction)
         sort = (2.0 * math.log2(max(sources, 2.0)) + 6.0) * self.n_moving
         parts.append({"part": "moving-channel push", "mac": 0.0, "elementwise": sort * sources, "transcendental": 0.0})
-        if self.fixed is None:
+        if self.fixed is None and self.source == "moments":
             for name, mac, el, tr in self.moments.operations(height, width, events_per_step, queries_per_step):
                 parts.append({"part": name, "mac": float(mac), "elementwise": float(el), "transcendental": float(tr)})
             if self.cloud:

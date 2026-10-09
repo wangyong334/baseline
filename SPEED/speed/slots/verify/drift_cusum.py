@@ -134,7 +134,7 @@ class DriftEvidence(nn.Module):
         log_g = torch.log(torch.clamp(G, min=math.exp(LOG_ZERO)))
         return self.aggregate_evidence(pixel_evidence(counts, mu0, log_g))
 
-    def step(self, state, counts, mu0, log_g_prev, events=None):
+    def step(self, state, counts, mu0, log_g_prev, events=None, motion_prev=None):
         """counts, mu0 [B,1,H,W]; log_g_prev [B,1,H,W] of the previous step or None -> new state (G, ell, k).
         events (the step's b, y, x, age_ms, idx) is unused here; MeasuredEvidence needs it."""
         k = int(state["k"])

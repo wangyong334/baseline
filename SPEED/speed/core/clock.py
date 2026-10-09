@@ -58,9 +58,10 @@ class EventBlocks(object):
     block(start, end) -> {"events": {t, b, y, x, pixel, negative, age_ms}, "labels", "idx", "n_steps", "start"}
         t is the step index within the block, age_ms the time from the event to the end of its step.
     accumulate(keys, values, size) sums values into a flat buffer with index_put_ (deterministic on CUDA).
+    extras: optional per-event arrays in file order (e.g. {"vel": [N, 2]}), returned in each block's events.
     """
 
-    def __init__(self, stream, steps, height, width, device, dtype=torch.float32):
+    def __init__(self, stream, steps, height, width, device, dtype=torch.float32, extras=None):
         self.steps, self.device, self.dtype = steps, device, dtype
         self.height, self.width = int(height), int(width)
         self.plane = self.height * self.width
@@ -79,6 +80,8 @@ class EventBlocks(object):
         self.label = upload(stream.label[order].astype(np.float32), torch.float32)
         self.age = upload(age, dtype)
         self.order = order
+        self.extras = {name: upload(np.asarray(value)[order], torch.float64 if np.asarray(value).dtype.kind == "f"
+                                    else torch.long) for name, value in (extras or {}).items()}
 
     def accumulate(self, keys, values, size):
         out = torch.zeros(size, dtype=self.dtype, device=self.device)
@@ -94,5 +97,7 @@ class EventBlocks(object):
         events = {"t": self.step_of[a:b] - start, "b": torch.zeros(b - a, dtype=torch.long, device=self.device),
                   "y": self.y[a:b], "x": self.x[a:b], "pixel": self.pixel[a:b], "negative": self.negative[a:b],
                   "age_ms": self.age[a:b]}
+        for name, value in self.extras.items():
+            events[name] = value[a:b]
         return {"events": events, "labels": self.label[a:b].to(self.dtype), "idx": self.order[a:b],
                 "n_steps": end - start, "start": start, "source": self}

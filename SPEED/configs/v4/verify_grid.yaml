@@ -1,0 +1,7 @@
+# Verifier ablation on a trained V4 network: the base 49-velocity grid (use with tools/infer.py --sections).
+verifier:
+  kind: drift_evidence
+  velocities_px_per_step: [-4, -2, -1, 0, 1, 2, 4]
+  footprint_px: 3
+  track_tau_ms: 250
+  gate_eps: 0.03

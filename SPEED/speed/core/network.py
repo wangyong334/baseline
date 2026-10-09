@@ -23,16 +23,21 @@ class Network(nn.Module):
     def blocks(self):
         return self.backbone.blocks()
 
+    def _heads(self, u, x):
+        # V4 heads with a motion branch also read the network input (it carries the events' timing)
+        return self.heads(u, x) if getattr(self.heads, "takes_input", False) else self.heads(u)
+
     def forward_step(self, x, states, carry=True, collect=False):
         u, states, info = self.backbone.forward_dense(x, states, carry, collect)
-        outputs = self.heads(u)
+        outputs = self._heads(u, x)
         return outputs, self.transport.apply(states, outputs), info
 
     def forward_chunk(self, inputs, states, carry=True, collect=False, force_stepwise=False):
         steps, batch = int(inputs.shape[0]), int(inputs.shape[1])
         if self.transport.is_identity and not force_stepwise:
             u, states, info = self.backbone.forward_dense_chunk(inputs, states, carry, collect)
-            flat = self.heads(u.reshape((steps * batch,) + tuple(u.shape[2:])))
+            flat = self._heads(u.reshape((steps * batch,) + tuple(u.shape[2:])),
+                               inputs.reshape((steps * batch,) + tuple(inputs.shape[2:])))
             outputs = {name: value.view((steps, batch) + tuple(value.shape[1:])) for name, value in flat.items()}
             return outputs, states, info
         per_step, infos = [], []

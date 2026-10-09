@@ -60,6 +60,13 @@ def energy_parts(system, height, width, stats):
     heads = system.network.heads
     out["heads"] = pixel_head(heads.in_channels, heads.hidden, 2, height * width, transcendental_per_position=1,
                               note="dense, as implemented")
+    if hasattr(heads, "motion_hidden"):
+        out["motion_head"] = pixel_head(heads.in_channels + heads.input_channels, heads.motion_hidden, 3,
+                                        height * width, note="dense, as implemented")
+    transport = system.network.transport
+    if not transport.is_identity and hasattr(transport, "operations"):
+        ops = transport.operations(system.network.backbone, height, width)
+        out["transport"] = part(ops["mac"], ops["ac"], ops["transcendental"])
     v = system.verifier
     if v is not None:
         out["verifier"] = _sum(v.operations(height, width, min(1.0, stats["verifier_active_fraction"]),

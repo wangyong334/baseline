@@ -21,9 +21,11 @@ from speed.core.build import build_system, with_overrides, with_sections  # noqa
 from speed.core.runtime import peak_memory_gib, seed_everything, write_json  # noqa: E402
 from speed.core.training import LayerMonitor, load_checkpoint  # noqa: E402
 from speed.data.dataset_card import iter_split, load_card  # noqa: E402
+from speed.eval.breakdown import MotionAccuracy  # noqa: E402
 from speed.eval.energy import system_energy  # noqa: E402
 from speed.eval.metrics import BenchmarkMetrics  # noqa: E402
 from speed.eval.results import save_result  # noqa: E402
+from speed.slots.publish.readouts import MotionProbe  # noqa: E402
 
 
 def main():
@@ -65,12 +67,17 @@ def main():
     energy = EnergyStats()
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
+    probe = MotionProbe() if "motion" in system.network.heads.outputs else None
+    motion_acc = MotionAccuracy(system.clock.step_ms, int(round(system.clock.step_ms * 1000))) if probe else None
+    run_readouts = list(system.readouts) + ([probe] if probe else [])
     t0 = time.perf_counter()
     events = steps_total = recordings = 0
     with torch.no_grad():
         for stream in iter_split(card, args.root, args.split, args.recordings):
             results, steps = system.run_stream(stream, carry=bool(cfg["training"].get("carry", True)), monitor=monitor,
-                                               energy=energy)
+                                               energy=energy, readouts=run_readouts)
+            if probe is not None:
+                motion_acc.update(stream, probe.extra["motion"])
             canvas = system.canvas(stream)
             for name in keep:
                 prob, publish_us = results[name]
@@ -102,6 +109,13 @@ def main():
         print("%-10s IoU %.4f ACC %.4f Pd %.4f Fa %.3e | publish mean %s ms | first det. median %s ms" % (
             name, r["iou"], r["acc"], r["pd"], r["fa"], fmt(r["publish_latency"]["mean_ms"], "%.1f"),
             fmt(r["first_detection"]["median_ms"], "%.1f")), flush=True)
+    if motion_acc is not None:
+        summary["motion_eval"] = ma = motion_acc.result()
+        if ma:
+            fmt = lambda v: "-" if v is None else "%.2f" % v  # noqa: E731
+            print("learned motion on target events (px/step): angle median %s deg | speed ratio %s | error median %s"
+                  " | inside sigma points %s" % (fmt(ma["angle_median"]), fmt(ma["speed_ratio_median"]),
+                                                 fmt(ma["error_median"]), fmt(ma["inside_sigma_points"])), flush=True)
     os.makedirs(args.out, exist_ok=True)
     write_json(os.path.join(args.out, "infer_summary.json"), summary)
     print("INFER FINISHED: %d recordings, %.0f s -> %s" % (recordings, seconds, args.out), flush=True)

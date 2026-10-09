@@ -221,6 +221,32 @@ class PublishUnits(object):
         return out
 
 
+class MotionProbe(object):
+    """Evaluation only: records the network's motion output (vy, vx px/ms, log sigma) at every event of its step."""
+    needs_verifier = False
+    name = "motion_probe"
+
+    def begin(self, n_events):
+        self.n_events, self.idx, self.values = n_events, [], []
+
+    def step(self, ctx):
+        m = ctx.get("motion")
+        if m is None:
+            raise ValueError("motion_probe needs a network with a motion head")
+        self.idx.append(ctx["idx"])
+        self.values.append(m[ctx["b"], :, ctx["y"], ctx["x"]].float().cpu().numpy())
+
+    def flush(self):
+        pass
+
+    def results(self, threshold):
+        out = np.zeros((self.n_events, 3), np.float32)
+        for idx, val in zip(self.idx, self.values):
+            out[idx] = val
+        self.extra = {"motion": out}
+        return {}
+
+
 def published_probability(z, label, theta, threshold):
     """sigmoid(z - theta + logit(threshold)), clamped to the side of the published label (so prob >= threshold
     reproduces the label exactly in float32)."""

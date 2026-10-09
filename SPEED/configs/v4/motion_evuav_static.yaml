@@ -1,0 +1,112 @@
+# V4 step 1 (learned motion through the whole system) on EV-UAV, ablation without memory transport. Changes to base_evuav.yaml:
+#   heads      + motion head (velocity px/ms and its sigma) on u7 and the network input
+#   transport  none (ablation: memory stays where it was written)
+#   loss       mark BCE + forecast of the next step's target events (intensity pushed along the velocity)
+#              + Gaussian NLL of the velocity on target events (labels' centroid velocity)
+#   verifier   proposals = learned velocity (centre) and sigma (cloud), zero velocity with adaptive weight
+# Everything else (representation, backbone, readouts, training recipe) is the base.
+dataset: evuav
+
+clock:
+  kind: fixed
+  step_ms: 50
+
+canvas:
+  multiple: 8                      # total downsampling of the backbone; sensor size padded bottom / right
+
+representation:
+  kind: evidence
+  taus_ms: [20, 100, 500, 2000]
+  dipole_taus_ms: [100, 500]
+  dipole_radius_px: 3
+  bg_fast_ms: 500
+  bg_slow_ms: 5000
+  bg_prior_per_px_step: 0.01
+  bg_prior_steps: 2
+  bg_floor_per_px_step: 0.001
+  bg_smooth_radius_px: 7
+  features: [count, ratio, age, dipole]
+
+network:
+  neuron:
+    kind: lif
+    v_threshold: 1.0
+    tau_init_ms: 200.0
+    tau_min_ms: 50.0
+    tau_max_ms: 2000.0
+    u_floor: -4                    # carried membrane floor, units of v_th
+    u_ceil: null
+  backbone:
+    kind: merged_unet
+    channels: [12, 24, 48, 48]
+  heads:
+    kind: mark_intensity_motion    # mark + intensity (as base) + motion: velocity px/ms and its sigma (V4-1)
+    hidden: 16
+    motion_hidden: 16
+    motion_sigma_init_px_per_step: 1.0
+    mark_prior: 0.03
+    intensity_prior_per_px_step: 0.0002
+    log_g_max: 8.0
+  transport:
+    kind: none
+
+verifier:
+  kind: measured_motion
+  source: network                  # proposals = the motion head of step k-1 (no hand-written estimator)
+  include_zero: true
+  cloud: true                      # 5 sigma points of N(v, sigma^2 I + spacing floor)
+  cloud_spacing_px_per_step: 1.0
+  zero_weight: adaptive
+  footprint_px: 3
+  track_tau_ms: 250
+  gate_eps: 0.03
+
+readouts:
+  - kind: net
+  - kind: fixed_delay
+    delays_steps: [1, 2, 3, 4, 5]
+    fusion_weight: 1.0
+  - kind: publish
+    deadline_steps: 5
+    theta: null                    # null = logit(evaluation.threshold)
+    upper: 1.0
+    lower: 2.0
+    collapse: linear
+    gate: null
+    anchor: true
+    fusion_weight: 1.0
+
+loss:
+  kind: mark_forecast_motion       # train what inference uses (V4-30 forecast, V4-1 velocity with uncertainty)
+  mark_weight: 1.0
+  forecast_weight: 1.0
+  motion_weight: 1.0
+  current_weight: 0.0
+  intensity_smooth_px: 3
+  forecast_floor_per_px_step: 0.0002   # = intensity prior; keeps log F finite where nothing is pushed
+
+training:
+  kind: tbptt
+  seed: 37
+  epochs: 50
+  lr: 0.001
+  lr_end: 0.0001
+  tbptt_steps: 16
+  grad_clip: 1.0
+  num_workers: 2
+  deterministic: true
+  carry: true
+  calibration:
+    sequences: 8
+    steps: 32
+    samples_per_channel: 2048
+    min_positive: 1024
+    quantile: 0.99
+    gain_min: 0.05
+    gain_max: 20.0
+
+evaluation:
+  threshold: 0.9
+  chunk_steps: 32
+  frame_ms: 50
+  correct_thresh: 0.0001

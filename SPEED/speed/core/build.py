@@ -13,11 +13,14 @@ from speed.core.network import Network
 from speed.core.system import System
 from speed.slots.backbone.merged_unet import DOWNSAMPLE, MergedUNet
 from speed.slots.heads.mark_intensity import MarkIntensityHeads
+from speed.slots.heads.motion import MarkIntensityMotionHeads
 from speed.slots.loss.mark_intensity import MarkIntensityLoss
+from speed.slots.loss.motion import MarkForecastMotionLoss
 from speed.slots.neuron.lif import build_neuron_factory
 from speed.slots.publish.readouts import build_readouts
 from speed.slots.representation.evidence import EvidenceFrontEnd
 from speed.slots.transport.identity import NoTransport
+from speed.slots.transport.motion import MotionTransport
 from speed.slots.verify.drift_cusum import DriftEvidence, velocity_grid
 from speed.slots.verify.measured_motion import MeasuredEvidence
 
@@ -42,13 +45,25 @@ def build_network(cfg, in_channels, dt_ms):
         raise ValueError("unknown backbone kind %s" % cfg["backbone"]["kind"])
     backbone = MergedUNet(in_channels, cfg["backbone"]["channels"], neuron)
     h = cfg["heads"]
-    if h["kind"] != "mark_intensity":
+    if h["kind"] == "mark_intensity":
+        heads = MarkIntensityHeads(backbone.out_channels, h["hidden"], h["mark_prior"],
+                                   h["intensity_prior_per_px_step"], h["log_g_max"])
+    elif h["kind"] == "mark_intensity_motion":
+        heads = MarkIntensityMotionHeads(backbone.out_channels, in_channels, dt_ms, h["hidden"], h["motion_hidden"],
+                                         h["mark_prior"], h["intensity_prior_per_px_step"], h["log_g_max"],
+                                         h.get("motion_sigma_init_px_per_step", 1.0))
+    else:
         raise ValueError("unknown heads kind %s" % h["kind"])
-    heads = MarkIntensityHeads(backbone.out_channels, h["hidden"], h["mark_prior"], h["intensity_prior_per_px_step"],
-                               h["log_g_max"])
-    if cfg.get("transport", {"kind": "none"})["kind"] != "none":
-        raise ValueError("unknown transport kind %s" % cfg["transport"]["kind"])
-    return Network(backbone, heads, NoTransport())
+    kind = cfg.get("transport", {"kind": "none"})["kind"]
+    if kind == "none":
+        transport = NoTransport()
+    elif kind == "motion":
+        if "motion" not in heads.outputs:
+            raise ValueError("transport 'motion' needs heads with a motion output")
+        transport = MotionTransport(dt_ms, float(cfg["transport"].get("gate_probability", 0.5)))
+    else:
+        raise ValueError("unknown transport kind %s" % kind)
+    return Network(backbone, heads, transport)
 
 
 def build_verifier(cfg, dt_ms):
@@ -60,12 +75,13 @@ def build_verifier(cfg, dt_ms):
         return DriftEvidence(velocity_grid(cfg["velocities_px_per_step"]), int(cfg["footprint_px"]), decay,
                              float(cfg.get("gate_eps", 0.0)))
     if cfg["kind"] == "measured_motion":
-        return MeasuredEvidence(dt_ms, cfg["taus_ms"], cfg["radii_px"], float(cfg.get("min_weight", 5.0)),
+        return MeasuredEvidence(dt_ms, cfg.get("taus_ms", (20.0,)), cfg.get("radii_px", (4,)),
+                                float(cfg.get("min_weight", 5.0)),
                                 int(cfg["footprint_px"]), decay, float(cfg.get("gate_eps", 0.0)),
                                 bool(cfg.get("include_zero", True)), cfg.get("fixed_velocity_px_per_step"),
                                 bool(cfg.get("oracle", False)), cloud=bool(cfg.get("cloud", False)),
                                 cloud_spacing=float(cfg.get("cloud_spacing_px_per_step", 1.0)),
-                                zero_weight=cfg.get("zero_weight", "equal"))
+                                zero_weight=cfg.get("zero_weight", "equal"), source=cfg.get("source", "moments"))
     raise ValueError("unknown verifier kind %s" % cfg["kind"])
 
 
@@ -81,10 +97,16 @@ def build_system(cfg):
                   ev["chunk_steps"], ev["threshold"], bool(ev.get("amp", False)))
 
 
-def build_loss(cfg):
-    if cfg["kind"] != "mark_intensity":
-        raise ValueError("unknown loss kind %s" % cfg["kind"])
-    return MarkIntensityLoss(cfg["mark_weight"], cfg["intensity_weight"], cfg["intensity_smooth_px"])
+def build_loss(cfg, dt_ms=None):
+    if cfg["kind"] == "mark_intensity":
+        return MarkIntensityLoss(cfg["mark_weight"], cfg["intensity_weight"], cfg["intensity_smooth_px"])
+    if cfg["kind"] == "mark_forecast_motion":
+        if dt_ms is None:
+            raise ValueError("the forecast loss needs the clock step (dt_ms)")
+        return MarkForecastMotionLoss(dt_ms, cfg["mark_weight"], cfg["forecast_weight"], cfg["motion_weight"],
+                                      cfg.get("current_weight", 0.0), cfg["intensity_smooth_px"],
+                                      cfg["forecast_floor_per_px_step"])
+    raise ValueError("unknown loss kind %s" % cfg["kind"])
 
 
 def with_sections(cfg, paths):

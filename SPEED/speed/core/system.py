@@ -54,7 +54,7 @@ class System(object):
             self.verifier.begin_stream(stream)
         for r in readouts:
             r.begin(stream.n_events)
-        states, prev_log_g = None, None
+        states, prev_log_g, prev_motion = None, None, None
         n = steps.n_steps
         for start in range(0, n, self.chunk_steps):
             end = min(start + self.chunk_steps, n)
@@ -81,21 +81,23 @@ class System(object):
                 if verify:
                     step_events = {"b": ev["b"][sl], "y": ev["y"][sl], "x": ev["x"][sl], "age_ms": ev["age_ms"][sl],
                                    "idx": blk["idx"][offset:offset + count]}
-                    ver_state = self.verifier.step(ver_state, aux["total"][t], aux["mu0"][t], prev_log_g, step_events)
+                    ver_state = self.verifier.step(ver_state, aux["total"][t], aux["mu0"][t], prev_log_g, step_events,
+                                                   prev_motion)
                     if energy is not None:
                         energy.update_verifier(ver_state, self.verifier)
                 ctx = {"k": k, "idx": blk["idx"][offset:offset + count], "b": ev["b"][sl], "y": ev["y"][sl],
                        "x": ev["x"][sl], "logits": logits[sl], "prob": net_prob[sl], "total": aux["total"][t],
-                       "verifier": ver_state}
+                       "verifier": ver_state, "motion": outputs["motion"][t] if "motion" in outputs else None}
                 for r in readouts:
                     r.step(ctx)
                 prev_log_g = outputs["log_g"][t]
+                prev_motion = outputs["motion"][t] if "motion" in outputs else None
                 offset += count
         results = {}
         for r in readouts:
             r.flush()
             results.update(r.results(self.threshold))
-            if energy is not None and hasattr(r, "extra"):
+            if energy is not None and hasattr(r, "extra") and "age" in r.extra:
                 energy.unit_steps += int(r.extra["age"].sum())
         if energy is not None:
             energy.events += stream.n_events
