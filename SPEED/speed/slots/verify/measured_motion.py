@@ -250,7 +250,8 @@ class MeasuredEvidence(DriftEvidence):
             pos = torch.searchsorted(flat, births["oracle_flat"])
             centre[pos] = births["oracle"].to(G.dtype)
             valid = valid.clone()
-            valid[pos] = True
+            # full-shape value: the deterministic CUDA index_put of torch 1.9 cannot broadcast a scalar
+            valid[pos] = torch.ones(int(pos.shape[0]), dtype=torch.bool, device=G.device)
         if not self.cloud:
             fields[0].view(B, 2, plane)[b, :, rem] = centre
             entry.view(B, 2, plane)[b, :, rem] = centre

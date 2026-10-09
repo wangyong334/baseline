@@ -382,3 +382,27 @@ class CloudTests(unittest.TestCase):
         for prob, when in res.values():
             self.assertTrue(np.isfinite(prob).all())
         self.assertEqual(v.n_hypotheses, 6)
+
+
+class CloudOracleTests(unittest.TestCase):
+    def test_oracle_replaces_only_the_centre(self):
+        base = small_system(seed=3)
+        cfg = with_overrides(load_config(CONFIG), SMALL)
+        decay = math.exp(-base.clock.step_ms / float(cfg["verifier"]["track_tau_ms"]))
+        f, gate = int(cfg["verifier"]["footprint_px"]), float(cfg["verifier"]["gate_eps"])
+        ostream = oracle_stream()
+        v = MeasuredEvidence(base.clock.step_ms, [20.0], [2], 5.0, f, decay, gate, oracle=True, cloud=True,
+                             zero_weight="adaptive")
+        with torch.no_grad():
+            res, _ = system_with(base, v, cfg).run_stream(ostream)
+        for prob, when in res.values():
+            self.assertTrue(np.isfinite(prob).all())
+        vx, vy, _ = target_kinematics(ostream)
+        steps = v_steps = base.clock.partition(ostream)
+        k = 5
+        sel = np.flatnonzero((ostream.label == 1) & (steps.step_of_events()[np.argsort(steps.order)] == k))
+        sel = sel[np.isfinite(vx[sel])]
+        for p in np.unique(ostream.x[sel]):
+            entry = v._hist[k][0, :, 12, p]
+            self.assertAlmostEqual(float(entry[1]), np.mean(vx[sel][ostream.x[sel] == p]) * DT, places=5)
+            self.assertGreater(float(entry[2]), 0.0)                          # the cloud keeps its spread
