@@ -19,6 +19,7 @@ from speed.slots.publish.readouts import build_readouts
 from speed.slots.representation.evidence import EvidenceFrontEnd
 from speed.slots.transport.identity import NoTransport
 from speed.slots.verify.drift_cusum import DriftEvidence, velocity_grid
+from speed.slots.verify.measured_motion import MeasuredEvidence
 
 
 def load_config(path):
@@ -53,12 +54,17 @@ def build_network(cfg, in_channels, dt_ms):
 def build_verifier(cfg, dt_ms):
     if cfg is None:
         return None
-    if cfg["kind"] != "drift_evidence":
-        raise ValueError("unknown verifier kind %s" % cfg["kind"])
     tau = float(cfg.get("track_tau_ms", 0.0))
     decay = math.exp(-float(dt_ms) / tau) if tau > 0 else 0.0
-    return DriftEvidence(velocity_grid(cfg["velocities_px_per_step"]), int(cfg["footprint_px"]), decay,
-                         float(cfg.get("gate_eps", 0.0)))
+    if cfg["kind"] == "drift_evidence":
+        return DriftEvidence(velocity_grid(cfg["velocities_px_per_step"]), int(cfg["footprint_px"]), decay,
+                             float(cfg.get("gate_eps", 0.0)))
+    if cfg["kind"] == "measured_motion":
+        return MeasuredEvidence(dt_ms, cfg["taus_ms"], cfg["radii_px"], float(cfg.get("min_weight", 5.0)),
+                                int(cfg["footprint_px"]), decay, float(cfg.get("gate_eps", 0.0)),
+                                bool(cfg.get("include_zero", True)), cfg.get("fixed_velocity_px_per_step"),
+                                bool(cfg.get("oracle", False)))
+    raise ValueError("unknown verifier kind %s" % cfg["kind"])
 
 
 def build_system(cfg):
@@ -77,6 +83,14 @@ def build_loss(cfg):
     if cfg["kind"] != "mark_intensity":
         raise ValueError("unknown loss kind %s" % cfg["kind"])
     return MarkIntensityLoss(cfg["mark_weight"], cfg["intensity_weight"], cfg["intensity_smooth_px"])
+
+
+def with_sections(cfg, paths):
+    """Replace whole top-level sections of cfg by those of the YAML files in paths (later files win)."""
+    out = copy.deepcopy(cfg)
+    for path in paths or []:
+        out.update(copy.deepcopy(load_config(path)))
+    return out
 
 
 def with_overrides(cfg, overrides):

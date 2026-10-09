@@ -21,12 +21,14 @@ class EnergyStats(object):
         self.active = 0.0
         self.active_steps = 0
         self.unit_steps = 0
+        self.queries = 0
 
     def update_inputs(self, inputs):
         self.nonzero += int((inputs != 0).sum())
         self.elements += int(inputs.numel())
 
     def update_verifier(self, state, verifier):
+        self.queries += int(state.get("queried", 0))
         if verifier.gate_eps <= 0:
             return
         act = (state["G"] >= verifier.gate_eps).to(state["G"].dtype)
@@ -40,6 +42,7 @@ class EnergyStats(object):
                 "input_density": self.nonzero / float(max(self.elements, 1)),
                 "verifier_active_fraction": (self.active / self.active_steps) if self.active_steps else 1.0,
                 "publish_unit_steps_per_step": self.unit_steps / float(max(self.steps, 1)),
+                "verifier_queries_per_step": self.queries / float(max(self.steps, 1)),
                 "firing_rates": {k: v["firing_rate"] for k, v in (monitor_summary or {}).items()}}
 
 
@@ -59,7 +62,9 @@ def energy_parts(system, height, width, stats):
                               note="dense, as implemented")
     v = system.verifier
     if v is not None:
-        out["verifier"] = _sum(v.operations(height, width, min(1.0, stats["verifier_active_fraction"])))
+        out["verifier"] = _sum(v.operations(height, width, min(1.0, stats["verifier_active_fraction"]),
+                                            events_per_step=e,
+                                            queries_per_step=float(stats.get("verifier_queries_per_step", 0.0))))
         V = float(v.n_hypotheses)
     for r in system.readouts:
         if isinstance(r, NetReadout):

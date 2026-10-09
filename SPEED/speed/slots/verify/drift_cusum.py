@@ -134,8 +134,9 @@ class DriftEvidence(nn.Module):
         log_g = torch.log(torch.clamp(G, min=math.exp(LOG_ZERO)))
         return self.aggregate_evidence(pixel_evidence(counts, mu0, log_g))
 
-    def step(self, state, counts, mu0, log_g_prev):
-        """counts, mu0 [B,1,H,W]; log_g_prev [B,1,H,W] of the previous step or None -> new state (G, ell, k)."""
+    def step(self, state, counts, mu0, log_g_prev, events=None):
+        """counts, mu0 [B,1,H,W]; log_g_prev [B,1,H,W] of the previous step or None -> new state (G, ell, k).
+        events (the step's b, y, x, age_ms, idx) is unused here; MeasuredEvidence needs it."""
         k = int(state["k"])
         shifts = self.step_shifts(k)
         g_prev = None if log_g_prev is None else torch.exp(log_g_prev)
@@ -169,7 +170,7 @@ class DriftEvidence(nn.Module):
         values = tensor[b.view(1, n).expand(V, n), vv, yy.clamp(0, H - 1), xx.clamp(0, W - 1)]
         return torch.where(inside, values, torch.zeros_like(values))
 
-    def operations(self, height, width, active_fraction=1.0):
+    def operations(self, height, width, active_fraction=1.0, **stats):
         """Operations per step over V hypotheses x canvas (dense unless an active fraction is given)."""
         p, v, f, a = float(int(height) * int(width)), float(self.n_hypotheses), self.footprint, float(active_fraction)
         vp = v * p * a

@@ -33,6 +33,10 @@ verifier.velocities_px_per_step: [evuav, "fixed velocity grid +-4 px/step; P3 (e
 verifier.footprint_px: [evuav, "evidence footprint 3x3 px (target size on EV-UAV)"]
 verifier.track_tau_ms: [evuav, "time constant of the tube intensity memory"]
 verifier.gate_eps: [evuav, "prediction gate for sparse execution (readouts unchanged on EV-UAV)"]
+# V4 step 1 (configs/v4/step1_*.yaml): the estimator replaces verifier.velocities_px_per_step (one evuav constant fewer)
+verifier.taus_ms: [design, "velocity estimator time scales (E1 A_sel, both training splits; values shared with representation.taus_ms)"]
+verifier.radii_px: [design, "velocity estimator box half-widths 4/8/16 px (E1 A_sel, powers of two)"]
+verifier.min_weight: [numerical, "minimum weight sum of a velocity fit (E1: 5)"]
 readouts.fixed_delay.delays_steps: [protocol, "reported fixed waits"]
 readouts.fixed_delay.fusion_weight: [design, "weight of the tube evidence (calibrated value 1)"]
 readouts.publish.deadline_steps: [evuav, "longest wait D in steps"]

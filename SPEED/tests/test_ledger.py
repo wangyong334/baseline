@@ -34,6 +34,10 @@ class LedgerTests(unittest.TestCase):
         for name in sorted(n for n in os.listdir(CONFIGS) if n.startswith("base_") and n.endswith(".yaml")):
             missing = [p for p in leaves(load_config(os.path.join(CONFIGS, name))) if p not in ledger]
             self.assertEqual(missing, [], name)
+        v4 = os.path.join(CONFIGS, "v4")
+        for name in sorted(n for n in os.listdir(v4) if n.endswith(".yaml")):
+            missing = [p for p in leaves(load_config(os.path.join(v4, name))) if p not in ledger]
+            self.assertEqual(missing, [], name)
 
 
 if __name__ == "__main__":

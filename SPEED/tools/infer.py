@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch  # noqa: E402
 
 from speed.core.accounting import EnergyStats, energy_parts  # noqa: E402
-from speed.core.build import build_system, with_overrides  # noqa: E402
+from speed.core.build import build_system, with_overrides, with_sections  # noqa: E402
 from speed.core.runtime import peak_memory_gib, seed_everything, write_json  # noqa: E402
 from speed.core.training import LayerMonitor, load_checkpoint  # noqa: E402
 from speed.data.dataset_card import iter_split, load_card  # noqa: E402
@@ -34,6 +34,8 @@ def main():
     parser.add_argument("--out", required=True)
     parser.add_argument("--card", default=None, help="defaults to the config's dataset")
     parser.add_argument("--readouts", nargs="*", default=None, help="subset of readout names to save")
+    parser.add_argument("--sections", nargs="*", default=[],
+                        help="YAML files whose top-level sections replace the checkpoint's (eval-time only)")
     parser.add_argument("--set", nargs="*", default=[], help="config overrides section.key=value (eval-time only)")
     parser.add_argument("--recordings", nargs="*", default=None, help="only these recordings (e.g. test/test_003.npz)")
     parser.add_argument("--evaluate", action="store_true")
@@ -42,7 +44,7 @@ def main():
 
     device = torch.device(args.device)
     ckpt = load_checkpoint(args.checkpoint, device)
-    cfg = with_overrides(ckpt["config"], args.set)
+    cfg = with_overrides(with_sections(ckpt["config"], args.sections), args.set)
     seed_everything(int(cfg["training"]["seed"]), bool(cfg["training"].get("deterministic", True)))
     system = build_system(cfg)
     system.network.load_state_dict(ckpt["network"])
@@ -83,7 +85,7 @@ def main():
     summary = {"checkpoint": os.path.abspath(args.checkpoint), "split": args.split, "recordings": recordings,
                "events": events, "steps": steps_total, "events_per_step": events / float(max(steps_total, 1)),
                "seconds": seconds, "peak_memory_gib": peak_memory_gib(device), "layers": monitor.summary(),
-               "readouts": keep, "overrides": args.set}
+               "readouts": keep, "overrides": args.set, "sections": args.sections, "verifier": cfg.get("verifier")}
     stats = energy.summary(summary["layers"])
     parts = energy_parts(system, canvas[0], canvas[1], stats)
     summary["energy"] = {"stats": stats, "canvas": list(canvas),

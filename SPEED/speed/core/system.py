@@ -50,6 +50,8 @@ class System(object):
         rep_state = self.representation.init_state(1, H, W, device, dtype)
         verify = self.verifier is not None and any(getattr(r, "needs_verifier", False) for r in readouts)
         ver_state = self.verifier.init_state(1, H, W, device, dtype) if verify else None
+        if verify and hasattr(self.verifier, "begin_stream"):
+            self.verifier.begin_stream(stream)
         for r in readouts:
             r.begin(stream.n_events)
         states, prev_log_g = None, None
@@ -77,7 +79,9 @@ class System(object):
                 count = int(steps.bounds[k + 1] - steps.bounds[k])
                 sl = slice(offset, offset + count)
                 if verify:
-                    ver_state = self.verifier.step(ver_state, aux["total"][t], aux["mu0"][t], prev_log_g)
+                    step_events = {"b": ev["b"][sl], "y": ev["y"][sl], "x": ev["x"][sl], "age_ms": ev["age_ms"][sl],
+                                   "idx": blk["idx"][offset:offset + count]}
+                    ver_state = self.verifier.step(ver_state, aux["total"][t], aux["mu0"][t], prev_log_g, step_events)
                     if energy is not None:
                         energy.update_verifier(ver_state, self.verifier)
                 ctx = {"k": k, "idx": blk["idx"][offset:offset + count], "b": ev["b"][sl], "y": ev["y"][sl],
