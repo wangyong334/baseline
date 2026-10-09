@@ -100,6 +100,72 @@ class HeadAndTransportTests(unittest.TestCase):
         self.assertTrue(torch.allclose(on[1], want1, atol=1e-12))
 
 
+class SparseTransportTests(unittest.TestCase):
+    def test_sparse_push_equals_dense_splat_with_gradients(self):
+        """The transport pushes only the moving cells; values and gradients equal the dense splat of p * u."""
+        torch.manual_seed(7)
+        tr = MotionTransport(DT)
+        H, W = 16, 24
+        mark = torch.randn(2, 1, H, W, dtype=torch.float64) * 3.0
+        motion = torch.randn(2, 3, H, W, dtype=torch.float64) * 0.05
+        outputs = {"mark": mark, "motion": motion}
+        shapes = [(2, 3, 16, 24), (2, 4, 8, 12), (2, 6, 4, 6), (2, 6, 2, 3)]
+        states = [torch.randn(*sh, dtype=torch.float64, requires_grad=True) for sh in shapes]
+        sparse = tr.apply(states, outputs)
+        p = torch.sigmoid(mark.float())                                     # the dense code of v4-1, line by line
+        p = p * (p >= 0.5).to(p.dtype)
+        v = motion[:, :2].float() * DT
+        dense = []
+        for st in states:
+            s = H // int(st.shape[2])
+            ps = p if s == 1 else torch.nn.functional.avg_pool2d(p, s)
+            vs = v if s == 1 else torch.nn.functional.avg_pool2d(p * v, s) / ps.clamp(min=1e-6) / s
+            moving = ps.to(st.dtype) * st
+            dense.append(st - moving + bilinear_splat(moving, vs[:, 0:1].to(st.dtype), vs[:, 1:2].to(st.dtype)))
+        for a, b in zip(sparse, dense):
+            self.assertTrue(torch.equal(a, b))
+        weights = [torch.randn_like(a) for a in sparse]
+        ga = torch.autograd.grad(sum((a * w).sum() for a, w in zip(sparse, weights)), states)
+        gb = torch.autograd.grad(sum((b * w).sum() for b, w in zip(dense, weights)), states)
+        for a, b in zip(ga, gb):
+            self.assertTrue(torch.allclose(a, b, atol=1e-14, rtol=0))
+
+
+    def test_sparse_push_is_bit_exact_in_deterministic_mode(self):
+        """float32 at the EV-UAV canvas, deterministic algorithms (as training): values and gradients bit-identical to
+        the dense splat; also on CUDA when available (the server's test gate)."""
+        import torch.nn.functional as F
+        devices = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+        was = torch.are_deterministic_algorithms_enabled()
+        torch.use_deterministic_algorithms(True)
+        try:
+            for device in devices:
+                g = torch.Generator().manual_seed(3)
+                H, W = 264, 352
+                mark = (torch.randn(1, 1, H, W, generator=g) * 2.0 - 3.0).to(device)
+                motion = (torch.randn(1, 3, H, W, generator=g) * 0.05).to(device)
+                shapes = [(1, 12, 264, 352), (1, 24, 132, 176), (1, 48, 66, 88), (1, 48, 33, 44)]
+                states = [torch.randn(*sh, generator=g).to(device).requires_grad_() for sh in shapes]
+                out = MotionTransport(DT).apply(states, {"mark": mark, "motion": motion})
+                p = torch.sigmoid(mark.float())
+                p = p * (p >= 0.5).to(p.dtype)
+                v = motion[:, :2].float() * DT
+                ref = []
+                for st in states:
+                    s = H // int(st.shape[2])
+                    ps = p if s == 1 else F.avg_pool2d(p, s)
+                    vs = v if s == 1 else F.avg_pool2d(p * v, s) / ps.clamp(min=1e-6) / s
+                    moving = ps.to(st.dtype) * st
+                    ref.append(st - moving + bilinear_splat(moving, vs[:, 0:1].to(st.dtype), vs[:, 1:2].to(st.dtype)))
+                weights = [torch.randn(a.shape, generator=g).to(device) for a in out]
+                ga = torch.autograd.grad(sum((a * w).sum() for a, w in zip(out, weights)), states)
+                gb = torch.autograd.grad(sum((b * w).sum() for b, w in zip(ref, weights)), states)
+                for a, b in zip(out + list(ga), ref + list(gb)):
+                    self.assertTrue(torch.equal(a, b), device)
+        finally:
+            torch.use_deterministic_algorithms(was)
+
+
 class LossTests(unittest.TestCase):
     def test_forecast_and_motion_terms(self):
         system, cfg = motion_system(seed=2, transport=False)

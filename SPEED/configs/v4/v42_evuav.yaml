@@ -9,6 +9,7 @@
 #   readouts        net, learned fused_d1..5, learned wait-safe publishing (pub)
 #   loss            + background NLL + evidence BCE (fused scores at delays 1..5) + stability BCE
 #   training        + event thinning / time compression; checkpoint selection by the validation IoU of pub
+# Memory transport is off (10-09: own problem branch, decided by v4-1's motion vs static and later on EV-Flying).
 # Ablations (retrain): network.neuron.kind=lif | loss.evidence_weight=0 | training.augment=null |
 #   network.heads.background=false verifier.background=front loss.background_weight=0 | representation.kind=evidence
 # Ablation (same weights): --set verifier.background=front (H0 = the front end's mu0, V2's background model)
@@ -59,8 +60,7 @@ network:
     intensity_prior_per_px_step: 0.0002
     log_g_max: 8.0
   transport:
-    kind: motion
-    gate_probability: 0.5
+    kind: none                     # memory transport is a separate problem branch (P3), not part of v4-2 (10-09)
   readout_head:
     max_delay_steps: 5             # deadline D: latency budget 250 ms
     mixture_radius_px: 2

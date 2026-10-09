@@ -6,11 +6,12 @@ more likely target than not (p >= gate, 0.5 = the decision boundary of the mark 
 never pushed along an untrained velocity, and the work scales with the moving fraction. Layers at stride s use the
 p-weighted mean velocity of each s x s cell divided by s, so coarse layers move by fewer cells (coarse-to-fine).
 p and the velocity are detached: the transport uses the heads, the gradients through the states stay.
+Only the moving cells are pushed (sparse splat); the result equals the dense splat of p * u, whose other cells are zero.
 """
 import torch
 import torch.nn.functional as F
 
-from speed.core.splat import bilinear_splat
+from speed.core.splat import splat_points
 
 
 class MotionTransport(object):
@@ -43,8 +44,23 @@ class MotionTransport(object):
                 ps = F.avg_pool2d(p, s)
                 vs = F.avg_pool2d(p * v, s) / ps.clamp(min=1e-6) / s
             moving = ps.to(st.dtype) * st
-            out.append(st - moving + bilinear_splat(moving, vs[:, 0:1].to(st.dtype), vs[:, 1:2].to(st.dtype)))
+            out.append(st - moving + self.push(moving, ps, vs))
         return out
+
+    @staticmethod
+    def push(moving, ps, vs):
+        """Bilinear push of the cells with ps > 0 (the only non-zero cells of moving) along vs."""
+        B, C, h, w = (int(n) for n in moving.shape)
+        flat = (ps.reshape(-1) > 0).nonzero().view(-1)
+        if int(flat.numel()) == 0:
+            return torch.zeros_like(moving)
+        plane = h * w
+        b, rem = torch.div(flat, plane, rounding_mode="floor"), flat % plane
+        y, x = torch.div(rem, w, rounding_mode="floor"), rem % w
+        values = moving.permute(0, 2, 3, 1).reshape(B * plane, C)[flat]
+        dy = vs[:, 0].reshape(-1)[flat].to(moving.dtype)
+        dx = vs[:, 1].reshape(-1)[flat].to(moving.dtype)
+        return splat_points(values, b, y, x, dy, dx, (B, h, w))
 
     def active_fraction(self):
         return float(self.active_sum) / self.calls if self.calls else 1.0
