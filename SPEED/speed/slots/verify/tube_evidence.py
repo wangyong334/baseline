@@ -15,6 +15,8 @@ With the 49 grid velocities, uniform weights and uniform pi this equals V2's dri
 gate (tests/test_v43.py). All mixtures have weights summing to one, fixed before the counts they weigh, so exp(F) is a
 test supermartingale under H0 when mu is the background rate. The loss of slot 9 calls the same functions.
 """
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -75,14 +77,25 @@ class TubeEvidence(object):
     hypotheses of the step's events (computed here once, from the motion features of this and the previous step)."""
     takes_outputs = True
 
-    def __init__(self, dt_ms, head, motion, hypotheses=5, mu_floor=1e-3, background="head", anchor=True):
+    def __init__(self, dt_ms, head, motion, hypotheses=5, mu_floor=1e-3, background="head", anchor=True,
+                 positions="learned"):
         if background not in BACKGROUNDS:
             raise ValueError("background must be one of %s" % (BACKGROUNDS,))
+        if positions not in ("learned", "uniform"):
+            raise ValueError("positions must be learned or uniform")
         if int(hypotheses) < 1 or float(mu_floor) <= 0:
             raise ValueError("need hypotheses >= 1 and mu_floor > 0")
         self.dt, self.head, self.motion = float(dt_ms), head, motion
         self.n_hypotheses = min(int(hypotheses), motion.size)
         self.mu_floor, self.background, self.anchor = float(mu_floor), background, bool(anchor)
+        self.positions = positions
+
+    def position_log_weights(self):
+        """Log weights of the 3 x 3 positions used by the readouts: learned, or uniform (V2's footprint)."""
+        learned = self.head.position_log_weights()
+        if self.positions == "learned":
+            return learned
+        return torch.full_like(learned, -math.log(float(learned.numel())))
 
     def background_rate(self, log_mu, mu0):
         if self.background == "head" and log_mu is not None:

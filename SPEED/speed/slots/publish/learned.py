@@ -36,7 +36,7 @@ class EvidenceChains(object):
 
     def advance(self, state, k):
         """Adds the evidence of step k to every pending event."""
-        log_pi = self.verifier.head.position_log_weights()
+        log_pi = self.verifier.position_log_weights()
         for e in self.pending:
             b = e["b"]
             e["run"], e["alive"] = tube_step(state["N"], b, state["mu"], b, state["g_prev"], b, state["support"],
@@ -59,14 +59,19 @@ def step_hypotheses(ctx):
 
 
 class LearnedDelayReadout(object):
+    """fusion_weight None: the learned w_d; a number: that fixed weight for every delay (e.g. 1.0 = V2)."""
     needs_verifier = True
 
-    def __init__(self, verifier, delays, prefix="fused_d"):
+    def __init__(self, verifier, delays, prefix="fused_d", fusion_weight=None):
         self.verifier, self.head, self.prefix = verifier, verifier.head, prefix
+        self.fixed_weight = None if fusion_weight is None else float(fusion_weight)
         self.delays = sorted(set(int(d) for d in delays))
         if not self.delays or self.delays[0] < 1 or self.delays[-1] > self.head.max_delay:
             raise ValueError("delays must lie in 1..%d (the readout head's max_delay)" % self.head.max_delay)
         self.max_delay = self.delays[-1]
+
+    def weight(self, d):
+        return self.head.fusion_weight(d) if self.fixed_weight is None else torch.tensor(self.fixed_weight)
 
     def begin(self, n_events):
         self.n_events, self.chains, self.last_k = n_events, EvidenceChains(self.verifier), -1
@@ -75,7 +80,7 @@ class LearnedDelayReadout(object):
     def _collect(self, entry, d, published):
         with torch.no_grad():
             logit = entry["logit"]
-            z = logit + self.head.fusion_weight(d).to(logit.dtype) * entry["F"].to(logit.dtype)
+            z = logit + self.weight(d).to(logit.device, logit.dtype) * entry["F"].to(logit.dtype)
         idx, part = entry["key"], self.parts[d]
         part[0].append(idx)
         part[1].append(torch.sigmoid(z).float().cpu().numpy())

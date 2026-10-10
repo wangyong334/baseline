@@ -84,7 +84,7 @@ def build_verifier(cfg, dt_ms, network=None):
             raise ValueError("verifier tube_evidence needs network.readout_head and the v43 heads (network.motion)")
         return TubeEvidence(dt_ms, network.readout_head, network.motion, int(cfg["hypotheses"]),
                             float(cfg["mu_floor_per_px_step"]), cfg.get("background", "head"),
-                            bool(cfg.get("anchor", True)))
+                            bool(cfg.get("anchor", True)), cfg.get("positions", "learned"))
     tau = float(cfg.get("track_tau_ms", 0.0))
     decay = math.exp(-float(dt_ms) / tau) if tau > 0 else 0.0
     if cfg["kind"] == "drift_evidence":

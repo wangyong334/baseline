@@ -293,7 +293,8 @@ def build_readouts(cfgs, verifier, threshold):
             if not hasattr(verifier, "motion"):
                 raise ValueError("readout %s needs the tube_evidence verifier" % kind)
             if kind == "learned_delay":
-                out.append(LearnedDelayReadout(verifier, cfg["delays_steps"], cfg.get("prefix", "fused_d")))
+                out.append(LearnedDelayReadout(verifier, cfg["delays_steps"], cfg.get("prefix", "fused_d"),
+                                               cfg.get("fusion_weight")))
             else:
                 theta = cfg.get("theta")
                 if theta is None:

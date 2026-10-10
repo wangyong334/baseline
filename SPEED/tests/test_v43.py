@@ -282,6 +282,23 @@ class SystemTests(unittest.TestCase):
             self.assertTrue(np.array_equal(want[name][0], got[name][0]), name)
             self.assertTrue(np.array_equal(want[name][1], got[name][1]), name)
 
+    def test_fixed_fusion_and_uniform_positions_at_inference(self):
+        system, _ = v43_system(extra=["readouts.1.fusion_weight=1.0", "verifier.positions=uniform"])
+        head = system.network.readout_head
+        with torch.no_grad():
+            head.fusion.mul_(0.1)
+            head.position_logits.copy_(torch.linspace(-1.0, 1.0, 9, dtype=head.position_logits.dtype))
+        self.assertTrue(torch.allclose(system.verifier.position_log_weights(),
+                                       torch.full((9,), -math.log(9.0), dtype=torch.float64)))
+        self.assertEqual(float(system.readouts[1].weight(2)), 1.0)
+        learned, _ = v43_system()
+        self.assertTrue(torch.equal(learned.verifier.position_log_weights(),
+                                    learned.network.readout_head.position_log_weights()))
+        system.network.eval()
+        with torch.no_grad():
+            res, _ = system.run_stream(synthetic_stream(seed=5))
+        self.assertTrue(all(np.isfinite(p).all() for p, _ in res.values()))
+
 
 if __name__ == "__main__":
     unittest.main()
