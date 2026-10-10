@@ -1,9 +1,10 @@
 """Slot 10 base variant: stateful truncated BPTT over whole streams, one parameter update per stream.
 
 train_stream: chunks of tbptt_steps (first chunk length random in 1..k so no step is always a chunk start);
-representation under no_grad (with gradients when it has learnable parameters, V4-2), network + heads + loss with
-gradients, network and representation states detached at chunk borders; loss divided by the stream's event count;
-gradient clipping; one optimiser step.
+representation under no_grad, network + heads + loss with gradients, states detached at chunk borders; loss divided
+by the stream's event count; gradient clipping (trainable parameters only); one optimiser step.
+Losses with needs_aux get the front end's aux, the motion features of the step before the chunk (prev_phi, detached)
+and the random state (query subsampling).
 checkpoint_steps > 0 recomputes activations in sub-chunks during backward (large sensors).
 Also: gain calibration driver, learning-rate schedule, layer monitor, checkpoint I/O.
 """
@@ -45,10 +46,6 @@ def select_subset(names, size, seed):
         return names
     picked = np.random.RandomState(int(seed)).choice(len(names), int(size), replace=False)
     return sorted(names[i] for i in picked)
-
-
-def detach_rep_state(state):
-    return {k: (v.detach() if torch.is_tensor(v) else v) for k, v in state.items()}
 
 
 def gradient_group_norms(network):
@@ -103,8 +100,9 @@ def train_stream(system, loss_fn, stream, optimizer, tbptt_steps, grad_clip, rng
         extras = {"vel": np.stack([vy, vx], 1)}                    # px/ms, nan where undefined
     blocks = EventBlocks(stream, steps, H, W, device, dtype, extras)
     rep_state = rep.init_state(1, H, W, device, dtype)
-    learnable_rep = getattr(rep, "learnable", False)
     needs_aux = getattr(loss_fn, "needs_aux", False)
+    prev_phi = None
+    trainable = [p for p in network.parameters() if p.requires_grad]
     states = None
     sums = {"loss_sum": 0.0, "mark_sum": 0.0, "intensity_sum": 0.0}
     norms, missing = {}, []
@@ -114,7 +112,7 @@ def train_stream(system, loss_fn, stream, optimizer, tbptt_steps, grad_clip, rng
         optimizer.zero_grad(set_to_none=True)
         for start, end in chunks:
             blk = blocks.block(start, end)
-            with torch.set_grad_enabled(learnable_rep):
+            with torch.no_grad():
                 rep_state, inputs, aux = rep.encode(rep_state, blk)
             if checkpoint_steps and int(inputs.shape[0]) > int(checkpoint_steps):
                 outputs, states = forward_checkpointed(network, inputs, states, carry, checkpoint_steps, amp)
@@ -127,7 +125,7 @@ def train_stream(system, loss_fn, stream, optimizer, tbptt_steps, grad_clip, rng
             ev = blk["events"]
             logits = outputs["mark"][ev["t"], ev["b"], 0, ev["y"], ev["x"]]
             if needs_aux:
-                blk["aux"] = aux
+                blk.update(aux=aux, prev_phi=prev_phi, rng=rng)
             loss, parts = loss_fn(outputs, logits, blk)
             for name, value in parts.items():
                 sums[name + "_sum"] = sums.get(name + "_sum", 0.0) + value
@@ -141,13 +139,13 @@ def train_stream(system, loss_fn, stream, optimizer, tbptt_steps, grad_clip, rng
                     raise RuntimeError("non-finite loss: %s steps %d-%d" % (stream.name, start, end))
                 sums["loss_sum"] += value
             states = detach_states(states)
-            if learnable_rep:
-                rep_state = detach_rep_state(rep_state)
+            if "phi" in outputs:
+                prev_phi = outputs["phi"][-1].detach()
         if amp:
             scaler.unscale_(optimizer)
         norms = gradient_group_norms(network)
         missing = [name for name, p in network.named_parameters() if p.requires_grad and p.grad is None]
-        torch.nn.utils.clip_grad_norm_(network.parameters(), float(grad_clip))
+        torch.nn.utils.clip_grad_norm_(trainable, float(grad_clip))
         if amp:
             scaler.step(optimizer)
             scaler.update()

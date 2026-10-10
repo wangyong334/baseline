@@ -30,7 +30,7 @@ from speed.eval.breakdown import MotionAccuracy  # noqa: E402
 from speed.eval.energy import system_energy  # noqa: E402
 from speed.eval.metrics import BenchmarkMetrics  # noqa: E402
 from speed.eval.results import save_result  # noqa: E402
-from speed.slots.publish.readouts import MotionProbe  # noqa: E402
+from speed.slots.publish.learned import MotionProbe  # noqa: E402
 
 
 def main():
@@ -74,8 +74,10 @@ def main():
     energy = EnergyStats()
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
-    probe = MotionProbe() if "motion" in system.network.heads.outputs else None
-    motion_acc = MotionAccuracy(system.clock.step_ms, int(round(system.clock.step_ms * 1000))) if probe else None
+    probe = MotionProbe(system.clock.step_ms, system.verifier.n_hypotheses) \
+        if getattr(system.verifier, "motion", None) is not None else None
+    motion_acc = MotionAccuracy(system.verifier.motion.table, system.clock.step_ms,
+                                int(round(system.clock.step_ms * 1000))) if probe else None
     run_readouts = list(system.readouts) + ([probe] if probe else [])
     t0 = time.perf_counter()
     events = steps_total = recordings = 0
@@ -87,7 +89,7 @@ def main():
             results, steps = system.run_stream(stream, carry=bool(cfg["training"].get("carry", True)), monitor=monitor,
                                                energy=energy, readouts=run_readouts)
             if probe is not None:
-                motion_acc.update(stream, probe.extra["motion"])
+                motion_acc.update(stream, probe.extra["velocity"], probe.extra["anchors"])
             canvas = system.canvas(stream)
             for name in keep:
                 prob, publish_us = results[name]
@@ -125,8 +127,12 @@ def main():
         if ma:
             fmt = lambda v: "-" if v is None else "%.2f" % v  # noqa: E731
             print("learned motion on target events (px/step): angle median %s deg | speed ratio %s | error median %s"
-                  " | inside sigma points %s" % (fmt(ma["angle_median"]), fmt(ma["speed_ratio_median"]),
-                                                 fmt(ma["error_median"]), fmt(ma["inside_sigma_points"])), flush=True)
+                  " | coverage %s" % (fmt(ma["angle_median"]), fmt(ma["speed_ratio_median"]), fmt(ma["error_median"]),
+                                      fmt(ma["coverage"])), flush=True)
+            for row in ma["bins"]:
+                print("   %-7s %7d events | angle %s | speed ratio %s | coverage %s" % (
+                    row["bin"], row["events"], fmt(row["angle_median"]), fmt(row["speed_ratio_median"]),
+                    fmt(row["coverage"])), flush=True)
     os.makedirs(args.out, exist_ok=True)
     write_json(os.path.join(args.out, "infer_summary.json"), summary)
     print("INFER FINISHED: %d recordings, %.0f s -> %s" % (recordings, seconds, args.out), flush=True)

@@ -55,7 +55,7 @@ class System(object):
         takes_outputs = verify and getattr(self.verifier, "takes_outputs", False)
         for r in readouts:
             r.begin(stream.n_events)
-        states, prev_log_g, prev_motion, prev_outputs = None, None, None, None
+        states, prev_log_g, prev_outputs = None, None, None
         n = steps.n_steps
         for start in range(0, n, self.chunk_steps):
             end = min(start + self.chunk_steps, n)
@@ -83,22 +83,22 @@ class System(object):
                     step_events = {"b": ev["b"][sl], "y": ev["y"][sl], "x": ev["x"][sl], "age_ms": ev["age_ms"][sl],
                                    "idx": blk["idx"][offset:offset + count]}
                     if takes_outputs:
+                        cur_outputs = {name: value[t] for name, value in outputs.items()}
                         ver_state = self.verifier.step(ver_state, aux["total"][t], aux["mu0"][t], prev_log_g,
-                                                       step_events, prev_motion, prev_outputs)
+                                                       step_events, None, prev_outputs, cur_outputs)
                     else:
                         ver_state = self.verifier.step(ver_state, aux["total"][t], aux["mu0"][t], prev_log_g,
-                                                       step_events, prev_motion)
+                                                       step_events)
                     if energy is not None:
                         energy.update_verifier(ver_state, self.verifier)
                 ctx = {"k": k, "idx": blk["idx"][offset:offset + count], "b": ev["b"][sl], "y": ev["y"][sl],
                        "x": ev["x"][sl], "logits": logits[sl], "prob": net_prob[sl], "total": aux["total"][t],
-                       "verifier": ver_state, "motion": outputs["motion"][t] if "motion" in outputs else None}
+                       "verifier": ver_state}
                 for r in readouts:
                     r.step(ctx)
                 prev_log_g = outputs["log_g"][t]
-                prev_motion = outputs["motion"][t] if "motion" in outputs else None
                 if takes_outputs:
-                    prev_outputs = {name: value[t] for name, value in outputs.items()}
+                    prev_outputs = cur_outputs if verify else {name: value[t] for name, value in outputs.items()}
                 offset += count
         results = {}
         for r in readouts:

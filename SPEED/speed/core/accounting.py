@@ -29,12 +29,8 @@ class EnergyStats(object):
         self.elements += int(inputs.numel())
 
     def update_verifier(self, state, verifier):
-        self.queries += int(state.get("queried", 0)) + int(state.get("sources", 0))
-        if hasattr(verifier, "active_fraction"):
-            self.active += verifier.active_fraction(state)
-            self.active_steps += 1
-            return
-        if verifier.gate_eps <= 0:
+        self.queries += int(state.get("queried", 0)) + int(state.get("queries", 0))
+        if getattr(verifier, "gate_eps", 0.0) <= 0:
             return
         act = (state["G"] >= verifier.gate_eps).to(state["G"].dtype)
         f = verifier.footprint
@@ -65,10 +61,10 @@ def energy_parts(system, height, width, stats):
     heads = system.network.heads
     out["heads"] = pixel_head(heads.in_channels, heads.hidden, 2, height * width, transcendental_per_position=1,
                               note="dense, as implemented")
-    if hasattr(heads, "motion_hidden"):
-        out["motion_head"] = pixel_head(heads.in_channels + heads.input_channels, heads.motion_hidden, 3,
-                                        height * width, note="dense, as implemented")
-    if getattr(heads, "background_channel", None) is not None:
+    if hasattr(heads, "motion_channels"):
+        out["motion_encoder"] = part(mac=height * width * heads.encoder_macs(),
+                                     ac=height * width * (heads.motion_hidden + heads.motion_channels),
+                                     note="dense, as implemented")
         out["background_head"] = pixel_head(heads.in_channels + heads.input_channels, heads.background_hidden, 1,
                                             height * width, note="dense, as implemented")
     transport = system.network.transport
@@ -94,16 +90,16 @@ def energy_parts(system, height, width, stats):
             out["readout_" + r.name] = part(ac=u * (3 * V if r.anchor else 2 * V) + (f2 * height * width if r.anchor else 0),
                                             transcendental=u * (V + 1))
         elif isinstance(r, LearnedDelayReadout):
-            # per event and step of its wait: bilinear read (8 MAC) and path (2 MAC) per hypothesis, anchored sum,
-            # hypothesis mixture (V exp + 1 log); per event: its cloud at birth and one fusion per delay
+            # per event and step of its wait, per hypothesis: tube positions, 9 offsets x (3 reads, ratio, product,
+            # difference) with one log1p, position mixture (9 exp + 1 log), anchored sum; hypothesis mixture
             u = e * float(r.max_delay)
-            out["readout_learned_delay"] = part(mac=u * 10 * V + e * (12 + len(r.delays)), ac=u * 4 * V + e * 10,
-                                                transcendental=u * (V + 1) + e * (2 + len(r.delays)))
+            out["readout_learned_delay"] = part(mac=u * V * (4 + 9 * 2), ac=u * V * (9 * 4 + 12),
+                                                transcendental=u * (V * (9 + 9 + 1) + V + 1) + e * len(r.delays))
         elif isinstance(r, LearnedPublishReadout):
             u = float(stats["publish_unit_steps_per_step"])
             h = r.head.operations_per_unit()
-            out["readout_" + r.name] = part(mac=u * (10 * V + 1 + h["mac"]) + e * (12 + h["mac"]),
-                                            ac=u * (4 * V + h["ac"]) + e * (10 + h["ac"]),
-                                            transcendental=u * (V + 1) + e * 2)
+            out["readout_" + r.name] = part(mac=u * (V * (4 + 9 * 2) + 1 + h["mac"]) + e * h["mac"],
+                                            ac=u * (V * (9 * 4 + 12) + h["ac"]) + e * h["ac"],
+                                            transcendental=u * (V * (9 + 9 + 1) + V + 1) + e)
     return out
 

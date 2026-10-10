@@ -1,51 +1,61 @@
-"""Slot 8, V4-2: readouts on the learned evidence (the functions of slot 7 that the loss of slot 9 trains).
+"""Slot 8, V4-3: readouts on the tube evidence (the functions of slot 7 that the loss of slot 9 also trains).
 
     learned_delay    z_d = m + w_d F_d after d steps, probability sigmoid(z_d)        (V2-1 fused_dD with learned w_d)
     learned_publish  learned wait-safe publishing (V3 idea, learned rule): at age d (z_0 = m, F_0 = 0) the stability
                      head gives q_d = P(1[z_d >= theta] equals the decision at the deadline D | z_d - theta, F_d, d / D);
                      an event is published with label 1[z_d >= theta] once q_d >= 1 - epsilon, at the latest at d = D
+    motion_probe     evaluation only: the most probable motion and the anchors kept for every event
 """
 import numpy as np
 import torch
 
 from speed.slots.heads.readout import log_epsilon_bound
 from speed.slots.publish.readouts import DEADLINE, EOS, LOWER, UPPER, published_probability, refill_by_index
-from speed.slots.verify.learned_evidence import N_HYPOTHESES, chain_step, score
+from speed.slots.verify.tube_evidence import score, tube_step
 
 PER_EVENT = ("b", "y", "x", "logit", "pos", "F")
 PER_HYPOTHESIS = ("run", "alive", "logw")
 
 
 class EvidenceChains(object):
-    """Pending events of one stream, one entry per birth step: cloud fixed at birth, anchored evidence so far."""
+    """Pending events of one stream, one entry per birth step: hypotheses fixed at birth, anchored evidence so far."""
 
     def __init__(self, verifier):
         self.verifier = verifier
         self.pending = []
 
-    def add(self, k, key, b, y, x, logit, motion, pos=None):
+    def add(self, k, key, b, y, x, logit, disp, logw, pos=None):
         n = int(y.shape[0])
         if n == 0:
             return
-        pts, logw = self.verifier.event_cloud(motion, b, y, x)
-        self.pending.append({"k": int(k), "key": key, "b": b, "y": y, "x": x, "logit": logit, "pts": pts,
+        K = int(disp.shape[0])
+        self.pending.append({"k": int(k), "key": key, "b": b, "y": y, "x": x, "logit": logit, "disp": disp,
                              "logw": logw, "pos": torch.arange(n, device=y.device) if pos is None else pos,
-                             "run": logit.new_zeros(N_HYPOTHESES, n), "F": torch.zeros_like(logit),
-                             "alive": torch.ones(N_HYPOTHESES, n, dtype=torch.bool, device=y.device)})
+                             "run": logit.new_zeros(K, n), "F": torch.zeros_like(logit),
+                             "alive": torch.ones(K, n, dtype=torch.bool, device=y.device)})
 
     def advance(self, state, k):
         """Adds the evidence of step k to every pending event."""
-        for entry in self.pending:
-            entry["run"], entry["alive"] = chain_step(state["E"], state["support"], entry["b"], entry["y"], entry["x"],
-                                                      entry["pts"], int(k) - entry["k"], entry["run"], entry["alive"])
-            entry["F"] = score(entry["run"], entry["logw"])
+        log_pi = self.verifier.head.position_log_weights()
+        for e in self.pending:
+            b = e["b"]
+            e["run"], e["alive"] = tube_step(state["N"], b, state["mu"], b, state["g_prev"], b, state["support"],
+                                             e["y"], e["x"], e["disp"], int(k) - e["k"], e["run"], e["alive"], log_pi)
+            e["F"] = score(e["run"], e["logw"])
 
     @staticmethod
     def subset(entry, mask):
-        out = {"k": entry["k"], "key": entry["key"], "pts": entry["pts"][:, mask]}
+        out = {"k": entry["k"], "key": entry["key"], "disp": entry["disp"][:, mask]}
         out.update({name: entry[name][mask] for name in PER_EVENT})
         out.update({name: entry[name][:, mask] for name in PER_HYPOTHESIS})
         return out
+
+
+def step_hypotheses(ctx):
+    hyp = ctx["verifier"]["hyp"]
+    if hyp is None:
+        raise ValueError("the tube_evidence verifier gave no hypotheses for a step with events")
+    return hyp["disp"], hyp["logw"]
 
 
 class LearnedDelayReadout(object):
@@ -73,12 +83,15 @@ class LearnedDelayReadout(object):
 
     def step(self, ctx):
         k = int(ctx["k"])
-        self.chains.advance(ctx["verifier"], k)
+        with torch.no_grad():
+            self.chains.advance(ctx["verifier"], k)
         for entry in self.chains.pending:
             if k - entry["k"] in self.delays:
                 self._collect(entry, k - entry["k"], k)
         self.chains.pending = [e for e in self.chains.pending if k - e["k"] < self.max_delay]
-        self.chains.add(k, ctx["idx"], ctx["b"], ctx["y"], ctx["x"], ctx["logits"], ctx["motion"])
+        if int(ctx["y"].shape[0]):
+            disp, logw = step_hypotheses(ctx)
+            self.chains.add(k, ctx["idx"], ctx["b"], ctx["y"], ctx["x"], ctx["logits"], disp, logw)
         self.last_k = k
 
     def flush(self):
@@ -135,7 +148,8 @@ class LearnedPublishReadout(object):
 
     def step(self, ctx):
         k = int(ctx["k"])
-        self.chains.advance(ctx["verifier"], k)
+        with torch.no_grad():
+            self.chains.advance(ctx["verifier"], k)
         kept = []
         for entry in self.chains.pending:
             age = k - entry["k"]
@@ -152,11 +166,12 @@ class LearnedPublishReadout(object):
             z, label, go = self._decide(logit, torch.zeros_like(logit), 0)
             pos = torch.arange(n, device=logit.device)
             if bool(go.any()):
-                self._record(ctx["idx"], pos[go], label[go], z[go], k, DEADLINE if self.deadline == 0 else None, 0)
+                self._record(ctx["idx"], pos[go], label[go], z[go], k, None, 0)
             rest = ~go
             if bool(rest.any()):
+                disp, logw = step_hypotheses(ctx)
                 self.chains.add(k, ctx["idx"], ctx["b"][rest], ctx["y"][rest], ctx["x"][rest], logit[rest],
-                                ctx["motion"], pos[rest])
+                                disp[:, rest], logw[:, rest], pos[rest])
         self.last_k = k
 
     def flush(self):
@@ -174,3 +189,35 @@ class LearnedPublishReadout(object):
         self.extra = {"z": z, "age": refill_by_index(self.n_events, *self.parts["age"], dtype=np.int64),
                       "reason": refill_by_index(self.n_events, *self.parts["reason"], dtype=np.int64)}
         return {self.name: (published_probability(z, label, self.theta, threshold), when)}
+
+
+class MotionProbe(object):
+    """Evaluation only: per event the most probable motion (vy, vx px/ms) and the indices of the anchors kept."""
+    needs_verifier = True
+    name = "motion_probe"
+
+    def __init__(self, dt_ms, hypotheses):
+        self.dt, self.K = float(dt_ms), int(hypotheses)
+
+    def begin(self, n_events):
+        self.n_events, self.idx, self.best, self.anchors = n_events, [], [], []
+
+    def step(self, ctx):
+        if not int(ctx["y"].shape[0]):
+            return
+        hyp = ctx["verifier"]["hyp"]
+        self.idx.append(ctx["idx"])
+        self.best.append((hyp["best"] / self.dt).float().cpu().numpy())
+        self.anchors.append(hyp["idx"].cpu().numpy())
+
+    def flush(self):
+        pass
+
+    def results(self, threshold):
+        best = np.zeros((self.n_events, 2), np.float32)
+        anchors = np.full((self.n_events, self.K), -1, np.int64)
+        for idx, b, a in zip(self.idx, self.best, self.anchors):
+            best[idx] = b
+            anchors[idx] = a
+        self.extra = {"velocity": best, "anchors": anchors}
+        return {}

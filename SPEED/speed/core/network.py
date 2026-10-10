@@ -4,22 +4,22 @@ transport of slot 5 applied between steps.
 forward_chunk(inputs [T,B,C,H,W], states) -> (outputs {name: [T,B,...]}, states, info)
     time-parallel path when the transport is the identity (convs batched over the chunk), step-by-step otherwise;
     both give the same result for the identity transport (force_stepwise exists for that check).
-V4-2 options: front (a learnable representation, trained and saved with the network), readout_head (the learned
-parameters of the verifier and readouts) and backbone_channels (the backbone reads only the first channels of the
-input; later dense channels such as log mu0 go to the heads only, so the event-driven input stays sparse).
+V4-3 options: readout_head and motion (learned parameters of the verifier and readouts: trained and saved with the
+network) and backbone_channels (the backbone reads only the first input channels; the dense log mu0 channel goes to
+the heads only, so the event-driven input stays sparse).
 """
 import torch
 import torch.nn as nn
 
 
 class Network(nn.Module):
-    def __init__(self, backbone, heads, transport, front=None, readout_head=None, backbone_channels=None):
+    def __init__(self, backbone, heads, transport, readout_head=None, backbone_channels=None, motion=None):
         super(Network, self).__init__()
         self.backbone = backbone
         self.heads = heads
         self.transport = transport
-        self.front = front
         self.readout_head = readout_head
+        self.motion = motion
         self.backbone_channels = None if backbone_channels is None else int(backbone_channels)
 
     def backbone_input(self, x):
@@ -34,7 +34,7 @@ class Network(nn.Module):
         return self.backbone.blocks()
 
     def _heads(self, u, x):
-        # V4 heads with a motion branch also read the network input (it carries the events' timing)
+        # V4-3 heads also read the network input (event features and log mu0)
         return self.heads(u, x) if getattr(self.heads, "takes_input", False) else self.heads(u)
 
     def forward_step(self, x, states, carry=True, collect=False):
@@ -61,4 +61,3 @@ class Network(nn.Module):
             info = {key: [torch.stack([i[key][layer] for i in infos]) for layer in range(len(infos[0][key]))]
                     for key in ("spikes", "u_pre")}
         return outputs, states, info
-

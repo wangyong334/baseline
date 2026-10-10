@@ -39,7 +39,7 @@ verifier.radii_px: [design, "velocity estimator box half-widths 4/8/16 px (E1 A_
 verifier.min_weight: [numerical, "minimum weight sum of a velocity fit (E1: 5)"]
 verifier.cloud_spacing_px_per_step: [physical, "1 px/step: smallest velocity difference that changes a one-step path on the pixel grid"]
 # V4 learned motion (configs/v4/motion_*.yaml)
-network.heads.motion_hidden: [design, "hidden width of the motion head (as the mark / intensity head)"]
+network.heads.motion_hidden: [design, "hidden width of the motion feature encoder (V4-3: 0 = one 1x1 projection)"]
 network.heads.motion_sigma_init_px_per_step: [init, "initial velocity sigma: one pixel per clock step"]
 network.transport.gate_probability: [requirement, "0.5 = decision boundary of the target posterior: only memory decided to be target moves"]
 loss.forecast_weight: [protocol, "weight of the next-step forecast term (as the base intensity weight)"]
@@ -94,3 +94,12 @@ loss.evidence_weight: [protocol, "weight of the evidence BCE (mean over delays 1
 loss.stability_weight: [protocol, "weight of the stability BCE of the publish rule"]
 training.augment.keep_min: [protocol, "event thinning: keep probability ~ U[keep_min, 1]"]
 training.augment.time_scale_min: [protocol, "time compression: timestamps x s, s ~ log-U[time_scale_min, 1]"]
+# V4-3 (configs/v4/v43_*.yaml): learned motion anchors + tube evidence with learned weights
+network.heads.motion_channels: [design, "motion feature channels matched between consecutive steps"]
+network.motion.rings_px_per_step: [design, "speed rings in octaves 0.5 ... 64 px per step: constant relative resolution, upper end = fastest targets seen (EV-Flying)"]
+network.motion.directions: [design, "16 directions (22.5 deg cells; a residual refines inside the cell)"]
+network.motion.hidden: [design, "hidden width of the anchor prior and residual heads"]
+verifier.hypotheses: [design, "top-K anchors kept per event (mixture weights renormalised)"]
+loss.residual_weight: [protocol, "weight of the anchor residual regression"]
+loss.growth_weight: [protocol, "weight of the one-step evidence (growth) objective of the motion distribution"]
+loss.max_queries: [numerical, "events per chunk for the motion / evidence terms (targets first); compute budget"]

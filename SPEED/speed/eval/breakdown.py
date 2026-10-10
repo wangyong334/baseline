@@ -157,30 +157,37 @@ def format_table(result, table, key):
 
 
 class MotionAccuracy(object):
-    """Learned velocity vs label velocity on target events, by speed (px per step): direction error, speed ratio,
-    |error| and how often the error lies inside the sqrt(3)-sigma circle (the verifier's sigma points)."""
+    """Learned motion vs label velocity on target events, by speed (px per step): direction error and speed ratio of the
+    most probable anchor (with its residual), |error|, and coverage = how often the label's own anchor (the dominant
+    one of its soft target) is among the anchors the verifier kept for the event."""
 
-    def __init__(self, step_ms=50.0, window_us=50000):
+    def __init__(self, table, step_ms=50.0, window_us=50000):
+        self.table = table
         self.step_ms, self.window_us = float(step_ms), int(window_us)
-        self.rows = []
+        self.rows, self.cover = [], []
 
-    def update(self, stream, motion):
-        """motion [N, 3] per event (vy, vx px/ms, log sigma px/ms), file order."""
+    def update(self, stream, velocity, anchors):
+        """velocity [N, 2] (vy, vx px/ms) and kept anchor indices [N, K] per event, file order."""
+        import torch
         vx, vy, _ = target_kinematics(stream, self.window_us)
         sel = (stream.label == 1) & np.isfinite(vx)
-        if sel.any():
-            self.rows.append(np.c_[vy[sel], vx[sel], motion[sel]])
+        if not sel.any():
+            return
+        true = np.c_[vy[sel], vx[sel]] * self.step_ms
+        _, dom, _ = self.table.soft_target(torch.from_numpy(true))
+        self.rows.append(np.c_[true, velocity[sel] * self.step_ms])
+        self.cover.append((anchors[sel] == dom.numpy().reshape(-1, 1)).any(1))
 
     def result(self):
         if not self.rows:
             return {}
         r = np.concatenate(self.rows).astype(np.float64)
-        true, est, sigma = r[:, 0:2] * self.step_ms, r[:, 2:4] * self.step_ms, np.exp(r[:, 4]) * self.step_ms
+        cover = np.concatenate(self.cover)
+        true, est = r[:, 0:2], r[:, 2:4]
         sp_t, sp_e = np.hypot(*true.T), np.hypot(*est.T)
         err = np.hypot(*(est - true).T)
         cos = (est * true).sum(1) / np.maximum(sp_t * sp_e, 1e-12)
         ang = np.degrees(np.arccos(np.clip(cos, -1.0, 1.0)))
-        inside = err <= np.sqrt(3.0) * sigma
         bins = bin_index(sp_t, SPEED_EDGES)
         out = {"events": int(len(r)), "unit": "px per step", "bins": []}
         for i, lab in enumerate(bin_labels(SPEED_EDGES)):
@@ -191,10 +198,9 @@ class MotionAccuracy(object):
             out["bins"].append({"bin": lab, "events": int(m.sum()),
                                 "angle_median": float(np.median(ang[mov])) if mov.any() else None,
                                 "speed_ratio_median": float(np.median(sp_e[mov] / sp_t[mov])) if mov.any() else None,
-                                "error_median": float(np.median(err[m])), "sigma_median": float(np.median(sigma[m])),
-                                "inside_sigma_points": float(np.mean(inside[m]))})
+                                "error_median": float(np.median(err[m])), "coverage": float(np.mean(cover[m]))})
         mov = sp_t >= 1.0
         out.update(angle_median=float(np.median(ang[mov])) if mov.any() else None,
                    speed_ratio_median=float(np.median(sp_e[mov] / sp_t[mov])) if mov.any() else None,
-                   error_median=float(np.median(err)), inside_sigma_points=float(np.mean(inside)))
+                   error_median=float(np.median(err)), coverage=float(np.mean(cover)))
         return out

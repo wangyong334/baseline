@@ -1,7 +1,9 @@
 """Train a SPEED system: gain calibration, then per epoch one update per training recording (shuffled), validation
 and checkpoint selection by the validation IoU of evaluation.select_readout (default net, the zero-wait readout;
 V4-2: pub) at the benchmark threshold, or by its mean IoU over thresholds 0.5-0.9 (select_metric mean_iou).
-Optional training.augment {keep_min, time_scale_min}: event thinning and time compression per stream and epoch.
+--init CKPT loads a trained SPEED checkpoint into the matching modules (e.g. the base network into a V4-3 network);
+training.freeze lists module prefixes whose parameters stay fixed (V4-3: the trunk and the base heads). With --init
+the gain calibration is skipped (the gains come with the checkpoint).
 
     python tools/train.py --config configs/base_evuav.yaml --root /path/to/EV-UAV-dataset --out runs/base_s37 \
         [--seed 37] [--set training.epochs=2] [--device cuda:1] [--max-train 4 --max-val 2 --max-steps 32]
@@ -24,9 +26,9 @@ import torch  # noqa: E402
 
 from speed.core.build import build_loss, build_system, load_config, with_overrides  # noqa: E402
 from speed.core.runtime import memory_line, peak_memory_gib, seed_everything, write_json  # noqa: E402
-from speed.core.training import (LayerMonitor, calibrate, linear_epoch_lr, save_checkpoint, select_subset,  # noqa: E402
+from speed.core.training import (LayerMonitor, calibrate, linear_epoch_lr, load_checkpoint, save_checkpoint,  # noqa: E402
+                                 select_subset,
                                  tau_statistics, train_stream)
-from speed.data.augment import augment_stream  # noqa: E402
 from speed.data.dataset_card import list_recordings, load_card  # noqa: E402
 from speed.data.readers import read_recording  # noqa: E402
 from speed.eval.metrics import BenchmarkMetrics  # noqa: E402
@@ -106,19 +108,34 @@ def validate(system, dataset, card, ev, carry, monitor):
 
 
 def learned_parameter_summary(network):
-    """Monitoring of the V4-2 learned constants (front end time scales, fusion and position weights)."""
+    """Monitoring of the V4-3 learned constants (fusion and position weights, correlation gains)."""
     out = {}
-    front, head = getattr(network, "front", None), getattr(network, "readout_head", None)
+    head, motion = getattr(network, "readout_head", None), getattr(network, "motion", None)
     with torch.no_grad():
-        if front is not None:
-            out["front_tau_ms"] = [float(v) for v in torch.exp(front.log_tau).cpu()]
         if head is not None:
-            pi = torch.exp(head.mix_log_weights()).cpu()
-            inner = (head.offsets.abs().max(1)[0] <= 1).cpu()
             out["fusion"] = [float(v) for v in head.fusion.cpu()]
-            out["mixture_inner_3x3"] = float(pi[inner].sum())
-            out["mixture_centre"] = float(pi[(head.offsets.abs().sum(1) == 0).cpu()].sum())
+            out["position_weights"] = [round(float(v), 4) for v in torch.exp(head.position_log_weights()).cpu()]
+        if motion is not None:
+            out["correlation_gain"] = [float(v) for v in motion.gain.cpu()]
     return out
+
+
+def load_initial_weights(network, path, device):
+    """Loads a SPEED checkpoint into the matching part of the network (a base checkpoint's heads.net.* -> the V4-3
+    heads.base.net.*). -> names of the loaded parameters and buffers."""
+    state = load_checkpoint(path, device)["network"]
+    own = network.state_dict()
+    mapped = {}
+    for key, value in state.items():
+        target = key
+        if key not in own and key.startswith("heads.net.") and "heads.base." + key[len("heads."):] in own:
+            target = "heads.base." + key[len("heads."):]
+        if target in own:
+            if tuple(own[target].shape) != tuple(value.shape):
+                raise ValueError("shape mismatch for %s: %s vs %s" % (target, tuple(own[target].shape), tuple(value.shape)))
+            mapped[target] = value
+    network.load_state_dict(mapped, strict=False)
+    return sorted(mapped)
 
 
 def main():
@@ -134,6 +151,7 @@ def main():
     parser.add_argument("--max-train", type=int, default=0, help="smoke runs: first N training recordings")
     parser.add_argument("--max-val", type=int, default=0, help="smoke runs: first N validation recordings")
     parser.add_argument("--max-steps", type=int, default=None, help="smoke runs: steps per training recording")
+    parser.add_argument("--init", default=None, help="SPEED checkpoint to start from (matching modules only)")
     args = parser.parse_args()
 
     cfg = with_overrides(load_config(args.config), args.set)
@@ -160,16 +178,29 @@ def main():
         "device": torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu",
         "features": system.representation.feature_names(),
         "parameters": sum(p.numel() for p in system.network.parameters())})
-    optimizer = torch.optim.Adam(system.network.parameters(), lr=float(tr["lr"]))
-    calib_names = set(select_subset([n for n, _ in train_items], int(tr["calibration"]["sequences"]), seed + 1000))
-    calib_streams = [read_recording(card, p, n) for n, p in train_items if n in calib_names]
     carry = bool(tr.get("carry", True))
-    reports = calibrate(system, calib_streams, tr["calibration"], seed, carry)
-    write_json(os.path.join(args.out, "calibration.json"), {"recordings": sorted(calib_names), "layers": reports})
-    del calib_streams
+    if args.init:
+        loaded = load_initial_weights(system.network, args.init, device)
+        if not bool(system.network.backbone.gain_calibrated):
+            raise RuntimeError("the initial checkpoint has no calibrated gains")
+        write_json(os.path.join(args.out, "calibration.json"), {"init": os.path.abspath(args.init), "loaded": loaded})
+        print("initialised from %s (%d tensors)" % (args.init, len(loaded)), flush=True)
+    frozen = tuple(tr.get("freeze") or ())
+    for name, p in system.network.named_parameters():
+        if name.startswith(frozen):
+            p.requires_grad_(False)
+    trainable = [p for p in system.network.parameters() if p.requires_grad]
+    print("trainable parameters: %d of %d" % (sum(p.numel() for p in trainable),
+                                              sum(p.numel() for p in system.network.parameters())), flush=True)
+    optimizer = torch.optim.Adam(trainable, lr=float(tr["lr"]))
+    if not args.init:
+        calib_names = set(select_subset([n for n, _ in train_items], int(tr["calibration"]["sequences"]), seed + 1000))
+        calib_streams = [read_recording(card, p, n) for n, p in train_items if n in calib_names]
+        reports = calibrate(system, calib_streams, tr["calibration"], seed, carry)
+        write_json(os.path.join(args.out, "calibration.json"), {"recordings": sorted(calib_names), "layers": reports})
+        del calib_streams
     print(memory_line(device, "after calibration"), flush=True)
     loss_fn = build_loss(cfg["loss"], float(cfg["clock"]["step_ms"]), system)
-    augment = tr.get("augment") or {}
     scaler = torch.cuda.amp.GradScaler() if bool(tr.get("amp", False)) and device.type == "cuda" else None
     train_set, val_set = Recordings(card, train_items), Recordings(card, val_items)
     epochs, best = int(tr["epochs"]), -float("inf")
@@ -178,16 +209,12 @@ def main():
         for group in optimizer.param_groups:
             group["lr"] = lr
         rng = np.random.RandomState(seed * 1000 + epoch + 7)
-        aug_rng = np.random.RandomState(seed * 1000 + epoch + 11)
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
         t0 = time.perf_counter()
         system.network.train()
         sums, events = {"loss_sum": 0.0, "mark_sum": 0.0, "intensity_sum": 0.0}, 0
         for stream in loader(train_set, seed * 1000 + epoch, tr.get("num_workers", 2)):
-            if augment:
-                stream = augment_stream(stream, aug_rng, augment.get("keep_min", 1.0),
-                                        augment.get("time_scale_min", 1.0))
             out = train_stream(system, loss_fn, stream, optimizer, tr["tbptt_steps"], tr["grad_clip"], rng,
                                args.max_steps, carry, int(tr.get("checkpoint_steps", 0)), tr.get("update_steps"),
                                scaler)

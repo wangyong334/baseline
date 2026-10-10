@@ -1,11 +1,11 @@
-"""V4-2: the learned parameters of the evidence readouts (registered in the network: trained and saved with it).
+"""V4-3: the learned parameters of the evidence readouts (registered in the network: trained and saved with it).
 
-    fusion      w_d per delay d = 1..D: fused logit z_d = mark + w_d * F_d (V2 used w = 1 for every d; V4-38)
-    mixture     log weights of the position offsets o in a (2r+1)^2 window around a path (V2: uniform 3x3 log-mean-exp;
-                initialised to that, the outer ring starts at a negligible weight and can grow)
+    fusion      w_d per delay d = 1..D: fused logit z_d = mark + w_d * F_d (V2 used w = 1 for every d; v4-2 learned
+                0.70 ... 0.48, i.e. evidence must be discounted with the wait)
+    position    log weights of the 3 x 3 offsets around a tube position (V2: uniform log-mean-exp; initialised to that;
+                v4-2's learned 5 x 5 kept 99.96% of the weight inside 3 x 3)
     stability   q_d = P(the decision at delay d equals the decision at the deadline D | z_d - theta, F_d, d / D):
-                the learned "wait-safe" test that replaces V3's hand-chosen margins (V3 idea kept; PABEE-like
-                early exit, but learned); a unit publishes once q_d >= 1 - epsilon (epsilon = tolerated flip rate)
+                the learned wait-safe rule (V3 idea); a unit publishes once q_d >= 1 - epsilon
 """
 import math
 
@@ -13,24 +13,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-OUTER_INIT = -8.0
-
 
 class EvidenceReadoutHead(nn.Module):
-    def __init__(self, max_delay=5, radius=2, stability_hidden=8):
+    def __init__(self, max_delay=5, stability_hidden=8):
         super(EvidenceReadoutHead, self).__init__()
-        self.max_delay, self.radius = int(max_delay), int(radius)
-        if self.max_delay < 1 or self.radius < 1:
-            raise ValueError("need max_delay >= 1 and radius >= 1")
+        self.max_delay = int(max_delay)
+        if self.max_delay < 1:
+            raise ValueError("need max_delay >= 1")
         self.fusion = nn.Parameter(torch.ones(self.max_delay))
-        r = self.radius
-        offsets = [(dy, dx) for dy in range(-r, r + 1) for dx in range(-r, r + 1)]
-        self.register_buffer("offsets", torch.tensor(offsets, dtype=torch.float32), persistent=False)
-        logits = torch.tensor([0.0 if max(abs(dy), abs(dx)) <= 1 else OUTER_INIT for dy, dx in offsets])
-        self.mix_logits = nn.Parameter(logits)
-        last = nn.Linear(int(stability_hidden), 1)
-        self.stability = nn.Sequential(nn.Linear(3, int(stability_hidden)), nn.ReLU(), last)
+        offsets = [(dy, dx) for dy in (-1, 0, 1) for dx in (-1, 0, 1)]
+        self.register_buffer("offsets", torch.tensor(offsets, dtype=torch.long), persistent=False)
+        self.position_logits = nn.Parameter(torch.zeros(len(offsets)))
         self.stability_hidden = int(stability_hidden)
+        self.stability = nn.Sequential(nn.Linear(3, self.stability_hidden), nn.ReLU(), nn.Linear(self.stability_hidden, 1))
 
     def fusion_weight(self, delay):
         d = int(delay)
@@ -38,8 +33,8 @@ class EvidenceReadoutHead(nn.Module):
             raise ValueError("delay %d outside 1..%d" % (d, self.max_delay))
         return self.fusion[d - 1]
 
-    def mix_log_weights(self):
-        return F.log_softmax(self.mix_logits, 0)
+    def position_log_weights(self):
+        return F.log_softmax(self.position_logits, 0)
 
     def stability_logit(self, margin, evidence, fraction):
         """margin = z_d - theta, evidence = F_d, fraction = d / D (tensors of one shape) -> logit of q_d."""

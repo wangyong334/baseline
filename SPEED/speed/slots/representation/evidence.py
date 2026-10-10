@@ -10,7 +10,7 @@ Features, all relative to the background (zero where nothing happened):
     ratio  log1p(A / (mu0 * tau / (2 dt)))            2K channels  ("how many times more than usual")
     age    min(B / (A + eps) / tau, 3)                2K channels
     dipole ON centroid - OFF centroid in a (2R+1)^2 neighbourhood, / R   2 per dipole scale
-    logmu  log mu0 (optional, V4-2: lets the background head learn a correction of mu0)   1 channel
+    logmu  log mu0 (optional; read by the V4-3 background head only, not by the backbone)   1 channel
 encode() also returns mu0 and the per-pixel event count of every step for the verifier (slot 7).
 """
 import math
@@ -20,7 +20,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 FEATURE_GROUPS = ("count", "ratio", "age", "dipole", "logmu")
-TAU_GUARD_MS = (1.0, 20000.0)               # numerical guard of learnable time scales (initial values lie inside)
 
 
 def offset_kernels(radius, dtype=torch.float32):
@@ -174,65 +173,3 @@ class EvidenceFrontEnd(nn.Module):
                           8 * p * scales, 0.0))
         return [{"part": name, "mac": float(mac), "elementwise": float(el), "transcendental": float(tr)}
                 for name, mac, el, tr in parts]
-
-
-class LearnableEvidenceFrontEnd(EvidenceFrontEnd):
-    """Slot 2 V4-2 variant: the V2 front end with learnable time scales.
-
-    The moment time constants tau_k are parameters (initialised at taus_ms) trained through the exact recursion and
-    the event weights exp(-age / tau) (learned event representations: EST, Gehrig et al. 2019; learnable time
-    constants: PLIF, Fang et al. 2021). Everything else (count / ratio / age / dipole / logmu forms) is the base.
-    """
-    learnable = True
-
-    def __init__(self, *args, **kwargs):
-        super(LearnableEvidenceFrontEnd, self).__init__(*args, **kwargs)
-        self.log_tau = nn.Parameter(torch.log(torch.tensor(self.taus, dtype=torch.float32)))
-
-    def tau_values(self, dtype):
-        low, high = (math.log(t) for t in TAU_GUARD_MS)
-        return torch.exp(self.log_tau.clamp(low, high)).to(dtype)
-
-    def scatter(self, blk):
-        src = blk["source"]
-        ev = blk["events"]
-        steps, plane, H, W = blk["n_steps"], src.plane, src.height, src.width
-        rel, pix, neg = ev["t"], ev["pixel"], ev["negative"]
-        ones = torch.ones(int(rel.shape[0]), dtype=src.dtype, device=src.device)
-        counts = src.accumulate((rel * 2 + neg) * plane + pix, ones, steps * 2 * plane).view(steps, 1, 2, H, W)
-        K = len(self.taus)
-        taus = self.tau_values(ev["age_ms"].dtype)
-        keys, wa, wb = [], [], []
-        for j in range(K):
-            w = torch.exp(-ev["age_ms"] / taus[j])
-            keys.append((rel * (2 * K) + 2 * j + neg) * plane + pix)
-            wa.append(w)
-            wb.append(w * ev["age_ms"])
-        keys = torch.cat(keys)
-        moment_a = src.accumulate(keys, torch.cat(wa), steps * 2 * K * plane).view(steps, 1, 2 * K, H, W)
-        moment_b = src.accumulate(keys, torch.cat(wb), steps * 2 * K * plane).view(steps, 1, 2 * K, H, W)
-        return counts, moment_a, moment_b
-
-    def step(self, state, counts, moment_a, moment_b):
-        mu0 = self.background(state)
-        dt = self.dt_ms
-        tau = self.tau_values(counts.dtype).repeat_interleave(2).view(1, -1, 1, 1)
-        decay = torch.exp(-dt / tau)
-        A_old, B_old = state["A"], state["B"]
-        A = decay * A_old + moment_a
-        B = decay * (B_old + dt * A_old) + moment_b
-        total = counts.sum(1, keepdim=True)
-        new_state = {"A": A, "B": B, "S_fast": self.beta_fast * state["S_fast"] + total,
-                     "S_slow": self.beta_slow * state["S_slow"] + total,
-                     "W_fast": self.beta_fast * state["W_fast"] + 1.0, "W_slow": self.beta_slow * state["W_slow"] + 1.0,
-                     "k": int(state["k"]) + 1}
-        available = {"count": torch.log1p(counts / (0.5 * mu0)), "ratio": torch.log1p(A / (mu0 * tau / (2.0 * dt))),
-                     "age": torch.clamp(B / (A + 1e-3) / tau, max=3.0)}
-        parts = [available[name] for name in ("count", "ratio", "age") if name in self.features]
-        if "dipole" in self.features:
-            for j in self.dipole_index:
-                parts.append(self.dipole(A[:, 2 * j:2 * j + 1], A[:, 2 * j + 1:2 * j + 2]))
-        if "logmu" in self.features:
-            parts.append(torch.log(mu0))
-        return new_state, torch.cat(parts, 1), mu0, total
-

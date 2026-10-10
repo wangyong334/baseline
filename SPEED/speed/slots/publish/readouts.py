@@ -12,7 +12,7 @@ Base variants:
     fixed_delay  sigmoid(mark + w F(d)) for each d in delays, published d steps later (V2-1 fused_dD;
                  truncated at the last step)
     publish      V3 wait-safe publishing units (two-sided sequential test, optional anchored evidence chain)
-V4-2 variants (speed.slots.publish.learned, with the learned_evidence verifier): learned_delay, learned_publish.
+V4-3 variants (speed.slots.publish.learned, with the tube_evidence verifier): learned_delay, learned_publish.
 """
 import math
 
@@ -222,32 +222,6 @@ class PublishUnits(object):
         return out
 
 
-class MotionProbe(object):
-    """Evaluation only: records the network's motion output (vy, vx px/ms, log sigma) at every event of its step."""
-    needs_verifier = False
-    name = "motion_probe"
-
-    def begin(self, n_events):
-        self.n_events, self.idx, self.values = n_events, [], []
-
-    def step(self, ctx):
-        m = ctx.get("motion")
-        if m is None:
-            raise ValueError("motion_probe needs a network with a motion head")
-        self.idx.append(ctx["idx"])
-        self.values.append(m[ctx["b"], :, ctx["y"], ctx["x"]].float().cpu().numpy())
-
-    def flush(self):
-        pass
-
-    def results(self, threshold):
-        out = np.zeros((self.n_events, 3), np.float32)
-        for idx, val in zip(self.idx, self.values):
-            out[idx] = val
-        self.extra = {"motion": out}
-        return {}
-
-
 def published_probability(z, label, theta, threshold):
     """sigmoid(z - theta + logit(threshold)), clamped to the side of the published label (so prob >= threshold
     reproduces the label exactly in float32)."""
@@ -316,8 +290,8 @@ def build_readouts(cfgs, verifier, threshold):
             out.append(PublishReadout(verifier, rule, cfg.get("anchor", True), cfg.get("name", "pub")))
         elif kind in ("learned_delay", "learned_publish"):
             from speed.slots.publish.learned import LearnedDelayReadout, LearnedPublishReadout
-            if not hasattr(verifier, "event_cloud"):
-                raise ValueError("readout %s needs the learned_evidence verifier" % kind)
+            if not hasattr(verifier, "motion"):
+                raise ValueError("readout %s needs the tube_evidence verifier" % kind)
             if kind == "learned_delay":
                 out.append(LearnedDelayReadout(verifier, cfg["delays_steps"], cfg.get("prefix", "fused_d")))
             else:

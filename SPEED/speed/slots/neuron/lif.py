@@ -79,63 +79,6 @@ class LIF2d(nn.Module):
         return torch.stack(spikes), state, (torch.stack(u_pres) if keep_u_pre else None)
 
 
-class ALIF2d(LIF2d):
-    """LIF with spike-frequency adaptation (adaptive threshold; Bellec et al. 2018, Yin et al. 2021), V4-20.
-
-        theta = v_th + b * a_prev,  s = H(u_pre - theta),  u = u_pre - theta * s.detach(),  a = lambda_a * a_prev + s
-    b >= 0 (softplus) and the adaptation time constant are learnable per channel; b starts small, so training starts
-    from the plain LIF. The carried state is [u, a] stacked on the channel axis (transport moves both)."""
-
-    def __init__(self, channels, dt_ms, tau_init_ms, tau_min_ms, tau_max_ms, v_threshold, u_floor=None, u_ceil=None,
-                 adapt_init=0.05, adapt_tau_init_ms=500.0):
-        super(ALIF2d, self).__init__(channels, dt_ms, tau_init_ms, tau_min_ms, tau_max_ms, v_threshold, u_floor, u_ceil)
-        if not tau_min_ms < adapt_tau_init_ms < tau_max_ms:
-            raise ValueError("need tau_min < adapt_tau_init < tau_max")
-        self.channels = int(channels)
-        b0 = float(adapt_init)
-        self.b_raw = nn.Parameter(torch.full((channels,), math.log(math.expm1(b0)), dtype=torch.float32))
-        frac = (adapt_tau_init_ms - tau_min_ms) / (tau_max_ms - tau_min_ms)
-        self.c = nn.Parameter(torch.full((channels,), math.log(frac / (1.0 - frac)), dtype=torch.float32))
-
-    def strength(self):
-        return torch.nn.functional.softplus(self.b_raw)
-
-    def adapt_decay(self):
-        tau = self.tau_min_ms + (self.tau_max_ms - self.tau_min_ms) * torch.sigmoid(self.c)
-        return torch.exp(-self.dt_ms / tau)
-
-    def _step(self, current, state, beta, b, lam):
-        C = self.channels
-        if state is None:
-            u_pre, a_prev = current, torch.zeros_like(current)
-        else:
-            u_pre, a_prev = beta * state[:, :C] + current, state[:, C:]
-        theta = self.v_threshold + b * a_prev
-        spikes = SurrogateSpike.apply(u_pre - theta)
-        u = self.bound_state(u_pre - theta * spikes.detach())
-        return spikes, torch.cat([u, lam * a_prev + spikes], 1), u_pre
-
-    def _params(self, dtype):
-        view = lambda t: t.to(dtype).view(1, -1, 1, 1)  # noqa: E731
-        return view(self.beta()), view(self.strength()), view(self.adapt_decay())
-
-    def forward(self, current, state):
-        return self._step(current, state, *self._params(current.dtype))
-
-    def forward_steps(self, current, state, carry=True, keep_u_pre=True):
-        steps = int(current.shape[0])
-        if steps == 0:
-            raise ValueError("a chunk needs at least one step")
-        params = self._params(current.dtype)
-        spikes, u_pres = [], []
-        for t in range(steps):
-            out, state, u_pre = self._step(current[t], state if carry else None, *params)
-            spikes.append(out)
-            if keep_u_pre:
-                u_pres.append(u_pre)
-        return torch.stack(spikes), state, (torch.stack(u_pres) if keep_u_pre else None)
-
-
 class ChannelGain(nn.Module):
     """Positive per-channel gain exp(log_gain); calibrated once before training, learnable afterwards."""
 
@@ -163,7 +106,7 @@ def detach_states(states):
     return [None if s is None else s.detach() for s in states]
 
 
-NEURONS = {"lif": LIF2d, "alif": ALIF2d}
+NEURONS = {"lif": LIF2d}
 
 
 def build_neuron_factory(cfg, dt_ms):
@@ -174,7 +117,4 @@ def build_neuron_factory(cfg, dt_ms):
     kwargs = dict(dt_ms=dt_ms, tau_init_ms=float(cfg["tau_init_ms"]), tau_min_ms=float(cfg["tau_min_ms"]),
                   tau_max_ms=float(cfg["tau_max_ms"]), v_threshold=float(cfg["v_threshold"]),
                   u_floor=cfg.get("u_floor"), u_ceil=cfg.get("u_ceil"))
-    if kind == "alif":
-        kwargs.update(adapt_init=float(cfg.get("adapt_init", 0.05)),
-                      adapt_tau_init_ms=float(cfg.get("adapt_tau_init_ms", 500.0)))
     return lambda channels: NEURONS[kind](channels, **kwargs)
