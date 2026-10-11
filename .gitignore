@@ -10,3 +10,5 @@ References/
 .pytest_cache/
 CLAUDE/
 CLAUDE.md
+outputs/
+tmp/
