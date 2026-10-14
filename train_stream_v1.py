@@ -76,6 +76,9 @@ def parse_args():
                         help="仅 eval：off 关闭所有选中层的双仓 M 读取，保留普通 LIF 跨窗 U；结果另存")
     parser.add_argument("--memory-off-layers", nargs="+", choices=LAYER_NAMES, default=None,
                         help="仅 eval：只关闭指定双仓层的 M 读取，如 enc3 enc4；不可与 --memory-ablation off 合用")
+    parser.add_argument("--subthreshold-ablation",
+                        choices=("none", "vertical_off", "skip_off", "all_off"), default="none",
+                        help="仅 eval：同权重关闭亚阈值残差的纵向路径、事件跳连或两者")
     parser.add_argument("--dump-dir", default=None,
                         help="eval 模式：把训练时状态模式下的逐事件预测按序列保存为 NPZ，供 tools/verify_predictions.py 独立核验")
     parser.add_argument("--execution", choices=EXECUTIONS, default=None,
@@ -128,6 +131,8 @@ def build_config(args):
     if getattr(args, "memory_off_layers", None):
         if args.mode != "eval" or getattr(args, "memory_ablation", "none") != "none":
             raise ValueError("--memory-off-layers 仅用于 eval，且不可与 --memory-ablation off 合用")
+    if getattr(args, "subthreshold_ablation", "none") != "none" and args.mode != "eval":
+        raise ValueError("--subthreshold-ablation 仅用于 eval")
     return cfg
 
 
@@ -172,7 +177,8 @@ def build_net(cfg, device):
         readout_hidden=int(cfg["readout_hidden"]), dt_ms=float(cfg["window_ms"]),
         tau_init_ms=float(cfg["tau_init_ms"]), tau_min_ms=float(cfg["tau_min_ms"]),
         tau_max_ms=float(cfg["tau_max_ms"]), v_threshold=float(cfg["v_threshold"]),
-        merged_decoder=cfg.get("merged_decoder", False), dual_memory=cfg.get("dual_memory"))
+        merged_decoder=cfg.get("merged_decoder", False), dual_memory=cfg.get("dual_memory"),
+        subthreshold_residual=cfg.get("subthreshold_residual"))
     return net.to(device)
 
 
@@ -265,6 +271,7 @@ class LayerMonitor(object):
         self.v_threshold = float(v_threshold)
         self.data = {}
         self.memory_data = {}
+        self.residual_data = {}
 
     def update(self, info):
         """累加 info：逐窗 forward 的每层 [B,C,H,W]，或 forward_chunk 的每层 [T,B,C,H,W]（T 个窗口）。
@@ -306,6 +313,53 @@ class LayerMonitor(object):
                 d["abs_max"] = torch.maximum(d["abs_max"], magnitude.max())
                 d["near_bound"] += (magnitude > 0.95).sum().double()
                 d["elements"] += memory.numel()
+            residual = info.get("subthreshold_residual")
+            if residual is not None:
+                magnitude = residual.abs()
+                d = self.residual_data
+                d["abs_sum"] = d.get("abs_sum", torch.zeros((), device=residual.device,
+                                                              dtype=torch.float64)) + magnitude.double().sum()
+                d["nonzero"] = d.get("nonzero", torch.zeros((), device=residual.device,
+                                                              dtype=torch.float64)) + residual.ne(0).sum().double()
+                d["positive"] = d.get("positive", torch.zeros((), device=residual.device,
+                                                                dtype=torch.float64)) + residual.gt(0).sum().double()
+                d["negative"] = d.get("negative", torch.zeros((), device=residual.device,
+                                                                dtype=torch.float64)) + residual.lt(0).sum().double()
+                d["abs_max"] = torch.maximum(d.get("abs_max", torch.zeros((), device=residual.device)),
+                                               magnitude.max())
+                d["elements"] = d.get("elements", 0) + residual.numel()
+            vertical = info.get("subthreshold_vertical_signal")
+            if vertical is not None:
+                magnitude = vertical.abs()
+                d = self.residual_data
+                d["vertical_abs_sum"] = d.get(
+                    "vertical_abs_sum", torch.zeros((), device=vertical.device,
+                                                      dtype=torch.float64)) + magnitude.double().sum()
+                d["vertical_nonzero"] = d.get(
+                    "vertical_nonzero", torch.zeros((), device=vertical.device,
+                                                      dtype=torch.float64)) + vertical.ne(0).sum().double()
+                d["vertical_positive"] = d.get(
+                    "vertical_positive", torch.zeros((), device=vertical.device,
+                                                       dtype=torch.float64)) + vertical.gt(0).sum().double()
+                d["vertical_negative"] = d.get(
+                    "vertical_negative", torch.zeros((), device=vertical.device,
+                                                       dtype=torch.float64)) + vertical.lt(0).sum().double()
+                d["vertical_abs_max"] = torch.maximum(
+                    d.get("vertical_abs_max", torch.zeros((), device=vertical.device)), magnitude.max())
+                d["vertical_elements"] = d.get("vertical_elements", 0) + vertical.numel()
+            gate = info.get("event_residual_gate")
+            correction = info.get("event_residual_correction")
+            if gate is not None:
+                d = self.residual_data
+                d["gate_sum"] = d.get("gate_sum", torch.zeros((), device=gate.device,
+                                                                dtype=torch.float64)) + gate.double().sum()
+                d["gate_support"] = d.get("gate_support", torch.zeros((), device=gate.device,
+                                                                        dtype=torch.float64)) + gate.gt(0).sum().double()
+                d["events"] = d.get("events", 0) + gate.numel()
+                d["correction_abs_sum"] = d.get(
+                    "correction_abs_sum", torch.zeros((), device=correction.device,
+                                                       dtype=torch.float64)) + correction.abs().double().sum()
+                d["correction_elements"] = d.get("correction_elements", 0) + correction.numel()
 
     def summary(self):
         """返回 {层名: 统计字典}。"""
@@ -324,6 +378,31 @@ class LayerMonitor(object):
                 out[name].update(memory_abs_mean=float(m["abs_sum"]) / max(m["elements"], 1),
                                  memory_abs_max=float(m["abs_max"]),
                                  memory_near_bound_frac=float(m["near_bound"]) / max(m["elements"], 1))
+        return out
+
+    def residual_summary(self):
+        """返回亚阈值残差和事件门控的聚合统计；没有该机制时返回空字典。"""
+        d = self.residual_data
+        if not d:
+            return {}
+        elements = max(d.get("elements", 0), 1)
+        out = {"residual_abs_mean": float(d["abs_sum"]) / elements,
+               "residual_abs_max": float(d["abs_max"]),
+               "residual_nonzero_frac": float(d["nonzero"]) / elements,
+               "residual_positive_frac": float(d["positive"]) / elements,
+               "residual_negative_frac": float(d["negative"]) / elements}
+        if d.get("vertical_elements", 0):
+            vertical_elements = d["vertical_elements"]
+            out.update(vertical_signal_abs_mean=float(d["vertical_abs_sum"]) / vertical_elements,
+                       vertical_signal_abs_max=float(d["vertical_abs_max"]),
+                       vertical_signal_nonzero_frac=float(d["vertical_nonzero"]) / vertical_elements,
+                       vertical_signal_positive_frac=float(d["vertical_positive"]) / vertical_elements,
+                       vertical_signal_negative_frac=float(d["vertical_negative"]) / vertical_elements)
+        if d.get("events", 0):
+            out.update(event_gate_mean=float(d["gate_sum"]) / d["events"],
+                       event_gate_support_frac=float(d["gate_support"]) / d["events"],
+                       event_correction_abs_mean=float(d["correction_abs_sum"])
+                       / max(d["correction_elements"], 1))
         return out
 
 
@@ -353,6 +432,25 @@ def tau_statistics(net):
                         out[name][prefix + "_" + suffix] = float(value)
                 out[name]["kappa_abs_mean"] = float(kappa.abs().mean())
                 out[name]["memory_read_enabled"] = neuron.memory_read_enabled
+    return out
+
+
+def subthreshold_parameter_statistics(net):
+    """竞争式纵向编码的逐通道阈值与有界注入幅度；其他方案返回空字典。"""
+    values = net.subthreshold_parameter_values()
+    if not values:
+        return {}
+    out = {}
+    with torch.no_grad():
+        for name, tensor in values.items():
+            tensor = tensor.detach().double().cpu()
+            out[name + "_min"] = float(tensor.min())
+            out[name + "_mean"] = float(tensor.mean())
+            out[name + "_max"] = float(tensor.max())
+            if name == "scale":
+                out["scale_abs_mean"] = float(tensor.abs().mean())
+                out["scale_positive_frac"] = float(tensor.gt(0).double().mean())
+                out["scale_negative_frac"] = float(tensor.lt(0).double().mean())
     return out
 
 
@@ -605,6 +703,8 @@ def evaluate_split(net, cfg, q99, device, split, state_mode, names=None, full=Fa
               "iou": float(iou), "acc": float(acc)}
     if monitor is not None:
         result["layers"] = monitor.summary()
+        if monitor.residual_summary():
+            result["subthreshold_diagnostics"] = monitor.residual_summary()
     if full:
         pd, fa = evaluator.cal_roc()
         tp, fp, fn, npos = (confusion_sum[:, j] for j in range(4))
@@ -615,6 +715,8 @@ def evaluate_split(net, cfg, q99, device, split, state_mode, names=None, full=Fa
             records += first_detection_latencies(t, label, target_id, probs, cfg["window_ms"],
                                                  cfg["threshold"], cfg["correct_thresh"], net_ms)
         rates = {name: s["firing_rate"] for name, s in result["layers"].items()}
+        rates["subthreshold_vertical"] = result.get(
+            "subthreshold_diagnostics", {}).get("vertical_signal_nonzero_frac", 0.0)
         result.update({
             "pd": float(pd), "fa": float(fa),
             "segment_iou": segment_iou(tp, fp, fn, cfg["segments"]),
@@ -645,7 +747,8 @@ def prepare_run(args, cfg, allow_existing=False):
     root = Path(cfg["save_root"])
     root.mkdir(parents=True, exist_ok=allow_existing)
     write_json(root / ("run_config_%s.json" % args.mode), {
-        "design_version": "v1-dual-memory" if net.has_dual_memory else "v1-3",
+        "design_version": "v1-subthreshold-residual" if net.has_subthreshold_residual else
+                          ("v1-dual-memory" if net.has_dual_memory else "v1-3"),
         "args": vars(args), "config": cfg, "stats": stats,
         "pos_weight": pos_weight, "parameters": count_parameters(net), "torch": torch.__version__,
         "device": torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu",
@@ -682,6 +785,8 @@ def mode_smoke(args, cfg):
               out["loss_sum"] / max(out["events"], 1), "grad_norms": out["grad_norms"],
               "missing_grads": out["missing_grads"], "train_ms_per_window": 1e3 * elapsed / 32,
               "peak_memory_gib": peak_memory_gib(device), "layers": layers, "tau": taus,
+              "subthreshold_diagnostics": monitor.residual_summary(),
+              "subthreshold_parameters": subthreshold_parameter_statistics(net),
               "warnings": health_warnings(layers, taus, out["grad_norms"])}
     write_json(root / "smoke.json", report)
     print(json.dumps(report, indent=2, ensure_ascii=False), flush=True)
@@ -729,7 +834,8 @@ def save_checkpoint(path, net, optimizer, epoch, best_val_iou, cfg, stats):
     """保存权重（含已校准增益与 tau 参数）、优化器状态与配置；不保存膜电位。"""
     torch.save({"model": net.state_dict(), "optimizer": optimizer.state_dict(), "epoch": epoch,
                 "best_val_iou": best_val_iou, "config": cfg, "stats": stats,
-                "design_version": "v1-dual-memory" if net.has_dual_memory else "v1-3"}, str(path))
+                "design_version": "v1-subthreshold-residual" if net.has_subthreshold_residual else
+                                  ("v1-dual-memory" if net.has_dual_memory else "v1-3")}, str(path))
 
 
 def mode_train(args, cfg):
@@ -747,6 +853,8 @@ def mode_train(args, cfg):
         ckpt = torch.load(str(root / "last.pt"), map_location=device)
         if ckpt["config"].get("dual_memory") != cfg.get("dual_memory"):
             raise ValueError("续训 dual_memory 配置与 checkpoint 不一致，不能改变时间常数范围或读取上限")
+        if ckpt["config"].get("subthreshold_residual") != cfg.get("subthreshold_residual"):
+            raise ValueError("续训 subthreshold_residual 配置与 checkpoint 不一致")
         net.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         start_epoch, best = int(ckpt["epoch"]) + 1, float(ckpt["best_val_iou"])
@@ -798,6 +906,8 @@ def mode_train(args, cfg):
                   "train_seconds": train_seconds, "epoch_seconds": time.perf_counter() - t0,
                   "peak_memory_gib": peak_memory_gib(device), "grad_norms": grad_mean,
                   "layers": val["layers"], "tau": taus,
+                  "subthreshold_diagnostics": val.get("subthreshold_diagnostics", {}),
+                  "subthreshold_parameters": subthreshold_parameter_statistics(net),
                   "warnings": health_warnings(val["layers"], taus, grad_mean)}
         with metrics_path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record) + "\n")
@@ -843,6 +953,10 @@ def mode_eval(args, cfg):
     if not bool(net.gain_calibrated):
         raise RuntimeError("checkpoint 中的增益未校准")
     net.readout_ablation = args.readout_ablation
+    subthreshold_ablation = getattr(args, "subthreshold_ablation", "none")
+    if subthreshold_ablation != "none" and not net.has_subthreshold_residual:
+        raise ValueError("当前 checkpoint 没有亚阈值残差机制，不能执行该消融")
+    net.set_subthreshold_ablation(subthreshold_ablation)
     memory_ablation = getattr(args, "memory_ablation", "none")
     off_layers = getattr(args, "memory_off_layers", None)
     if off_layers and memory_ablation != "none":
@@ -858,6 +972,8 @@ def mode_eval(args, cfg):
         suffix += "_memory_off_" + "_".join(off_layers)
     elif memory_ablation != "none":
         suffix += "_memory_" + memory_ablation
+    if subthreshold_ablation != "none":
+        suffix += "_subthreshold_" + subthreshold_ablation
     out_path = Path(args.checkpoint).parent / ("eval_%s_%s%s.json" % (
         args.split, Path(args.checkpoint).stem, suffix))
     if out_path.exists() and not args.overwrite:
@@ -865,6 +981,9 @@ def mode_eval(args, cfg):
     results = {"checkpoint": args.checkpoint, "epoch": ckpt["epoch"], "parameters": count_parameters(net),
                "trained_state_mode": train_cfg["state_mode"], "neuron": train_cfg["neuron"],
                "readout_ablation": args.readout_ablation, "dual_memory": train_cfg.get("dual_memory"),
+               "subthreshold_residual": train_cfg.get("subthreshold_residual"),
+               "subthreshold_ablation": subthreshold_ablation,
+               "subthreshold_parameters": subthreshold_parameter_statistics(net),
                "memory_ablation": memory_ablation,
                "memory_off_layers": list(net.dual_memory_layers) if memory_ablation == "off" else (off_layers or [])}
     for mode in ("carry", "reset_each_window"):

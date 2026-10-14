@@ -32,7 +32,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from model.lif2d_stream import (ChannelGain, ReLUNeuron, StreamingGraded2d,
-                                StreamingLIF2d, StreamingDualMemoryLIF2d)
+                                StreamingLIF2d, StreamingDualMemoryLIF2d,
+                                SurrogateSpike)
 from utils.stream_common import gains_from_positive_samples
 
 LAYER_NAMES = ("enc1", "enc2", "enc3", "enc4", "dec3", "dec2", "dec1")
@@ -71,29 +72,35 @@ class SpikingConvBlock(nn.Module):
             raise ValueError("未知的 neuron 类型: %s" % neuron)
         self.out_ch = out_ch
 
-    def forward(self, x, state, extra_current=None):
+    def _currents(self, x, extra_current=None):
+        """返回（增益后电流，增益前电流）；供普通前向和浅层观测残差共用，避免重复卷积。"""
         current = self.conv(x)
         if extra_current is not None:
             current = current + extra_current
-        current = self.norm(current)
-        spikes, new_state, u_pre = self.neuron(self.gain(current), state)
-        return spikes, new_state, u_pre, current
+        pre_gain = self.norm(current)
+        return self.gain(pre_gain), pre_gain
 
-    def forward_steps(self, x, state, carry, keep_u_pre, extra_current=None, collect_memory=False):
+    def forward(self, x, state, extra_current=None, return_driving_current=False):
+        driving, pre_gain = self._currents(x, extra_current)
+        spikes, new_state, u_pre = self.neuron(driving, state)
+        result = (spikes, new_state, u_pre, pre_gain)
+        return result + (driving,) if return_driving_current else result
+
+    def forward_steps(self, x, state, carry, keep_u_pre, extra_current=None, collect_memory=False,
+                      return_driving_current=False):
         """一个片段的多窗口版本：卷积在 T*B 维上批量计算，神经元再按时间递推。
 
         输入: x [T,B,C_in,H,W]；extra_current 为已展平的 [T*B,C_out,H',W'] 或 None。
         输出: (spikes [T,B,...], 最后一步膜电位 [B,...], u_pre [T,B,...] 或 None)。不返回增益前电流（校准仍逐窗做）。
         """
         steps, batch = int(x.shape[0]), int(x.shape[1])
-        current = self.conv(x.reshape((steps * batch,) + tuple(x.shape[2:])))
-        if extra_current is not None:
-            current = current + extra_current
-        current = self.gain(self.norm(current))
+        current, _ = self._currents(x.reshape((steps * batch,) + tuple(x.shape[2:])), extra_current)
         current = current.view((steps, batch) + tuple(current.shape[1:]))
         if collect_memory and isinstance(self.neuron, StreamingDualMemoryLIF2d):
-            return self.neuron.forward_steps(current, state, carry, keep_u_pre, collect_memory=True)
-        return self.neuron.forward_steps(current, state, carry, keep_u_pre)
+            result = self.neuron.forward_steps(current, state, carry, keep_u_pre, collect_memory=True)
+        else:
+            result = self.neuron.forward_steps(current, state, carry, keep_u_pre)
+        return result + (current,) if return_driving_current else result
 
 
 class EvSpSegNetStream(nn.Module):
@@ -113,7 +120,7 @@ class EvSpSegNetStream(nn.Module):
     def __init__(self, in_channels=12, channels=(12, 24, 48, 48), neuron="lif", norm="none",
                  state_mode="carry", readout_hidden=32, dt_ms=50.0, tau_init_ms=200.0,
                  tau_min_ms=50.0, tau_max_ms=2000.0, v_threshold=1.0, merged_decoder=False,
-                 dual_memory=None):
+                 dual_memory=None, subthreshold_residual=None):
         super(EvSpSegNetStream, self).__init__()
         if state_mode not in ("carry", "reset_each_window"):
             raise ValueError("state_mode 必须是 carry 或 reset_each_window")
@@ -165,6 +172,62 @@ class EvSpSegNetStream(nn.Module):
                     memory_tau_min_ms=float(dual_memory.get("tau_min_ms", 50.0)),
                     memory_tau_max_ms=float(dual_memory.get("tau_max_ms", 1000.0)),
                     kappa_max=float(dual_memory.get("kappa_max", 0.5)))
+        # 浅层分级残差只表达当前窗口 enc1 电流，绝不保存为状态。新模块放在基础网络构造之后，
+        # 因而启用该机制不会消耗随机数并改变原 U-Net 参数的初始化。
+        if subthreshold_residual is None:
+            subthreshold_residual = {}
+        if not isinstance(subthreshold_residual, dict):
+            raise ValueError("subthreshold_residual 必须为配置字典")
+        residual_allowed = {"vertical", "event_skip", "local_kernel", "vertical_mode",
+                            "vertical_peak_kernel", "vertical_threshold_init",
+                            "vertical_threshold_min", "vertical_threshold_max",
+                            "vertical_scale_max"}
+        if set(subthreshold_residual) - residual_allowed:
+            raise ValueError("未知亚阈值残差配置: %s" % sorted(set(subthreshold_residual) - residual_allowed))
+        self.subthreshold_vertical = subthreshold_residual.get("vertical", False)
+        self.subthreshold_event_skip = subthreshold_residual.get("event_skip", False)
+        if not isinstance(self.subthreshold_vertical, bool) or not isinstance(self.subthreshold_event_skip, bool):
+            raise ValueError("subthreshold_residual.vertical/event_skip 必须为 YAML 布尔值")
+        self.residual_local_kernel = int(subthreshold_residual.get("local_kernel", 3))
+        if self.residual_local_kernel < 1 or self.residual_local_kernel % 2 != 1:
+            raise ValueError("subthreshold_residual.local_kernel 必须为正奇数")
+        if (self.subthreshold_vertical or self.subthreshold_event_skip) and neuron != "lif":
+            raise ValueError("亚阈值残差机制只支持 neuron: lif")
+        if (self.subthreshold_vertical or self.subthreshold_event_skip) and "enc1" in self.dual_memory_layers:
+            raise ValueError("亚阈值残差要求 enc1 为普通 LIF；双仓应部署在 enc2 及更深层")
+        self.subthreshold_vertical_mode = str(subthreshold_residual.get("vertical_mode", "graded"))
+        if self.subthreshold_vertical_mode not in ("graded", "competitive"):
+            raise ValueError("subthreshold_residual.vertical_mode 必须为 graded 或 competitive")
+        self.residual_vertical_peak_kernel = int(subthreshold_residual.get("vertical_peak_kernel", 3))
+        if self.residual_vertical_peak_kernel < 1 or self.residual_vertical_peak_kernel % 2 != 1:
+            raise ValueError("subthreshold_residual.vertical_peak_kernel 必须为正奇数")
+        threshold_min = float(subthreshold_residual.get("vertical_threshold_min", 0.2))
+        threshold_init = float(subthreshold_residual.get("vertical_threshold_init", 0.5))
+        threshold_max = float(subthreshold_residual.get("vertical_threshold_max", 0.9))
+        self.residual_vertical_scale_max = float(subthreshold_residual.get("vertical_scale_max", 0.5))
+        if not 0.0 < threshold_min < threshold_init < threshold_max <= 1.0:
+            raise ValueError("需要 0 < vertical_threshold_min < vertical_threshold_init < "
+                             "vertical_threshold_max <= 1")
+        if not 0.0 < self.residual_vertical_scale_max < 1.0:
+            raise ValueError("vertical_scale_max 必须在 (0,1) 内")
+        self.residual_vertical_threshold_min = threshold_min
+        self.residual_vertical_threshold_max = threshold_max
+        if self.subthreshold_vertical and self.subthreshold_vertical_mode == "competitive":
+            fraction = (threshold_init - threshold_min) / (threshold_max - threshold_min)
+            threshold_raw = float(np.log(fraction / (1.0 - fraction)))
+            self.residual_vertical_threshold_raw = nn.Parameter(
+                torch.full((c1,), threshold_raw, dtype=torch.float32))
+            # 零初始化让新路径在训练开始时严格等同 enc234 基线；若残差有用，梯度先打开逐通道幅度，
+            # 随后的梯度再联合调整竞争阈值。tanh 有界且允许通道选择促进或抑制。
+            self.residual_vertical_scale_raw = nn.Parameter(torch.zeros(c1, dtype=torch.float32))
+        if self.subthreshold_event_skip:
+            self.residual_gate = nn.Linear(c1, 1, bias=True)
+            self.residual_project = nn.Linear(c1, c1, bias=False)
+            nn.init.zeros_(self.residual_gate.weight)
+            nn.init.zeros_(self.residual_gate.bias)
+            nn.init.zeros_(self.residual_project.weight)
+        self.subthreshold_vertical_enabled = self.subthreshold_vertical
+        self.subthreshold_event_skip_enabled = self.subthreshold_event_skip
         self.state_mode = state_mode
         self.neuron_kind = neuron
         self.merged_decoder = merged_decoder
@@ -192,6 +255,89 @@ class EvSpSegNetStream(nn.Module):
     def has_dual_memory(self):
         return bool(self.dual_memory_layers)
 
+    @property
+    def has_subthreshold_residual(self):
+        return self.subthreshold_vertical or self.subthreshold_event_skip
+
+    def set_subthreshold_ablation(self, mode):
+        """同权重推理消融；不删除模块，也不改变 enc1 的 LIF 状态动力学。"""
+        if mode not in ("none", "vertical_off", "skip_off", "all_off"):
+            raise ValueError("未知亚阈值残差消融: %s" % mode)
+        self.subthreshold_vertical_enabled = self.subthreshold_vertical and mode not in ("vertical_off", "all_off")
+        self.subthreshold_event_skip_enabled = self.subthreshold_event_skip and mode not in ("skip_off", "all_off")
+
+    def _observation_residual(self, driving_current, spikes):
+        """当前观测的有界有符号亚阈值残差；I=0 时严格为零，不会重播旧膜电位。"""
+        return (1.0 - spikes.detach()) * torch.clamp(
+            driving_current / self.v_threshold, min=-1.0, max=1.0)
+
+    def _vertical_residual(self, residual):
+        """纵向编码：原连续残差，或局部竞争后的稀疏双极脉冲。
+
+        competitive 模式只保留超过逐通道可学习阈值、且为同通道局部幅值峰值的位置。
+        输出为 {-g_c, 0, +g_c}，g_c 有界且零初始化；g_c 可折叠进 enc2 卷积核，
+        因而在事件驱动实现中仍可按稀疏加/减累加，而不要求整幅连续 MAC。
+        """
+        if self.subthreshold_vertical_mode == "graded":
+            return residual
+        original_shape = residual.shape
+        if residual.dim() == 5:
+            residual = residual.reshape((-1,) + tuple(residual.shape[2:]))
+        magnitude = residual.abs()
+        fraction = torch.sigmoid(self.residual_vertical_threshold_raw).to(residual.dtype)
+        threshold = (self.residual_vertical_threshold_min
+                     + (self.residual_vertical_threshold_max
+                        - self.residual_vertical_threshold_min) * fraction).view(1, -1, 1, 1)
+        selected = SurrogateSpike.apply(magnitude - threshold)
+        if self.residual_vertical_peak_kernel > 1:
+            pad = self.residual_vertical_peak_kernel // 2
+            local_max = F.max_pool2d(magnitude.detach(), self.residual_vertical_peak_kernel,
+                                     stride=1, padding=pad)
+            selected = selected * magnitude.detach().ge(local_max).to(residual.dtype)
+        scale = (self.residual_vertical_scale_max
+                 * torch.tanh(self.residual_vertical_scale_raw).to(residual.dtype)).view(1, -1, 1, 1)
+        signal = residual.sign() * selected * scale
+        return signal.reshape(original_shape)
+
+    def subthreshold_parameter_values(self):
+        """返回可学习纵向竞争参数；只供诊断，不参与前向。"""
+        if not (self.subthreshold_vertical and self.subthreshold_vertical_mode == "competitive"):
+            return {}
+        fraction = torch.sigmoid(self.residual_vertical_threshold_raw)
+        threshold = (self.residual_vertical_threshold_min
+                     + (self.residual_vertical_threshold_max
+                        - self.residual_vertical_threshold_min) * fraction)
+        scale = self.residual_vertical_scale_max * torch.tanh(self.residual_vertical_scale_raw)
+        return {"threshold": threshold, "scale": scale}
+
+    def _event_features(self, u_pre, residual, deep_current, events):
+        """读取逐事件 dec1 特征，并在配置开启时加入受深层局部活动约束的瞬时浅层修正。"""
+        if u_pre.dim() == 5:
+            steps, batch = int(u_pre.shape[0]), int(u_pre.shape[1])
+            flat_index = events["t"] * batch + events["b"]
+            shape = (steps * batch,) + tuple(u_pre.shape[2:])
+            u_map = u_pre.reshape(shape)
+            d_map = deep_current.reshape(shape)
+        else:
+            flat_index = events["b"]
+            u_map, d_map = u_pre, deep_current
+        feat = u_map[flat_index, :, events["y"], events["x"]]
+        if not self.subthreshold_event_skip_enabled:
+            return feat, None, None
+        r_map = residual.reshape(u_map.shape) if residual.dim() == 5 else residual
+        pad = self.residual_local_kernel // 2
+        # 门控只读取深层支持，不允许这条浅层捷径反向塑造深层特征；先 detach 可避免池化图占用训练显存。
+        gate_map = d_map.detach()
+        local_deep = F.avg_pool2d(gate_map, self.residual_local_kernel, stride=1, padding=pad)
+        activity = gate_map.abs().sum(1, keepdim=True)
+        support = F.max_pool2d(activity, self.residual_local_kernel, stride=1, padding=pad).gt(0).detach()
+        deep_event = local_deep[flat_index, :, events["y"], events["x"]]
+        support_event = support[flat_index, 0, events["y"], events["x"]].to(feat.dtype)
+        gate = support_event * torch.sigmoid(self.residual_gate(deep_event)).squeeze(1)
+        residual_event = r_map[flat_index, :, events["y"], events["x"]]
+        correction = self.residual_project(residual_event * gate.unsqueeze(1))
+        return feat + correction, gate, correction
+
     def set_memory_read_enabled(self, enabled, layers=None):
         """只关闭新增记忆的读取，保留所有层的普通 LIF 历史；用于同权重消融。"""
         if not self.has_dual_memory:
@@ -211,27 +357,41 @@ class EvSpSegNetStream(nn.Module):
         prev = states if (mode == "carry" and states is not None) else [None] * 7
         if len(prev) != 7:
             raise ValueError("states 应为 7 个膜电位，收到 %d 个" % len(prev))
-        s1, n1, u1, i1 = self.enc1(x, prev[0])
-        s2, n2, u2, i2 = self.enc2(s1, prev[1])
+        if self.has_subthreshold_residual:
+            s1, n1, u1, i1, drive1 = self.enc1(x, prev[0], return_driving_current=True)
+            residual1 = self._observation_residual(drive1, s1)
+        else:
+            s1, n1, u1, i1 = self.enc1(x, prev[0])
+            residual1 = None
+        vertical1 = self._vertical_residual(residual1) if self.subthreshold_vertical_enabled else None
+        enc2_input = s1 + vertical1 if vertical1 is not None else s1
+        s2, n2, u2, i2 = self.enc2(enc2_input, prev[1])
         s3, n3, u3, i3 = self.enc3(s2, prev[2])
         s4, n4, u4, i4 = self.enc4(s3, prev[3])
         if self.merged_decoder:
             # 两路突触电流在神经元内相加：跳连脉冲经解码卷积，深层脉冲经 ConvT（作为 extra_current）
             s5, n5, u5, i5 = self.dec3(s3, prev[4], self.up3(s4))
             s6, n6, u6, i6 = self.dec2(s2, prev[5], self.up2(s5))
-            s7, n7, u7, i7 = self.dec1(s1, prev[6], self.up1(s6))
+            deep1 = self.up1(s6)
+            s7, n7, u7, i7 = self.dec1(s1, prev[6], deep1)
         else:
             s5, n5, u5, i5 = self.dec3(torch.cat([self.up3(s4), s3], 1), prev[4])
             s6, n6, u6, i6 = self.dec2(torch.cat([self.up2(s5), s2], 1), prev[5])
-            s7, n7, u7, i7 = self.dec1(torch.cat([self.up1(s6), s1], 1), prev[6])
-        # 高级索引 u7[b, :, y, x] 的结果形状为 [N, C]
-        feat = u7[events["b"], :, events["y"], events["x"]]
+            deep1 = self.up1(s6)
+            s7, n7, u7, i7 = self.dec1(torch.cat([deep1, s1], 1), prev[6])
+        feat, residual_gate, residual_correction = self._event_features(
+            u7, residual1, deep1, events)
         logits = self._readout(feat, events)
         info = None
         if collect:
             info = {"spikes": [s1, s2, s3, s4, s5, s6, s7],
                     "u_pre": [u1, u2, u3, u4, u5, u6, u7],
                     "current": [i1, i2, i3, i4, i5, i6, i7]}
+            if self.has_subthreshold_residual:
+                info.update(subthreshold_residual=residual1,
+                            subthreshold_vertical_signal=vertical1,
+                            event_residual_gate=residual_gate,
+                            event_residual_correction=residual_correction)
             if self.has_dual_memory:
                 info["memory"] = {name: state[1].detach()
                                   for name, state in zip(LAYER_NAMES, [n1, n2, n3, n4, n5, n6, n7])
@@ -270,34 +430,51 @@ class EvSpSegNetStream(nn.Module):
 
         memories = {}
 
-        def run_layer(name, inputs, extra_current=None, keep_u_pre=None):
+        def run_layer(name, inputs, extra_current=None, keep_u_pre=None, return_driving_current=False):
             keep = collect if keep_u_pre is None else keep_u_pre
             result = getattr(self, name).forward_steps(
                 inputs, prev[LAYER_NAMES.index(name)], carry, keep,
-                extra_current=extra_current, collect_memory=collect)
+                extra_current=extra_current, collect_memory=collect,
+                return_driving_current=return_driving_current)
             if collect and name in self.dual_memory_layers:
                 memories[name] = result[3]
-            return result[:3]
+            return result[:3] + ((result[-1],) if return_driving_current else ())
 
-        s1, n1, u1 = run_layer("enc1", x)
-        s2, n2, u2 = run_layer("enc2", s1)
+        if self.has_subthreshold_residual:
+            s1, n1, u1, drive1 = run_layer("enc1", x, return_driving_current=True)
+            residual1 = self._observation_residual(drive1, s1)
+        else:
+            s1, n1, u1 = run_layer("enc1", x)
+            residual1 = None
+        vertical1 = self._vertical_residual(residual1) if self.subthreshold_vertical_enabled else None
+        enc2_input = s1 + vertical1 if vertical1 is not None else s1
+        s2, n2, u2 = run_layer("enc2", enc2_input)
         s3, n3, u3 = run_layer("enc3", s2)
         s4, n4, u4 = run_layer("enc4", s3)
         if self.merged_decoder:
             s5, n5, u5 = run_layer("dec3", s3, self.up3(flat(s4)))
             s6, n6, u6 = run_layer("dec2", s2, self.up2(flat(s5)))
-            s7, n7, u7 = run_layer("dec1", s1, self.up1(flat(s6)), keep_u_pre=True)
+            deep1 = unflat(self.up1(flat(s6)))
+            s7, n7, u7 = run_layer("dec1", s1, flat(deep1), keep_u_pre=True)
         else:
             s5, n5, u5 = run_layer("dec3", torch.cat([unflat(self.up3(flat(s4))), s3], 2))
             s6, n6, u6 = run_layer("dec2", torch.cat([unflat(self.up2(flat(s5))), s2], 2))
-            s7, n7, u7 = run_layer("dec1", torch.cat([unflat(self.up1(flat(s6))), s1], 2),
+            deep1 = unflat(self.up1(flat(s6)))
+            s7, n7, u7 = run_layer("dec1", torch.cat([deep1, s1], 2),
                                    keep_u_pre=True)
-        feat = u7[events["t"], events["b"], :, events["y"], events["x"]]
+        feat, residual_gate, residual_correction = self._event_features(
+            u7, residual1, deep1, events)
         logits = self._readout(feat, events)
         info = None
         if collect:
             info = {"spikes": [s1, s2, s3, s4, s5, s6, s7],
-                    "u_pre": [u1, u2, u3, u4, u5, u6, u7]}
+                    "u_pre": [u1, u2, u3, u4, u5, u6, u7],
+                    }
+            if self.has_subthreshold_residual:
+                info.update(subthreshold_residual=residual1,
+                            subthreshold_vertical_signal=vertical1,
+                            event_residual_gate=residual_gate,
+                            event_residual_correction=residual_correction)
             if self.has_dual_memory:
                 info["memory"] = memories
         return logits, [n1, n2, n3, n4, n5, n6, n7], info
@@ -452,7 +629,16 @@ def estimate_operations(net, height, width, firing_rates, events_per_window, inp
     add("enc1", d, 0.0, d)                                           # 实数输入 -> MAC
     for name, src in (("enc2", "enc1"), ("enc3", "enc2"), ("enc4", "enc3")):
         d = conv_ops(getattr(net, name).conv, size[name])
-        add(name, 0.0, firing_rates[src] * d, d)
+        if name == "enc2" and net.subthreshold_vertical_enabled:
+            if net.subthreshold_vertical_mode == "competitive":
+                # S1 与残差信号按构造互斥。逐通道幅度可折叠进卷积核，稀疏双极码按累加估计。
+                density = min(1.0, firing_rates[src]
+                              + firing_rates.get("subthreshold_vertical", 0.0))
+                add(name, 0.0, density * d, d)
+            else:
+                add(name, d, 0.0, d)                                # S1+R1 含连续观测残差
+        else:
+            add(name, 0.0, firing_rates[src] * d, d)
     for up, dec, deep, skip, hw in (("up3", "dec3", "enc4", "enc3", size["enc3"]),
                                     ("up2", "dec2", "dec3", "enc2", size["enc2"]),
                                     ("up1", "dec1", "dec2", "enc1", size["enc1"])):
@@ -472,6 +658,11 @@ def estimate_operations(net, height, width, firing_rates, events_per_window, inp
     lin1, lin2 = net.readout[0], net.readout[2]
     per_event = lin1.in_features * lin1.out_features + lin2.in_features * lin2.out_features
     add("readout", per_event * float(events_per_window), 0.0, per_event * float(events_per_window))
+    if net.subthreshold_event_skip_enabled:
+        c1 = net.enc1.out_ch
+        residual_event_ops = c1 + c1 * c1                  # 12->1 门 + 12->12 投影；不计池化/逐元素门控
+        add("event_residual_skip", residual_event_ops * float(events_per_window), 0.0,
+            residual_event_ops * float(events_per_window))
     if not net.spiking:                       # graded / relu 对照输出实数，没有脉冲，全部按 MAC 计
         for layer in layers:
             layer["mac"], layer["sop"] = layer["dense"], 0.0
@@ -500,6 +691,24 @@ def estimate_operations(net, height, width, firing_rates, events_per_window, inp
             "tanh_per_window": extra,
             "included_in_mac_sop": False,
             "note": "额外逐元素算术与 tanh 单列，未折算为卷积 MAC/SOP 或总能耗；需实测耗时。"}
+    if net.has_subthreshold_residual:
+        competitive_parameters = (2 * net.enc1.out_ch
+                                  if (net.subthreshold_vertical
+                                      and net.subthreshold_vertical_mode == "competitive") else 0)
+        result["subthreshold_residual"] = {
+            "vertical": bool(net.subthreshold_vertical),
+            "event_skip": bool(net.subthreshold_event_skip),
+            "vertical_enabled": bool(net.subthreshold_vertical_enabled),
+            "event_skip_enabled": bool(net.subthreshold_event_skip_enabled),
+            "vertical_mode": net.subthreshold_vertical_mode,
+            "vertical_peak_kernel": int(net.residual_vertical_peak_kernel),
+            "local_kernel": int(net.residual_local_kernel),
+            "parameters": competitive_parameters + (((net.enc1.out_ch + 1)
+                                                       + net.enc1.out_ch ** 2)
+                                                      if net.subthreshold_event_skip else 0),
+            "note": ("graded vertical 使 enc2 按连续输入 MAC 计；competitive vertical 的逐通道"
+                     "幅度可折叠进卷积核，按实测稀疏双极码密度计 SOP；event_skip 只在事件坐标"
+                     "计线性层。池化、比较、clamp、门控和访存未折算。")}
     if input_density is not None:
         enc1 = layers[0]
         result["input_density"] = float(input_density)
