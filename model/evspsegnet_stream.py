@@ -31,7 +31,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model.lif2d_stream import ChannelGain, ReLUNeuron, StreamingGraded2d, StreamingLIF2d
+from model.lif2d_stream import (ChannelGain, ReLUNeuron, StreamingGraded2d,
+                                StreamingLIF2d, StreamingDualMemoryLIF2d)
 from utils.stream_common import gains_from_positive_samples
 
 LAYER_NAMES = ("enc1", "enc2", "enc3", "enc4", "dec3", "dec2", "dec1")
@@ -78,7 +79,7 @@ class SpikingConvBlock(nn.Module):
         spikes, new_state, u_pre = self.neuron(self.gain(current), state)
         return spikes, new_state, u_pre, current
 
-    def forward_steps(self, x, state, carry, keep_u_pre, extra_current=None):
+    def forward_steps(self, x, state, carry, keep_u_pre, extra_current=None, collect_memory=False):
         """一个片段的多窗口版本：卷积在 T*B 维上批量计算，神经元再按时间递推。
 
         输入: x [T,B,C_in,H,W]；extra_current 为已展平的 [T*B,C_out,H',W'] 或 None。
@@ -90,6 +91,8 @@ class SpikingConvBlock(nn.Module):
             current = current + extra_current
         current = self.gain(self.norm(current))
         current = current.view((steps, batch) + tuple(current.shape[1:]))
+        if collect_memory and isinstance(self.neuron, StreamingDualMemoryLIF2d):
+            return self.neuron.forward_steps(current, state, carry, keep_u_pre, collect_memory=True)
         return self.neuron.forward_steps(current, state, carry, keep_u_pre)
 
 
@@ -99,17 +102,18 @@ class EvSpSegNetStream(nn.Module):
     forward(x, events, states, state_mode=None, collect=False) -> (logits, new_states, info)
         x          [B,12,H,W] 当前窗口输入
         events     字典：b/y/x 为 long [N]，p/t_local 为 float [N]（当前窗口的逐事件信息）
-        states     上一窗口返回的 7 个膜电位列表，或 None
-        state_mode 'carry'（使用 states）或 'reset_each_window'（忽略 states，等价 beta=0）；
+        states     上一窗口返回的 7 组状态列表，或 None；双仓层的状态为 (U, M)
+        state_mode 'carry'（使用 states）或 'reset_each_window'（忽略 U/M 全部历史）；
                    None 时使用构造参数中的默认值
         collect    True 时 info 返回每层的脉冲、u_pre、增益前电流（用于监控与校准）
         logits     [N] 每个事件的原始 logit
-        new_states 7 个软复位后的膜电位（ReLU 版本为 None 列表）
+        new_states 7 组状态：普通 LIF 为软复位后的 U，双仓为 (U, M)，ReLU 为 None
     """
 
     def __init__(self, in_channels=12, channels=(12, 24, 48, 48), neuron="lif", norm="none",
                  state_mode="carry", readout_hidden=32, dt_ms=50.0, tau_init_ms=200.0,
-                 tau_min_ms=50.0, tau_max_ms=2000.0, v_threshold=1.0, merged_decoder=False):
+                 tau_min_ms=50.0, tau_max_ms=2000.0, v_threshold=1.0, merged_decoder=False,
+                 dual_memory=None):
         super(EvSpSegNetStream, self).__init__()
         if state_mode not in ("carry", "reset_each_window"):
             raise ValueError("state_mode 必须是 carry 或 reset_each_window")
@@ -138,6 +142,29 @@ class EvSpSegNetStream(nn.Module):
             self.dec1 = block(c1 + c1, c1, 1)
         self.readout = nn.Sequential(nn.Linear(c1 + 2, readout_hidden), nn.ReLU(),
                                      nn.Linear(readout_hidden, 1))
+        self.dual_memory_layers = ()
+        if dual_memory is not None:
+            if not isinstance(dual_memory, dict):
+                raise ValueError("dual_memory 必须为配置字典")
+            if neuron != "lif":
+                raise ValueError("dual_memory 仅支持 neuron: lif")
+            allowed = {"layers", "tau_init_ms", "tau_min_ms", "tau_max_ms", "kappa_max"}
+            if set(dual_memory) - allowed:
+                raise ValueError("未知双仓配置: %s" % sorted(set(dual_memory) - allowed))
+            selected = dual_memory.get("layers")
+            if (not isinstance(selected, (list, tuple)) or not selected
+                    or any(n not in LAYER_NAMES for n in selected)
+                    or len(set(selected)) != len(selected)):
+                raise ValueError("dual_memory.layers 必须是 enc1/enc2/enc3/enc4/dec3/dec2/dec1 的非空、无重复列表")
+            self.dual_memory_layers = tuple(n for n in LAYER_NAMES if n in selected)
+            for name in self.dual_memory_layers:
+                selected_block = getattr(self, name)
+                selected_block.neuron = StreamingDualMemoryLIF2d(
+                    selected_block.out_ch, **lif,
+                    memory_tau_init_ms=float(dual_memory.get("tau_init_ms", 300.0)),
+                    memory_tau_min_ms=float(dual_memory.get("tau_min_ms", 50.0)),
+                    memory_tau_max_ms=float(dual_memory.get("tau_max_ms", 1000.0)),
+                    kappa_max=float(dual_memory.get("kappa_max", 0.5)))
         self.state_mode = state_mode
         self.neuron_kind = neuron
         self.merged_decoder = merged_decoder
@@ -160,6 +187,22 @@ class EvSpSegNetStream(nn.Module):
     def stateful(self):
         """是否保留跨窗膜电位（lif 与 graded 保留，relu 没有状态）。"""
         return self.neuron_kind in ("lif", "graded")
+
+    @property
+    def has_dual_memory(self):
+        return bool(self.dual_memory_layers)
+
+    def set_memory_read_enabled(self, enabled, layers=None):
+        """只关闭新增记忆的读取，保留所有层的普通 LIF 历史；用于同权重消融。"""
+        if not self.has_dual_memory:
+            raise ValueError("当前模型没有双仓记忆")
+        selected = self.dual_memory_layers if layers is None else layers
+        if (not isinstance(selected, (list, tuple)) or not selected
+                or any(n not in self.dual_memory_layers for n in selected)
+                or len(set(selected)) != len(selected)):
+            raise ValueError("Memory read ablation requires unique, configured dual-memory layers")
+        for name in selected:
+            getattr(self, name).neuron.memory_read_enabled = bool(enabled)
 
     def forward(self, x, events, states, state_mode=None, collect=False):
         mode = self.state_mode if state_mode is None else state_mode
@@ -189,6 +232,10 @@ class EvSpSegNetStream(nn.Module):
             info = {"spikes": [s1, s2, s3, s4, s5, s6, s7],
                     "u_pre": [u1, u2, u3, u4, u5, u6, u7],
                     "current": [i1, i2, i3, i4, i5, i6, i7]}
+            if self.has_dual_memory:
+                info["memory"] = {name: state[1].detach()
+                                  for name, state in zip(LAYER_NAMES, [n1, n2, n3, n4, n5, n6, n7])
+                                  if name in self.dual_memory_layers}
         return logits, [n1, n2, n3, n4, n5, n6, n7], info
 
     def forward_chunk(self, x, events, states, state_mode=None, collect=False):
@@ -221,28 +268,38 @@ class EvSpSegNetStream(nn.Module):
         def unflat(tensor):
             return tensor.view((steps, batch) + tuple(tensor.shape[1:]))
 
-        s1, n1, u1 = self.enc1.forward_steps(x, prev[0], carry, collect)
-        s2, n2, u2 = self.enc2.forward_steps(s1, prev[1], carry, collect)
-        s3, n3, u3 = self.enc3.forward_steps(s2, prev[2], carry, collect)
-        s4, n4, u4 = self.enc4.forward_steps(s3, prev[3], carry, collect)
+        memories = {}
+
+        def run_layer(name, inputs, extra_current=None, keep_u_pre=None):
+            keep = collect if keep_u_pre is None else keep_u_pre
+            result = getattr(self, name).forward_steps(
+                inputs, prev[LAYER_NAMES.index(name)], carry, keep,
+                extra_current=extra_current, collect_memory=collect)
+            if collect and name in self.dual_memory_layers:
+                memories[name] = result[3]
+            return result[:3]
+
+        s1, n1, u1 = run_layer("enc1", x)
+        s2, n2, u2 = run_layer("enc2", s1)
+        s3, n3, u3 = run_layer("enc3", s2)
+        s4, n4, u4 = run_layer("enc4", s3)
         if self.merged_decoder:
-            s5, n5, u5 = self.dec3.forward_steps(s3, prev[4], carry, collect, self.up3(flat(s4)))
-            s6, n6, u6 = self.dec2.forward_steps(s2, prev[5], carry, collect, self.up2(flat(s5)))
-            s7, n7, u7 = self.dec1.forward_steps(s1, prev[6], carry, True, self.up1(flat(s6)))
+            s5, n5, u5 = run_layer("dec3", s3, self.up3(flat(s4)))
+            s6, n6, u6 = run_layer("dec2", s2, self.up2(flat(s5)))
+            s7, n7, u7 = run_layer("dec1", s1, self.up1(flat(s6)), keep_u_pre=True)
         else:
-            s5, n5, u5 = self.dec3.forward_steps(torch.cat([unflat(self.up3(flat(s4))), s3], 2), prev[4],
-                                                 carry, collect)
-            s6, n6, u6 = self.dec2.forward_steps(torch.cat([unflat(self.up2(flat(s5))), s2], 2), prev[5],
-                                                 carry, collect)
-            s7, n7, u7 = self.dec1.forward_steps(torch.cat([unflat(self.up1(flat(s6))), s1], 2), prev[6],
-                                                 carry, True)
-        # 高级索引 u7[t, b, :, y, x] 的结果形状为 [N, C]
+            s5, n5, u5 = run_layer("dec3", torch.cat([unflat(self.up3(flat(s4))), s3], 2))
+            s6, n6, u6 = run_layer("dec2", torch.cat([unflat(self.up2(flat(s5))), s2], 2))
+            s7, n7, u7 = run_layer("dec1", torch.cat([unflat(self.up1(flat(s6))), s1], 2),
+                                   keep_u_pre=True)
         feat = u7[events["t"], events["b"], :, events["y"], events["x"]]
         logits = self._readout(feat, events)
         info = None
         if collect:
             info = {"spikes": [s1, s2, s3, s4, s5, s6, s7],
                     "u_pre": [u1, u2, u3, u4, u5, u6, u7]}
+            if self.has_dual_memory:
+                info["memory"] = memories
         return logits, [n1, n2, n3, n4, n5, n6, n7], info
 
     def _readout(self, feat, events):
@@ -426,6 +483,23 @@ def estimate_operations(net, height, width, firing_rates, events_per_window, inp
     result = {"dense_ops": sum(l["dense"] for l in layers), "mac": sum(l["mac"] for l in layers),
               "sop": sum(l["sop"] for l in layers), "per_layer": layers,
               "state_elements": state_elements if net.stateful else 0}
+    if net.has_dual_memory:
+        extra_by_layer = {name: getattr(net, name).out_ch * state_size[name] for name in net.dual_memory_layers}
+        extra = sum(extra_by_layer.values())
+        result["state_elements"] += extra
+        result["dual_memory"] = {
+            "layers": list(net.dual_memory_layers), "additional_state_elements": extra,
+            "state_elements_per_layer": extra_by_layer,
+            "additional_state_bytes_fp32": extra * 4,
+            "parameters": 2 * sum(getattr(net, name).out_ch for name in net.dual_memory_layers),
+            # 每位置：Q 除阈值；M 两乘一加；旧 M 读取一乘一加。
+            # 不含逐通道系数、autograd、监控、内存访问；无状态首窗略少。
+            "elementwise_mul_per_window": 3 * extra,
+            "elementwise_add_per_window": 2 * extra,
+            "elementwise_div_per_window": extra,
+            "tanh_per_window": extra,
+            "included_in_mac_sop": False,
+            "note": "额外逐元素算术与 tanh 单列，未折算为卷积 MAC/SOP 或总能耗；需实测耗时。"}
     if input_density is not None:
         enc1 = layers[0]
         result["input_density"] = float(input_density)

@@ -34,6 +34,7 @@ import torch.nn.functional as F  # noqa: E402
 from dataset.ev_uav_stream import EvUAVStream  # noqa: E402
 from dataset.stream_source import NumpyWindowSource, TorchWindowSource  # noqa: E402
 from model.evspsegnet_stream import LAYER_NAMES  # noqa: E402
+from model.lif2d_stream import detach_states, state_tensors  # noqa: E402
 from utils.stream_metrics import iou_from_counts  # noqa: E402
 
 FLOAT64_TOLERANCE = 1e-9          # logits / u_pre / 膜电位 / 参数梯度的相对误差
@@ -172,12 +173,11 @@ def compare_chunks(net, seq, cfg, q99, device, dtype, offset, chunk, pos_weight)
             report["u_pre_rel_error"][name] = max(report["u_pre_rel_error"][name],
                                                   relative_error(torch.stack(kept["u_pre"][layer]),
                                                                  info_b["u_pre"][layer]))
-        for a, b in zip(states_a, states_b):
-            if a is not None:
-                report["state_rel_error"] = max(report["state_rel_error"], relative_error(a, b))
+        for a, b in zip(state_tensors(states_a), state_tensors(states_b)):
+            report["state_rel_error"] = max(report["state_rel_error"], relative_error(a, b))
         del kept, info_b
-        states_a = [None if s is None else s.detach() for s in states_a]
-        states_b = [None if s is None else s.detach() for s in states_b]
+        states_a = detach_states(states_a)
+        states_b = detach_states(states_b)
     worst, worst_name = 0.0, None
     for (name, pa), (_, pb) in zip(net_a.named_parameters(), net_b.named_parameters()):
         if (pa.grad is None) != (pb.grad is None):

@@ -111,6 +111,91 @@ class StreamingLIF2d(nn.Module):
         return torch.stack(spikes), state, (torch.stack(u_pres) if keep_u_pre else None)
 
 
+class StreamingDualMemoryLIF2d(StreamingLIF2d):
+    """编码层双仓实验：输入写入有界 M，旧 M 以受限电流参与原 V1 软复位。
+
+    Q=tanh(I/theta); M=alpha*M_prev+(1-alpha)*Q
+    U_pre=beta*U_prev+I+(1-beta)*kappa*theta*M_prev
+    |kappa|<kappa_max<1。状态为 (U, M)，不存储在模块内。
+    memory_read_enabled=False 仅用于同权重读取消融；不清除 U 的正常历史。
+    零初始化 kappa 不消耗随机数，因此同种子下其他网络权重仍与 V1 一致。
+    """
+
+    def __init__(self, channels, dt_ms, tau_init_ms, tau_min_ms, tau_max_ms, v_threshold,
+                 memory_tau_init_ms=300.0, memory_tau_min_ms=50.0,
+                 memory_tau_max_ms=1000.0, kappa_max=0.5):
+        super(StreamingDualMemoryLIF2d, self).__init__(
+            channels, dt_ms, tau_init_ms, tau_min_ms, tau_max_ms, v_threshold)
+        values = (dt_ms, v_threshold, memory_tau_init_ms, memory_tau_min_ms,
+                  memory_tau_max_ms, kappa_max)
+        if not all(math.isfinite(float(v)) for v in values):
+            raise ValueError("双仓参数必须有限")
+        if dt_ms <= 0 or v_threshold <= 0:
+            raise ValueError("双仓 dt_ms 与 v_threshold 必须为正")
+        if not 0 < memory_tau_min_ms < memory_tau_init_ms < memory_tau_max_ms:
+            raise ValueError("需要 0 < memory_tau_min_ms < memory_tau_init_ms < memory_tau_max_ms")
+        if not 0 < kappa_max < 1:
+            raise ValueError("双仓需要 0 < kappa_max < 1")
+        self.memory_tau_min_ms = float(memory_tau_min_ms)
+        self.memory_tau_max_ms = float(memory_tau_max_ms)
+        self.kappa_max = float(kappa_max)
+        frac = (memory_tau_init_ms - memory_tau_min_ms) / (memory_tau_max_ms - memory_tau_min_ms)
+        self.memory_a = nn.Parameter(torch.full((channels,), math.log(frac / (1.0 - frac))))
+        self.kappa_raw = nn.Parameter(torch.zeros(channels))
+        self.memory_read_enabled = True
+
+    def memory_tau(self):
+        return self.memory_tau_min_ms + (self.memory_tau_max_ms - self.memory_tau_min_ms) * torch.sigmoid(self.memory_a)
+
+    def memory_alpha(self):
+        return torch.exp(-self.dt_ms / self.memory_tau())
+
+    def kappa(self):
+        return self.kappa_max * torch.tanh(self.kappa_raw)
+
+    def _coefficients(self, current):
+        beta = self.beta().to(current.dtype).view(1, -1, 1, 1)
+        alpha = self.memory_alpha().to(current.dtype).view(1, -1, 1, 1)
+        gain = (1.0 - beta) * self.v_threshold * self.kappa().to(current.dtype).view(1, -1, 1, 1)
+        if not self.memory_read_enabled:
+            gain = gain * 0.0
+        return beta, alpha, gain
+
+    def _step(self, current, state, beta, alpha, gain):
+        if state is None:
+            u_pre = current
+            memory = (1.0 - alpha) * torch.tanh(current / self.v_threshold)
+        else:
+            if not isinstance(state, tuple) or len(state) != 2:
+                raise ValueError("双仓状态必须为 (U, M)，新序列使用 None")
+            soma, old_memory = state
+            if soma.shape != current.shape or old_memory.shape != current.shape:
+                raise ValueError("双仓状态与输入形状不匹配；独立序列应使用 None 初始化")
+            u_pre = beta * soma + current + gain * old_memory
+            memory = alpha * old_memory + (1.0 - alpha) * torch.tanh(current / self.v_threshold)
+        output, fired = self.activate(u_pre)
+        soma = u_pre - self.v_threshold * fired
+        return output, (soma, memory), u_pre
+
+    def forward(self, current, state):
+        return self._step(current, state, *self._coefficients(current))
+
+    def forward_steps(self, current, state, carry=True, keep_u_pre=True, collect_memory=False):
+        if current.shape[0] == 0:
+            raise ValueError("片段至少需要 1 个窗口")
+        coefficients = self._coefficients(current)
+        spikes, u_pres, memories = [], [], []
+        for t in range(int(current.shape[0])):
+            output, state, u_pre = self._step(current[t], state if carry else None, *coefficients)
+            spikes.append(output)
+            if keep_u_pre:
+                u_pres.append(u_pre)
+            if collect_memory:
+                memories.append(state[1].detach())
+        result = (torch.stack(spikes), state, torch.stack(u_pres) if keep_u_pre else None)
+        return result + (torch.stack(memories),) if collect_memory else result
+
+
 class StreamingGraded2d(StreamingLIF2d):
     """有状态但不发放的对照：阈值、复位、时间常数、代理梯度都与 LIF 相同，只有发放幅值不同。
 
@@ -174,7 +259,20 @@ class ChannelGain(nn.Module):
 
 
 def detach_states(states):
-    """截断梯度但保留膜电位数值（TBPTT 片段边界使用）。None 元素保持 None。"""
+    """递归截断梯度、保留数值及容器结构，支持双仓的 (U, M)。"""
     if states is None:
         return None
-    return [None if s is None else s.detach() for s in states]
+    if isinstance(states, tuple):
+        return tuple(detach_states(s) for s in states)
+    if isinstance(states, list):
+        return [detach_states(s) for s in states]
+    return states.detach()
+
+
+def state_tensors(states):
+    """按顺序遍历状态树中的张量，供等价性检查及内存统计使用。"""
+    if isinstance(states, (list, tuple)):
+        for state in states:
+            yield from state_tensors(state)
+    elif states is not None:
+        yield states

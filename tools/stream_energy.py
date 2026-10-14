@@ -89,6 +89,9 @@ def account(operations, nonzero_fraction, n_windows):
                                     * MAC_PJ * 1e-9) / max(energy_mj(mac, sop), 1e-30)}
     state = int(operations.get("state_elements", 0))
     out["membrane_leak_upper_bound_mj_per_8s"] = energy_mj(state * n_windows, 0.0)
+    if "dual_memory" in operations:
+        out["dual_memory_unpriced_operations"] = operations["dual_memory"]
+        out["energy_scope_note"] = "卷积/读出能耗不含双仓额外算术、tanh 和访存；不能当作完整能耗。"
     return out
 
 
@@ -133,6 +136,8 @@ def main():
         print("%-64s %8.4f %14.2f %14.2f %12.2f" % (row["name"][-64:], row["iou"], row["dense"]["energy_mj_per_8s"],
                                                     row["event"]["energy_mj_per_8s"],
                                                     row["membrane_leak_upper_bound_mj_per_8s"]))
+        if "dual_memory_unpriced_operations" in row:
+            print("  注意：双仓额外逐元素运算与 tanh 未计入上表能耗，详见 JSON。")
     for row in baselines:
         print("%-64s %8.4f %14s %14.2f %12s" % (row["name"][-64:], row["iou"], "-", row["energy_mj_per_8s"], "-"))
     print("（基线 IoU 来自 baseline_energy.py 调用的原 miou 函数；SNN IoU 来自 eval 结果，两者都是阈值 0.9 的正类 IoU）")

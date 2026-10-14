@@ -36,7 +36,7 @@ from dataset.stream_source import INPUT_DEVICES, make_window_source  # noqa: E40
 from dataset.stream_windows import refill_by_index  # noqa: E402
 from model.evspsegnet_stream import (LAYER_NAMES, EvSpSegNetStream, calibrate_gains,  # noqa: E402
                                      count_parameters, estimate_operations)
-from model.lif2d_stream import StreamingLIF2d, detach_states  # noqa: E402
+from model.lif2d_stream import StreamingLIF2d, StreamingDualMemoryLIF2d, detach_states  # noqa: E402
 from utils.stream_common import (health_warnings, linear_epoch_lr, load_flat_config,  # noqa: E402
                                  make_chunks, select_subset, subset_due, summarize_history)
 from utils.stream_metrics import (first_detection_latencies, iou_from_counts, rolling_iou,  # noqa: E402
@@ -72,6 +72,10 @@ def parse_args():
     parser.add_argument("--readout-ablation", choices=("none", "zero_extra", "zero_feature"),
                         default="none",
                         help="eval 模式的读出消融：zero_extra 屏蔽 p/t_local；zero_feature 屏蔽网络特征")
+    parser.add_argument("--memory-ablation", choices=("none", "off"), default="none",
+                        help="仅 eval：off 关闭所有选中层的双仓 M 读取，保留普通 LIF 跨窗 U；结果另存")
+    parser.add_argument("--memory-off-layers", nargs="+", choices=LAYER_NAMES, default=None,
+                        help="仅 eval：只关闭指定双仓层的 M 读取，如 enc3 enc4；不可与 --memory-ablation off 合用")
     parser.add_argument("--dump-dir", default=None,
                         help="eval 模式：把训练时状态模式下的逐事件预测按序列保存为 NPZ，供 tools/verify_predictions.py 独立核验")
     parser.add_argument("--execution", choices=EXECUTIONS, default=None,
@@ -119,6 +123,11 @@ def build_config(args):
             raise ValueError("--tbptt-k 必须 >= 1")
         cfg["tbptt_k"] = args.tbptt_k
     speed_options(cfg)
+    if getattr(args, "memory_ablation", "none") != "none" and args.mode != "eval":
+        raise ValueError("--memory-ablation 仅用于 eval；训练结构由 YAML 的 dual_memory 决定")
+    if getattr(args, "memory_off_layers", None):
+        if args.mode != "eval" or getattr(args, "memory_ablation", "none") != "none":
+            raise ValueError("--memory-off-layers 仅用于 eval，且不可与 --memory-ablation off 合用")
     return cfg
 
 
@@ -163,7 +172,7 @@ def build_net(cfg, device):
         readout_hidden=int(cfg["readout_hidden"]), dt_ms=float(cfg["window_ms"]),
         tau_init_ms=float(cfg["tau_init_ms"]), tau_min_ms=float(cfg["tau_min_ms"]),
         tau_max_ms=float(cfg["tau_max_ms"]), v_threshold=float(cfg["v_threshold"]),
-        merged_decoder=cfg.get("merged_decoder", False))
+        merged_decoder=cfg.get("merged_decoder", False), dual_memory=cfg.get("dual_memory"))
     return net.to(device)
 
 
@@ -255,6 +264,7 @@ class LayerMonitor(object):
     def __init__(self, v_threshold):
         self.v_threshold = float(v_threshold)
         self.data = {}
+        self.memory_data = {}
 
     def update(self, info):
         """累加 info：逐窗 forward 的每层 [B,C,H,W]，或 forward_chunk 的每层 [T,B,C,H,W]（T 个窗口）。
@@ -284,6 +294,18 @@ class LayerMonitor(object):
                 u_abs = u_pre.abs()
                 d["u_abs_max"] = torch.maximum(d["u_abs_max"], u_abs.max())
                 d["big"] += (u_abs > 10.0 * self.v_threshold).sum().double()
+            for name, memory in info.get("memory", {}).items():
+                d = self.memory_data.get(name)
+                if d is None:
+                    d = {"abs_sum": torch.zeros((), device=memory.device, dtype=torch.float64),
+                         "abs_max": torch.zeros((), device=memory.device), "elements": 0,
+                         "near_bound": torch.zeros((), device=memory.device, dtype=torch.float64)}
+                    self.memory_data[name] = d
+                magnitude = memory.abs()
+                d["abs_sum"] += magnitude.double().sum()
+                d["abs_max"] = torch.maximum(d["abs_max"], magnitude.max())
+                d["near_bound"] += (magnitude > 0.95).sum().double()
+                d["elements"] += memory.numel()
 
     def summary(self):
         """返回 {层名: 统计字典}。"""
@@ -297,6 +319,11 @@ class LayerMonitor(object):
                 "u_abs_max": float(d["u_abs_max"]),
                 "big_membrane_frac": float(d["big"]) / max(d["elements"], 1),
             }
+            if name in self.memory_data:
+                m = self.memory_data[name]
+                out[name].update(memory_abs_mean=float(m["abs_sum"]) / max(m["elements"], 1),
+                                 memory_abs_max=float(m["abs_max"]),
+                                 memory_near_bound_frac=float(m["near_bound"]) / max(m["elements"], 1))
         return out
 
 
@@ -316,6 +343,16 @@ def tau_statistics(net):
                      "beta_max": float(beta.max()),
                      "near_min_frac": float((tau < neuron.tau_min_ms + margin).double().mean()),
                      "near_max_frac": float((tau > neuron.tau_max_ms - margin).double().mean())}
+        if isinstance(neuron, StreamingDualMemoryLIF2d):
+            with torch.no_grad():
+                mtau = neuron.memory_tau().double().cpu()
+                alpha = neuron.memory_alpha().double().cpu()
+                kappa = neuron.kappa().double().cpu()
+                for prefix, values in (("memory_tau", mtau), ("memory_alpha", alpha), ("kappa", kappa)):
+                    for suffix, value in (("min", values.min()), ("mean", values.mean()), ("max", values.max())):
+                        out[name][prefix + "_" + suffix] = float(value)
+                out[name]["kappa_abs_mean"] = float(kappa.abs().mean())
+                out[name]["memory_read_enabled"] = neuron.memory_read_enabled
     return out
 
 
@@ -608,7 +645,8 @@ def prepare_run(args, cfg, allow_existing=False):
     root = Path(cfg["save_root"])
     root.mkdir(parents=True, exist_ok=allow_existing)
     write_json(root / ("run_config_%s.json" % args.mode), {
-        "design_version": "v1-3", "args": vars(args), "config": cfg, "stats": stats,
+        "design_version": "v1-dual-memory" if net.has_dual_memory else "v1-3",
+        "args": vars(args), "config": cfg, "stats": stats,
         "pos_weight": pos_weight, "parameters": count_parameters(net), "torch": torch.__version__,
         "device": torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu",
         "source_sha256": source_hashes()})
@@ -649,8 +687,9 @@ def mode_smoke(args, cfg):
     print(json.dumps(report, indent=2, ensure_ascii=False), flush=True)
     missing = out["missing_grads"]
     if cfg["state_mode"] == "reset_each_window":
-        # reset 模式下 beta 不参与计算，时间常数参数 a 本来就没有梯度，不算错误
-        missing = [name for name in missing if not name.endswith(".neuron.a")]
+        # reset 模式下 U/M 都不跨窗读取，时间常数与双仓耦合参数没有梯度是预期行为。
+        missing = [name for name in missing if not name.endswith(
+            (".neuron.a", ".neuron.memory_a", ".neuron.kappa_raw"))]
     if missing:
         raise RuntimeError("以下参数没有梯度: %s" % missing)
     print("SMOKE TEST FINISHED:", root, flush=True)
@@ -690,7 +729,7 @@ def save_checkpoint(path, net, optimizer, epoch, best_val_iou, cfg, stats):
     """保存权重（含已校准增益与 tau 参数）、优化器状态与配置；不保存膜电位。"""
     torch.save({"model": net.state_dict(), "optimizer": optimizer.state_dict(), "epoch": epoch,
                 "best_val_iou": best_val_iou, "config": cfg, "stats": stats,
-                "design_version": "v1-3"}, str(path))
+                "design_version": "v1-dual-memory" if net.has_dual_memory else "v1-3"}, str(path))
 
 
 def mode_train(args, cfg):
@@ -706,6 +745,8 @@ def mode_train(args, cfg):
     metrics_path = root / "metrics.jsonl"
     if args.resume:
         ckpt = torch.load(str(root / "last.pt"), map_location=device)
+        if ckpt["config"].get("dual_memory") != cfg.get("dual_memory"):
+            raise ValueError("续训 dual_memory 配置与 checkpoint 不一致，不能改变时间常数范围或读取上限")
         net.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         start_epoch, best = int(ckpt["epoch"]) + 1, float(ckpt["best_val_iou"])
@@ -802,14 +843,30 @@ def mode_eval(args, cfg):
     if not bool(net.gain_calibrated):
         raise RuntimeError("checkpoint 中的增益未校准")
     net.readout_ablation = args.readout_ablation
+    memory_ablation = getattr(args, "memory_ablation", "none")
+    off_layers = getattr(args, "memory_off_layers", None)
+    if off_layers and memory_ablation != "none":
+        raise ValueError("不可同时指定全部关闭与逐层关闭记忆")
+    if memory_ablation == "off":
+        net.set_memory_read_enabled(False)
+    elif off_layers:
+        net.set_memory_read_enabled(False, off_layers)
+        off_layers = [name for name in LAYER_NAMES if name in off_layers]
+        memory_ablation = "selected"
     suffix = "" if args.readout_ablation == "none" else ("_" + args.readout_ablation)
+    if memory_ablation == "selected":
+        suffix += "_memory_off_" + "_".join(off_layers)
+    elif memory_ablation != "none":
+        suffix += "_memory_" + memory_ablation
     out_path = Path(args.checkpoint).parent / ("eval_%s_%s%s.json" % (
         args.split, Path(args.checkpoint).stem, suffix))
     if out_path.exists() and not args.overwrite:
         raise RuntimeError("结果已存在: %s（使用 --overwrite 覆盖）" % out_path)
     results = {"checkpoint": args.checkpoint, "epoch": ckpt["epoch"], "parameters": count_parameters(net),
                "trained_state_mode": train_cfg["state_mode"], "neuron": train_cfg["neuron"],
-               "readout_ablation": args.readout_ablation}
+               "readout_ablation": args.readout_ablation, "dual_memory": train_cfg.get("dual_memory"),
+               "memory_ablation": memory_ablation,
+               "memory_off_layers": list(net.dual_memory_layers) if memory_ablation == "off" else (off_layers or [])}
     for mode in ("carry", "reset_each_window"):
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)

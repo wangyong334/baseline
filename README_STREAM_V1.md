@@ -1,5 +1,8 @@
 # 流式 SNN Baseline-V1（设计版本 v1-3）
 
+双仓编码器实验（enc4 / enc3+enc4 / enc2+enc3+enc4）的机制、三卡训练与测试命令见
+[README_STREAM_DUAL_MEMORY.md](README_STREAM_DUAL_MEMORY.md)。
+
 50 ms 块因果流式分割：每个窗口构造 12 通道输入 → 二维脉冲 U-Net（逐位置独立 LIF，状态跨窗保持）→
 读取最后一层复位前膜电位做逐事件分类 → 按原始下标回填 → 调用原 `utils/eval.py` 计算 IoU/ACC/Pd/Fa。
 
