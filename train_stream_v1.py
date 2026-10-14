@@ -436,7 +436,7 @@ def tau_statistics(net):
 
 
 def subthreshold_parameter_statistics(net):
-    """竞争式纵向编码的逐通道阈值与有界注入幅度；其他方案返回空字典。"""
+    """竞争式纵向与选择性横向的阈值、幅度统计；其他方案返回空字典。"""
     values = net.subthreshold_parameter_values()
     if not values:
         return {}

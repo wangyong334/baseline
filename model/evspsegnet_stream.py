@@ -181,7 +181,9 @@ class EvSpSegNetStream(nn.Module):
         residual_allowed = {"vertical", "event_skip", "local_kernel", "vertical_mode",
                             "vertical_peak_kernel", "vertical_threshold_init",
                             "vertical_threshold_min", "vertical_threshold_max",
-                            "vertical_scale_max"}
+                            "vertical_scale_max", "event_skip_mode",
+                            "event_threshold_init", "event_threshold_min",
+                            "event_threshold_max", "event_correction_max"}
         if set(subthreshold_residual) - residual_allowed:
             raise ValueError("未知亚阈值残差配置: %s" % sorted(set(subthreshold_residual) - residual_allowed))
         self.subthreshold_vertical = subthreshold_residual.get("vertical", False)
@@ -220,12 +222,35 @@ class EvSpSegNetStream(nn.Module):
             # 零初始化让新路径在训练开始时严格等同 enc234 基线；若残差有用，梯度先打开逐通道幅度，
             # 随后的梯度再联合调整竞争阈值。tanh 有界且允许通道选择促进或抑制。
             self.residual_vertical_scale_raw = nn.Parameter(torch.zeros(c1, dtype=torch.float32))
+        self.subthreshold_event_skip_mode = str(subthreshold_residual.get("event_skip_mode", "legacy"))
+        if self.subthreshold_event_skip_mode not in ("legacy", "selective"):
+            raise ValueError("subthreshold_residual.event_skip_mode 必须为 legacy 或 selective")
+        if (self.subthreshold_event_skip_mode == "selective"
+                and not (self.subthreshold_vertical and self.subthreshold_vertical_mode == "competitive")):
+            raise ValueError("selective 横向路径要求同时启用 competitive 纵向编码")
+        self.residual_event_correction_max = float(
+            subthreshold_residual.get("event_correction_max", 0.25))
+        if not 0.0 < self.residual_event_correction_max <= 1.0:
+            raise ValueError("event_correction_max 必须在 (0,1] 内")
         if self.subthreshold_event_skip:
             self.residual_gate = nn.Linear(c1, 1, bias=True)
             self.residual_project = nn.Linear(c1, c1, bias=False)
             nn.init.zeros_(self.residual_gate.weight)
             nn.init.zeros_(self.residual_gate.bias)
             nn.init.zeros_(self.residual_project.weight)
+            if self.subthreshold_event_skip_mode == "selective":
+                event_threshold_min = float(subthreshold_residual.get("event_threshold_min", 0.5))
+                event_threshold_init = float(subthreshold_residual.get("event_threshold_init", 0.8))
+                event_threshold_max = float(subthreshold_residual.get("event_threshold_max", 0.98))
+                if not 0.0 < event_threshold_min < event_threshold_init < event_threshold_max <= 1.0:
+                    raise ValueError("需要 0 < event_threshold_min < event_threshold_init < "
+                                     "event_threshold_max <= 1")
+                fraction = ((event_threshold_init - event_threshold_min)
+                            / (event_threshold_max - event_threshold_min))
+                self.residual_event_threshold_min = event_threshold_min
+                self.residual_event_threshold_max = event_threshold_max
+                self.residual_event_threshold_raw = nn.Parameter(torch.tensor(
+                    float(np.log(fraction / (1.0 - fraction))), dtype=torch.float32))
         self.subthreshold_vertical_enabled = self.subthreshold_vertical
         self.subthreshold_event_skip_enabled = self.subthreshold_event_skip
         self.state_mode = state_mode
@@ -271,15 +296,8 @@ class EvSpSegNetStream(nn.Module):
         return (1.0 - spikes.detach()) * torch.clamp(
             driving_current / self.v_threshold, min=-1.0, max=1.0)
 
-    def _vertical_residual(self, residual):
-        """纵向编码：原连续残差，或局部竞争后的稀疏双极脉冲。
-
-        competitive 模式只保留超过逐通道可学习阈值、且为同通道局部幅值峰值的位置。
-        输出为 {-g_c, 0, +g_c}，g_c 有界且零初始化；g_c 可折叠进 enc2 卷积核，
-        因而在事件驱动实现中仍可按稀疏加/减累加，而不要求整幅连续 MAC。
-        """
-        if self.subthreshold_vertical_mode == "graded":
-            return residual
+    def _competitive_residual_code(self, residual):
+        """把当前观测残差编码为 {-1,0,+1} 稀疏码，供纵向与选择性横向路径共享。"""
         original_shape = residual.shape
         if residual.dim() == 5:
             residual = residual.reshape((-1,) + tuple(residual.shape[2:]))
@@ -294,21 +312,39 @@ class EvSpSegNetStream(nn.Module):
             local_max = F.max_pool2d(magnitude.detach(), self.residual_vertical_peak_kernel,
                                      stride=1, padding=pad)
             selected = selected * magnitude.detach().ge(local_max).to(residual.dtype)
+        return (residual.sign() * selected).reshape(original_shape)
+
+    def _vertical_residual(self, residual):
+        """纵向编码：原连续残差，或局部竞争后的稀疏双极脉冲。
+
+        competitive 模式只保留超过逐通道可学习阈值、且为同通道局部幅值峰值的位置。
+        输出为 {-g_c, 0, +g_c}，g_c 有界且零初始化；g_c 可折叠进 enc2 卷积核，
+        因而在事件驱动实现中仍可按稀疏加/减累加，而不要求整幅连续 MAC。
+        """
+        if self.subthreshold_vertical_mode == "graded":
+            return residual
+        code = self._competitive_residual_code(residual)
         scale = (self.residual_vertical_scale_max
-                 * torch.tanh(self.residual_vertical_scale_raw).to(residual.dtype)).view(1, -1, 1, 1)
-        signal = residual.sign() * selected * scale
-        return signal.reshape(original_shape)
+                 * torch.tanh(self.residual_vertical_scale_raw).to(residual.dtype))
+        scale = scale.view((1, 1, -1, 1, 1) if residual.dim() == 5 else (1, -1, 1, 1))
+        return code * scale
 
     def subthreshold_parameter_values(self):
-        """返回可学习纵向竞争参数；只供诊断，不参与前向。"""
-        if not (self.subthreshold_vertical and self.subthreshold_vertical_mode == "competitive"):
-            return {}
-        fraction = torch.sigmoid(self.residual_vertical_threshold_raw)
-        threshold = (self.residual_vertical_threshold_min
-                     + (self.residual_vertical_threshold_max
-                        - self.residual_vertical_threshold_min) * fraction)
-        scale = self.residual_vertical_scale_max * torch.tanh(self.residual_vertical_scale_raw)
-        return {"threshold": threshold, "scale": scale}
+        """返回竞争式纵向及选择性横向阈值；只供诊断，不参与前向。"""
+        result = {}
+        if self.subthreshold_vertical and self.subthreshold_vertical_mode == "competitive":
+            fraction = torch.sigmoid(self.residual_vertical_threshold_raw)
+            result["threshold"] = (self.residual_vertical_threshold_min
+                                   + (self.residual_vertical_threshold_max
+                                      - self.residual_vertical_threshold_min) * fraction)
+            result["scale"] = (self.residual_vertical_scale_max
+                               * torch.tanh(self.residual_vertical_scale_raw))
+        if self.subthreshold_event_skip and self.subthreshold_event_skip_mode == "selective":
+            fraction = torch.sigmoid(self.residual_event_threshold_raw)
+            result["event_threshold"] = (self.residual_event_threshold_min
+                                         + (self.residual_event_threshold_max
+                                            - self.residual_event_threshold_min) * fraction)
+        return result
 
     def _event_features(self, u_pre, residual, deep_current, events):
         """读取逐事件 dec1 特征，并在配置开启时加入受深层局部活动约束的瞬时浅层修正。"""
@@ -330,12 +366,30 @@ class EvSpSegNetStream(nn.Module):
         gate_map = d_map.detach()
         local_deep = F.avg_pool2d(gate_map, self.residual_local_kernel, stride=1, padding=pad)
         activity = gate_map.abs().sum(1, keepdim=True)
-        support = F.max_pool2d(activity, self.residual_local_kernel, stride=1, padding=pad).gt(0).detach()
+        if self.subthreshold_event_skip_mode == "selective":
+            # 深层活动必须接近本地峰值；比值归一化避免固定阈值受卷积幅值尺度支配。
+            local_max = F.max_pool2d(activity, self.residual_local_kernel, stride=1, padding=pad)
+            ratio = activity / (local_max + torch.finfo(activity.dtype).eps)
+            fraction = torch.sigmoid(self.residual_event_threshold_raw).to(activity.dtype)
+            threshold = (self.residual_event_threshold_min
+                         + (self.residual_event_threshold_max
+                            - self.residual_event_threshold_min) * fraction)
+            deep_support = (SurrogateSpike.apply(ratio - threshold)
+                            * activity.gt(0).to(activity.dtype))
+            # 横向只读取与纵向相同的竞争式浅层峰值，不再读取所有连续残差。
+            r_map = self._competitive_residual_code(r_map)
+            shallow_support = r_map.detach().abs().sum(1, keepdim=True).gt(0).to(activity.dtype)
+            support = deep_support * shallow_support
+        else:
+            support = F.max_pool2d(activity, self.residual_local_kernel,
+                                   stride=1, padding=pad).gt(0).detach()
         deep_event = local_deep[flat_index, :, events["y"], events["x"]]
         support_event = support[flat_index, 0, events["y"], events["x"]].to(feat.dtype)
         gate = support_event * torch.sigmoid(self.residual_gate(deep_event)).squeeze(1)
         residual_event = r_map[flat_index, :, events["y"], events["x"]]
         correction = self.residual_project(residual_event * gate.unsqueeze(1))
+        if self.subthreshold_event_skip_mode == "selective":
+            correction = self.residual_event_correction_max * torch.tanh(correction)
         return feat + correction, gate, correction
 
     def set_memory_read_enabled(self, enabled, layers=None):
@@ -695,6 +749,11 @@ def estimate_operations(net, height, width, firing_rates, events_per_window, inp
         competitive_parameters = (2 * net.enc1.out_ch
                                   if (net.subthreshold_vertical
                                       and net.subthreshold_vertical_mode == "competitive") else 0)
+        event_parameters = (((net.enc1.out_ch + 1) + net.enc1.out_ch ** 2)
+                            if net.subthreshold_event_skip else 0)
+        if (net.subthreshold_event_skip
+                and net.subthreshold_event_skip_mode == "selective"):
+            event_parameters += 1
         result["subthreshold_residual"] = {
             "vertical": bool(net.subthreshold_vertical),
             "event_skip": bool(net.subthreshold_event_skip),
@@ -702,13 +761,13 @@ def estimate_operations(net, height, width, firing_rates, events_per_window, inp
             "event_skip_enabled": bool(net.subthreshold_event_skip_enabled),
             "vertical_mode": net.subthreshold_vertical_mode,
             "vertical_peak_kernel": int(net.residual_vertical_peak_kernel),
+            "event_skip_mode": net.subthreshold_event_skip_mode,
+            "event_correction_max": float(net.residual_event_correction_max),
             "local_kernel": int(net.residual_local_kernel),
-            "parameters": competitive_parameters + (((net.enc1.out_ch + 1)
-                                                       + net.enc1.out_ch ** 2)
-                                                      if net.subthreshold_event_skip else 0),
+            "parameters": competitive_parameters + event_parameters,
             "note": ("graded vertical 使 enc2 按连续输入 MAC 计；competitive vertical 的逐通道"
                      "幅度可折叠进卷积核，按实测稀疏双极码密度计 SOP；event_skip 只在事件坐标"
-                     "计线性层。池化、比较、clamp、门控和访存未折算。")}
+                      "计线性层。selective 横向的池化、比较、clamp、tanh、门控和访存未折算。")}
     if input_density is not None:
         enc1 = layers[0]
         result["input_density"] = float(input_density)

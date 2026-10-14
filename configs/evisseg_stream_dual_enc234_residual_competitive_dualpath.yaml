@@ -1,0 +1,79 @@
+# enc234 双仓 + 竞争式纵向 + 原事件级横向修正，用于检验两路协同。
+# 50 ms 块因果；每窗一次 LIF 更新；5 个时间 bin 是输入通道，不是 SNN 时间步。
+DATA:
+  root: /media/stephen/nvme0n1/wy_data/datasets/EV-UAV-dataset
+  stats_path: configs/stream_v1_train_stats.json   # 由 tools/stream_train_stats.py 生成
+  window_ms: 50
+  n_windows: 160
+  time_bins: 5
+  height: 260
+  width_px: 346
+  pad_height: 264          # 3 次 stride=2 下采样，对齐到 8 的倍数；只补右侧和下侧
+  pad_width: 352
+  input_clip: 3.0          # X = clip(log1p(C)/q99, 0, 3)
+
+NET:
+  channels: [12, 24, 48, 48]   # 约 0.10M 参数，不与原 4.0M 模型对齐
+  dual_memory:
+    layers: [enc2, enc3, enc4]
+    tau_init_ms: 300.0
+    tau_min_ms: 50.0
+    tau_max_ms: 1000.0
+    kappa_max: 0.5             # kappa = 0.5*tanh(raw)，raw 零初始化
+  subthreshold_residual:
+    vertical: true             # enc2 输入 S1 + Z1；Z1 是当前窗口的稀疏双极残差脉冲
+    event_skip: true           # 与第一轮相同的横向事件修正
+    event_skip_mode: legacy    # 深层非零支持 + 可学习门；用于机制组合对照
+    vertical_mode: competitive
+    vertical_peak_kernel: 3    # 每通道 3x3 局部竞争，只保留幅值峰值
+    vertical_threshold_min: 0.2
+    vertical_threshold_init: 0.5
+    vertical_threshold_max: 0.9
+    vertical_scale_max: 0.5    # g=0.5*tanh(raw)，raw 零初始化，初始严格等同 enc234
+    local_kernel: 3
+  neuron: lif                  # lif 有状态+脉冲 | graded 有状态+实数 | relu 无状态+实数（后两者用于对照）
+  state_mode: carry            # carry | reset_each_window（等价 beta=0）
+  norm: none                   # none | groupnorm_noshift（备选）
+  v_threshold: 1.0
+  tau_init_ms: 200.0           # beta0 = exp(-50/200) ≈ 0.779
+  tau_min_ms: 50.0
+  tau_max_ms: 2000.0
+  readout_hidden: 32
+
+CALIB:
+  calib_sequences: 8           # 固定种子选出的训练序列
+  calib_windows: 32            # 每个序列取前 32 个连续窗口，带状态前向
+  calib_samples_per_channel: 2048
+  calib_min_positive: 1024     # 正电流样本不足时回退整层分位数
+  calib_quantile: 0.99
+  calib_gain_min: 0.05
+  calib_gain_max: 20.0
+
+TRAIN:
+  seed: 37
+  epochs: 50
+  lr: 0.001
+  lr_end: 0.0001               # 按 epoch 线性衰减
+  tbptt_k: 16
+  optimizer_step: per_sequence # per_sequence（默认）| per_chunk（欠拟合时的回退预案）
+  grad_clip: 1.0
+  pos_weight_cap: 30.0         # pos_weight = min(train_neg/train_pos, 30)
+  train_subset_size: 24        # 训练子集评估，用于区分欠拟合与泛化问题
+  num_workers: 2
+  # 训练加速：默认走加速路径（每轮 545 -> 73 s）。与原实现数学等价，已在 float64 下核对，
+  # 见 tools/check_stream_execution.py。要复现 09-16 那批原实现的数字，加 --execution step --input-device cpu。
+  # --mode eval 始终用 step + cpu，不受这里影响：论文指标与逐窗延迟都来自原实现。
+  execution: layer             # step 逐窗（原实现）| layer 片段内逐层时间并行
+  input_device: gpu            # cpu numpy 逐窗构造（原实现）| gpu 事件常驻显存按片段构造（输入逐位相同）
+  train_subset_every: 5        # 训练子集每几轮评估一次（只用于诊断；验证集始终每轮评估、选模型）
+  eval_chunk: 32               # layer 模式每轮验证时一次处理的窗口数
+  deterministic: true
+  save_root: log/stream_dual_enc234_residual_competitive_dualpath_seed37
+
+EVAL:
+  threshold: 0.9               # 与基线一致
+  pd_detT: 50
+  correct_thresh: 0.0001
+  rolling_window: 10
+  segments: [[0, 15], [64, 79], [144, 159]]
+  timing_warmup_windows: 20

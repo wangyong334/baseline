@@ -138,6 +138,56 @@ class ResidualExecutionTests(unittest.TestCase):
         self.assertEqual(out["missing_grads"], [])
         self.assertGreater(out["grad_norms"]["residual_vertical_scale_raw"], 0.0)
 
+    def test_selective_dualpath_starts_as_exact_baseline(self):
+        selective = make_net(vertical=True, event_skip=True,
+                             residual_extra={"vertical_mode": "competitive",
+                                             "event_skip_mode": "selective"})
+        baseline = make_net(vertical=False, event_skip=False)
+        x = torch.randn(1, 12, H, W, dtype=torch.float64)
+        with torch.no_grad():
+            a, sa, info = selective(x, events(4), None, collect=True)
+            b, sb, _ = baseline(x, events(4), None)
+        self.assertTrue(torch.equal(a, b))
+        self.assertEqual(float(info["subthreshold_vertical_signal"].abs().sum()), 0.0)
+        self.assertEqual(float(info["event_residual_correction"].abs().sum()), 0.0)
+        for left, right in zip(state_tensors(sa), state_tensors(sb)):
+            self.assertTrue(torch.equal(left, right))
+
+    def test_selective_horizontal_is_sparse_and_bounded(self):
+        model = make_net(vertical=True, event_skip=True,
+                         residual_extra={"vertical_mode": "competitive",
+                                         "event_skip_mode": "selective",
+                                         "event_correction_max": 0.25})
+        with torch.no_grad():
+            model.residual_project.weight.copy_(10.0 * torch.eye(SMALL[0], dtype=torch.float64))
+        u = torch.zeros(1, SMALL[0], H, W, dtype=torch.float64)
+        residual = torch.zeros_like(u)
+        residual[0, 0, 3, 4] = 0.9
+        residual[0, 0, 3, 5] = 0.8  # 超阈但不是局部峰值
+        deep = torch.zeros_like(u)
+        deep[0, :, 3, 4] = 1.0
+        deep[0, :, 3, 5] = 0.9
+        ev = events(2)
+        ev["x"] = torch.tensor([4, 5], dtype=torch.long)
+        _, gate, correction = model._event_features(u, residual, deep, ev)
+        self.assertGreater(float(gate[0].detach()), 0.0)
+        self.assertEqual(float(gate[1].detach()), 0.0)
+        self.assertGreater(float(correction[0].detach().abs().sum()), 0.0)
+        self.assertEqual(float(correction[1].detach().abs().sum()), 0.0)
+        self.assertLessEqual(float(correction.detach().abs().max()), 0.25)
+
+    def test_selective_dualpath_parameters_are_connected(self):
+        model = make_net(vertical=True, event_skip=True,
+                         residual_extra={"vertical_mode": "competitive",
+                                         "event_skip_mode": "selective"})
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        out = T.train_sequence(model, synthetic_sequence(seed=29), optimizer,
+                               dict(CFG, execution="layer", input_device="gpu"),
+                               Q99, 3.0, torch.device("cpu"), np.random.RandomState(8))
+        self.assertEqual(out["missing_grads"], [])
+        self.assertIn("residual_event_threshold_raw", out["grad_norms"])
+        self.assertGreater(out["grad_norms"]["residual_project"], 0.0)
+
     def test_training_updates_new_projection_and_all_parameters_are_connected(self):
         model = make_net(vertical=True, event_skip=True)
         before = model.residual_project.weight.detach().clone()
@@ -152,9 +202,11 @@ class ResidualExecutionTests(unittest.TestCase):
     def test_step_and_layer_match_forward_states_logits_and_gradients(self):
         source = TorchWindowSource(synthetic_sequence(seed=13), CFG, Q99, torch.device("cpu"), torch.float64)
         step = make_net(vertical=True, event_skip=True,
-                        residual_extra={"vertical_mode": "competitive"})
+                        residual_extra={"vertical_mode": "competitive",
+                                        "event_skip_mode": "selective"})
         with torch.no_grad():
             step.residual_vertical_scale_raw.fill_(0.4)
+            step.residual_project.weight.copy_(0.1 * torch.eye(SMALL[0], dtype=torch.float64))
         layer = copy.deepcopy(step)
         xs, event_parts = [], []
         step_logits, state_step = [], None
@@ -189,18 +241,24 @@ class ResidualExecutionTests(unittest.TestCase):
         hybrid = make_net(vertical=True, event_skip=True)
         competitive = make_net(vertical=True, event_skip=False,
                                residual_extra={"vertical_mode": "competitive"})
+        selective = make_net(vertical=True, event_skip=True,
+                             residual_extra={"vertical_mode": "competitive",
+                                             "event_skip_mode": "selective"})
         self.assertEqual(count_parameters(vertical)["total"], count_parameters(base)["total"])
         expected_parameters = SMALL[0] + 1 + SMALL[0] ** 2
         self.assertEqual(count_parameters(hybrid)["total"] - count_parameters(base)["total"],
                          expected_parameters)
         self.assertEqual(count_parameters(competitive)["total"] - count_parameters(base)["total"],
                          2 * SMALL[0])
+        self.assertEqual(count_parameters(selective)["total"] - count_parameters(base)["total"],
+                         2 * SMALL[0] + expected_parameters + 1)
         rates = dict.fromkeys(LAYER_NAMES, 0.1)
         rates["subthreshold_vertical"] = 0.02
         base_ops = estimate_operations(base, H, W, rates, 5)
         vertical_ops = estimate_operations(vertical, H, W, rates, 5)
         hybrid_ops = estimate_operations(hybrid, H, W, rates, 5)
         competitive_ops = estimate_operations(competitive, H, W, rates, 5)
+        selective_ops = estimate_operations(selective, H, W, rates, 5)
         base_enc2 = next(row for row in base_ops["per_layer"] if row["layer"] == "enc2")
         vertical_enc2 = next(row for row in vertical_ops["per_layer"] if row["layer"] == "enc2")
         self.assertEqual(base_enc2["mac"], 0.0)
@@ -211,6 +269,9 @@ class ResidualExecutionTests(unittest.TestCase):
         self.assertAlmostEqual(competitive_enc2["sop"], 0.12 * competitive_enc2["dense"])
         self.assertEqual(competitive_ops["subthreshold_residual"]["parameters"], 2 * SMALL[0])
         self.assertEqual(hybrid_ops["subthreshold_residual"]["parameters"], expected_parameters)
+        self.assertEqual(selective_ops["subthreshold_residual"]["parameters"],
+                         2 * SMALL[0] + expected_parameters + 1)
+        self.assertEqual(selective_ops["subthreshold_residual"]["event_skip_mode"], "selective")
         self.assertTrue(any(row["layer"] == "event_residual_skip" for row in hybrid_ops["per_layer"]))
         hybrid.set_subthreshold_ablation("all_off")
         ablated_ops = estimate_operations(hybrid, H, W, rates, 5)
