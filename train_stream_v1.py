@@ -33,19 +33,21 @@ import torch.nn.functional as F  # noqa: E402
 
 from dataset.ev_uav_stream import EvUAVStream, make_sequence_loader, window_to_device  # noqa: E402
 from dataset.stream_source import INPUT_DEVICES, make_window_source  # noqa: E402
-from dataset.stream_windows import refill_by_index  # noqa: E402
+from dataset.stream_windows import num_input_channels, refill_by_index  # noqa: E402
 from model.evspsegnet_stream import (LAYER_NAMES, EvSpSegNetStream, calibrate_gains,  # noqa: E402
                                      count_parameters, estimate_operations)
 from model.lif2d_stream import StreamingLIF2d, StreamingDualMemoryLIF2d, detach_states  # noqa: E402
 from utils.stream_common import (health_warnings, linear_epoch_lr, load_flat_config,  # noqa: E402
                                  make_chunks, select_subset, subset_due, summarize_history)
-from utils.stream_metrics import (first_detection_latencies, iou_from_counts, rolling_iou,  # noqa: E402
-                                  segment_iou, summarize_latencies, window_confusion)
+from utils.stream_metrics import (SWEEP_THRESHOLDS, first_detection_latencies, iou_from_counts,  # noqa: E402
+                                  rolling_iou, segment_iou, summarize_latencies, sweep_summary,
+                                  threshold_counts, window_confusion)
 
 SOURCE_FILES = ("train_stream_v1.py", "dataset/stream_windows.py", "dataset/ev_uav_stream.py",
                 "dataset/stream_source.py", "model/lif2d_stream.py", "model/evspsegnet_stream.py",
                 "utils/stream_common.py", "utils/stream_metrics.py", "utils/eval.py")
 EXECUTIONS = ("step", "layer")
+TRAINERS = ("sequence", "streams")
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +89,10 @@ def parse_args():
                         help="窗口输入在哪里构造：cpu（原实现）| gpu（网络所在设备）")
     parser.add_argument("--train-subset-every", type=int, default=None, help="每隔几轮评估一次训练子集")
     parser.add_argument("--tbptt-k", type=int, default=None, help="覆盖 YAML 中的 TBPTT 片段长度（窗口数）")
+    parser.add_argument("--trainer", choices=TRAINERS, default=None,
+                        help="sequence：原实现（每条序列一次更新）| streams：标准有状态 TBPTT（B 条并行流，每 n 个片段一次更新）")
+    parser.add_argument("--streams", type=int, default=None, help="trainer=streams 的并行流数 B")
+    parser.add_argument("--accumulate", type=int, default=None, help="trainer=streams 每几个片段更新一次参数（n）")
     parser.add_argument("--device", default="cuda:0")
     return parser.parse_args()
 
@@ -125,6 +131,18 @@ def build_config(args):
         if args.tbptt_k < 1:
             raise ValueError("--tbptt-k 必须 >= 1")
         cfg["tbptt_k"] = args.tbptt_k
+    for key in ("trainer", "streams", "accumulate"):
+        if getattr(args, key, None) is not None:
+            cfg[key] = getattr(args, key)
+    cfg.setdefault("trainer", "sequence")
+    cfg.setdefault("streams", 4)
+    cfg.setdefault("accumulate", 1)
+    if cfg["trainer"] not in TRAINERS:
+        raise ValueError("trainer 必须是 %s 之一" % (TRAINERS,))
+    if int(cfg["streams"]) < 1 or int(cfg["accumulate"]) < 1:
+        raise ValueError("streams 与 accumulate 必须 >= 1")
+    if cfg["trainer"] == "streams" and cfg.get("execution", "step") != "layer":
+        raise ValueError("trainer=streams 需要 execution=layer")
     speed_options(cfg)
     if getattr(args, "memory_ablation", "none") != "none" and args.mode != "eval":
         raise ValueError("--memory-ablation 仅用于 eval；训练结构由 YAML 的 dual_memory 决定")
@@ -464,6 +482,24 @@ def gradient_group_norms(net):
     return {k: math.sqrt(v) for k, v in squares.items()}
 
 
+def clip_statistics(total_norms, clipped_steps, clip):
+    """汇总一轮内每次更新裁剪前的总梯度范数。
+
+    effective_scale = min(1, clip/|g|) 是裁剪后实际施加的缩放：它越小，同一学习率下的实际步长越小。
+    用于检验"k 越大 -> 时间方向梯度越大 -> 裁剪越多 -> 有效学习率越低"这一解释。
+    """
+    if not total_norms:
+        nan = float("nan")
+        return {"steps": 0, "total_norm_mean": nan, "total_norm_median": nan, "total_norm_p90": nan,
+                "total_norm_max": nan, "clip_frac": 0.0, "effective_scale_mean": nan}
+    arr = np.asarray(total_norms, dtype=np.float64)
+    scale = np.minimum(1.0, float(clip) / np.maximum(arr, 1e-12))
+    return {"steps": int(arr.size), "total_norm_mean": float(arr.mean()),
+            "total_norm_median": float(np.median(arr)), "total_norm_p90": float(np.percentile(arr, 90)),
+            "total_norm_max": float(arr.max()), "clip_frac": float(clipped_steps) / arr.size,
+            "effective_scale_mean": float(scale.mean())}
+
+
 class WindowTimer(object):
     """记录每个窗口的预处理、网络、后处理耗时（毫秒），跳过前 warmup 个窗口；计时前后均做 CUDA 同步。"""
 
@@ -507,7 +543,8 @@ class WindowTimer(object):
 # ---------------------------------------------------------------------------
 
 
-def train_sequence(net, seq, optimizer, cfg, q99, pos_weight, device, rng, max_windows=None):
+def train_sequence(net, seq, optimizer, cfg, q99, pos_weight, device, rng, max_windows=None,
+                   first_len=None):
     """用一个 8 秒序列训练（stateful TBPTT）。
 
     流程：随机第一段长度（1..K）切片段；每段前向 K 个窗口后立即反向并释放计算图，
@@ -517,30 +554,41 @@ def train_sequence(net, seq, optimizer, cfg, q99, pos_weight, device, rng, max_w
     空窗口照常前向（使状态衰减），只是不产生损失；没有事件的片段不调用 backward。
     execution=layer 时每个片段调用一次 forward_chunk，片段损失是片段内全部事件的求和，与逐窗求和相同。
     max_windows 仅供冒烟测试截断使用。
-    返回: {"loss_sum", "events", "grad_norms", "missing_grads", "steps"}
+    first_len 给定时第一段长度固定为它（不消耗 rng），供梯度探针对齐片段边界。
+    optimizer=None 时只累加梯度、不裁剪不更新，梯度留在 p.grad 里（梯度探针用，须配合 per_sequence）。
+    返回: {"loss_sum", "events", "grad_norms", "missing_grads", "steps",
+           "grad_total_norms"（每次更新裁剪前的总范数）, "clipped_steps"（总范数超过 grad_clip 的次数）}
     """
     k = int(cfg["tbptt_k"])
     execution, _ = speed_options(cfg)
     n_windows = seq.n_windows if max_windows is None else min(int(max_windows), seq.n_windows)
-    chunks = make_chunks(n_windows, k, int(rng.randint(1, k + 1)))
+    first = int(rng.randint(1, k + 1)) if first_len is None else int(first_len)
+    chunks = make_chunks(n_windows, k, first)
     per_sequence = cfg["optimizer_step"] == "per_sequence"
     if cfg["optimizer_step"] not in ("per_sequence", "per_chunk"):
         raise ValueError("optimizer_step 必须是 per_sequence 或 per_chunk")
+    if optimizer is None and not per_sequence:
+        raise ValueError("optimizer=None（只算梯度）只支持 per_sequence")
     total_events = int(seq.bounds[n_windows] - seq.bounds[0])
     dtype = next(net.parameters()).dtype
     source = make_window_source(seq, cfg, q99, device, dtype)
     weight = torch.tensor([pos_weight], dtype=dtype, device=device)
     loss_sum, steps, grad_norms, missing = 0.0, 0, {}, []
+    total_norms = []
 
     def step():
-        """记录裁剪前的分组梯度范数与缺失梯度的参数名，然后裁剪并更新一次参数。"""
+        """记录裁剪前的分组梯度范数、总范数与缺失梯度的参数名，然后裁剪并更新一次参数。"""
         norms = gradient_group_norms(net)
         lost = [name for name, p in net.named_parameters() if p.requires_grad and p.grad is None]
-        torch.nn.utils.clip_grad_norm_(net.parameters(), float(cfg["grad_clip"]))
+        if optimizer is None:
+            return norms, lost
+        total = float(torch.nn.utils.clip_grad_norm_(net.parameters(), float(cfg["grad_clip"])))
+        total_norms.append(total)
         optimizer.step()
         return norms, lost
 
-    optimizer.zero_grad(set_to_none=True)
+    if optimizer is not None:
+        optimizer.zero_grad(set_to_none=True)
     states = None
     for start, end in chunks:
         if not per_sequence:
@@ -576,8 +624,172 @@ def train_sequence(net, seq, optimizer, cfg, q99, pos_weight, device, rng, max_w
     if per_sequence and total_events > 0:
         grad_norms, missing = step()
         steps = 1
+    clip = float(cfg["grad_clip"])
+    clipped = sum(1 for v in total_norms if v > clip)
     return {"loss_sum": loss_sum, "events": total_events, "grad_norms": grad_norms,
-            "missing_grads": missing, "steps": steps}
+            "missing_grads": missing, "steps": steps,
+            "grad_total_norms": total_norms, "clipped_steps": clipped}
+
+
+# ---------------------------------------------------------------------------
+# 标准有状态 TBPTT：B 条并行流（trainer=streams）
+# ---------------------------------------------------------------------------
+
+
+def plan_streams(lengths, n_streams, k, rng):
+    """把训练录像分配给 B 条并行流。
+
+    lengths[i] 为数据集第 i 条录像的窗数。按 rng 打乱录像顺序后，依次放进当前总窗数最少的流（各流总长接近，
+    一轮末尾空转少；EV-Flying 录像长短差很多时尤其重要）。每条流开头随机延迟 0..k-1 个空窗，
+    相当于随机片段相位：片段边界不会总落在录像内的同一位置。只打乱录像，录像内部的窗顺序不变。
+    返回: [(delay, [(index, n_windows), ...]), ...]，共 n_streams 条。
+    """
+    order = rng.permutation(len(lengths))
+    streams, totals = [[] for _ in range(int(n_streams))], [0] * int(n_streams)
+    for i in order:
+        s = int(np.argmin(totals))
+        streams[s].append((int(i), int(lengths[i])))
+        totals[s] += int(lengths[i])
+    return [(int(rng.randint(0, int(k))), items) for items in streams]
+
+
+def stream_total_windows(plan):
+    """各流时间轴长度（含开头延迟）的最大值，即一轮需要的窗数。"""
+    return max(delay + sum(n for _, n in items) for delay, items in plan)
+
+
+def stream_pieces(plan, chunk_start, chunk_end):
+    """流时间轴上窗 [chunk_start, chunk_end) 这一片段内，每条流由哪些录像的哪些窗组成。
+
+    返回: 每条流一个列表 [(index, a, b, offset, new_start)]：录像 index 的第 a..b-1 窗放在片段内第 offset 窗起；
+          new_start=True 表示该录像从这一窗开始（该流状态在此清零）。没有录像的位置是空窗（零输入、无事件）。
+    """
+    out = []
+    for delay, items in plan:
+        pieces, start = [], delay
+        for index, n in items:
+            if start >= chunk_end:
+                break
+            end = start + n
+            if end > chunk_start:
+                lo, hi = max(chunk_start, start), min(chunk_end, end)
+                pieces.append((index, lo - start, hi - start, lo - chunk_start, lo == start))
+            start = end
+        out.append(pieces)
+    return out
+
+
+class StreamSources(object):
+    """多流训练按需读取录像并构造窗口数据来源；录像的最后一窗用完即释放。"""
+
+    def __init__(self, dataset, cfg, q99, device, dtype):
+        self.dataset, self.cfg, self.q99, self.device, self.dtype = dataset, cfg, q99, device, dtype
+        self.sources, self.bounds = {}, {}
+
+    def get(self, index):
+        if index not in self.sources:
+            seq = self.dataset[index]
+            self.sources[index] = make_window_source(seq, self.cfg, self.q99, self.device, self.dtype)
+            self.bounds[index] = seq.bounds
+        return self.sources[index]
+
+    def events(self, index, lo, hi):
+        """录像 index 第 lo..hi-1 窗的事件数（不经过网络，只读窗口边界）。"""
+        self.get(index)
+        return int(self.bounds[index][hi] - self.bounds[index][lo])
+
+    def release(self, index):
+        self.sources.pop(index, None)
+        self.bounds.pop(index, None)
+
+
+def assemble_streams(sources, pieces, steps, cfg, device, dtype):
+    """把各流的片段组成拼成一个批：x [T,B,C,H,W]、events（b = 流号，t = 片段内窗号）、labels [N]、keep [T,B]。"""
+    batch = len(pieces)
+    x = torch.zeros((steps, batch, num_input_channels(cfg["time_bins"]), int(cfg["pad_height"]),
+                     int(cfg["pad_width"])), dtype=dtype, device=device)
+    keep = torch.ones((steps, batch), dtype=dtype, device=device)
+    parts, labels = {key: [] for key in ("t", "b", "y", "x", "p", "t_local")}, []
+    for b, stream in enumerate(pieces):
+        for index, lo, hi, offset, new_start in stream:
+            xs, events, lab, _ = sources.get(index).chunk(lo, hi)
+            x[offset:offset + (hi - lo), b] = xs[:, 0]
+            if new_start:
+                keep[offset, b] = 0
+            parts["t"].append(events["t"] + int(offset))
+            parts["b"].append(torch.full_like(events["t"], b))
+            for key in ("y", "x", "p", "t_local"):
+                parts[key].append(events[key])
+            labels.append(lab)
+    if labels:
+        events = {key: torch.cat(value) for key, value in parts.items()}
+        labels = torch.cat(labels)
+    else:
+        long_empty = torch.zeros(0, dtype=torch.long, device=device)
+        float_empty = torch.zeros(0, dtype=dtype, device=device)
+        events = {"t": long_empty, "b": long_empty, "y": long_empty, "x": long_empty,
+                  "p": float_empty, "t_local": float_empty}
+        labels = float_empty
+    return x, events, labels, keep
+
+
+def train_streams(net, dataset, lengths, optimizer, cfg, q99, pos_weight, device, rng, max_chunks=None, plan=None):
+    """标准有状态 TBPTT（一轮）：B 条并行流一起前向 k 窗、反向 k 窗，每 n 个片段更新一次参数。
+
+    状态跨片段延续，片段边界 detach（只切梯度、保留数值）；某条流开始新录像时只清零该流状态（keep 掩码）。
+    损失按"一次更新"归一：一次更新包含的 n 个片段里全部事件的 BCE 之和 / 这 n 个片段的总事件数
+    （与梯度累加的常规做法相同；事件数只读窗口边界、不经过网络，所以可以在反传前算好）。
+    因此 n=1 即逐片段更新（原 per_chunk），B=1 且 n = 录像窗数 / k 时即原 per_sequence。没有事件的片段不反传。
+    推理不受影响，仍是整段连续。max_chunks 只供冒烟和计时截断；plan 只供测试指定分配。
+    返回字段与 train_sequence 相同（steps = 参数更新次数，grad_norms 为各次更新的平均），另有 chunks。
+    """
+    k, n_streams, accumulate = int(cfg["tbptt_k"]), int(cfg["streams"]), int(cfg["accumulate"])
+    if speed_options(cfg)[0] != "layer":
+        raise ValueError("trainer=streams 需要 execution=layer（一次前向一个 [k,B] 片段）")
+    plan = plan_streams(lengths, n_streams, k, rng) if plan is None else plan
+    n_chunks = int(math.ceil(stream_total_windows(plan) / float(k)))
+    if max_chunks is not None:
+        n_chunks = min(n_chunks, int(max_chunks))
+    dtype = next(net.parameters()).dtype
+    sources = StreamSources(dataset, cfg, q99, device, dtype)
+    weight = torch.tensor([pos_weight], dtype=dtype, device=device)
+    clip = float(cfg["grad_clip"])
+    loss_sum, events_total, updates, grad_acc, total_norms, missing = 0.0, 0, 0, {}, [], []
+    states = None
+    optimizer.zero_grad(set_to_none=True)
+    for first in range(0, n_chunks, accumulate):
+        block = [stream_pieces(plan, c * k, (c + 1) * k) for c in range(first, min(first + accumulate, n_chunks))]
+        block_events = sum(sources.events(index, lo, hi)
+                           for pieces in block for stream in pieces for index, lo, hi, _, _ in stream)
+        for offset, pieces in enumerate(block):
+            x, events, labels, keep = assemble_streams(sources, pieces, k, cfg, device, dtype)
+            logits, states, _ = net.forward_chunk(x, events, states, keep=keep)
+            if labels.numel():
+                chunk_loss = F.binary_cross_entropy_with_logits(logits, labels, pos_weight=weight, reduction="sum")
+                (chunk_loss / float(block_events)).backward()
+                value = float(chunk_loss.detach())
+                if not math.isfinite(value):
+                    raise RuntimeError("损失出现非有限值: 片段 %d" % (first + offset))
+                loss_sum += value
+                events_total += int(labels.numel())
+            states = detach_states(states)
+            for stream in pieces:
+                for index, lo, hi, _, _ in stream:
+                    if hi == lengths[index]:
+                        sources.release(index)
+        if block_events > 0:
+            norms = gradient_group_norms(net)
+            missing = [name for name, p in net.named_parameters() if p.requires_grad and p.grad is None]
+            total_norms.append(float(torch.nn.utils.clip_grad_norm_(net.parameters(), clip)))
+            optimizer.step()
+            for key, value in norms.items():
+                grad_acc[key] = grad_acc.get(key, 0.0) + value
+            updates += 1
+        optimizer.zero_grad(set_to_none=True)
+    return {"loss_sum": loss_sum, "events": events_total,
+            "grad_norms": {key: value / max(updates, 1) for key, value in grad_acc.items()},
+            "missing_grads": missing, "steps": updates, "chunks": n_chunks,
+            "grad_total_norms": total_norms, "clipped_steps": sum(1 for v in total_norms if v > clip)}
 
 
 def count_nonzero_input(stats, x):
@@ -672,6 +884,7 @@ def evaluate_split(net, cfg, q99, device, split, state_mode, names=None, full=Fa
     timer = WindowTimer(cfg["timing_warmup_windows"], device) if full else None
     input_stats = {"nonzero": 0, "elements": 0} if full else None
     confusion_sum = np.zeros((int(cfg["n_windows"]), 4), dtype=np.int64)
+    sweep = np.zeros((len(SWEEP_THRESHOLDS), 3), dtype=np.int64)
     kept, total_events = [], 0
     was_training = net.training
     net.eval()
@@ -681,6 +894,7 @@ def evaluate_split(net, cfg, q99, device, split, state_mode, names=None, full=Fa
             probs, confusion = run_sequence(net, seq, cfg, q99, device, state_mode, monitor, timer,
                                             input_stats)
             confusion_sum += confusion
+            sweep += threshold_counts(probs, seq.label)
             total_events += seq.n_events
             evaluator.matches[str(i)] = {"seg_pred": torch.from_numpy(probs),
                                          "seg_gt": torch.from_numpy(seq.label)}
@@ -700,7 +914,7 @@ def evaluate_split(net, cfg, q99, device, split, state_mode, names=None, full=Fa
     net.train(was_training)
     iou, acc = evaluator.evaluate_iou_and_accuracy(thresh=float(cfg["threshold"]))
     result = {"split": split, "state_mode": state_mode, "n_sequences": len(dataset),
-              "iou": float(iou), "acc": float(acc)}
+              "iou": float(iou), "acc": float(acc), "threshold_sweep": sweep_summary(sweep)}
     if monitor is not None:
         result["layers"] = monitor.summary()
         if monitor.residual_summary():
@@ -762,12 +976,20 @@ def mode_smoke(args, cfg):
     device, stats, q99, pos_weight, net, root = prepare_run(args, cfg)
     run_calibration(net, cfg, q99, device, root)
     optimizer = torch.optim.Adam(net.parameters(), lr=float(cfg["lr"]))
-    seq = EvUAVStream(cfg["root"], "train", cfg, [train_file_names(cfg)[0]])[0]
+    names = train_file_names(cfg)
+    seq = EvUAVStream(cfg["root"], "train", cfg, [names[0]])[0]
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     t0 = time.perf_counter()
-    out = train_sequence(net, seq, optimizer, cfg, q99, pos_weight, device,
-                         np.random.RandomState(int(cfg["seed"])), max_windows=32)
+    if cfg.get("trainer", "sequence") == "streams":
+        # B 条流各一条录像，跑 2 个片段（32 窗 / k=16），覆盖拼批、按流清零、更新
+        smoke_set = EvUAVStream(cfg["root"], "train", cfg, names[:max(int(cfg["streams"]), 1)])
+        lengths = [int(smoke_set[i].n_windows) for i in range(len(smoke_set))]
+        out = train_streams(net, smoke_set, lengths, optimizer, cfg, q99, pos_weight, device,
+                            np.random.RandomState(int(cfg["seed"])), max_chunks=max(1, 32 // int(cfg["tbptt_k"])))
+    else:
+        out = train_sequence(net, seq, optimizer, cfg, q99, pos_weight, device,
+                             np.random.RandomState(int(cfg["seed"])), max_windows=32)
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     elapsed = time.perf_counter() - t0
@@ -872,28 +1094,46 @@ def mode_train(args, cfg):
     subset = select_subset(train_file_names(cfg), int(cfg["train_subset_size"]), seed + 2000)
     train_set = EvUAVStream(cfg["root"], "train", cfg)
     execution, input_device = speed_options(cfg)
+    trainer = cfg.get("trainer", "sequence")
+    lengths = None
+    if trainer == "streams":
+        # 各录像窗数（分配并行流用）；读一遍训练集，此后每轮按需读取
+        lengths = [int(train_set[i].n_windows) for i in range(len(train_set))]
+        print("标准 TBPTT：%d 条并行流、k=%d、每 %d 个片段更新一次（每次更新 %d 窗）| 训练集 %d 条录像 %d 窗" % (
+            int(cfg["streams"]), int(cfg["tbptt_k"]), int(cfg["accumulate"]),
+            int(cfg["streams"]) * int(cfg["tbptt_k"]) * int(cfg["accumulate"]), len(lengths), sum(lengths)), flush=True)
     print("执行方式 %s | 输入构造 %s | 训练子集每 %d 轮评估 | 验证片段 %d 窗" % (
         execution, input_device, int(cfg.get("train_subset_every", 1)), int(cfg.get("eval_chunk", 32))), flush=True)
     for epoch in range(start_epoch, epochs):
         lr = linear_epoch_lr(epoch, epochs, float(cfg["lr"]), float(cfg["lr_end"]))
         for group in optimizer.param_groups:
             group["lr"] = lr
-        loader = make_sequence_loader(train_set, True, seed * 1000 + epoch, cfg["num_workers"])
         rng = np.random.RandomState(seed * 1000 + epoch + 7)
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
         t0 = time.perf_counter()
         net.train()
         loss_sum, event_sum, grad_acc, n_seq = 0.0, 0, {}, 0
-        for seq in loader:
-            out = train_sequence(net, seq, optimizer, cfg, q99, pos_weight, device, rng)
-            loss_sum += out["loss_sum"]
-            event_sum += out["events"]
-            for key, value in out["grad_norms"].items():
-                grad_acc[key] = grad_acc.get(key, 0.0) + value
-            n_seq += 1
+        total_norms, clipped_steps, updates = [], 0, 0
+        if trainer == "streams":
+            out = train_streams(net, train_set, lengths, optimizer, cfg, q99, pos_weight, device, rng)
+            loss_sum, event_sum, grad_acc, n_seq = out["loss_sum"], out["events"], out["grad_norms"], 1
+            total_norms, clipped_steps, updates = out["grad_total_norms"], out["clipped_steps"], out["steps"]
+        else:
+            loader = make_sequence_loader(train_set, True, seed * 1000 + epoch, cfg["num_workers"])
+            for seq in loader:
+                out = train_sequence(net, seq, optimizer, cfg, q99, pos_weight, device, rng)
+                loss_sum += out["loss_sum"]
+                event_sum += out["events"]
+                for key, value in out["grad_norms"].items():
+                    grad_acc[key] = grad_acc.get(key, 0.0) + value
+                total_norms += out["grad_total_norms"]
+                clipped_steps += out["clipped_steps"]
+                updates += out["steps"]
+                n_seq += 1
         train_seconds = time.perf_counter() - t0
         grad_mean = {k: v / max(n_seq, 1) for k, v in grad_acc.items()}
+        grad_clip_stats = clip_statistics(total_norms, clipped_steps, float(cfg["grad_clip"]))
         val = evaluate_split(net, cfg, q99, device, "val", cfg["state_mode"], collect_layers=True)
         sub = None
         if subset_due(epoch, epochs, int(cfg.get("train_subset_every", 1))):
@@ -905,6 +1145,10 @@ def mode_train(args, cfg):
                   "execution": execution, "input_device": input_device,
                   "train_seconds": train_seconds, "epoch_seconds": time.perf_counter() - t0,
                   "peak_memory_gib": peak_memory_gib(device), "grad_norms": grad_mean,
+                  "grad_clip_stats": grad_clip_stats, "tbptt_k": int(cfg["tbptt_k"]),
+                  "trainer": trainer, "streams": int(cfg.get("streams", 1)), "accumulate": int(cfg.get("accumulate", 1)),
+                  "updates": updates,
+                  "val_threshold_sweep": val["threshold_sweep"],
                   "layers": val["layers"], "tau": taus,
                   "subthreshold_diagnostics": val.get("subthreshold_diagnostics", {}),
                   "subthreshold_parameters": subthreshold_parameter_statistics(net),
@@ -916,9 +1160,13 @@ def mode_train(args, cfg):
             best = val["iou"]
             save_checkpoint(root / ("best_val_iou_seed%d.pt" % seed), net, optimizer, epoch, best, cfg, stats)
         save_checkpoint(root / "last.pt", net, optimizer, epoch, best, cfg, stats)
-        print("epoch %d lr %.2e loss/event %.5f val IoU %.4f ACC %.4f | train-subset IoU %s | %.0fs（训练 %.0fs）| 警告 %d" % (
-            epoch, lr, record["loss_per_event"], val["iou"], val["acc"], "%.4f" % sub["iou"] if sub else "-",
-            record["epoch_seconds"], train_seconds, len(record["warnings"])), flush=True)
+        print("epoch %d lr %.2e loss/event %.5f val IoU %.4f ACC %.4f | train-subset IoU %s | "
+              "更新 %d 次 |g| 中位 %.3f 裁剪 %.0f%% | %.0fs（训练 %.0fs）| 显存峰值 %.2f GiB | 警告 %d" % (
+                  epoch, lr, record["loss_per_event"], val["iou"], val["acc"],
+                  "%.4f" % sub["iou"] if sub else "-", updates,
+                  grad_clip_stats["total_norm_median"], 100.0 * grad_clip_stats["clip_frac"],
+                  record["epoch_seconds"], train_seconds, record["peak_memory_gib"] or 0.0,
+                  len(record["warnings"])), flush=True)
         for w in record["warnings"]:
             print("  [health]", w, flush=True)
     summary = summarize_history(history, seed)
@@ -979,6 +1227,7 @@ def mode_eval(args, cfg):
     if out_path.exists() and not args.overwrite:
         raise RuntimeError("结果已存在: %s（使用 --overwrite 覆盖）" % out_path)
     results = {"checkpoint": args.checkpoint, "epoch": ckpt["epoch"], "parameters": count_parameters(net),
+               "threshold": float(train_cfg["threshold"]), "tbptt_k": int(train_cfg["tbptt_k"]),
                "trained_state_mode": train_cfg["state_mode"], "neuron": train_cfg["neuron"],
                "readout_ablation": args.readout_ablation, "dual_memory": train_cfg.get("dual_memory"),
                "subthreshold_residual": train_cfg.get("subthreshold_residual"),

@@ -87,11 +87,13 @@ class StreamingLIF2d(nn.Module):
         new_state = u_pre - self.v_threshold * fired
         return output, new_state, u_pre
 
-    def forward_steps(self, current, state, carry=True, keep_u_pre=True):
+    def forward_steps(self, current, state, carry=True, keep_u_pre=True, keep=None):
         """按时间顺序处理一个片段的 T 个窗口，与连续调用 forward T 次数学等价（逐层时间并行训练用）。
 
         输入: current [T,B,C,H,W] 各窗口电流；state 片段开始前的膜电位 [B,C,H,W] 或 None；
-              carry=False 表示 reset_each_window，每一步都不使用上一状态。
+              carry=False 表示 reset_each_window，每一步都不使用上一状态；
+              keep [T,B]（可选）为 0 的位置表示该流在该窗开始一段新录像：先把旧状态乘 0 再递推。
+              零状态与"没有历史"（None）数值完全相同，梯度也在该处截断（多流训练用）。
         输出: (spikes [T,B,C,H,W], 最后一步软复位后的膜电位 [B,C,H,W], u_pre [T,B,C,H,W] 或 None)
         膜电位递推只在神经元内部逐像素进行，卷积已由调用者在 T*B 维上批量算完。
         """
@@ -101,7 +103,7 @@ class StreamingLIF2d(nn.Module):
         beta = self.beta().to(current.dtype).view(1, -1, 1, 1)
         spikes, u_pres = [], []
         for t in range(steps):
-            prev = state if carry else None
+            prev = mask_state(state if carry else None, keep, t)
             u_pre = current[t] if prev is None else beta * prev + current[t]
             output, fired = self.activate(u_pre)
             state = u_pre - self.v_threshold * fired
@@ -180,13 +182,15 @@ class StreamingDualMemoryLIF2d(StreamingLIF2d):
     def forward(self, current, state):
         return self._step(current, state, *self._coefficients(current))
 
-    def forward_steps(self, current, state, carry=True, keep_u_pre=True, collect_memory=False):
+    def forward_steps(self, current, state, carry=True, keep_u_pre=True, collect_memory=False, keep=None):
         if current.shape[0] == 0:
             raise ValueError("片段至少需要 1 个窗口")
         coefficients = self._coefficients(current)
         spikes, u_pres, memories = [], [], []
         for t in range(int(current.shape[0])):
-            output, state, u_pre = self._step(current[t], state if carry else None, *coefficients)
+            # (U, M) 同时乘 0 等价于 None：U_pre = I，M = (1-alpha) tanh(I/theta)
+            prev = mask_state(state if carry else None, keep, t)
+            output, state, u_pre = self._step(current[t], prev, *coefficients)
             spikes.append(output)
             if keep_u_pre:
                 u_pres.append(u_pre)
@@ -227,8 +231,8 @@ class ReLUNeuron(nn.Module):
     def forward(self, current, state):
         return torch.relu(current), None, current
 
-    def forward_steps(self, current, state, carry=True, keep_u_pre=True):
-        """多窗口版本 [T,B,C,H,W]；无状态，各窗口互不影响。"""
+    def forward_steps(self, current, state, carry=True, keep_u_pre=True, keep=None):
+        """多窗口版本 [T,B,C,H,W]；无状态，各窗口互不影响（keep 无作用）。"""
         return torch.relu(current), None, current
 
 
@@ -256,6 +260,19 @@ class ChannelGain(nn.Module):
 
     def forward(self, x):
         return x * self.gain().to(x.dtype).view(1, -1, 1, 1)
+
+
+def mask_state(state, keep, t):
+    """多流训练：第 t 窗按 keep[t]（形状 [B]）逐流保留或清零上一状态；keep 为 None 或状态为 None 时原样返回。
+
+    支持单个张量 [B,...] 与双仓的 (U, M)。乘 0 后的零状态与 None 数值相同，并在此截断梯度。
+    """
+    if state is None or keep is None:
+        return state
+    if isinstance(state, tuple):
+        return tuple(mask_state(s, keep, t) for s in state)
+    factor = keep[t].to(state.dtype).view((-1,) + (1,) * (state.dim() - 1))
+    return state * factor
 
 
 def detach_states(states):

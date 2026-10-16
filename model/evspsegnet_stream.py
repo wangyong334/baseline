@@ -87,19 +87,20 @@ class SpikingConvBlock(nn.Module):
         return result + (driving,) if return_driving_current else result
 
     def forward_steps(self, x, state, carry, keep_u_pre, extra_current=None, collect_memory=False,
-                      return_driving_current=False):
+                      return_driving_current=False, keep=None):
         """一个片段的多窗口版本：卷积在 T*B 维上批量计算，神经元再按时间递推。
 
-        输入: x [T,B,C_in,H,W]；extra_current 为已展平的 [T*B,C_out,H',W'] 或 None。
+        输入: x [T,B,C_in,H,W]；extra_current 为已展平的 [T*B,C_out,H',W'] 或 None；
+              keep [T,B] 或 None（多流训练中某条流在片段中途开始新录像时清零该流状态，见 mask_state）。
         输出: (spikes [T,B,...], 最后一步膜电位 [B,...], u_pre [T,B,...] 或 None)。不返回增益前电流（校准仍逐窗做）。
         """
         steps, batch = int(x.shape[0]), int(x.shape[1])
         current, _ = self._currents(x.reshape((steps * batch,) + tuple(x.shape[2:])), extra_current)
         current = current.view((steps, batch) + tuple(current.shape[1:]))
         if collect_memory and isinstance(self.neuron, StreamingDualMemoryLIF2d):
-            result = self.neuron.forward_steps(current, state, carry, keep_u_pre, collect_memory=True)
+            result = self.neuron.forward_steps(current, state, carry, keep_u_pre, collect_memory=True, keep=keep)
         else:
-            result = self.neuron.forward_steps(current, state, carry, keep_u_pre)
+            result = self.neuron.forward_steps(current, state, carry, keep_u_pre, keep=keep)
         return result + (current,) if return_driving_current else result
 
 
@@ -452,7 +453,7 @@ class EvSpSegNetStream(nn.Module):
                                   if name in self.dual_memory_layers}
         return logits, [n1, n2, n3, n4, n5, n6, n7], info
 
-    def forward_chunk(self, x, events, states, state_mode=None, collect=False):
+    def forward_chunk(self, x, events, states, state_mode=None, collect=False, keep=None):
         """逐层时间并行：一次处理一个片段的 T 个连续窗口，与按时间顺序调用 forward T 次数学等价。
 
         本网络层与层之间没有时间反馈，每层的输出序列只取决于它的输入序列，
@@ -461,6 +462,8 @@ class EvSpSegNetStream(nn.Module):
             x       [T,B,12,H,W]
             events  在 forward 的字段之外多一个 t（事件所在窗口在片段内的序号，long [N]）；b 为序列在 batch 内的序号
             states  片段开始前的 7 个膜电位 [B,C,H,W]，或 None
+            keep    [T,B] 或 None：多流训练时，keep[t,b]=0 表示第 b 条流在第 t 窗开始一段新录像，
+                    所有层在该窗递推前把这条流的状态清零（等价于该流从 None 重新开始，梯度在此截断）
         输出: (logits [N]，顺序与 events 相同, 片段结束时的 7 个膜电位, info)
             collect=True 时 info 含每层 [T,B,C,H,W] 的 spikes 与 u_pre（不含增益前电流）。
         流式推理与增益校准仍使用 forward。
@@ -475,6 +478,8 @@ class EvSpSegNetStream(nn.Module):
             raise ValueError("forward_chunk 的输入应为 [T,B,C,H,W]，收到 %d 维" % x.dim())
         carry = mode == "carry"
         steps, batch = int(x.shape[0]), int(x.shape[1])
+        if keep is not None and tuple(keep.shape) != (steps, batch):
+            raise ValueError("keep 应为 [T,B]=(%d,%d)，收到 %s" % (steps, batch, tuple(keep.shape)))
 
         def flat(seq):
             return seq.reshape((steps * batch,) + tuple(seq.shape[2:]))
@@ -485,11 +490,11 @@ class EvSpSegNetStream(nn.Module):
         memories = {}
 
         def run_layer(name, inputs, extra_current=None, keep_u_pre=None, return_driving_current=False):
-            keep = collect if keep_u_pre is None else keep_u_pre
+            keep_flag = collect if keep_u_pre is None else keep_u_pre
             result = getattr(self, name).forward_steps(
-                inputs, prev[LAYER_NAMES.index(name)], carry, keep,
+                inputs, prev[LAYER_NAMES.index(name)], carry, keep_flag,
                 extra_current=extra_current, collect_memory=collect,
-                return_driving_current=return_driving_current)
+                return_driving_current=return_driving_current, keep=keep)
             if collect and name in self.dual_memory_layers:
                 memories[name] = result[3]
             return result[:3] + ((result[-1],) if return_driving_current else ())

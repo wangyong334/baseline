@@ -22,6 +22,42 @@ def window_confusion(pred_prob, label, threshold):
     return tp, fp, fn, int(np.count_nonzero(pos))
 
 
+SWEEP_THRESHOLDS = (0.3, 0.5, 0.6, 0.7, 0.8, 0.85, 0.9, 0.95)
+
+
+def threshold_counts(pred_prob, label, thresholds=SWEEP_THRESHOLDS):
+    """一次统计多个阈值下的事件级 TP/FP/FN（判定规则与 window_confusion 相同：prob >= 阈值）。
+
+    输出: int64 数组 [阈值个数, 3]，可在序列之间直接相加（全局拼接口径）。
+    """
+    pos = np.asarray(label) == 1
+    prob = np.asarray(pred_prob)
+    out = np.zeros((len(thresholds), 3), dtype=np.int64)
+    for i, thr in enumerate(thresholds):
+        pred = prob >= float(thr)
+        out[i] = (np.count_nonzero(pred & pos), np.count_nonzero(pred & ~pos), np.count_nonzero(~pred & pos))
+    return out
+
+
+def sweep_summary(counts, thresholds=SWEEP_THRESHOLDS):
+    """把累计的阈值扫描计数换算成每个阈值的 IoU / 召回 / 精确率，并给出 IoU 最高的阈值。
+
+    只作诊断（比较不同模型的概率尺度与排序能力）；主表仍以原 utils/eval.py 在 0.9 下的结果为准，
+    原评测用严格大于号，与这里的 >= 只在概率恰好等于阈值时不同。
+    """
+    rows = []
+    for thr, (tp, fp, fn) in zip(thresholds, np.asarray(counts)):
+        tp, fp, fn = int(tp), int(fp), int(fn)
+        rows.append({"threshold": float(thr), "iou": iou_from_counts(tp, fp, fn),
+                     "recall": tp / float(tp + fn) if tp + fn else float("nan"),
+                     "precision": tp / float(tp + fp) if tp + fp else float("nan"),
+                     "tp": tp, "fp": fp, "fn": fn})
+    valid = [r for r in rows if not np.isnan(r["iou"])]
+    best = max(valid, key=lambda r: r["iou"]) if valid else None
+    return {"rows": rows, "best_iou": best["iou"] if best else None,
+            "best_threshold": best["threshold"] if best else None}
+
+
 def iou_from_counts(tp, fp, fn):
     """由累计的 TP/FP/FN 计算 IoU；分母为 0（该段既无正事件也无误报）时返回 NaN。"""
     union = tp + fp + fn
