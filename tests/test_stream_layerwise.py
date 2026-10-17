@@ -271,6 +271,47 @@ class TrainingLoopTests(unittest.TestCase):
             T.run_sequence(net, seq, dict(CFG, execution="layer"), Q99, torch.device("cpu"), "carry",
                            timer=T.WindowTimer(0, torch.device("cpu")))
 
+    def test_run_sequence_periodic_reset(self):
+        """周期清零（记忆长度诊断）：M=1 等于 reset_each_window，M>=窗数等于 carry，中间值与逐窗手写参考一致。"""
+        import train_stream_v1 as T
+        seq = synthetic_sequence(seed=4)
+        net = make_net(seed=13).eval()
+        cfg = dict(CFG, execution="step", input_device="cpu")
+        device = torch.device("cpu")
+        with torch.no_grad():
+            carry = T.run_sequence(net, seq, cfg, Q99, device, "carry")
+            reset = T.run_sequence(net, seq, cfg, Q99, device, "reset_each_window")
+            every1 = T.run_sequence(net, seq, cfg, Q99, device, "carry", reset_every=1)
+            every_all = T.run_sequence(net, seq, cfg, Q99, device, "carry", reset_every=WINDOWS)
+            periodic = T.run_sequence(net, seq, cfg, Q99, device, "carry", reset_every=5, reset_offset=2)
+            # 手写参考：在窗 2、7 前清零（k=0 本来就是零状态）
+            source = make_window_source(seq, cfg, Q99, device, torch.float64)
+            states, parts, prob_parts = None, [], []
+            for k in range(seq.n_windows):
+                if k in (2, 7):
+                    states = None
+                x, events, _, idx = source.window(k)
+                logits, states, _ = net(x, events, states, state_mode="carry")
+                parts.append(idx)
+                prob_parts.append(torch.sigmoid(logits).float().numpy())
+            reference = sw.refill_by_index(seq.n_events, parts, prob_parts)
+        self.assertTrue(np.array_equal(every1[0], reset[0]) and np.array_equal(every1[1], reset[1]))
+        self.assertTrue(np.array_equal(every_all[0], carry[0]) and np.array_equal(every_all[1], carry[1]))
+        self.assertLess(float(np.abs(periodic[0] - reference).max()), 1e-6)
+        first = seq.order[seq.bounds[0]:seq.bounds[2]]
+        self.assertTrue(np.array_equal(periodic[0][first], carry[0][first]))   # 第一次清零之前与 carry 相同
+        self.assertGreater(float(np.abs(periodic[0] - carry[0]).max()), 0.0)   # 清零之后确实改变了结果
+        for every, offset in ((-1, 0), (0, 1), (5, 5), (5, -1)):
+            with self.assertRaises(ValueError):
+                T.check_periodic_reset(every, offset)
+        with self.assertRaises(ValueError):
+            T.run_sequence(net, seq, dict(CFG, execution="layer"), Q99, device, "carry", reset_every=4)
+        base = dict(config="configs/evisseg_stream_v1.yaml", seed=None, state_mode=None, neuron=None,
+                    save_root=None, execution=None, input_device=None, train_subset_every=None, tbptt_k=None)
+        with self.assertRaises(ValueError):
+            T.build_config(SimpleNamespace(mode="train", reset_every=8, reset_offset=0, **base))
+        self.assertIn("seed", T.build_config(SimpleNamespace(mode="eval", reset_every=8, reset_offset=3, **base)))
+
     def test_options_validation_and_subset_schedule(self):
         import train_stream_v1 as T
         self.assertEqual(T.speed_options({}), ("step", "cpu"))

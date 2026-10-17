@@ -83,6 +83,9 @@ def parse_args():
                         help="仅 eval：同权重关闭亚阈值残差的纵向路径、事件跳连或两者")
     parser.add_argument("--dump-dir", default=None,
                         help="eval 模式：把训练时状态模式下的逐事件预测按序列保存为 NPZ，供 tools/verify_predictions.py 独立核验")
+    parser.add_argument("--reset-every", type=int, default=0,
+                        help="仅 eval（记忆长度诊断）：carry 推理中，窗号 k>0 且 (k-offset)%%M==0 时把全部状态清零；0 为关闭")
+    parser.add_argument("--reset-offset", type=int, default=0, help="仅 eval：--reset-every 的相位偏移，0 <= offset < M")
     parser.add_argument("--execution", choices=EXECUTIONS, default=None,
                         help="训练与每轮验证的执行方式：step 逐窗（原实现）| layer 逐层时间并行")
     parser.add_argument("--input-device", choices=INPUT_DEVICES, default=None,
@@ -154,7 +157,18 @@ def build_config(args):
             raise ValueError("--memory-off-layers 仅用于 eval，且不可与 --memory-ablation off 合用")
     if getattr(args, "subthreshold_ablation", "none") != "none" and args.mode != "eval":
         raise ValueError("--subthreshold-ablation 仅用于 eval")
+    check_periodic_reset(getattr(args, "reset_every", 0), getattr(args, "reset_offset", 0))
+    if getattr(args, "reset_every", 0) and args.mode != "eval":
+        raise ValueError("--reset-every 仅用于 eval")
     return cfg
+
+
+def check_periodic_reset(every, offset):
+    """校验周期清零参数：every=0 关闭；every>0 时要求 0 <= offset < every。"""
+    every, offset = int(every), int(offset)
+    if every < 0 or (every == 0 and offset != 0) or (every > 0 and not 0 <= offset < every):
+        raise ValueError("--reset-every 必须 >= 0，且开启时 0 <= --reset-offset < --reset-every")
+    return every, offset
 
 
 def seed_everything(seed, deterministic):
@@ -846,7 +860,8 @@ def nonzero_fraction(stats):
     return float(stats["nonzero"]) / float(max(stats["elements"], 1))
 
 
-def run_sequence(net, seq, cfg, q99, device, state_mode, monitor=None, timer=None, input_stats=None):
+def run_sequence(net, seq, cfg, q99, device, state_mode, monitor=None, timer=None, input_stats=None,
+                 reset_every=0, reset_offset=0):
     """推理一个完整序列（全部窗口，按时间顺序，状态按 state_mode 处理）。
 
     返回: (probs, confusion)
@@ -855,10 +870,15 @@ def run_sequence(net, seq, cfg, q99, device, state_mode, monitor=None, timer=Non
     调用方负责 torch.no_grad() 与 net.eval()。
     execution=layer 时每 eval_chunk 个窗口调用一次 forward_chunk（吞吐快，但不能用来测单窗延迟，timer 必须为空）。
     input_stats 不为空时，累计输入中非零元素的个数与总数（事件驱动口径的能耗要用，见 estimate_operations）。
+    reset_every=M>0（记忆长度诊断，只用于 step 执行）：窗号 k>0 且 (k-reset_offset)%M==0 时先把全部状态清零，
+    于是第 k 窗看到的历史长度 h = k - 最近一次清零的窗号 + 1（k=0 本来就从零状态开始）；M=1 等价于 reset_each_window。
     """
     execution, _ = speed_options(cfg)
     if execution == "layer" and timer is not None:
         raise ValueError("逐窗延迟只能在 execution=step 下测量")
+    reset_every, reset_offset = check_periodic_reset(reset_every, reset_offset)
+    if reset_every and execution == "layer":
+        raise ValueError("周期清零只支持 execution=step")
     threshold = float(cfg["threshold"])
     source = make_window_source(seq, cfg, q99, device, next(net.parameters()).dtype)
     states = None
@@ -885,6 +905,8 @@ def run_sequence(net, seq, cfg, q99, device, state_mode, monitor=None, timer=Non
                 offset += count
     else:
         for k in range(seq.n_windows):
+            if reset_every and k > 0 and (k - reset_offset) % reset_every == 0:
+                states = None
             t0 = timer.now() if timer else None
             x, events, _, idx = source.window(k)
             t1 = timer.now() if timer else None
@@ -904,7 +926,7 @@ def run_sequence(net, seq, cfg, q99, device, state_mode, monitor=None, timer=Non
 
 
 def evaluate_split(net, cfg, q99, device, split, state_mode, names=None, full=False,
-                   collect_layers=False, dump_dir=None):
+                   collect_layers=False, dump_dir=None, reset_every=0, reset_offset=0):
     """在一个划分（或其子集）上评估。
 
     主指标 IoU/ACC 调用原仓库 utils/eval.py 的 evaluate_iou_and_accuracy（全局拼接口径）；
@@ -914,6 +936,7 @@ def evaluate_split(net, cfg, q99, device, split, state_mode, names=None, full=Fa
     collect_layers=True 时统计每层发放与膜电位（训练中每轮验证也会用到，用于健康门槛）。
     dump_dir 不为空时，把每个序列的逐事件预测保存为 NPZ（字段与原仓库诊断文件一致：
     locs [batch,x,y,t]、labels、probabilities，另加 target_id），文件顺序与原 NPZ 一致。
+    reset_every / reset_offset 原样传给 run_sequence（周期清零，记忆长度诊断）。
     """
     from utils.eval import evalute        # 延迟导入：该模块依赖 cv2/pandas，只在评估时需要
 
@@ -933,7 +956,7 @@ def evaluate_split(net, cfg, q99, device, split, state_mode, names=None, full=Fa
         for i in range(len(dataset)):
             seq = dataset[i]
             probs, confusion = run_sequence(net, seq, cfg, q99, device, state_mode, monitor, timer,
-                                            input_stats)
+                                            input_stats, reset_every, reset_offset)
             if confusion.shape[0] > confusion_sum.shape[0]:
                 confusion_sum = np.concatenate(
                     [confusion_sum, np.zeros((confusion.shape[0] - confusion_sum.shape[0], 4), dtype=np.int64)])
@@ -1265,6 +1288,12 @@ def mode_eval(args, cfg):
         suffix += "_memory_" + memory_ablation
     if subthreshold_ablation != "none":
         suffix += "_subthreshold_" + subthreshold_ablation
+    reset_every, reset_offset = check_periodic_reset(getattr(args, "reset_every", 0),
+                                                     getattr(args, "reset_offset", 0))
+    if reset_every:
+        if train_cfg["state_mode"] != "carry":
+            raise ValueError("周期清零只对 carry 训练的模型有意义")
+        suffix += "_reset_every%d" % reset_every + ("_offset%d" % reset_offset if reset_offset else "")
     out_path = Path(args.checkpoint).parent / ("eval_%s_%s%s.json" % (
         args.split, Path(args.checkpoint).stem, suffix))
     if out_path.exists() and not args.overwrite:
@@ -1277,15 +1306,18 @@ def mode_eval(args, cfg):
                "subthreshold_ablation": subthreshold_ablation,
                "subthreshold_parameters": subthreshold_parameter_statistics(net),
                "memory_ablation": memory_ablation,
-               "memory_off_layers": list(net.dual_memory_layers) if memory_ablation == "off" else (off_layers or [])}
-    for mode in ("carry", "reset_each_window"):
+               "memory_off_layers": list(net.dual_memory_layers) if memory_ablation == "off" else (off_layers or []),
+               "reset_every": reset_every, "reset_offset": reset_offset}
+    # 周期清零时只跑 carry：M=1 即 reset_each_window，常规评估里已有
+    for mode in (("carry",) if reset_every else ("carry", "reset_each_window")):
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
         dump = None
         if args.dump_dir and mode == train_cfg["state_mode"]:
             dump = args.dump_dir
             os.makedirs(dump, exist_ok=True)
-        r = evaluate_split(net, train_cfg, q99, device, args.split, mode, full=True, dump_dir=dump)
+        r = evaluate_split(net, train_cfg, q99, device, args.split, mode, full=True, dump_dir=dump,
+                           reset_every=reset_every, reset_offset=reset_offset)
         r["peak_memory_gib"] = peak_memory_gib(device)
         r["tau"] = tau_statistics(net)
         r["warnings"] = health_warnings(r["layers"], r["tau"], {})
