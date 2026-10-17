@@ -137,8 +137,11 @@ def build_config(args):
     cfg.setdefault("trainer", "sequence")
     cfg.setdefault("streams", 4)
     cfg.setdefault("accumulate", 1)
+    cfg.setdefault("stream_layout", "greedy")
     if cfg["trainer"] not in TRAINERS:
         raise ValueError("trainer 必须是 %s 之一" % (TRAINERS,))
+    if cfg["stream_layout"] not in STREAM_LAYOUTS:
+        raise ValueError("stream_layout 必须是 %s 之一" % (STREAM_LAYOUTS,))
     if int(cfg["streams"]) < 1 or int(cfg["accumulate"]) < 1:
         raise ValueError("streams 与 accumulate 必须 >= 1")
     if cfg["trainer"] == "streams" and cfg.get("execution", "step") != "layer":
@@ -636,44 +639,76 @@ def train_sequence(net, seq, optimizer, cfg, q99, pos_weight, device, rng, max_w
 # ---------------------------------------------------------------------------
 
 
-def plan_streams(lengths, n_streams, k, rng):
-    """把训练录像分配给 B 条并行流。
+STREAM_LAYOUTS = ("greedy", "batchify")
 
-    lengths[i] 为数据集第 i 条录像的窗数。按 rng 打乱录像顺序后，依次放进当前总窗数最少的流（各流总长接近，
-    一轮末尾空转少；EV-Flying 录像长短差很多时尤其重要）。每条流开头随机延迟 0..k-1 个空窗，
-    相当于随机片段相位：片段边界不会总落在录像内的同一位置。只打乱录像，录像内部的窗顺序不变。
-    返回: [(delay, [(index, n_windows), ...]), ...]，共 n_streams 条。
+
+def plan_streams(lengths, n_streams, k, rng, layout="greedy"):
+    """把训练录像分配给 B 条并行流。lengths[i] 为数据集第 i 条录像的窗数；先按 rng 打乱录像顺序。
+
+    layout="greedy"（默认，EV-UAV / EV-Flying 的结果都用它）：整段录像依次放进当前总窗数最少的流。
+        最长的录像不超过"总窗数 / B"时各流长度接近；超过时（如 EBSSA 一段占训练集 29%）分不平，
+        一轮末尾只剩一条流在跑，连续很多次更新来自同一段录像。
+    layout="batchify"（语言模型 TBPTT 的标准排法）：打乱后首尾接成一条长带，等分成 B 段，每条流一样长、同时结束；
+        跨等分点的录像被切开，后半截作为新起点（该流状态清零），每轮最多切 B-1 刀。
+    每条流开头随机延迟 0..k-1 个空窗（随机片段相位）。录像内部的窗顺序不变。
+    返回: [(delay, items), ...]，共 n_streams 条；items 元素为 (index, n_windows)（整段）或 (index, first, n_windows)
+    （从录像第 first 窗起的 n_windows 窗）。
     """
+    if layout not in STREAM_LAYOUTS:
+        raise ValueError("stream_layout 必须是 %s 之一" % (STREAM_LAYOUTS,))
     order = rng.permutation(len(lengths))
-    streams, totals = [[] for _ in range(int(n_streams))], [0] * int(n_streams)
-    for i in order:
-        s = int(np.argmin(totals))
-        streams[s].append((int(i), int(lengths[i])))
-        totals[s] += int(lengths[i])
+    n_streams = int(n_streams)
+    streams = [[] for _ in range(n_streams)]
+    if layout == "greedy":
+        totals = [0] * n_streams
+        for i in order:
+            s = int(np.argmin(totals))
+            streams[s].append((int(i), int(lengths[i])))
+            totals[s] += int(lengths[i])
+    else:
+        total = int(sum(int(n) for n in lengths))
+        bounds = [s * total // n_streams for s in range(n_streams + 1)]
+        pos, s = 0, 0
+        for i in order:
+            n, first = int(lengths[i]), 0
+            while first < n:
+                while pos >= bounds[s + 1]:
+                    s += 1
+                take = min(n - first, bounds[s + 1] - pos)
+                streams[s].append((int(i), first, take))
+                first += take
+                pos += take
     return [(int(rng.randint(0, int(k))), items) for items in streams]
+
+
+def plan_item(item):
+    """计划里的一项 -> (index, first, n_windows)。"""
+    return (item[0], 0, item[1]) if len(item) == 2 else tuple(item)
 
 
 def stream_total_windows(plan):
     """各流时间轴长度（含开头延迟）的最大值，即一轮需要的窗数。"""
-    return max(delay + sum(n for _, n in items) for delay, items in plan)
+    return max(delay + sum(item[-1] for item in items) for delay, items in plan)
 
 
 def stream_pieces(plan, chunk_start, chunk_end):
     """流时间轴上窗 [chunk_start, chunk_end) 这一片段内，每条流由哪些录像的哪些窗组成。
 
     返回: 每条流一个列表 [(index, a, b, offset, new_start)]：录像 index 的第 a..b-1 窗放在片段内第 offset 窗起；
-          new_start=True 表示该录像从这一窗开始（该流状态在此清零）。没有录像的位置是空窗（零输入、无事件）。
+          new_start=True 表示计划中的这一项从这一窗开始（整段录像的开头，或 batchify 切开后的后半截；该流状态在此清零）。
+          没有录像的位置是空窗（零输入、无事件）。
     """
     out = []
     for delay, items in plan:
         pieces, start = [], delay
-        for index, n in items:
+        for item in items:
+            index, first, n = plan_item(item)
             if start >= chunk_end:
                 break
             end = start + n
             if end > chunk_start:
                 lo, hi = max(chunk_start, start), min(chunk_end, end)
-                pieces.append((index, lo - start, hi - start, lo - chunk_start, lo == start))
+                pieces.append((index, first + lo - start, first + hi - start, lo - chunk_start, lo == start))
             start = end
         out.append(pieces)
     return out
@@ -746,7 +781,10 @@ def train_streams(net, dataset, lengths, optimizer, cfg, q99, pos_weight, device
     k, n_streams, accumulate = int(cfg["tbptt_k"]), int(cfg["streams"]), int(cfg["accumulate"])
     if speed_options(cfg)[0] != "layer":
         raise ValueError("trainer=streams 需要 execution=layer（一次前向一个 [k,B] 片段）")
-    plan = plan_streams(lengths, n_streams, k, rng) if plan is None else plan
+    if plan is None:
+        plan = plan_streams(lengths, n_streams, k, rng, cfg.get("stream_layout", "greedy"))
+    # 计划中每一项的最后一窗：用完即释放该录像（batchify 切开的录像若后面还要用，会重新读取）
+    item_ends = {(index, first + n) for _, items in plan for index, first, n in map(plan_item, items)}
     n_chunks = int(math.ceil(stream_total_windows(plan) / float(k)))
     if max_chunks is not None:
         n_chunks = min(n_chunks, int(max_chunks))
@@ -775,7 +813,7 @@ def train_streams(net, dataset, lengths, optimizer, cfg, q99, pos_weight, device
             states = detach_states(states)
             for stream in pieces:
                 for index, lo, hi, _, _ in stream:
-                    if hi == lengths[index]:
+                    if (index, hi) in item_ends:
                         sources.release(index)
         if block_events > 0:
             norms = gradient_group_norms(net)
@@ -1103,8 +1141,8 @@ def mode_train(args, cfg):
     if trainer == "streams":
         # 各录像窗数（分配并行流用）；读一遍训练集，此后每轮按需读取
         lengths = [int(train_set[i].n_windows) for i in range(len(train_set))]
-        print("标准 TBPTT：%d 条并行流、k=%d、每 %d 个片段更新一次（每次更新 %d 窗）| 训练集 %d 条录像 %d 窗" % (
-            int(cfg["streams"]), int(cfg["tbptt_k"]), int(cfg["accumulate"]),
+        print("标准 TBPTT：%d 条并行流（排法 %s）、k=%d、每 %d 个片段更新一次（每次更新 %d 窗）| 训练集 %d 条录像 %d 窗" % (
+            int(cfg["streams"]), cfg.get("stream_layout", "greedy"), int(cfg["tbptt_k"]), int(cfg["accumulate"]),
             int(cfg["streams"]) * int(cfg["tbptt_k"]) * int(cfg["accumulate"]), len(lengths), sum(lengths)), flush=True)
     print("执行方式 %s | 输入构造 %s | 训练子集每 %d 轮评估 | 验证片段 %d 窗" % (
         execution, input_device, int(cfg.get("train_subset_every", 1)), int(cfg.get("eval_chunk", 32))), flush=True)
@@ -1151,6 +1189,7 @@ def mode_train(args, cfg):
                   "peak_memory_gib": peak_memory_gib(device), "grad_norms": grad_mean,
                   "grad_clip_stats": grad_clip_stats, "tbptt_k": int(cfg["tbptt_k"]),
                   "trainer": trainer, "streams": int(cfg.get("streams", 1)), "accumulate": int(cfg.get("accumulate", 1)),
+                  "stream_layout": cfg.get("stream_layout", "greedy"),
                   "updates": updates,
                   "val_threshold_sweep": val["threshold_sweep"],
                   "layers": val["layers"], "tau": taus,

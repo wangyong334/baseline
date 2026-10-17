@@ -125,6 +125,41 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(seen, {(i, w): 1 for i, n in enumerate(lengths) for w in range(n)})
         self.assertEqual(starts, {i: 1 for i in range(len(lengths))})
 
+    def check_batchify(self, lengths, n_streams, k, seed):
+        plan = T.plan_streams(lengths, n_streams, k, np.random.RandomState(seed), "batchify")
+        self.assertEqual(plan, T.plan_streams(lengths, n_streams, k, np.random.RandomState(seed), "batchify"))
+        total = sum(lengths)
+        sizes = [sum(item[-1] for item in items) for _, items in plan]
+        self.assertEqual(sizes, [(s + 1) * total // n_streams - s * total // n_streams for s in range(n_streams)])
+        items = [T.plan_item(item) for _, its in plan for item in its]
+        self.assertLessEqual(len(items) - len(lengths), n_streams - 1)          # 最多切 B-1 刀
+        seen, starts = {}, []
+        for c in range(-(-T.stream_total_windows(plan) // k)):
+            for stream in T.stream_pieces(plan, c * k, (c + 1) * k):
+                for index, lo, hi, offset, new_start in stream:
+                    self.assertTrue(0 <= offset < k and offset + (hi - lo) <= k)
+                    for w in range(lo, hi):
+                        seen[(index, w)] = seen.get((index, w), 0) + 1
+                    if new_start:
+                        starts.append((index, lo))
+        self.assertEqual(seen, {(i, w): 1 for i, n in enumerate(lengths) for w in range(n)})
+        self.assertEqual(sorted(starts), sorted((index, first) for index, first, _ in items))   # 每一项开头清零一次
+        return plan
+
+    def test_batchify_equal_streams(self):
+        self.check_batchify([12, 7, 30, 5, 18, 9], 2, 4, 0)
+        self.check_batchify([12, 7, 30, 5, 18, 9], 4, 4, 3)
+
+    def test_batchify_recording_longer_than_a_stream(self):
+        plan = self.check_batchify([40, 5, 5, 5], 4, 4, 1)              # 40 窗 > 每条流 13–14 窗：被切成 3 段以上
+        pieces = [T.plan_item(item) for _, items in plan for item in items if item[0] == 0]
+        self.assertGreaterEqual(len(pieces), 3)
+        self.assertEqual(sum(n for _, _, n in pieces), 40)
+
+    def test_unknown_layout_rejected(self):
+        with self.assertRaises(ValueError):
+            T.plan_streams([4, 4], 2, 4, np.random.RandomState(0), "round_robin")
+
 
 class TrainStreamsTests(unittest.TestCase):
     def cfg(self, **kw):
@@ -211,6 +246,19 @@ class TrainStreamsTests(unittest.TestCase):
         self.assertEqual(out["steps"], 4)                           # 每 2 个片段一次，最后不足 2 个也更新
         self.assertEqual(out["events"], sum(seq.n_events for seq in dataset))
         self.assertTrue(any(not torch.equal(a, b.detach()) for a, b in zip(before, net.parameters())))
+        self.assertEqual(out["missing_grads"], [])
+
+    def test_batchify_training_uses_every_event_once(self):
+        dataset = [synthetic_sequence(seed) for seed in (0, 1, 2)]
+        lengths = [seq.n_windows for seq in dataset]
+        net = make_net()
+        opt = torch.optim.SGD(net.parameters(), lr=0.05)
+        rng_plan = T.plan_streams(lengths, 2, 4, np.random.RandomState(5), "batchify")
+        self.assertTrue(any(len(item) == 3 and item[1] > 0 for _, items in rng_plan for item in items))  # 有录像被切开
+        out = T.train_streams(net, dataset, lengths, opt, self.cfg(streams=2, stream_layout="batchify"), Q99,
+                              POS_WEIGHT, CPU, np.random.RandomState(5))
+        self.assertEqual(out["events"], sum(seq.n_events for seq in dataset))
+        self.assertEqual(out["chunks"], -(-T.stream_total_windows(rng_plan) // 4))
         self.assertEqual(out["missing_grads"], [])
 
     def test_mode_train_end_to_end(self):

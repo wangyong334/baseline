@@ -1,0 +1,67 @@
+# 10-17 收敛检查：只把轮数从 16 加到 32（学习率仍按轮线性 1e-3 -> 1e-4；并行流排法仍为默认 greedy），其余与 evisseg_stream_v1_evflying.yaml 完全相同。
+# 判定（跑之前定好）：val 末 5 轮均值比 16 轮（V1 0.8335 / 双仓 0.8325）高不到 0.005 -> 16 轮已收敛；否则主表改用 32 轮。
+# 流式 SNN V1 在 EV-Flying（4x4 合并版，方案 B）上：网络结构与 EV-UAV 完全相同，只换数据与训练方式
+# 数据：tools/convert_evflying_x4.py 转换；有效区域 320x180，网络画布 320x184（只在下方补 4 行，补到 8 的倍数）
+# 录像 120–300 s（2401–6002 窗），n_windows: 0 表示按每条录像自身长度取窗数；推理整段连续
+DATA:
+  root: /media/stephen/nvme0n1/wy_data/datasets/evflying_x4
+  stats_path: configs/stream_v1_evflying_x4_stats.json   # 由 tools/stream_train_stats.py 用本配置生成（只用训练集）
+  window_ms: 50
+  n_windows: 0             # 0 = 按录像自身长度（t_max // 50 + 1）
+  time_bins: 5
+  height: 180
+  width_px: 320
+  pad_height: 184          # 3 次 stride=2 下采样，对齐到 8 的倍数；只补下侧
+  pad_width: 320
+  input_clip: 3.0          # X = clip(log1p(C)/q99, 0, 3)
+
+NET:
+  channels: [12, 24, 48, 48]
+  neuron: lif
+  state_mode: carry
+  norm: none
+  v_threshold: 1.0
+  tau_init_ms: 200.0
+  tau_min_ms: 50.0
+  tau_max_ms: 2000.0
+  readout_hidden: 32
+
+CALIB:
+  calib_sequences: 8
+  calib_windows: 32
+  calib_samples_per_channel: 2048
+  calib_min_positive: 1024
+  calib_quantile: 0.99
+  calib_gain_min: 0.05
+  calib_gain_max: 20.0
+
+TRAIN:
+  seed: 37
+  # 轮数规则：总更新次数与 EV-UAV 上已验证的配方（B=4、n=1、50 轮 x 约 251 次 = 约 12550 次）相当；
+  # EV-Flying 训练集 17 条录像 50418 窗，B=4、k=16 每轮约 790 次更新 -> 16 轮
+  epochs: 32
+  lr: 0.001
+  lr_end: 0.0001
+  tbptt_k: 16
+  trainer: streams             # 标准有状态 TBPTT：B 条并行流，每 n 个片段更新一次（10-16 定稿 B=4、n=1、k=16）
+  streams: 4
+  accumulate: 1
+  optimizer_step: per_sequence # 只对 trainer=sequence 生效
+  grad_clip: 1.0
+  pos_weight_cap: 30.0
+  train_subset_size: 4         # 训练集只有 17 条长录像，取 4 条做训练子集评估
+  num_workers: 2
+  execution: layer
+  input_device: gpu
+  train_subset_every: 5
+  eval_chunk: 32
+  deterministic: true
+  save_root: log/stream_v1_evflying_x4_e32_seed37
+
+EVAL:
+  threshold: 0.9
+  pd_detT: 50
+  correct_thresh: 0.0001
+  rolling_window: 10
+  segments: [[0, 15], [64, 79], [144, 159]]
+  timing_warmup_windows: 20
