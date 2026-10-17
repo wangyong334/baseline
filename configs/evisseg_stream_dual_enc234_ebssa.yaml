@@ -1,0 +1,67 @@
+# V1 + 编码层 [enc2, enc3, enc4] 有界双仓记忆，在 EBSSA（DAVIS 部分）上；除 dual_memory 外与 evisseg_stream_v1_ebssa.yaml 相同
+DATA:
+  root: /media/stephen/nvme0n1/wy_data/datasets/ebssa_davis
+  stats_path: configs/stream_v1_ebssa_davis_stats.json   # 与 V1 共用同一份训练集统计
+  window_ms: 50
+  n_windows: 0
+  time_bins: 5
+  height: 180
+  width_px: 240
+  pad_height: 184
+  pad_width: 240
+  input_clip: 3.0
+
+NET:
+  channels: [12, 24, 48, 48]
+  dual_memory:
+    layers: [enc2, enc3, enc4]
+    tau_init_ms: 300.0
+    tau_min_ms: 50.0
+    tau_max_ms: 1000.0
+    kappa_max: 0.5
+  neuron: lif
+  state_mode: carry
+  norm: none
+  v_threshold: 1.0
+  tau_init_ms: 200.0
+  tau_min_ms: 50.0
+  tau_max_ms: 2000.0
+  readout_hidden: 32
+
+CALIB:
+  calib_sequences: 8
+  calib_windows: 32
+  calib_samples_per_channel: 2048
+  calib_min_positive: 1024
+  calib_quantile: 0.99
+  calib_gain_min: 0.05
+  calib_gain_max: 20.0
+
+TRAIN:
+  seed: 37
+  epochs: 10
+  lr: 0.001
+  lr_end: 0.0001
+  tbptt_k: 16
+  trainer: streams
+  streams: 4
+  accumulate: 1
+  optimizer_step: per_sequence
+  grad_clip: 1.0
+  pos_weight_cap: 30.0
+  train_subset_size: 4
+  num_workers: 2
+  execution: layer
+  input_device: gpu
+  train_subset_every: 5
+  eval_chunk: 32
+  deterministic: true
+  save_root: log/stream_dual_enc234_ebssa_davis_seed37
+
+EVAL:
+  threshold: 0.9
+  pd_detT: 50
+  correct_thresh: 0.0001
+  rolling_window: 10
+  segments: [[0, 15], [64, 79], [144, 159]]
+  timing_warmup_windows: 20

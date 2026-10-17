@@ -1,0 +1,38 @@
+# 原论文发布代码的网络（时间下采样核 3，即 K3：t%4==2 的输入没有下采样连接）在 EV-Flying x4 上；
+# 除 down_kernel 外与 evisseg_evflying_x4_k5.yaml 完全相同（同一训练配方，只隔离网络结构的差别）。
+# 原发布代码的训练方式（StepLR、第 40 轮后才验证）在 15 轮下无法使用，所以不沿用。
+STRUCTURE:
+  model_name: evissgnet
+  width: 12
+  block_residual: True
+  block_reps: 2
+  use_coords: True
+  down_kernel: 3
+DATA:
+  input_channel: 4
+  root: /media/stephen/nvme0n1/wy_data/datasets/evflying_x4_blocks8s
+  whole_t: 8000
+  res: [320, 180]
+TRAIN:
+  epochs: 15
+  batch_size: 1
+  train_workers: 0
+  optim: Adam
+  lr: 0.001
+  lr_schedule: linear
+  lr_end: 0.0001
+  k: 3
+  t: 5
+  stc_gamma: 1.0
+  max_events_num: 700000
+  seed: 37
+  validation_start: 0
+  model_save_root: log/k3orig_evflying_x4_seed37
+TEST:
+  vis: False
+  eval: True
+  roc: True
+  pd_detT: 50
+  correct_thresh: 0.0001
+  save: True
+  model_path: log/k3orig_evflying_x4_seed37/best_iou_seed37.pt

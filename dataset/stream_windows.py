@@ -135,6 +135,8 @@ def load_npz_events(path, height, width, window_ms, n_windows, time_bins):
         evs_norm[:,4]      -> label
         evs_norm[:,5]      -> target_id
     不做任何降采样；所有事件都会被处理且只处理一次。
+    n_windows <= 0（或 None）表示按录像自身长度取窗数：t_max // window_ms + 1（EV-Flying 等长录像用）；
+    EV-UAV 配置为固定 160 窗，行为不变。
     """
     with np.load(path) as data:
         ev_loc = np.asarray(data["ev_loc"])
@@ -151,6 +153,8 @@ def load_npz_events(path, height, width, window_ms, n_windows, time_bins):
     xyt = xyt.astype(np.int64)
     x, y, t = xyt[:, 0], xyt[:, 1], xyt[:, 2]
     p_raw, label_raw = evs_norm[:, 3], evs_norm[:, 4]
+    if n_windows is None or int(n_windows) <= 0:
+        n_windows = int(t.max()) // int(window_ms) + 1 if t.size else 1
     total_ms = int(window_ms) * int(n_windows)
     validate_events(x, y, t, p_raw, label_raw, height, width, total_ms)
     order, bounds = split_windows(t, window_ms, n_windows)

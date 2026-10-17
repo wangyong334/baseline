@@ -58,6 +58,80 @@ def sweep_summary(counts, thresholds=SWEEP_THRESHOLDS):
             "best_threshold": best["threshold"] if best else None}
 
 
+class FastRoc(object):
+    """原 utils/eval.py 中 roc_update / cal_roc（Pd / Fa）的逐位等价向量化实现，传感器尺寸可配置。
+
+    原实现对每一帧都扫一遍整条序列的全部事件（帧数 x 事件数），EV-UAV（160 帧、约 10 万事件）还可以，
+    EV-Flying（一段 3600 帧、数百万事件）要几个小时。这里先算出每个事件所属的帧再分组，结果与原实现完全相同，
+    连原实现的边界行为也一并保留（单元测试逐项核对）：
+        帧 i 只含满足 i*T < t < (i+1)*T 的事件（严格不等号：t 恰为 T 的整数倍的事件不计入任何帧）
+        帧号从绝对时间 0 起算，只取 i = 0..int((t_max - t_min)/T)；frame_num 每段加 int((t_max - t_min)/T)
+        Pd：每帧每个非零 target_id 计一个目标，(预测==标签 的个数) / 标签和 >= correct_thresh 记为检出
+        Fa：每帧把虚警事件（标签 0、预测 1）累加到 uint8 掩码（与原实现一样会在 256 处回绕），8 连通域数之和
+        判定在 float32 上做：prob >= float32(thresh)（与 torch 张量和 Python 标量比较的结果一致）
+    t、x、y 为整数值（毫秒、像素），prob 为 float32 概率，label 为 0/1，target_id 为浮点目标号（0 为背景）。
+    """
+
+    def __init__(self, pd_detT, correct_thresh, height, width):
+        self.T = int(pd_detT)
+        self.correct_thresh = float(correct_thresh)
+        self.height, self.width = int(height), int(width)
+        self.obj_num = self.correct_num = self.false_num = self.frame_num = 0
+
+    def update(self, t, prob, target_id, label, x, y, thresh):
+        import cv2   # 延迟导入：只在完整评估时需要
+        t32 = np.asarray(t, dtype=np.float32)
+        if t32.size == 0:
+            return
+        span = np.float32(t32.max()) - np.float32(t32.min())
+        frames = int(span / np.float32(self.T))
+        self.frame_num += frames
+        ti = t32.astype(np.int64)
+        frame = ti // self.T
+        inside = (ti % self.T != 0) & (frame >= 0) & (frame <= frames)
+        pred = (np.asarray(prob, dtype=np.float32) >= np.float32(thresh)).astype(np.float32)
+        lab = np.asarray(label, dtype=np.float32)
+        tid = np.asarray(target_id, dtype=np.float64)
+        f, p_, l_, d_ = frame[inside], pred[inside], lab[inside], tid[inside]
+        # Pd：(帧, 目标号) 分组
+        obj = d_ != 0
+        if np.any(obj):
+            keys = np.stack([f[obj].astype(np.float64), d_[obj]], 1)
+            groups, inverse = np.unique(keys, axis=0, return_inverse=True)
+            equal = np.bincount(inverse, weights=(p_[obj] == l_[obj]).astype(np.float64), minlength=len(groups))
+            label_sum = np.bincount(inverse, weights=l_[obj].astype(np.float64), minlength=len(groups))
+            with np.errstate(divide="ignore", invalid="ignore"):
+                # 原实现：int64 计数 / float32 标签和 -> float32，再与 float32 阈值比较；0/0 -> nan（不检出），k/0 -> inf（检出）
+                ratio = equal.astype(np.float32) / label_sum.astype(np.float32)
+            self.obj_num += int(len(groups))
+            self.correct_num += int(np.count_nonzero(ratio >= np.float32(self.correct_thresh)))
+        # Fa：每帧虚警像素计数（uint8 回绕）后数 8 连通域
+        false = (l_ == 0) & (p_ == 1)
+        if np.any(false):
+            xs = np.asarray(x, dtype=np.int64)[inside][false]
+            ys = np.asarray(y, dtype=np.int64)[inside][false]
+            pixel_key = (f[false] * self.height + ys) * self.width + xs
+            keys, counts = np.unique(pixel_key, return_counts=True)
+            keep = (counts % 256) != 0
+            keys = keys[keep]
+            frame_of = keys // (self.height * self.width)
+            pixel = keys % (self.height * self.width)
+            starts = np.flatnonzero(np.r_[True, frame_of[1:] != frame_of[:-1]]) if keys.size else []
+            ends = list(starts[1:]) + [keys.size] if keys.size else []
+            for a, b in zip(starts, ends):
+                mask = np.zeros(self.height * self.width, dtype=np.uint8)
+                mask[pixel[a:b]] = 1
+                n_labels = cv2.connectedComponentsWithStats(mask.reshape(self.height, self.width),
+                                                            connectivity=8, ltype=cv2.CV_32S)[0]
+                self.false_num += int(n_labels) - 1
+
+    def result(self):
+        """返回 (Pd, Fa)；Fa 的分母 = 帧数 x 传感器像素数。"""
+        pd = self.correct_num / float(self.obj_num) if self.obj_num else float("nan")
+        fa = self.false_num / float(self.frame_num * self.height * self.width) if self.frame_num else float("nan")
+        return pd, fa
+
+
 def iou_from_counts(tp, fp, fn):
     """由累计的 TP/FP/FN 计算 IoU；分母为 0（该段既无正事件也无误报）时返回 NaN。"""
     union = tp + fp + fn

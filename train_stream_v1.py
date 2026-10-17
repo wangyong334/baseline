@@ -39,7 +39,7 @@ from model.evspsegnet_stream import (LAYER_NAMES, EvSpSegNetStream, calibrate_ga
 from model.lif2d_stream import StreamingLIF2d, StreamingDualMemoryLIF2d, detach_states  # noqa: E402
 from utils.stream_common import (health_warnings, linear_epoch_lr, load_flat_config,  # noqa: E402
                                  make_chunks, select_subset, subset_due, summarize_history)
-from utils.stream_metrics import (SWEEP_THRESHOLDS, first_detection_latencies, iou_from_counts,  # noqa: E402
+from utils.stream_metrics import (SWEEP_THRESHOLDS, FastRoc, first_detection_latencies, iou_from_counts,  # noqa: E402
                                   rolling_iou, segment_iou, summarize_latencies, sweep_summary,
                                   threshold_counts, window_confusion)
 
@@ -870,7 +870,9 @@ def evaluate_split(net, cfg, q99, device, split, state_mode, names=None, full=Fa
     """在一个划分（或其子集）上评估。
 
     主指标 IoU/ACC 调用原仓库 utils/eval.py 的 evaluate_iou_and_accuracy（全局拼接口径）；
-    full=True 时额外调用原 roc_update 计算 Pd/Fa，并统计逐窗 IoU、分段 IoU、首次检出延迟、耗时、理论运算量。
+    full=True 时额外计算 Pd/Fa（utils/stream_metrics.FastRoc：与原 roc_update / cal_roc 逐位等价的向量化实现，
+    传感器尺寸取 cfg 的 height / width_px，EV-UAV 即 260x346），并统计逐窗 IoU、分段 IoU、首次检出延迟、耗时、理论运算量。
+    序列长度可以不同（n_windows<=0 时按录像自身长度）：逐窗统计按窗号对齐累加，较短的序列只贡献前面的窗。
     collect_layers=True 时统计每层发放与膜电位（训练中每轮验证也会用到，用于健康门槛）。
     dump_dir 不为空时，把每个序列的逐事件预测保存为 NPZ（字段与原仓库诊断文件一致：
     locs [batch,x,y,t]、labels、probabilities，另加 target_id），文件顺序与原 NPZ 一致。
@@ -878,14 +880,15 @@ def evaluate_split(net, cfg, q99, device, split, state_mode, names=None, full=Fa
     from utils.eval import evalute        # 延迟导入：该模块依赖 cv2/pandas，只在评估时需要
 
     dataset = EvUAVStream(cfg["root"], split, cfg, names)
-    evaluator = evalute(SimpleNamespace(roc=full, pd_detT=cfg["pd_detT"],
+    evaluator = evalute(SimpleNamespace(roc=False, pd_detT=cfg["pd_detT"],
                                         correct_thresh=cfg["correct_thresh"]))
+    roc = FastRoc(cfg["pd_detT"], cfg["correct_thresh"], cfg["height"], cfg["width_px"]) if full else None
     monitor = LayerMonitor(net.v_threshold) if (collect_layers or full) else None
     timer = WindowTimer(cfg["timing_warmup_windows"], device) if full else None
     input_stats = {"nonzero": 0, "elements": 0} if full else None
-    confusion_sum = np.zeros((int(cfg["n_windows"]), 4), dtype=np.int64)
+    confusion_sum = np.zeros((0, 4), dtype=np.int64)
     sweep = np.zeros((len(SWEEP_THRESHOLDS), 3), dtype=np.int64)
-    kept, total_events = [], 0
+    kept, total_events, total_windows = [], 0, 0
     was_training = net.training
     net.eval()
     with torch.no_grad():
@@ -893,9 +896,13 @@ def evaluate_split(net, cfg, q99, device, split, state_mode, names=None, full=Fa
             seq = dataset[i]
             probs, confusion = run_sequence(net, seq, cfg, q99, device, state_mode, monitor, timer,
                                             input_stats)
-            confusion_sum += confusion
+            if confusion.shape[0] > confusion_sum.shape[0]:
+                confusion_sum = np.concatenate(
+                    [confusion_sum, np.zeros((confusion.shape[0] - confusion_sum.shape[0], 4), dtype=np.int64)])
+            confusion_sum[:confusion.shape[0]] += confusion
             sweep += threshold_counts(probs, seq.label)
             total_events += seq.n_events
+            total_windows += seq.n_windows
             evaluator.matches[str(i)] = {"seg_pred": torch.from_numpy(probs),
                                          "seg_gt": torch.from_numpy(seq.label)}
             if dump_dir is not None:
@@ -906,10 +913,7 @@ def evaluate_split(net, cfg, q99, device, split, state_mode, names=None, full=Fa
                          probabilities=probs.astype(np.float32),
                          target_id=seq.target_id.astype(np.float64))
             if full:
-                zeros = np.zeros(seq.n_events, dtype=np.float32)
-                ev_locs = torch.from_numpy(np.stack([zeros, seq.x, seq.y, seq.t], 1).astype(np.float32))
-                evaluator.roc_update(ev_locs[:, 3], torch.from_numpy(probs), seq.target_id,
-                                     torch.from_numpy(seq.label), ev_locs, thresh=float(cfg["threshold"]))
+                roc.update(seq.t, probs, seq.target_id, seq.label, seq.x, seq.y, float(cfg["threshold"]))
                 kept.append((seq.t, seq.label, seq.target_id, probs))
     net.train(was_training)
     iou, acc = evaluator.evaluate_iou_and_accuracy(thresh=float(cfg["threshold"]))
@@ -920,7 +924,7 @@ def evaluate_split(net, cfg, q99, device, split, state_mode, names=None, full=Fa
         if monitor.residual_summary():
             result["subthreshold_diagnostics"] = monitor.residual_summary()
     if full:
-        pd, fa = evaluator.cal_roc()
+        pd, fa = roc.result()
         tp, fp, fn, npos = (confusion_sum[:, j] for j in range(4))
         timing = timer.summary(cfg["window_ms"])
         net_ms = timing.get("net_ms_mean", 0.0)
@@ -941,7 +945,7 @@ def evaluate_split(net, cfg, q99, device, split, state_mode, names=None, full=Fa
             "timing": timing,
             "input_nonzero_fraction": nonzero_fraction(input_stats),
             "operations": estimate_operations(net, cfg["pad_height"], cfg["pad_width"], rates,
-                                              total_events / float(len(dataset) * int(cfg["n_windows"])),
+                                              total_events / float(max(total_windows, 1)),
                                               nonzero_fraction(input_stats)),
         })
     return result

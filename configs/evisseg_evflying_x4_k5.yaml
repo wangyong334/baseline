@@ -1,0 +1,39 @@
+# K5 基线（EV-SpSegNet + 时间下采样核 [3,3,5] 修复）在 EV-Flying x4（320x180）上，10-08 协议：每 8 s 一块训练 / 推理。
+# 训练配方与 EV-UAV 上的 K5（evisseg_evuav_baseline_v2_repolr.yaml）相同：lr 1e-3 -> 1e-4 线性、每轮验证、FP32、batch 1、700k 事件上限；
+# 轮数 15 与 10-08 原生分辨率 K5 EV-Flying 相同。单卡：EVUAV_MP_SPLIT=0。
+# 块数据由 tools/make_blocks.py --k5-width 320 --k5-height 192 生成；整段评测用 tools/eval_baseline_stitched.py。
+STRUCTURE:
+  model_name: evissgnet
+  width: 12
+  block_residual: True
+  block_reps: 2
+  use_coords: True
+  down_kernel: [3, 3, 5]
+DATA:
+  input_channel: 4
+  root: /media/stephen/nvme0n1/wy_data/datasets/evflying_x4_blocks8s
+  whole_t: 8000
+  res: [320, 180]
+TRAIN:
+  epochs: 15
+  batch_size: 1
+  train_workers: 0
+  optim: Adam
+  lr: 0.001
+  lr_schedule: linear
+  lr_end: 0.0001
+  k: 3
+  t: 5
+  stc_gamma: 1.0
+  max_events_num: 700000
+  seed: 37
+  validation_start: 0
+  model_save_root: log/k5_evflying_x4_seed37
+TEST:
+  vis: False
+  eval: True
+  roc: True
+  pd_detT: 50
+  correct_thresh: 0.0001
+  save: True
+  model_path: log/k5_evflying_x4_seed37/best_iou_seed37.pt

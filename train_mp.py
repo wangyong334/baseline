@@ -66,9 +66,22 @@ def cpu_state(net):
             for name, value in net.state_dict().items()}
 
 
+def mp_split():
+    """EVUAV_MP_SPLIT: 1/2/3 = two-GPU partition point (default 2); 0 = whole network on one GPU."""
+    return int(os.environ.get("EVUAV_MP_SPLIT", "2"))
+
+
+def used_devices():
+    return (0,) if mp_split() == 0 else (0, 1)
+
+
+def build_net(split):
+    return evspsegnet(cfg).cuda(0) if split == 0 else evspsegnet_mp(cfg, split)
+
+
 def memory(reset=False):
     result = {}
-    for device in (0, 1):
+    for device in used_devices():
         torch.cuda.synchronize(device)
         result[str(device)] = {
             "peak_allocated_GiB": round(torch.cuda.max_memory_allocated(device) / 2**30, 3),
@@ -81,7 +94,7 @@ def memory(reset=False):
 
 def clear_unused():
     gc.collect()
-    for device in (0, 1):
+    for device in used_devices():
         with torch.cuda.device(device):
             torch.cuda.empty_cache()
 
@@ -114,7 +127,7 @@ def forward_loss(net, criterion, batch):
 
 
 def check_gradients(net):
-    counts = {0: 0, 1: 0}
+    counts = {device: 0 for device in used_devices()}
     for name, param in net.named_parameters():
         if param.requires_grad:
             if param.grad is None:
@@ -278,7 +291,7 @@ def compare(split):
 
 def smoke(split):
     setup(run_seed())
-    net = evspsegnet_mp(cfg, split).train()
+    net = build_net(split).train()
     dataset = make_dataset("train")
     criterion = STCLoss(k=cfg.k, t=cfg.t, cfg=cfg).cuda(0)
     optimizer = torch.optim.Adam(net.parameters(), lr=cfg.lr)
@@ -296,11 +309,11 @@ def smoke(split):
         loss.backward()
         counts = check_gradients(net)
         if not all(counts.values()):
-            raise RuntimeError("Both GPUs must receive gradients")
+            raise RuntimeError("Every used GPU must receive gradients")
         print("Backward passed; gradient tensors:", counts, flush=True)
         optimizer.step()
         check_state(net)
-        changed = {0: 0, 1: 0}
+        changed = {device: 0 for device in used_devices()}
         for name, param in net.named_parameters():
             if not torch.equal(before[name], param.detach().cpu()):
                 changed[param.device.index] += 1
@@ -309,7 +322,7 @@ def smoke(split):
         print("Adam updated parameter tensors:", changed, flush=True)
         print("Memory:", json.dumps(memory()), flush=True)
         del batch, preds, loss, before
-    print("DUAL FP32 TWO-STEP SMOKE TEST: OK", flush=True)
+    print("%s FP32 TWO-STEP SMOKE TEST: OK" % ("SINGLE" if split == 0 else "DUAL"), flush=True)
 
 
 def linear_epoch_lr(epoch, epochs, start_lr, end_lr):
@@ -390,7 +403,7 @@ def train(split):
         "lr_policy": policy, "seed": seed, "validation_start": val_start,
         "save_root": str(root),
         "visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
-        "torch": torch.__version__, "gpu_names": [torch.cuda.get_device_name(i) for i in (0, 1)],
+        "torch": torch.__version__, "gpu_names": [torch.cuda.get_device_name(i) for i in used_devices()],
         "validation": ("eval mode; epochs >= %d; foreground IoU threshold 0.9"
                        % val_start),
         "source_sha256": {
@@ -400,7 +413,7 @@ def train(split):
                          "dataset/basedataset.py")
         },
     }, indent=2), encoding="utf-8")
-    net = evspsegnet_mp(cfg, split).train()
+    net = build_net(split).train()
     train_data = make_dataset("train")
     loader = make_loader(train_data, True)
     criterion = STCLoss(k=cfg.k, t=cfg.t, cfg=cfg).cuda(0)
@@ -488,22 +501,27 @@ def train(split):
 
 
 if __name__ == "__main__":
-    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
-        raise RuntimeError("This entry requires two visible CUDA GPUs")
+    split = mp_split()
+    if split not in (0, 1, 2, 3):
+        raise ValueError("EVUAV_MP_SPLIT must be 0 (single GPU) or 1/2/3 (two GPUs)")
+    if not torch.cuda.is_available() or torch.cuda.device_count() < len(used_devices()):
+        raise RuntimeError("This entry requires %d visible CUDA GPU(s)" % len(used_devices()))
     torch.cuda.set_device(0)  # Dataset/HAIS_OP .cuda() allocations use logical GPU 0.
     if cfg.batch_size != 1:
         raise ValueError("Keep batch_size=1 for this initial model-parallel experiment")
-    split = int(os.environ.get("EVUAV_MP_SPLIT", "2"))
     mode = os.environ.get("EVUAV_MODE", "smoke")
-    print("Mode:", mode, "split:", split, "max_events:", cfg.max_events_num, flush=True)
-    print("GPUs:", [torch.cuda.get_device_name(i) for i in (0, 1)], flush=True)
+    print("Mode:", mode, "split:", split, "max_events:", cfg.max_events_num,
+          "down_kernel:", getattr(cfg, "down_kernel", [3, 3, 5]), flush=True)
+    print("GPUs:", [torch.cuda.get_device_name(i) for i in used_devices()], flush=True)
     if mode not in ("compare", "smoke", "train"):
         raise ValueError("EVUAV_MODE must be compare, smoke or train")
+    if mode == "compare" and split == 0:
+        raise ValueError("compare checks the two-GPU partition; use EVUAV_MP_SPLIT=1/2/3")
     try:
         {"compare": compare, "smoke": smoke, "train": train}[mode](split)
     except Exception:
         # No synchronize or new CUDA allocation here: preserve the original error.
-        for device in (0, 1):
+        for device in used_devices():
             print("Failure memory cuda:%d allocated=%.3f GiB reserved=%.3f GiB peak=%.3f GiB" % (
                 device, torch.cuda.memory_allocated(device) / 2**30,
                 torch.cuda.memory_reserved(device) / 2**30,
