@@ -16,7 +16,8 @@ merged_decoder=True（电流合并解码器）时，每个解码阶段写成两�
     up3   ConvT4x4 s2 p1 48->48 (S4)  +  dec3 Conv3x3 48->48 (S3)  -> 增益 -> LIF5   66x88
     up2   ConvT4x4 s2 p1 48->24 (S5)  +  dec2 Conv3x3 24->24 (S2)  -> 增益 -> LIF6  132x176
     up1   ConvT4x4 s2 p1 24->12 (S6)  +  dec1 Conv3x3 12->12 (S1)  -> 增益 -> LIF7  264x352
-所有突触运算的输入都是 0/1 脉冲，仍为 7 组状态、读出不变。原版 ConvT2x2 与解码卷积之间没有非线性，
+所有突触运算的输入都是 0/1 脉冲（neuron=tif 时为多级电平 theta*q，传输的是整数变化量 Δq），
+仍为 7 组状态、读出不变。原版 ConvT2x2 与解码卷积之间没有非线性，
 Conv3x3(cat[ConvT2x2(S_deep), S_skip]) 可以精确合成上式，训练好的原版权重可无损换算，
 见 merge_decoder_state_dict 与 tools/convert_to_merged_decoder.py。
 
@@ -24,6 +25,7 @@ Conv3x3(cat[ConvT2x2(S_deep), S_skip]) 可以精确合成上式，训练好的�
     forward        逐窗：每个窗口依次经过 7 层（流式推理、增益校准、正式评估）
     forward_chunk  逐层：一个 TBPTT 片段的 T 个窗口先整体过完一层再进入下一层（训练加速）
 """
+import math
 from collections import OrderedDict
 
 import numpy as np
@@ -32,12 +34,39 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from model.lif2d_stream import (ChannelGain, ReLUNeuron, StreamingGraded2d,
-                                StreamingLIF2d, StreamingDualMemoryLIF2d,
+                                StreamingLIF2d, StreamingDualMemoryLIF2d, StreamingTIF2d,
                                 SurrogateSpike)
 from utils.stream_common import gains_from_positive_samples
 
 LAYER_NAMES = ("enc1", "enc2", "enc3", "enc4", "dec3", "dec2", "dec1")
 DECODER_STAGES = (("up3", "dec3"), ("up2", "dec2"), ("up1", "dec1"))
+TIF_DEFAULTS = {"levels": 7, "quantize": True, "transport": True, "k_init": 0.05}
+# 第 1 轮（10-19 前）的搬运规则带可学先验 eps；两侧限量配对之后不再使用，旧 checkpoint 配置里的这个键直接丢弃
+TIF_LEGACY_KEYS = ("eps_init",)
+
+
+def tif_settings(tif):
+    """校验 TIF 配置字典并补全默认值；None 表示全部取默认（见 TIF_DEFAULTS）。"""
+    if tif is None:
+        tif = {}
+    if not isinstance(tif, dict):
+        raise ValueError("tif 必须为配置字典")
+    tif = {key: value for key, value in tif.items() if key not in TIF_LEGACY_KEYS}
+    unknown = set(tif) - set(TIF_DEFAULTS)
+    if unknown:
+        raise ValueError("未知 TIF 配置: %s" % sorted(unknown))
+    out = dict(TIF_DEFAULTS)
+    out.update(tif)
+    if isinstance(out["levels"], bool) or int(out["levels"]) != out["levels"] or int(out["levels"]) < 1:
+        raise ValueError("tif.levels 必须是 >= 1 的整数")
+    if not isinstance(out["quantize"], bool) or not isinstance(out["transport"], bool):
+        raise ValueError("tif.quantize / tif.transport 必须为 YAML 布尔值")
+    value = float(out["k_init"])
+    if not (np.isfinite(value) and value > 0):
+        raise ValueError("tif.k_init 必须是有限正数")
+    out["k_init"] = value
+    out["levels"] = int(out["levels"])
+    return out
 
 
 def make_norm(kind, channels):
@@ -57,7 +86,7 @@ class SpikingConvBlock(nn.Module):
         pre_gain_current 是乘增益之前的电流，只用于增益校准统计。
     """
 
-    def __init__(self, in_ch, out_ch, stride, neuron, norm, lif_kwargs):
+    def __init__(self, in_ch, out_ch, stride, neuron, norm, lif_kwargs, tif_kwargs=None):
         super(SpikingConvBlock, self).__init__()
         self.conv = nn.Conv2d(in_ch, out_ch, 3, stride=stride, padding=1, bias=False)
         self.norm = make_norm(norm, out_ch)
@@ -68,6 +97,8 @@ class SpikingConvBlock(nn.Module):
             self.neuron = StreamingGraded2d(out_ch, **lif_kwargs)
         elif neuron == "relu":
             self.neuron = ReLUNeuron()
+        elif neuron == "tif":
+            self.neuron = StreamingTIF2d(out_ch, **dict(lif_kwargs, **(tif_kwargs or {})))
         else:
             raise ValueError("未知的 neuron 类型: %s" % neuron)
         self.out_ch = out_ch
@@ -115,22 +146,27 @@ class EvSpSegNetStream(nn.Module):
                    None 时使用构造参数中的默认值
         collect    True 时 info 返回每层的脉冲、u_pre、增益前电流（用于监控与校准）
         logits     [N] 每个事件的原始 logit
-        new_states 7 组状态：普通 LIF 为软复位后的 U，双仓为 (U, M)，ReLU 为 None
+        new_states 7 组状态：普通 LIF 为软复位后的 U，双仓为 (U, M)，TIF 为信念 M，ReLU 为 None
+    neuron="tif" 时 tif 为 TIF 配置字典（键见 TIF_DEFAULTS；None 取默认）；TIF 参数不消耗随机数，
+    同种子下卷积与读出的初始化与 LIF 版本逐位相同。
     """
 
     def __init__(self, in_channels=12, channels=(12, 24, 48, 48), neuron="lif", norm="none",
                  state_mode="carry", readout_hidden=32, dt_ms=50.0, tau_init_ms=200.0,
                  tau_min_ms=50.0, tau_max_ms=2000.0, v_threshold=1.0, merged_decoder=False,
-                 dual_memory=None, subthreshold_residual=None):
+                 dual_memory=None, subthreshold_residual=None, tif=None):
         super(EvSpSegNetStream, self).__init__()
         if state_mode not in ("carry", "reset_each_window"):
             raise ValueError("state_mode 必须是 carry 或 reset_each_window")
         if not isinstance(merged_decoder, bool):
             raise ValueError("merged_decoder 必须是 YAML 布尔值（true/false）")
+        if tif is not None and neuron != "tif":
+            raise ValueError("tif 配置只用于 neuron: tif")
+        self.tif_config = tif_settings(tif) if neuron == "tif" else None
         c1, c2, c3, c4 = channels
         lif = dict(dt_ms=dt_ms, tau_init_ms=tau_init_ms, tau_min_ms=tau_min_ms,
                    tau_max_ms=tau_max_ms, v_threshold=v_threshold)
-        block = lambda i, o, s: SpikingConvBlock(i, o, s, neuron, norm, lif)  # noqa: E731
+        block = lambda i, o, s: SpikingConvBlock(i, o, s, neuron, norm, lif, self.tif_config)  # noqa: E731
         self.enc1 = block(in_channels, c1, 1)
         self.enc2 = block(c1, c2, 2)
         self.enc3 = block(c2, c3, 2)
@@ -274,8 +310,24 @@ class EvSpSegNetStream(nn.Module):
 
     @property
     def stateful(self):
-        """是否保留跨窗膜电位（lif 与 graded 保留，relu 没有状态）。"""
-        return self.neuron_kind in ("lif", "graded")
+        """是否保留跨窗状态（lif、graded、tif 保留，relu 没有状态）。"""
+        return self.neuron_kind in ("lif", "graded", "tif")
+
+    @property
+    def is_tif(self):
+        return self.neuron_kind == "tif"
+
+    def start_tif_stats(self):
+        """开始累计各 TIF 层的诊断统计（消息率、电平占用、被搬走的质量比例）；非 TIF 网络不做任何事。"""
+        if self.is_tif:
+            for block in self.blocks():
+                block.neuron.start_stats()
+
+    def stop_tif_stats(self):
+        """停止累计并返回 {层名: 统计}；非 TIF 网络返回空字典。"""
+        if not self.is_tif:
+            return {}
+        return {name: block.neuron.stop_stats() for name, block in zip(LAYER_NAMES, self.blocks())}
 
     @property
     def has_dual_memory(self):
@@ -722,7 +774,8 @@ def estimate_operations(net, height, width, firing_rates, events_per_window, inp
         residual_event_ops = c1 + c1 * c1                  # 12->1 门 + 12->12 投影；不计池化/逐元素门控
         add("event_residual_skip", residual_event_ops * float(events_per_window), 0.0,
             residual_event_ops * float(events_per_window))
-    if not net.spiking:                       # graded / relu 对照输出实数，没有脉冲，全部按 MAC 计
+    tif_quantized = net.is_tif and net.tif_config["quantize"]
+    if not net.spiking and not tif_quantized:  # graded / relu / 不量化的 TIF 输出实数，全部按 MAC 计
         for layer in layers:
             layer["mac"], layer["sop"] = layer["dense"], 0.0
     state_size = dict(size)
@@ -733,6 +786,20 @@ def estimate_operations(net, height, width, firing_rates, events_per_window, inp
     result = {"dense_ops": sum(l["dense"] for l in layers), "mac": sum(l["mac"] for l in layers),
               "sop": sum(l["sop"] for l in layers), "per_layer": layers,
               "state_elements": state_elements if net.stateful else 0}
+    if net.is_tif:
+        cfg = net.tif_config
+        transport_ops = 56 if cfg["transport"] else 0   # 两次 8 邻域求和 16 加 + 8 条边各约 5 次 + 新息约 4 次
+        update_ops = 7 + (4 if cfg["quantize"] else 0)  # 驱动、EMA、截断约 7 次；量化与 Δq 约 4 次
+        result["tif"] = {
+            "levels": cfg["levels"], "quantize": cfg["quantize"], "transport": cfg["transport"],
+            "message_payload_bits": int(math.ceil(math.log2(2 * cfg["levels"] + 1))),
+            "sop_basis": "firing_rates 为每神经元每窗平均 |Δq|：SOP = 单位脉冲口径（每个单位电平变化一次突触累加）",
+            "elementwise_ops_per_window": (transport_ops + update_ops) * state_elements,
+            "transport_elementwise_ops_per_window": transport_ops * state_elements,
+            "synaptic_accumulator_elements": state_elements,
+            "included_in_mac_sop": False,
+            "note": ("逐元素运算单列，未折算进 MAC/SOP；事件驱动实现按 Δ 网络做法为每个神经元保存一份突触累积，"
+                     "另列 synaptic_accumulator_elements；quantize=false 时层间是实数，全部按 MAC 计")}
     if net.has_dual_memory:
         extra_by_layer = {name: getattr(net, name).out_ch * state_size[name] for name in net.dual_memory_layers}
         extra = sum(extra_by_layer.values())

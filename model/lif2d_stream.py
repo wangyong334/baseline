@@ -9,12 +9,15 @@
 每个 50 ms 窗口只调用一次神经元：5 个时间 bin 是输入通道，不是 SNN 时间步。
 三种神经元用于分离"脉冲"与"跨窗记忆"两个因素：StreamingLIF2d（有状态+二值）、
 StreamingGraded2d（有状态+实数）、ReLUNeuron（无状态+实数）。
+StreamingTIF2d 是 V5 的 TIF 神经元（信念 M 与"已告知"分离 + 新息配对搬运 + 多级变化汇报），见类说明。
 forward 逐窗调用（流式推理、增益校准）；forward_steps 一次处理一个片段的多个窗口（逐层时间并行训练），两者等价。
 """
 import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import torch.utils.checkpoint as checkpoint_utils
 
 
 class SurrogateSpike(torch.autograd.Function):
@@ -216,6 +219,212 @@ class StreamingGraded2d(StreamingLIF2d):
     def activate(self, u_pre):
         fired = SurrogateSpike.apply(u_pre - self.v_threshold)
         return fired * u_pre, fired.detach()
+
+
+def inverse_softplus(value):
+    """softplus 的反函数：返回 x 使 softplus(x) = value（value > 0）。"""
+    value = float(value)
+    if not (math.isfinite(value) and value > 0):
+        raise ValueError("inverse_softplus 需要有限正数，收到 %r" % value)
+    return value + math.log(-math.expm1(-value))
+
+
+class StreamingTIF2d(StreamingLIF2d):
+    """TIF 神经元（Transport–Integrate–and–Fire，V5 基础版 TIF-B，见 Stream-SNN-Innovations.md 第 11 节）。
+
+    每个窗口、每个通道、每个像素（N8 = 3x3 邻域去掉中心的求和，补零边界）：
+        z   = I - k                               驱动；k = softplus(.) >= 0，低于 k 的输入不积累（CUSUM 式参考值）
+        d   = relu(z) - M_prev                    新息：当前证据能支持的记忆量减去已有记忆
+        e   = relu(d)                             记忆解释不了的新证据（可以接收）
+        m   = relu(-d)                            失去证据支持的记忆（可以搬走）
+        搬运：失去支持的记忆 m 只配给 8 邻域里的新证据 e；两侧限量（搬走的 <= m，搬来的 <= e），见 transport_memory
+        M~  = M_prev - 流出 + 流入                新息配对搬运：守恒、非负；搬走的 <= m，搬来的 <= e；
+                                                  有支持的记忆不动；没有可学参数、不估计速度、没有方向先验
+        M   = min(relu(lam * M~ + (1 - lam) * z), D * theta)    有界的泄漏证据累积（EMA 形式，稳态 M = z）
+        out = theta * round(M / theta)            多级汇报（round 用直通估计）；quantize=False 时 out = M
+    lam = exp(-dt/tau) 沿用 V1 的 tau 参数化；theta = exp(.) 逐通道可学（LSQ 式步长），初值 v_th / D，
+    使量程 D*theta 与增益校准的目标（q99 正电流 = v_th）一致。
+    状态只有 M（没有复位）；下游需要的整数消息是 Δq = q_t - q_{t-1}（q = round(M/theta)），
+    由 M 序列确定，这里不单独保存。关闭 transport 时严格等于反射累积器（消融用）。
+    state 为 None 与零状态数值相同。
+    forward(current, state) -> (out, M, M)：第三项对应 LIF 的 u_pre，最后一层用它做逐事件读出。
+    训练（forward_steps 且需要梯度）时每一步的神经元运算在反向时重算（梯度检查点），数学不变、只省显存：
+    否则每步要为反向保存约 11 张整幅中间图。
+    """
+
+    def __init__(self, channels, dt_ms, tau_init_ms, tau_min_ms, tau_max_ms, v_threshold,
+                 levels=7, quantize=True, transport=True, k_init=0.05):
+        super(StreamingTIF2d, self).__init__(channels, dt_ms, tau_init_ms, tau_min_ms, tau_max_ms,
+                                             v_threshold)
+        if isinstance(levels, bool) or int(levels) != levels or int(levels) < 1:
+            raise ValueError("TIF levels 必须是 >= 1 的整数")
+        if not isinstance(quantize, bool) or not isinstance(transport, bool):
+            raise ValueError("TIF quantize / transport 必须是布尔值")
+        self.levels = int(levels)
+        self.quantize = quantize
+        self.transport = transport
+        self.k_raw = nn.Parameter(torch.full((channels,), inverse_softplus(k_init), dtype=torch.float32))
+        self.log_theta = nn.Parameter(torch.full((channels,), math.log(float(v_threshold) / self.levels),
+                                                 dtype=torch.float32))
+        kernel = torch.ones(channels, 1, 3, 3, dtype=torch.float32)
+        kernel[:, :, 1, 1] = 0.0
+        self.register_buffer("neighbor_kernel", kernel, persistent=False)
+        self.collect_stats = False
+        self._stats = {}
+
+    def k(self):
+        """参考值 k >= 0，形状 [C]。"""
+        return F.softplus(self.k_raw)
+
+    def theta(self):
+        """量化步长 theta > 0，形状 [C]。"""
+        return torch.exp(self.log_theta)
+
+    def _coefficients(self, current):
+        view = (1, -1, 1, 1)
+        lam = self.beta().to(current.dtype).view(view)
+        theta = self.theta().to(current.dtype).view(view)
+        return lam, self.k().to(current.dtype).view(view), theta, theta * self.levels
+
+    def neighbor_sum(self, x):
+        """3x3 邻域（不含中心）求和，补零边界；逐通道 depthwise 卷积。"""
+        return F.conv2d(x, self.neighbor_kernel.to(x.dtype), padding=1, groups=x.shape[1])
+
+    def transport_memory(self, memory, support):
+        """新息配对搬运（两侧限量）。返回 (搬运后的记忆, 每个位置的流出量)。
+
+        输入 memory >= 0、support = relu(z) >= 0 [B,C,H,W]。原则：记忆搬多少，正好等于这一拍的变化能解释多少。
+          e = relu(support - memory) 记忆解释不了的新证据（可以接收），m = relu(memory - support) 失去支持的记忆（可以搬走）；
+          同一位置不会同时有 m 和 e。只在 8 邻域内搬（每拍最远一格），方向等权，没有可学参数、不估计速度。
+        一轮比例拟合（部分最优传输的两侧上限）：
+          源端：y 报出 min(m(y), D(y))，按 e 的比例分给邻格，r(y) = m(y) / max(D(y), m(y))，D = N8(e)；
+          目的地：x 最多收下 e(x)，接收比例 a(x) = 1 / max(1, N8(r)(x))，收不下的留在源处；
+          f(y->x) = r(y) e(x) a(x)  =>  流出(y) = r(y) N8(e a)(y) <= m(y)，流入(x) = e(x) min(1, N8(r)(x)) <= e(x)，
+          两式逐边相同，总量守恒。于是弱噪声最多只吸走与它等量的记忆，目标闪烁一拍时记忆基本留在原地。
+        """
+        innovation = support - memory
+        evidence = torch.relu(innovation)
+        surplus = torch.relu(-innovation)
+        demand = self.neighbor_sum(evidence)
+        offer = surplus / (torch.maximum(demand, surplus) + 1e-12)        # 1e-12 只防 0/0（此时分子为 0）
+        offered = self.neighbor_sum(offer)
+        accept = 1.0 / torch.clamp(offered, min=1.0)
+        outflow = offer * self.neighbor_sum(evidence * accept)
+        inflow = evidence * torch.clamp(offered, max=1.0)
+        return memory - outflow + inflow, outflow
+
+    def level(self, memory):
+        """量化电平 q = round(M/theta)（整数值张量，不带梯度）；memory 为 None 时返回 None。"""
+        if memory is None:
+            return None
+        theta = self.theta().to(memory.dtype).view(1, -1, 1, 1)
+        return torch.round(memory.detach() / theta)
+
+    def _compute(self, current, prev, lam, k, theta, cap):
+        """一个窗口的 TIF 运算，返回 (输出, 新记忆 M, 搬运流出量或 None)。"""
+        z = current - k
+        support = torch.relu(z)
+        outflow = None
+        if prev is None:
+            pre = (1.0 - lam) * z
+        else:
+            carried = prev
+            if self.transport:
+                carried, outflow = self.transport_memory(prev, support)
+            pre = lam * carried + (1.0 - lam) * z
+        memory = torch.minimum(torch.relu(pre), cap)
+        if self.quantize:
+            scaled = memory / theta
+            output = theta * (scaled + (torch.round(scaled) - scaled).detach())
+        else:
+            output = memory
+        return output, memory, outflow
+
+    def _checkpoint_body(self, current, prev, lam, k, theta, cap):
+        output, memory, _ = self._compute(current, prev, lam, k, theta, cap)
+        return output, memory
+
+    def _step(self, current, prev, lam, k, theta, cap, recompute=False):
+        if recompute and prev is not None and torch.is_grad_enabled() and not self.collect_stats:
+            output, memory = checkpoint_utils.checkpoint(self._checkpoint_body, current, prev, lam, k, theta,
+                                                         cap, preserve_rng_state=False)
+            outflow = None
+        else:
+            output, memory, outflow = self._compute(current, prev, lam, k, theta, cap)
+        if self.collect_stats:
+            self._accumulate(memory, prev, outflow)
+        return output, memory
+
+    def forward(self, current, state):
+        output, memory = self._step(current, state, *self._coefficients(current))
+        return output, memory, memory
+
+    def forward_steps(self, current, state, carry=True, keep_u_pre=True, keep=None):
+        """按时间顺序处理一个片段的 T 个窗口，与连续调用 forward T 次数学等价（接口同 StreamingLIF2d）。"""
+        steps = int(current.shape[0])
+        if steps == 0:
+            raise ValueError("片段至少需要 1 个窗口")
+        coefficients = self._coefficients(current)
+        outputs, memories = [], []
+        for t in range(steps):
+            prev = mask_state(state if carry else None, keep, t)
+            output, state = self._step(current[t], prev, *coefficients, recompute=True)
+            outputs.append(output)
+            if keep_u_pre:
+                memories.append(state)
+        return torch.stack(outputs), state, (torch.stack(memories) if keep_u_pre else None)
+
+    # ----- 诊断统计（只用于验证，不参与前向；训练时关闭） -----
+
+    def start_stats(self):
+        """开始累计诊断统计（清空旧值）。"""
+        self._stats = {}
+        self.collect_stats = True
+
+    def _accumulate(self, memory, prev, outflow):
+        with torch.no_grad():
+            s = self._stats
+            if not s:
+                zero = torch.zeros((), device=memory.device, dtype=torch.float64)
+                s.update(elements=0, windows=0, occupied=zero.clone(), saturated=zero.clone(),
+                         level_sum=zero.clone(), message_abs=zero.clone(), message_nonzero=zero.clone(),
+                         mass=zero.clone(), moved=zero.clone())
+            q = self.level(memory)
+            q_prev = torch.zeros_like(q) if prev is None else self.level(prev)
+            delta = q - q_prev
+            s["elements"] += memory.numel()
+            s["windows"] += 1
+            s["occupied"] += (memory > 0).sum().double()
+            s["saturated"] += (q >= self.levels).sum().double()
+            s["level_sum"] += q.double().sum()
+            s["message_abs"] += delta.abs().double().sum()
+            s["message_nonzero"] += delta.ne(0).sum().double()
+            if prev is not None:
+                s["mass"] += prev.detach().double().sum()
+            if outflow is not None:
+                s["moved"] += outflow.detach().double().sum()
+
+    def stop_stats(self):
+        """停止累计并返回汇总（每个神经元每窗的平均值）；没有数据时返回空字典。
+
+        message_abs_rate      平均 |Δq|（单位脉冲口径：每个单位电平变化 = 一次突触累加）
+        message_nonzero_rate  Δq 非零的比例（graded 口径：一条消息携带一个小整数）
+        level_mean / occupancy / saturation  电平均值、M>0 的比例、电平到顶（q = D）的比例
+        moved_mass_frac       搬运移走的记忆质量 / 搬运前的记忆总量（搬运是否在工作）
+        """
+        self.collect_stats = False
+        s = self._stats
+        if not s:
+            return {}
+        n = float(max(s["elements"], 1))
+        mass = float(s["mass"])
+        return {"message_abs_rate": float(s["message_abs"]) / n,
+                "message_nonzero_rate": float(s["message_nonzero"]) / n,
+                "level_mean": float(s["level_sum"]) / n,
+                "occupancy": float(s["occupied"]) / n,
+                "saturation": float(s["saturated"]) / n,
+                "moved_mass_frac": (float(s["moved"]) / mass) if mass > 0 else 0.0,
+                "windows": int(s["windows"])}
 
 
 class ReLUNeuron(nn.Module):

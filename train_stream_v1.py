@@ -35,8 +35,9 @@ from dataset.ev_uav_stream import EvUAVStream, make_sequence_loader, window_to_d
 from dataset.stream_source import INPUT_DEVICES, make_window_source  # noqa: E402
 from dataset.stream_windows import num_input_channels, refill_by_index  # noqa: E402
 from model.evspsegnet_stream import (LAYER_NAMES, EvSpSegNetStream, calibrate_gains,  # noqa: E402
-                                     count_parameters, estimate_operations)
-from model.lif2d_stream import StreamingLIF2d, StreamingDualMemoryLIF2d, detach_states  # noqa: E402
+                                     count_parameters, estimate_operations, tif_settings)
+from model.lif2d_stream import (StreamingLIF2d, StreamingDualMemoryLIF2d, StreamingTIF2d,  # noqa: E402
+                                detach_states)
 from utils.stream_common import (health_warnings, linear_epoch_lr, load_flat_config,  # noqa: E402
                                  make_chunks, select_subset, subset_due, summarize_history)
 from utils.stream_metrics import (SWEEP_THRESHOLDS, FastRoc, first_detection_latencies, iou_from_counts,  # noqa: E402
@@ -63,8 +64,9 @@ def parse_args():
     parser.add_argument("--save-root", default=None, help="输出目录，默认取 YAML 的 save_root")
     parser.add_argument("--seed", type=int, default=None, help="覆盖 YAML 中的 seed")
     parser.add_argument("--state-mode", choices=("carry", "reset_each_window"), default=None)
-    parser.add_argument("--neuron", choices=("lif", "graded", "relu"), default=None,
-                        help="lif 有状态+脉冲 | graded 有状态+实数（分离脉冲与记忆的对照）| relu 无状态+实数")
+    parser.add_argument("--neuron", choices=("lif", "graded", "relu", "tif"), default=None,
+                        help="lif 有状态+脉冲 | graded 有状态+实数（分离脉冲与记忆的对照）| relu 无状态+实数 | "
+                             "tif V5 TIF 神经元（配置见 YAML 的 tif 小节）")
     parser.add_argument("--checkpoint", default=None, help="eval 模式使用的权重文件")
     parser.add_argument("--split", choices=("val", "test"), default="val")
     parser.add_argument("--sequence", default=None, help="overfit 模式的序列文件名")
@@ -213,8 +215,18 @@ def build_net(cfg, device):
         tau_init_ms=float(cfg["tau_init_ms"]), tau_min_ms=float(cfg["tau_min_ms"]),
         tau_max_ms=float(cfg["tau_max_ms"]), v_threshold=float(cfg["v_threshold"]),
         merged_decoder=cfg.get("merged_decoder", False), dual_memory=cfg.get("dual_memory"),
-        subthreshold_residual=cfg.get("subthreshold_residual"))
+        subthreshold_residual=cfg.get("subthreshold_residual"),
+        tif=cfg.get("tif") if cfg["neuron"] == "tif" else None)
     return net.to(device)
+
+
+def design_version(net):
+    """写入 run_config 与 checkpoint 的设计版本标记。"""
+    if net.is_tif:
+        return "v5-tif"
+    if net.has_subthreshold_residual:
+        return "v1-subthreshold-residual"
+    return "v1-dual-memory" if net.has_dual_memory else "v1-3"
 
 
 def train_file_names(cfg):
@@ -467,6 +479,23 @@ def tau_statistics(net):
                         out[name][prefix + "_" + suffix] = float(value)
                 out[name]["kappa_abs_mean"] = float(kappa.abs().mean())
                 out[name]["memory_read_enabled"] = neuron.memory_read_enabled
+    return out
+
+
+def tif_parameter_statistics(net):
+    """TIF 各层参考值 k、量化步长 theta 的最小/平均/最大值（非 TIF 网络返回空字典；搬运没有可学参数）。"""
+    out = {}
+    for name, block in zip(LAYER_NAMES, net.blocks()):
+        neuron = block.neuron
+        if not isinstance(neuron, StreamingTIF2d):
+            continue
+        with torch.no_grad():
+            values = {"k": neuron.k(), "theta": neuron.theta()}
+            out[name] = {}
+            for key, value in values.items():
+                value = value.double().cpu()
+                out[name].update({key + "_min": float(value.min()), key + "_mean": float(value.mean()),
+                                  key + "_max": float(value.max())})
     return out
 
 
@@ -952,6 +981,8 @@ def evaluate_split(net, cfg, q99, device, split, state_mode, names=None, full=Fa
     kept, total_events, total_windows = [], 0, 0
     was_training = net.training
     net.eval()
+    if monitor is not None:
+        net.start_tif_stats()                 # TIF 消息率与搬运比例；非 TIF 网络不做任何事
     with torch.no_grad():
         for i in range(len(dataset)):
             seq = dataset[i]
@@ -976,6 +1007,7 @@ def evaluate_split(net, cfg, q99, device, split, state_mode, names=None, full=Fa
             if full:
                 roc.update(seq.t, probs, seq.target_id, seq.label, seq.x, seq.y, float(cfg["threshold"]))
                 kept.append((seq.t, seq.label, seq.target_id, probs))
+    tif_stats = net.stop_tif_stats() if monitor is not None else {}
     net.train(was_training)
     iou, acc = evaluator.evaluate_iou_and_accuracy(thresh=float(cfg["threshold"]))
     result = {"split": split, "state_mode": state_mode, "n_sequences": len(dataset),
@@ -984,6 +1016,8 @@ def evaluate_split(net, cfg, q99, device, split, state_mode, names=None, full=Fa
         result["layers"] = monitor.summary()
         if monitor.residual_summary():
             result["subthreshold_diagnostics"] = monitor.residual_summary()
+        if tif_stats:
+            result["tif"] = tif_stats
     if full:
         pd, fa = roc.result()
         tp, fp, fn, npos = (confusion_sum[:, j] for j in range(4))
@@ -994,6 +1028,9 @@ def evaluate_split(net, cfg, q99, device, split, state_mode, names=None, full=Fa
             records += first_detection_latencies(t, label, target_id, probs, cfg["window_ms"],
                                                  cfg["threshold"], cfg["correct_thresh"], net_ms)
         rates = {name: s["firing_rate"] for name, s in result["layers"].items()}
+        if net.is_tif and net.tif_config["quantize"]:
+            # TIF 层间传的是整数变化量 Δq：按每神经元每窗平均 |Δq| 计突触累加（单位脉冲口径）
+            rates.update({name: tif_stats[name]["message_abs_rate"] for name in LAYER_NAMES})
         rates["subthreshold_vertical"] = result.get(
             "subthreshold_diagnostics", {}).get("vertical_signal_nonzero_frac", 0.0)
         result.update({
@@ -1026,8 +1063,7 @@ def prepare_run(args, cfg, allow_existing=False):
     root = Path(cfg["save_root"])
     root.mkdir(parents=True, exist_ok=allow_existing)
     write_json(root / ("run_config_%s.json" % args.mode), {
-        "design_version": "v1-subthreshold-residual" if net.has_subthreshold_residual else
-                          ("v1-dual-memory" if net.has_dual_memory else "v1-3"),
+        "design_version": design_version(net), "tif": net.tif_config,
         "args": vars(args), "config": cfg, "stats": stats,
         "pos_weight": pos_weight, "parameters": count_parameters(net), "torch": torch.__version__,
         "device": torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu",
@@ -1061,17 +1097,20 @@ def mode_smoke(args, cfg):
     monitor = LayerMonitor(net.v_threshold)
     with torch.no_grad():
         net.eval()
+        net.start_tif_stats()
         states = None
         for k in range(32):
             x, events, _, _ = window_to_device(seq, k, q99, cfg, device)
             _, states, info = net(x, events, states, collect=True)
             monitor.update(info)
+        tif_stats = net.stop_tif_stats()
         net.train()
     layers, taus = monitor.summary(), tau_statistics(net)
     report = {"sequence": seq.name, "events_in_32_windows": out["events"], "loss_per_event":
               out["loss_sum"] / max(out["events"], 1), "grad_norms": out["grad_norms"],
               "missing_grads": out["missing_grads"], "train_ms_per_window": 1e3 * elapsed / 32,
               "peak_memory_gib": peak_memory_gib(device), "layers": layers, "tau": taus,
+              "tif": tif_stats, "tif_parameters": tif_parameter_statistics(net),
               "subthreshold_diagnostics": monitor.residual_summary(),
               "subthreshold_parameters": subthreshold_parameter_statistics(net),
               "warnings": health_warnings(layers, taus, out["grad_norms"])}
@@ -1121,8 +1160,7 @@ def save_checkpoint(path, net, optimizer, epoch, best_val_iou, cfg, stats):
     """保存权重（含已校准增益与 tau 参数）、优化器状态与配置；不保存膜电位。"""
     torch.save({"model": net.state_dict(), "optimizer": optimizer.state_dict(), "epoch": epoch,
                 "best_val_iou": best_val_iou, "config": cfg, "stats": stats,
-                "design_version": "v1-subthreshold-residual" if net.has_subthreshold_residual else
-                                  ("v1-dual-memory" if net.has_dual_memory else "v1-3")}, str(path))
+                "design_version": design_version(net)}, str(path))
 
 
 def mode_train(args, cfg):
@@ -1142,6 +1180,10 @@ def mode_train(args, cfg):
             raise ValueError("续训 dual_memory 配置与 checkpoint 不一致，不能改变时间常数范围或读取上限")
         if ckpt["config"].get("subthreshold_residual") != cfg.get("subthreshold_residual"):
             raise ValueError("续训 subthreshold_residual 配置与 checkpoint 不一致")
+        if ckpt["config"].get("neuron") != cfg.get("neuron") or (
+                cfg.get("neuron") == "tif"
+                and tif_settings(ckpt["config"].get("tif")) != tif_settings(cfg.get("tif"))):
+            raise ValueError("续训 neuron / tif 配置与 checkpoint 不一致")
         net.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         start_epoch, best = int(ckpt["epoch"]) + 1, float(ckpt["best_val_iou"])
@@ -1216,6 +1258,7 @@ def mode_train(args, cfg):
                   "updates": updates,
                   "val_threshold_sweep": val["threshold_sweep"],
                   "layers": val["layers"], "tau": taus,
+                  "tif": val.get("tif", {}), "tif_parameters": tif_parameter_statistics(net),
                   "subthreshold_diagnostics": val.get("subthreshold_diagnostics", {}),
                   "subthreshold_parameters": subthreshold_parameter_statistics(net),
                   "warnings": health_warnings(val["layers"], taus, grad_mean)}
@@ -1233,6 +1276,11 @@ def mode_train(args, cfg):
                   grad_clip_stats["total_norm_median"], 100.0 * grad_clip_stats["clip_frac"],
                   record["epoch_seconds"], train_seconds, record["peak_memory_gib"] or 0.0,
                   len(record["warnings"])), flush=True)
+        if record["tif"]:
+            print("  [tif] 每窗 |Δq| " + " ".join("%s %.4f" % (n, record["tif"][n]["message_abs_rate"])
+                                                  for n in LAYER_NAMES)
+                  + " | 搬走比例 " + " ".join("%s %.3f" % (n, record["tif"][n]["moved_mass_frac"])
+                                              for n in LAYER_NAMES), flush=True)
         for w in record["warnings"]:
             print("  [health]", w, flush=True)
     summary = summarize_history(history, seed)
@@ -1303,6 +1351,7 @@ def mode_eval(args, cfg):
                "trained_state_mode": train_cfg["state_mode"], "neuron": train_cfg["neuron"],
                "readout_ablation": args.readout_ablation, "dual_memory": train_cfg.get("dual_memory"),
                "subthreshold_residual": train_cfg.get("subthreshold_residual"),
+               "tif": net.tif_config, "tif_parameters": tif_parameter_statistics(net),
                "subthreshold_ablation": subthreshold_ablation,
                "subthreshold_parameters": subthreshold_parameter_statistics(net),
                "memory_ablation": memory_ablation,
