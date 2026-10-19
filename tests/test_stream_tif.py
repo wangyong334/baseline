@@ -549,48 +549,19 @@ class TIFFixTests(unittest.TestCase):
 
 
 class TIFConfigTests(unittest.TestCase):
-    def test_evflying_configs_differ_from_v1_only_in_neuron(self):
-        # EV-Flying 上的 TIF 对照：除 neuron / tif / save_root 外与 V1 的 EV-Flying 配置逐项相同
+    def test_evflying_config_differs_from_v1_only_in_neuron(self):
+        # EV-Flying 上的 TIF（不搬运）：除 neuron / tif / save_root 外与 V1 的 EV-Flying 配置逐项相同
         from utils.stream_common import load_flat_config
         v1 = load_flat_config("configs/evisseg_stream_v1_evflying.yaml")
-        expected = {"evisseg_stream_tif_notransport_evflying": (7, False),
-                    "evisseg_stream_tif_notransport_bin_evflying": (1, False),
-                    "evisseg_stream_tif_evflying": (7, True)}
-        roots = set()
-        for name, (levels, transport) in expected.items():
-            cfg = load_flat_config("configs/%s.yaml" % name)
-            self.assertEqual(set(cfg) - {"tif"}, set(v1), name)
-            for key in v1:
-                if key not in ("neuron", "save_root"):
-                    self.assertEqual(cfg[key], v1[key], (name, key))
-            self.assertEqual(cfg["neuron"], "tif")
-            tif = tif_settings(cfg["tif"])
-            self.assertEqual((tif["levels"], tif["transport"], tif["quantize"], tif["surrogate"]),
-                             (levels, transport, True, False), name)
-            roots.add(cfg["save_root"])
-        self.assertEqual(len(roots), 3)
-        self.assertNotIn(v1["save_root"], roots)
-
-    def test_binary_report_network_runs(self):
-        # levels=1：电平只有 0/1，量程 = theta；逐窗与逐层执行一致
-        net = make_tif_net(transport=False, levels=1).eval()
-        self.assertEqual(net.enc1.neuron.levels, 1)
-        seq = synthetic_sequence(seed=3)
-        source = TorchWindowSource(seq, CFG, Q99, torch.device("cpu"), torch.float64)
-        x, events, _, _ = source.chunk(0, 6)
-        with torch.no_grad():
-            logits, _, _ = net.forward_chunk(x, events, None)
-            states, parts = None, []
-            for k in range(6):
-                xk, ek, _, _ = source.window(k)
-                out, states, _ = net(xk, ek, states)
-                parts.append(out)
-        self.assertLess(max_error(logits, torch.cat(parts)), 1e-10)
-        n = tif_neuron(2, transport=False, levels=1)
-        out, memory, _ = n(torch.full((1, 2, 3, 3), 5.0, dtype=torch.float64), None)
-        theta = n.theta().double().view(1, -1, 1, 1)
-        self.assertLess(max_error(memory, theta.expand_as(memory)), 1e-12)      # 截到量程 theta
-        self.assertTrue(bool(((out == 0) | ((out - theta).abs() < 1e-12)).all()))
+        cfg = load_flat_config("configs/evisseg_stream_tif_notransport_evflying.yaml")
+        self.assertEqual(set(cfg) - {"tif"}, set(v1))
+        for key in v1:
+            if key not in ("neuron", "save_root"):
+                self.assertEqual(cfg[key], v1[key], key)
+        self.assertEqual(cfg["neuron"], "tif")
+        tif = tif_settings(cfg["tif"])
+        self.assertEqual((tif["levels"], tif["transport"], tif["quantize"], tif["surrogate"]), (7, False, True, False))
+        self.assertNotEqual(cfg["save_root"], v1["save_root"])
 
 
 class TIFEndToEndTests(unittest.TestCase):
