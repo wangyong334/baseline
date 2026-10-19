@@ -1522,3 +1522,21 @@ def tif_step(z, M, q_prev, K, eps, lam, theta, D):
   - ② 搬运；
   - ③ 搬运 + δ；
   - ④ 第一层不搬运，或不量化版本。
+
+### 11.10 缺陷修正的实现（10-19，第 3 轮用；默认关，旧配置逐位不变）
+- `tif.surrogate: true`：在 0 处反射时，前向不变；反向在 x ≤ 0 时取 1/(1+|x|)²，与 V1 LIF 的代理梯度相同。测试：全程负驱动的通道，关掉代理梯度时输入和 k 的梯度为 0，打开后不为 0；两种设置前向逐位相同。
+- `tif.transport_ref_init: δ0 > 0`：搬运参考值 δ = softplus(·)，逐通道可学；e = relu(d−δ)，m = relu(−d−δ)。守恒和两侧上限对缩小后的 e、m 仍然成立；|新息| ≤ δ 的单拍涨落不配对。
+- `tif.transport_layers`：只在列出的层搬运。只换神经元，不消耗随机数。
+- 监控：TIF 层的健康检查改用"死通道（M 恒为 0）"和"电平到顶"，去掉"几乎每窗 q>0"这一项；统计里新增 `dead_channel_frac`。
+- 兼容：与已上传服务器的 91bdb00 相比，默认配置下前向、状态、全部梯度和 checkpoint 键都逐位相同，旧配置带 `eps_init` 的也一样。
+- 开销（CPU，一个片段）：代理梯度 +1%，参考值 +3%；enc1 不搬运时反而更快。
+- 配置（第 3 轮）：
+
+| 配置 | 内容 |
+|---|---|
+| `evisseg_stream_tif_sg_notransport` | 代理梯度，不搬运 |
+| `evisseg_stream_tif_sg` | 代理梯度，搬运 |
+| `evisseg_stream_tif_sg_ref` | 代理梯度，搬运，δ0 = 0.05 |
+| `evisseg_stream_tif_sg_noenc1` | 代理梯度，搬运，enc1 不搬运 |
+
+- 测试：`test_stream*.py` 共 153 个。

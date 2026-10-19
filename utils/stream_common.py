@@ -155,6 +155,7 @@ HEALTH_DEFAULTS = {
     "max_silent_channel_frac": 0.5,   # 超过一半通道在评估期间从未发放：疑似死神经元
     "max_always_on_frac": 0.1,        # 超过 10% 神经元几乎每窗都发放：疑似饱和
     "max_big_membrane_frac": 0.01,    # |U_pre| > 10*阈值 的元素占比过高：疑似膜电位失控
+    "max_level_saturation_frac": 0.05,  # TIF：电平到顶（q = D）的元素占比过高：量程饱和
     "tau_bound_frac": 0.9,            # 超过 90% 通道的 tau 贴近上下界
 }
 
@@ -182,6 +183,8 @@ def health_warnings(layer_stats, tau_stats, grad_norms, limits=None):
             warnings.append("%s 有 %.1f%% 神经元几乎每窗发放（饱和）" % (name, 100 * s["always_on_frac"]))
         if s.get("big_membrane_frac", 0.0) > lim["max_big_membrane_frac"]:
             warnings.append("%s 膜电位过大元素占比 %.2f%%" % (name, 100 * s["big_membrane_frac"]))
+        if s.get("level_saturation_frac", 0.0) > lim["max_level_saturation_frac"]:
+            warnings.append("%s 有 %.1f%% 元素电平到顶（量程饱和）" % (name, 100 * s["level_saturation_frac"]))
     for name, s in tau_stats.items():
         if s.get("near_min_frac", 0.0) > lim["tau_bound_frac"]:
             warnings.append("%s 的 tau 几乎全部收缩到下界（模型可能放弃了长历史）" % name)

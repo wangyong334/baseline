@@ -40,7 +40,10 @@ from utils.stream_common import gains_from_positive_samples
 
 LAYER_NAMES = ("enc1", "enc2", "enc3", "enc4", "dec3", "dec2", "dec1")
 DECODER_STAGES = (("up3", "dec3"), ("up2", "dec2"), ("up1", "dec1"))
-TIF_DEFAULTS = {"levels": 7, "quantize": True, "transport": True, "k_init": 0.05}
+# surrogate / transport_ref_init / transport_layers 是 10-19 缺陷修正的开关，默认值 = 修正前的行为（旧配置逐位不变）
+TIF_DEFAULTS = {"levels": 7, "quantize": True, "transport": True, "k_init": 0.05,
+                "surrogate": False, "transport_ref_init": 0.0, "transport_layers": LAYER_NAMES}
+TIF_NEURON_KEYS = ("levels", "quantize", "transport", "k_init", "surrogate", "transport_ref_init")
 # 第 1 轮（10-19 前）的搬运规则带可学先验 eps；两侧限量配对之后不再使用，旧 checkpoint 配置里的这个键直接丢弃
 TIF_LEGACY_KEYS = ("eps_init",)
 
@@ -59,12 +62,21 @@ def tif_settings(tif):
     out.update(tif)
     if isinstance(out["levels"], bool) or int(out["levels"]) != out["levels"] or int(out["levels"]) < 1:
         raise ValueError("tif.levels 必须是 >= 1 的整数")
-    if not isinstance(out["quantize"], bool) or not isinstance(out["transport"], bool):
-        raise ValueError("tif.quantize / tif.transport 必须为 YAML 布尔值")
+    if not all(isinstance(out[key], bool) for key in ("quantize", "transport", "surrogate")):
+        raise ValueError("tif.quantize / tif.transport / tif.surrogate 必须为 YAML 布尔值")
     value = float(out["k_init"])
     if not (np.isfinite(value) and value > 0):
         raise ValueError("tif.k_init 必须是有限正数")
     out["k_init"] = value
+    value = float(out["transport_ref_init"])
+    if not (np.isfinite(value) and value >= 0):
+        raise ValueError("tif.transport_ref_init 必须是有限非负数（0 = 不用搬运参考值）")
+    out["transport_ref_init"] = value
+    layers = out["transport_layers"]
+    if (not isinstance(layers, (list, tuple)) or not layers or len(set(layers)) != len(layers)
+            or any(name not in LAYER_NAMES for name in layers)):
+        raise ValueError("tif.transport_layers 必须是 enc1/enc2/enc3/enc4/dec3/dec2/dec1 的非空、无重复列表")
+    out["transport_layers"] = tuple(name for name in LAYER_NAMES if name in layers)
     out["levels"] = int(out["levels"])
     return out
 
@@ -166,7 +178,9 @@ class EvSpSegNetStream(nn.Module):
         c1, c2, c3, c4 = channels
         lif = dict(dt_ms=dt_ms, tau_init_ms=tau_init_ms, tau_min_ms=tau_min_ms,
                    tau_max_ms=tau_max_ms, v_threshold=v_threshold)
-        block = lambda i, o, s: SpikingConvBlock(i, o, s, neuron, norm, lif, self.tif_config)  # noqa: E731
+        neuron_tif = (None if self.tif_config is None
+                      else {key: self.tif_config[key] for key in TIF_NEURON_KEYS})
+        block = lambda i, o, s: SpikingConvBlock(i, o, s, neuron, norm, lif, neuron_tif)  # noqa: E731
         self.enc1 = block(in_channels, c1, 1)
         self.enc2 = block(c1, c2, 2)
         self.enc3 = block(c2, c3, 2)
@@ -186,6 +200,13 @@ class EvSpSegNetStream(nn.Module):
             self.dec1 = block(c1 + c1, c1, 1)
         self.readout = nn.Sequential(nn.Linear(c1 + 2, readout_hidden), nn.ReLU(),
                                      nn.Linear(readout_hidden, 1))
+        if neuron_tif is not None and neuron_tif["transport"]:
+            # 不在 transport_layers 里的层换成不搬运的 TIF（构造 TIF 不消耗随机数，其余初始化不变）
+            for name in LAYER_NAMES:
+                if name not in self.tif_config["transport_layers"]:
+                    selected_block = getattr(self, name)
+                    selected_block.neuron = StreamingTIF2d(
+                        selected_block.out_ch, **dict(lif, **dict(neuron_tif, transport=False)))
         self.dual_memory_layers = ()
         if dual_memory is not None:
             if not isinstance(dual_memory, dict):
@@ -788,14 +809,19 @@ def estimate_operations(net, height, width, firing_rates, events_per_window, inp
               "state_elements": state_elements if net.stateful else 0}
     if net.is_tif:
         cfg = net.tif_config
-        transport_ops = 56 if cfg["transport"] else 0   # 两次 8 邻域求和 16 加 + 8 条边各约 5 次 + 新息约 4 次
+        # 每个搬运层每元素约 28 次逐元素运算：三次 8 邻域求和 24 加 + 新息、配比、接收约 4 次（参考值再加 2 次）
+        transport_ops = 28 + (2 if cfg["transport_ref_init"] > 0 else 0)
+        transport_elements = sum(block.out_ch * state_size[name] for name, block in zip(LAYER_NAMES, net.blocks())
+                                 if block.neuron.transport)
         update_ops = 7 + (4 if cfg["quantize"] else 0)  # 驱动、EMA、截断约 7 次；量化与 Δq 约 4 次
         result["tif"] = {
             "levels": cfg["levels"], "quantize": cfg["quantize"], "transport": cfg["transport"],
             "message_payload_bits": int(math.ceil(math.log2(2 * cfg["levels"] + 1))),
             "sop_basis": "firing_rates 为每神经元每窗平均 |Δq|：SOP = 单位脉冲口径（每个单位电平变化一次突触累加）",
-            "elementwise_ops_per_window": (transport_ops + update_ops) * state_elements,
-            "transport_elementwise_ops_per_window": transport_ops * state_elements,
+            "elementwise_ops_per_window": transport_ops * transport_elements + update_ops * state_elements,
+            "transport_elementwise_ops_per_window": transport_ops * transport_elements,
+            "transport_layers": [name for name, block in zip(LAYER_NAMES, net.blocks()) if block.neuron.transport],
+            "surrogate": cfg["surrogate"], "transport_ref_init": cfg["transport_ref_init"],
             "synaptic_accumulator_elements": state_elements,
             "included_in_mac_sop": False,
             "note": ("逐元素运算单列，未折算进 MAC/SOP；事件驱动实现按 Δ 网络做法为每个神经元保存一份突触累积，"

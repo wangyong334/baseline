@@ -7,6 +7,8 @@
     4. 诊断统计：|Δq| 与搬走比例与手算一致
     5. 网络：配置校验、与 LIF 同种子初始化逐位相同、forward_chunk 与逐窗 forward 等价、增益校准、
        运算量估计、完整训练 + 评估入口（2 轮合成数据）
+    6. 10-19 缺陷修正的三个开关：反射代理梯度（死通道仍有梯度）、搬运参考值、只在部分层搬运；
+       死通道统计与 TIF 语义的健康检查
 误差一律用 (a - b).abs().max() 比较。
 """
 import copy
@@ -23,7 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dataset.stream_source import TorchWindowSource  # noqa: E402
 from model.evspsegnet_stream import (LAYER_NAMES, TIF_DEFAULTS, EvSpSegNetStream,  # noqa: E402
                                      calibrate_gains, estimate_operations, tif_settings)
-from model.lif2d_stream import StreamingTIF2d, inverse_softplus  # noqa: E402
+from model.lif2d_stream import ReflectSurrogate, StreamingTIF2d, inverse_softplus  # noqa: E402
 from test_stream_layerwise import (CFG, CHUNKS, H, Q99, SMALL, W, max_error, rel_error,  # noqa: E402
                                    synthetic_sequence)
 
@@ -248,10 +250,10 @@ class TIFStepsTests(unittest.TestCase):
         self.assertGreater(stats["moved_mass_frac"], 0.0)
 
 
-def make_tif_net(merged=False, transport=True, quantize=True, seed=5, threshold=0.05):
+def make_tif_net(merged=False, transport=True, quantize=True, seed=5, threshold=0.05, **extra):
     """float64 小 TIF 网络；阈值（即 theta 初值）与参考值调低，让未校准的小网络各层都有活动。"""
     torch.manual_seed(seed)
-    tif = dict(ACTIVE_TIF, transport=transport, quantize=quantize)
+    tif = dict(ACTIVE_TIF, transport=transport, quantize=quantize, **extra)
     net = EvSpSegNetStream(channels=SMALL, neuron="tif", merged_decoder=merged, v_threshold=threshold,
                            tif=tif).double()
     # 输出量程 D*theta = threshold；与 graded 对照相同，把增益放大 1/threshold，让信号逐层保持量级
@@ -292,14 +294,18 @@ class TIFNetworkTests(unittest.TestCase):
     def test_forward_chunk_matches_step_forward(self):
         seq = synthetic_sequence()
         source = TorchWindowSource(seq, CFG, Q99, torch.device("cpu"), torch.float64)
-        cases = [(False, t, q) for t, q in COMBOS] + [(True, True, True)]
-        for merged, transport, quantize in cases:
+        fixes = {"surrogate": True, "transport_ref_init": 0.002,
+                 "transport_layers": ["enc2", "enc3", "enc4", "dec3", "dec2", "dec1"]}
+        cases = ([(False, t, q, {}) for t, q in COMBOS] + [(True, True, True, {})]
+                 + [(False, True, True, {"surrogate": True}), (False, True, True, fixes),
+                    (False, False, True, {"surrogate": True})])
+        for merged, transport, quantize, extra in cases:
             for mode in ("carry", "reset_each_window"):
-                with self.subTest(merged=merged, transport=transport, quantize=quantize, mode=mode):
-                    self.check_pair(source, merged, transport, quantize, mode)
+                with self.subTest(merged=merged, transport=transport, quantize=quantize, extra=extra, mode=mode):
+                    self.check_pair(source, merged, transport, quantize, mode, extra)
 
-    def check_pair(self, source, merged, transport, quantize, mode):
-        net_a = make_tif_net(merged, transport, quantize)
+    def check_pair(self, source, merged, transport, quantize, mode, extra=None):
+        net_a = make_tif_net(merged, transport, quantize, **(extra or {}))
         net_b = copy.deepcopy(net_a)
         g = torch.Generator().manual_seed(3)
         states, logits_a, outs_a, mems_a, chunk_states = None, [], [], [], []
@@ -406,6 +412,122 @@ class TIFNetworkTests(unittest.TestCase):
             self.assertGreater(ops["state_elements"], 0)
 
 
+class TIFFixTests(unittest.TestCase):
+    def test_reflect_surrogate_forward_and_gradient(self):
+        x = torch.tensor([-2.0, -0.5, 0.0, 0.3, 1.5], dtype=torch.float64, requires_grad=True)
+        y = ReflectSurrogate.apply(x)
+        self.assertEqual(max_error(y, torch.clamp(x, min=0.0)), 0.0)
+        y.sum().backward()
+        expected = torch.tensor([1 / 9.0, 1 / 2.25, 1.0, 1.0, 1.0], dtype=torch.float64)
+        self.assertLess(max_error(x.grad, expected), 1e-12)
+
+    def test_dead_channel_gets_gradient_only_with_surrogate(self):
+        # 全程负驱动 = 通道不激活：普通反射下它的输入与参考值 k 收不到梯度；代理梯度下仍能学
+        grads = {}
+        for surrogate in (False, True):
+            n = tif_neuron(2, transport=False, surrogate=surrogate)
+            current = torch.full((1, 2, 4, 4), -1.0, dtype=torch.float64, requires_grad=True)
+            state, outs = None, []
+            for _ in range(3):
+                out, state, _ = n(current, state)
+                outs.append(out)
+            outs = torch.stack(outs)
+            self.assertEqual(float(outs.abs().max()), 0.0)                 # 前向相同：都不激活
+            outs.sum().backward()
+            grads[surrogate] = (float(current.grad.abs().max()), float(n.k_raw.grad.abs().max()))
+        self.assertEqual(grads[False], (0.0, 0.0))
+        self.assertGreater(min(grads[True]), 0.0)
+        # 有正有负的一般输入：两种反射前向逐位相同
+        g = torch.Generator().manual_seed(9)
+        current = torch.randn(2, 3, 5, 6, generator=g, dtype=torch.float64)
+        a, b = tif_neuron(3, surrogate=False), tif_neuron(3, surrogate=True)
+        state_a = state_b = None
+        for _ in range(3):
+            out_a, state_a, _ = a(current, state_a)
+            out_b, state_b, _ = b(current, state_b)
+            self.assertEqual(max_error(out_a, out_b), 0.0)
+            self.assertEqual(max_error(state_a, state_b), 0.0)
+
+    def test_transport_reference(self):
+        n = tif_neuron(1, transport_ref_init=0.05)
+        self.assertEqual(sorted(name for name, _ in n.named_parameters()), ["a", "k_raw", "log_theta", "ref_raw"])
+        self.assertFalse(hasattr(tif_neuron(1, transport=False, transport_ref_init=0.05), "ref_raw"))
+        ref = n.ref().double().view(1, -1, 1, 1)
+        self.assertLess(abs(float(ref) - 0.05), 1e-6)
+
+        def run(memory, support):
+            m = torch.tensor(memory, dtype=torch.float64).view(1, 1, 1, -1)
+            s = torch.tensor(support, dtype=torch.float64).view(1, 1, 1, -1)
+            return n.transport_memory(m, s, ref)[0].flatten()
+        # 单拍小涨落（|新息| <= 参考值）不配对
+        self.assertEqual(max_error(run([0, .8, .3, 0], [0, .76, .34, 0]),
+                                   torch.tensor([0, .8, .3, 0.], dtype=torch.float64)), 0.0)
+        # 右移一格：超出参考值的部分搬走，参考值那一份留在原处
+        self.assertLess(max_error(run([0, .8, 0, 0], [0, 0, .8, 0]),
+                                  torch.tensor([0, .05, .75, 0], dtype=torch.float64)), 1e-6)
+        for seed in range(10):
+            g = torch.Generator().manual_seed(seed)
+            memory, support = random_map(g, (2, 1, 9, 11)), random_map(g, (2, 1, 9, 11))
+            moved, outflow = n.transport_memory(memory, support, ref)
+            inflow = moved - memory + outflow
+            d = support - memory
+            self.assertLess(max_error(moved.sum((2, 3)), memory.sum((2, 3))), 1e-12)
+            self.assertTrue(bool((outflow <= torch.relu(-d - ref) + 1e-15).all()))
+            self.assertTrue(bool((inflow <= torch.relu(d - ref) + 1e-15).all()))
+            self.assertGreaterEqual(float(moved.min()), -1e-15)
+
+    def test_transport_layers(self):
+        layers = ["enc2", "dec1"]
+        torch.manual_seed(3)
+        net = EvSpSegNetStream(channels=SMALL, neuron="tif",
+                               tif={"transport_layers": layers, "transport_ref_init": 0.05, "surrogate": True})
+        for name, block in zip(LAYER_NAMES, net.blocks()):
+            self.assertEqual(block.neuron.transport, name in layers, name)
+            self.assertEqual(hasattr(block.neuron, "ref_raw"), name in layers, name)
+            self.assertTrue(block.neuron.surrogate, name)
+        self.assertEqual(net.tif_config["transport_layers"], ("enc2", "dec1"))
+        torch.manual_seed(3)
+        lif = EvSpSegNetStream(channels=SMALL, neuron="lif")
+        lif_params = dict(lif.named_parameters())
+        for name, param in net.named_parameters():                     # 换神经元不消耗随机数
+            if name in lif_params:
+                self.assertEqual(max_error(param, lif_params[name]), 0.0, name)
+        off = EvSpSegNetStream(channels=SMALL, neuron="tif", tif={"transport": False, "transport_layers": layers})
+        self.assertFalse(any(block.neuron.transport for block in off.blocks()))
+        for bad in ([], ["enc5"], ["enc1", "enc1"], "enc1"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                tif_settings({"transport_layers": bad})
+        for bad in ({"surrogate": 1}, {"transport_ref_init": -0.1}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                tif_settings(bad)
+        ops = estimate_operations(net, H, W, {name: 0.5 for name in LAYER_NAMES}, 100)
+        self.assertEqual(ops["tif"]["transport_layers"], layers)
+
+    def test_dead_channel_statistic(self):
+        n = tif_neuron(3)
+        g = torch.Generator().manual_seed(4)
+        current = random_map(g, (1, 3, 6, 6), scale=1.5, density=0.8)
+        current[:, 2] = -1.0                                            # 第 3 个通道全程不激活
+        n.start_stats()
+        state = None
+        for _ in range(3):
+            _, state, _ = n(current, state)
+        self.assertAlmostEqual(n.stop_stats()["dead_channel_frac"], 1.0 / 3, places=12)
+
+    def test_health_uses_tif_semantics(self):
+        import train_stream_v1 as T
+        from utils.stream_common import health_warnings
+        layers = {"enc1": {"firing_rate": 0.5, "silent_channel_frac": 0.0, "always_on_frac": 0.9,
+                           "big_membrane_frac": 0.0}}
+        self.assertIs(T.health_layer_stats(layers, {}), layers)
+        warnings = health_warnings(T.health_layer_stats(layers, {"enc1": {"dead_channel_frac": 0.7,
+                                                                           "saturation": 0.2}}), {}, {})
+        text = " ".join(warnings)
+        self.assertIn("70%", text)
+        self.assertIn("电平到顶", text)
+        self.assertNotIn("每窗发放", text)
+
+
 class TIFEndToEndTests(unittest.TestCase):
     def test_mode_train_and_eval(self):
         # 文件读取、TIF 增益校准、一轮多流训练、验证（含 TIF 统计）、checkpoint、正式评估（逐窗执行、运算量）
@@ -438,32 +560,39 @@ class TIFEndToEndTests(unittest.TestCase):
                         neg += seq.n_events - int(seq.label.sum())
             stats = dict(q99=Q99.tolist(), train_pos=pos, train_neg=neg, pos_weight=min(neg / pos, 30.0))
             (root / "stats.json").write_text(json.dumps(stats), encoding="utf-8")
-            cfg = load_flat_config("configs/evisseg_stream_tif.yaml")
-            self.assertEqual((cfg["neuron"], cfg["trainer"], cfg["streams"], cfg["accumulate"]),
-                             ("tif", "streams", 4, 1))
-            cfg.update(root=str(root), stats_path=str(root / "stats.json"), save_root=str(root / "run"),
-                       channels=list(SMALL), height=H, width_px=W, pad_height=H, pad_width=W,
-                       n_windows=12, epochs=2, num_workers=0, tbptt_k=4, train_subset_size=1,
-                       calib_sequences=1, calib_windows=8, calib_samples_per_channel=32, calib_min_positive=4,
-                       segments=[[0, 3], [4, 7], [8, 11]], timing_warmup_windows=1, eval_chunk=4,
-                       execution="layer", input_device="gpu", streams=2)
-            T.mode_train(SimpleNamespace(device="cpu", mode="train", resume=False), cfg)
-            record = json.loads((root / "run" / "metrics.jsonl").read_text(encoding="utf-8").splitlines()[-1])
-            self.assertEqual(set(record["tif"]), set(LAYER_NAMES))
-            self.assertEqual(set(record["tif_parameters"]), set(LAYER_NAMES))
-            self.assertIn("theta_mean", record["tif_parameters"]["enc2"])
-            checkpoint = root / "run" / "best_val_iou_seed37.pt"
-            self.assertTrue(checkpoint.exists())
-            args = SimpleNamespace(checkpoint=str(checkpoint), device="cpu", mode="eval", split="val",
-                                   overwrite=True, execution=None, input_device=None, readout_ablation="none",
-                                   subthreshold_ablation="none", memory_ablation="none", memory_off_layers=None,
-                                   reset_every=0, reset_offset=0, dump_dir=None)
-            T.mode_eval(args, cfg)
-            result = json.loads((root / "run" / "eval_val_best_val_iou_seed37.json").read_text(encoding="utf-8"))
-            self.assertEqual(result["tif"]["levels"], 7)
-            for mode in ("carry", "reset_each_window"):
-                self.assertEqual(set(result[mode]["tif"]), set(LAYER_NAMES))
-                self.assertIn("tif", result[mode]["operations"])
+            for config in ("evisseg_stream_tif", "evisseg_stream_tif_sg_ref", "evisseg_stream_tif_sg_noenc1"):
+                run = root / config
+                cfg = load_flat_config("configs/%s.yaml" % config)
+                self.assertEqual((cfg["neuron"], cfg["trainer"], cfg["streams"], cfg["accumulate"]),
+                                 ("tif", "streams", 4, 1))
+                cfg.update(root=str(root), stats_path=str(root / "stats.json"), save_root=str(run),
+                           channels=list(SMALL), height=H, width_px=W, pad_height=H, pad_width=W,
+                           n_windows=12, epochs=2, num_workers=0, tbptt_k=4, train_subset_size=1,
+                           calib_sequences=1, calib_windows=8, calib_samples_per_channel=32, calib_min_positive=4,
+                           segments=[[0, 3], [4, 7], [8, 11]], timing_warmup_windows=1, eval_chunk=4,
+                           execution="layer", input_device="gpu", streams=2)
+                T.mode_train(SimpleNamespace(device="cpu", mode="train", resume=False), cfg)
+                record = json.loads((run / "metrics.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+                self.assertEqual(set(record["tif"]), set(LAYER_NAMES), config)
+                self.assertEqual(set(record["tif_parameters"]), set(LAYER_NAMES), config)
+                self.assertIn("theta_mean", record["tif_parameters"]["enc2"])
+                self.assertIn("dead_channel_frac", record["tif"]["dec3"])
+                if config.endswith("_ref"):
+                    self.assertIn("ref_mean", record["tif_parameters"]["enc2"])
+                if config.endswith("_noenc1"):
+                    self.assertEqual(record["tif"]["enc1"]["moved_mass_frac"], 0.0)
+                checkpoint = run / "best_val_iou_seed37.pt"
+                self.assertTrue(checkpoint.exists())
+                args = SimpleNamespace(checkpoint=str(checkpoint), device="cpu", mode="eval", split="val",
+                                       overwrite=True, execution=None, input_device=None, readout_ablation="none",
+                                       subthreshold_ablation="none", memory_ablation="none", memory_off_layers=None,
+                                       reset_every=0, reset_offset=0, dump_dir=None)
+                T.mode_eval(args, cfg)
+                result = json.loads((run / "eval_val_best_val_iou_seed37.json").read_text(encoding="utf-8"))
+                self.assertEqual(result["tif"]["levels"], 7)
+                for mode in ("carry", "reset_each_window"):
+                    self.assertEqual(set(result[mode]["tif"]), set(LAYER_NAMES))
+                    self.assertIn("tif", result[mode]["operations"])
 
 
 if __name__ == "__main__":

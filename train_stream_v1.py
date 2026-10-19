@@ -483,7 +483,7 @@ def tau_statistics(net):
 
 
 def tif_parameter_statistics(net):
-    """TIF 各层参考值 k、量化步长 theta 的最小/平均/最大值（非 TIF 网络返回空字典；搬运没有可学参数）。"""
+    """TIF 各层参考值 k、量化步长 theta（启用时还有搬运参考值 ref）的最小/平均/最大值；非 TIF 网络返回空字典。"""
     out = {}
     for name, block in zip(LAYER_NAMES, net.blocks()):
         neuron = block.neuron
@@ -491,11 +491,32 @@ def tif_parameter_statistics(net):
             continue
         with torch.no_grad():
             values = {"k": neuron.k(), "theta": neuron.theta()}
+            if neuron.ref() is not None:
+                values["ref"] = neuron.ref()
             out[name] = {}
             for key, value in values.items():
                 value = value.double().cpu()
                 out[name].update({key + "_min": float(value.min()), key + "_mean": float(value.mean()),
                                   key + "_max": float(value.max())})
+    return out
+
+
+def health_layer_stats(layers, tif_stats):
+    """健康检查的输入：TIF 网络按 TIF 的语义改写（非 TIF 原样返回）。
+
+    TIF 的输出是持续存在的电平，"几乎每窗 q>0"只说明信念一直在，不是饱和，所以去掉 always_on_frac；
+    死通道改用"M 始终为 0"（dead_channel_frac），饱和改用"电平到顶"（level_saturation_frac）。
+    """
+    if not tif_stats:
+        return layers
+    out = {}
+    for name, stats in layers.items():
+        stats = dict(stats)
+        stats.pop("always_on_frac", None)
+        if name in tif_stats and tif_stats[name]:
+            stats["silent_channel_frac"] = tif_stats[name]["dead_channel_frac"]
+            stats["level_saturation_frac"] = tif_stats[name]["saturation"]
+        out[name] = stats
     return out
 
 
@@ -1113,14 +1134,14 @@ def mode_smoke(args, cfg):
               "tif": tif_stats, "tif_parameters": tif_parameter_statistics(net),
               "subthreshold_diagnostics": monitor.residual_summary(),
               "subthreshold_parameters": subthreshold_parameter_statistics(net),
-              "warnings": health_warnings(layers, taus, out["grad_norms"])}
+              "warnings": health_warnings(health_layer_stats(layers, tif_stats), taus, out["grad_norms"])}
     write_json(root / "smoke.json", report)
     print(json.dumps(report, indent=2, ensure_ascii=False), flush=True)
     missing = out["missing_grads"]
     if cfg["state_mode"] == "reset_each_window":
-        # reset 模式下 U/M 都不跨窗读取，时间常数与双仓耦合参数没有梯度是预期行为。
+        # reset 模式下 U/M 都不跨窗读取，时间常数、双仓耦合参数与 TIF 搬运参考值没有梯度是预期行为。
         missing = [name for name in missing if not name.endswith(
-            (".neuron.a", ".neuron.memory_a", ".neuron.kappa_raw"))]
+            (".neuron.a", ".neuron.memory_a", ".neuron.kappa_raw", ".neuron.ref_raw"))]
     if missing:
         raise RuntimeError("以下参数没有梯度: %s" % missing)
     print("SMOKE TEST FINISHED:", root, flush=True)
@@ -1261,7 +1282,7 @@ def mode_train(args, cfg):
                   "tif": val.get("tif", {}), "tif_parameters": tif_parameter_statistics(net),
                   "subthreshold_diagnostics": val.get("subthreshold_diagnostics", {}),
                   "subthreshold_parameters": subthreshold_parameter_statistics(net),
-                  "warnings": health_warnings(val["layers"], taus, grad_mean)}
+                  "warnings": health_warnings(health_layer_stats(val["layers"], val.get("tif")), taus, grad_mean)}
         with metrics_path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record) + "\n")
         history.append(record)
@@ -1369,7 +1390,7 @@ def mode_eval(args, cfg):
                            reset_every=reset_every, reset_offset=reset_offset)
         r["peak_memory_gib"] = peak_memory_gib(device)
         r["tau"] = tau_statistics(net)
-        r["warnings"] = health_warnings(r["layers"], r["tau"], {})
+        r["warnings"] = health_warnings(health_layer_stats(r["layers"], r.get("tif")), r["tau"], {})
         results[mode] = r
         print("[%s] IoU %.4f ACC %.4f Pd %.4f Fa %.3e | 分段 %s | %.2f ms/窗 | 延迟中位数 %s ms" % (
             mode, r["iou"], r["acc"], r["pd"], r["fa"],

@@ -38,6 +38,25 @@ class SurrogateSpike(torch.autograd.Function):
         return grad_output / (1.0 + v.abs()).pow(2)
 
 
+class ReflectSurrogate(torch.autograd.Function):
+    """0 处反射 max(0, x)：前向不变；反向在 x > 0 时为 1，x <= 0 时用代理梯度 1/(1+|x|)^2（与 SurrogateSpike 同形）。
+
+    普通 relu 在 x <= 0 时梯度为 0：一个通道若全程不激活，它的权重与参考值 k 永远收不到梯度（通道死亡、不可恢复）。
+    LIF 在阈值下方有代理梯度，没有这个问题；TIF 用同一个代理函数补上（tif.surrogate: true）。
+    """
+
+    @staticmethod
+    def forward(ctx, x):
+        ctx.save_for_backward(x)
+        return torch.clamp(x, min=0.0)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (x,) = ctx.saved_tensors
+        slope = torch.where(x > 0, torch.ones_like(x), 1.0 / (1.0 + x.abs()).pow(2))
+        return grad_output * slope
+
+
 class StreamingLIF2d(nn.Module):
     """逐通道、逐像素独立的 LIF 神经元（膜电位更新不交换邻域状态）。
 
@@ -250,20 +269,31 @@ class StreamingTIF2d(StreamingLIF2d):
     forward(current, state) -> (out, M, M)：第三项对应 LIF 的 u_pre，最后一层用它做逐事件读出。
     训练（forward_steps 且需要梯度）时每一步的神经元运算在反向时重算（梯度检查点），数学不变、只省显存：
     否则每步要为反向保存约 11 张整幅中间图。
+    两个开关（默认关，旧配置的行为逐位不变；见 Stream-SNN-Innovations.md 11.9）：
+        surrogate=True           反射 relu 用代理梯度（ReflectSurrogate），防止通道死亡后不可恢复；前向不变
+        transport_ref_init > 0   搬运参考值 delta = softplus(.)（逐通道可学，初值即该数）：e = relu(d - delta)、
+                                 m = relu(-d - delta)，幅度不超过 delta 的新息（单拍涨落）不参与配对
     """
 
     def __init__(self, channels, dt_ms, tau_init_ms, tau_min_ms, tau_max_ms, v_threshold,
-                 levels=7, quantize=True, transport=True, k_init=0.05):
+                 levels=7, quantize=True, transport=True, k_init=0.05, surrogate=False, transport_ref_init=0.0):
         super(StreamingTIF2d, self).__init__(channels, dt_ms, tau_init_ms, tau_min_ms, tau_max_ms,
                                              v_threshold)
         if isinstance(levels, bool) or int(levels) != levels or int(levels) < 1:
             raise ValueError("TIF levels 必须是 >= 1 的整数")
-        if not isinstance(quantize, bool) or not isinstance(transport, bool):
-            raise ValueError("TIF quantize / transport 必须是布尔值")
+        if not isinstance(quantize, bool) or not isinstance(transport, bool) or not isinstance(surrogate, bool):
+            raise ValueError("TIF quantize / transport / surrogate 必须是布尔值")
+        transport_ref_init = float(transport_ref_init)
+        if not (math.isfinite(transport_ref_init) and transport_ref_init >= 0):
+            raise ValueError("TIF transport_ref_init 必须是有限非负数（0 表示不用参考值）")
         self.levels = int(levels)
         self.quantize = quantize
         self.transport = transport
+        self.surrogate = surrogate
         self.k_raw = nn.Parameter(torch.full((channels,), inverse_softplus(k_init), dtype=torch.float32))
+        if transport and transport_ref_init > 0:
+            self.ref_raw = nn.Parameter(torch.full((channels,), inverse_softplus(transport_ref_init),
+                                                   dtype=torch.float32))
         self.log_theta = nn.Parameter(torch.full((channels,), math.log(float(v_threshold) / self.levels),
                                                  dtype=torch.float32))
         kernel = torch.ones(channels, 1, 3, 3, dtype=torch.float32)
@@ -280,17 +310,23 @@ class StreamingTIF2d(StreamingLIF2d):
         """量化步长 theta > 0，形状 [C]。"""
         return torch.exp(self.log_theta)
 
+    def ref(self):
+        """搬运参考值 delta > 0，形状 [C]；没有启用时为 None。"""
+        return F.softplus(self.ref_raw) if hasattr(self, "ref_raw") else None
+
     def _coefficients(self, current):
         view = (1, -1, 1, 1)
         lam = self.beta().to(current.dtype).view(view)
         theta = self.theta().to(current.dtype).view(view)
-        return lam, self.k().to(current.dtype).view(view), theta, theta * self.levels
+        ref = self.ref()
+        return (lam, self.k().to(current.dtype).view(view), theta, theta * self.levels,
+                None if ref is None else ref.to(current.dtype).view(view))
 
     def neighbor_sum(self, x):
         """3x3 邻域（不含中心）求和，补零边界；逐通道 depthwise 卷积。"""
         return F.conv2d(x, self.neighbor_kernel.to(x.dtype), padding=1, groups=x.shape[1])
 
-    def transport_memory(self, memory, support):
+    def transport_memory(self, memory, support, ref=None):
         """新息配对搬运（两侧限量）。返回 (搬运后的记忆, 每个位置的流出量)。
 
         输入 memory >= 0、support = relu(z) >= 0 [B,C,H,W]。原则：记忆搬多少，正好等于这一拍的变化能解释多少。
@@ -301,10 +337,15 @@ class StreamingTIF2d(StreamingLIF2d):
           目的地：x 最多收下 e(x)，接收比例 a(x) = 1 / max(1, N8(r)(x))，收不下的留在源处；
           f(y->x) = r(y) e(x) a(x)  =>  流出(y) = r(y) N8(e a)(y) <= m(y)，流入(x) = e(x) min(1, N8(r)(x)) <= e(x)，
           两式逐边相同，总量守恒。于是弱噪声最多只吸走与它等量的记忆，目标闪烁一拍时记忆基本留在原地。
+        ref（可选，[1,C,1,1]）为搬运参考值：只有超出 ref 的新息参与配对，以上性质对缩小后的 e、m 同样成立。
         """
         innovation = support - memory
-        evidence = torch.relu(innovation)
-        surplus = torch.relu(-innovation)
+        if ref is None:
+            evidence = torch.relu(innovation)
+            surplus = torch.relu(-innovation)
+        else:
+            evidence = torch.relu(innovation - ref)
+            surplus = torch.relu(-innovation - ref)
         demand = self.neighbor_sum(evidence)
         offer = surplus / (torch.maximum(demand, surplus) + 1e-12)        # 1e-12 只防 0/0（此时分子为 0）
         offered = self.neighbor_sum(offer)
@@ -320,7 +361,7 @@ class StreamingTIF2d(StreamingLIF2d):
         theta = self.theta().to(memory.dtype).view(1, -1, 1, 1)
         return torch.round(memory.detach() / theta)
 
-    def _compute(self, current, prev, lam, k, theta, cap):
+    def _compute(self, current, prev, lam, k, theta, cap, ref):
         """一个窗口的 TIF 运算，返回 (输出, 新记忆 M, 搬运流出量或 None)。"""
         z = current - k
         support = torch.relu(z)
@@ -330,9 +371,10 @@ class StreamingTIF2d(StreamingLIF2d):
         else:
             carried = prev
             if self.transport:
-                carried, outflow = self.transport_memory(prev, support)
+                carried, outflow = self.transport_memory(prev, support, ref)
             pre = lam * carried + (1.0 - lam) * z
-        memory = torch.minimum(torch.relu(pre), cap)
+        reflected = ReflectSurrogate.apply(pre) if self.surrogate else torch.relu(pre)
+        memory = torch.minimum(reflected, cap)
         if self.quantize:
             scaled = memory / theta
             output = theta * (scaled + (torch.round(scaled) - scaled).detach())
@@ -340,17 +382,17 @@ class StreamingTIF2d(StreamingLIF2d):
             output = memory
         return output, memory, outflow
 
-    def _checkpoint_body(self, current, prev, lam, k, theta, cap):
-        output, memory, _ = self._compute(current, prev, lam, k, theta, cap)
+    def _checkpoint_body(self, current, prev, lam, k, theta, cap, ref):
+        output, memory, _ = self._compute(current, prev, lam, k, theta, cap, ref)
         return output, memory
 
-    def _step(self, current, prev, lam, k, theta, cap, recompute=False):
+    def _step(self, current, prev, lam, k, theta, cap, ref, recompute=False):
         if recompute and prev is not None and torch.is_grad_enabled() and not self.collect_stats:
             output, memory = checkpoint_utils.checkpoint(self._checkpoint_body, current, prev, lam, k, theta,
-                                                         cap, preserve_rng_state=False)
+                                                         cap, ref, preserve_rng_state=False)
             outflow = None
         else:
-            output, memory, outflow = self._compute(current, prev, lam, k, theta, cap)
+            output, memory, outflow = self._compute(current, prev, lam, k, theta, cap, ref)
         if self.collect_stats:
             self._accumulate(memory, prev, outflow)
         return output, memory
@@ -388,13 +430,15 @@ class StreamingTIF2d(StreamingLIF2d):
                 zero = torch.zeros((), device=memory.device, dtype=torch.float64)
                 s.update(elements=0, windows=0, occupied=zero.clone(), saturated=zero.clone(),
                          level_sum=zero.clone(), message_abs=zero.clone(), message_nonzero=zero.clone(),
-                         mass=zero.clone(), moved=zero.clone())
+                         mass=zero.clone(), moved=zero.clone(),
+                         channel_active=torch.zeros(memory.shape[1], dtype=torch.bool, device=memory.device))
             q = self.level(memory)
             q_prev = torch.zeros_like(q) if prev is None else self.level(prev)
             delta = q - q_prev
             s["elements"] += memory.numel()
             s["windows"] += 1
             s["occupied"] += (memory > 0).sum().double()
+            s["channel_active"] |= (memory > 0).flatten(2).any(2).any(0)
             s["saturated"] += (q >= self.levels).sum().double()
             s["level_sum"] += q.double().sum()
             s["message_abs"] += delta.abs().double().sum()
@@ -410,7 +454,8 @@ class StreamingTIF2d(StreamingLIF2d):
         message_abs_rate      平均 |Δq|（单位脉冲口径：每个单位电平变化 = 一次突触累加）
         message_nonzero_rate  Δq 非零的比例（graded 口径：一条消息携带一个小整数）
         level_mean / occupancy / saturation  电平均值、M>0 的比例、电平到顶（q = D）的比例
-        moved_mass_frac       搬运移走的记忆质量 / 搬运前的记忆总量（搬运是否在工作）
+        moved_mass_frac       搬运移走的记忆质量 / 搬运前的记忆总量（含背景涨落，不等于"在跟随目标"）
+        dead_channel_frac     评估期间 M 始终为 0 的通道占比（死通道；不量化时与"从未发放"相同）
         """
         self.collect_stats = False
         s = self._stats
@@ -424,6 +469,7 @@ class StreamingTIF2d(StreamingLIF2d):
                 "occupancy": float(s["occupied"]) / n,
                 "saturation": float(s["saturated"]) / n,
                 "moved_mass_frac": (float(s["moved"]) / mass) if mass > 0 else 0.0,
+                "dead_channel_frac": 1.0 - float(s["channel_active"].double().mean()),
                 "windows": int(s["windows"])}
 
 
