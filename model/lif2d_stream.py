@@ -38,23 +38,28 @@ class SurrogateSpike(torch.autograd.Function):
         return grad_output / (1.0 + v.abs()).pow(2)
 
 
-class ReflectSurrogate(torch.autograd.Function):
-    """0 处反射 max(0, x)：前向不变；反向在 x > 0 时为 1，x <= 0 时用代理梯度 1/(1+|x|)^2（与 SurrogateSpike 同形）。
+class BoundedSurrogate(torch.autograd.Function):
+    """截断到 [0, cap]：前向 min(max(x, 0), cap) 不变；反向在区间内为 1，两端之外用代理梯度。
 
-    普通 relu 在 x <= 0 时梯度为 0：一个通道若全程不激活，它的权重与参考值 k 永远收不到梯度（通道死亡、不可恢复）。
-    LIF 在阈值下方有代理梯度，没有这个问题；TIF 用同一个代理函数补上（tif.surrogate: true）。
+        x <= 0      1/(1+|x|)^2          不激活的通道仍能学（否则 relu 梯度为 0，通道死亡后不可恢复）
+        x >= cap    1/(1+(x-cap))^2      到顶的元素仍能学着降下来（否则只剩 cap 一条梯度通路）
+        cap         在触顶处得到梯度 1（与 torch.minimum 相同，量程 D*theta 继续可学）
+    代理函数与 SurrogateSpike 同形：LIF 在阈值两侧都有梯度，TIF 的两个边界也一样（tif.surrogate: true）。
     """
 
     @staticmethod
-    def forward(ctx, x):
-        ctx.save_for_backward(x)
-        return torch.clamp(x, min=0.0)
+    def forward(ctx, x, cap):
+        ctx.save_for_backward(x, cap)
+        return torch.minimum(torch.clamp(x, min=0.0), cap)
 
     @staticmethod
     def backward(ctx, grad_output):
-        (x,) = ctx.saved_tensors
-        slope = torch.where(x > 0, torch.ones_like(x), 1.0 / (1.0 + x.abs()).pow(2))
-        return grad_output * slope
+        x, cap = ctx.saved_tensors
+        below = 1.0 / (1.0 + x.abs()).pow(2)
+        above = 1.0 / (1.0 + (x - cap)).pow(2)
+        slope = torch.where(x <= 0, below, torch.where(x >= cap, above, torch.ones_like(x)))
+        grad_cap = (grad_output * (x >= cap).to(grad_output.dtype)).sum_to_size(cap.shape)
+        return grad_output * slope, grad_cap
 
 
 class StreamingLIF2d(nn.Module):
@@ -270,7 +275,8 @@ class StreamingTIF2d(StreamingLIF2d):
     训练（forward_steps 且需要梯度）时每一步的神经元运算在反向时重算（梯度检查点），数学不变、只省显存：
     否则每步要为反向保存约 11 张整幅中间图。
     两个开关（默认关，旧配置的行为逐位不变；见 Stream-SNN-Innovations.md 11.9）：
-        surrogate=True           反射 relu 用代理梯度（ReflectSurrogate），防止通道死亡后不可恢复；前向不变
+        surrogate=True           0 处反射与 D*theta 处截断都用代理梯度（BoundedSurrogate）：不激活的通道与到顶的元素
+                                 仍有梯度（第 1 轮观测到不量化时 dec3 过半通道 M 恒为 0、dec1 约 30% 元素到顶）；前向不变
         transport_ref_init > 0   搬运参考值 delta = softplus(.)（逐通道可学，初值即该数）：e = relu(d - delta)、
                                  m = relu(-d - delta)，幅度不超过 delta 的新息（单拍涨落）不参与配对
     """
@@ -373,8 +379,10 @@ class StreamingTIF2d(StreamingLIF2d):
             if self.transport:
                 carried, outflow = self.transport_memory(prev, support, ref)
             pre = lam * carried + (1.0 - lam) * z
-        reflected = ReflectSurrogate.apply(pre) if self.surrogate else torch.relu(pre)
-        memory = torch.minimum(reflected, cap)
+        if self.surrogate:
+            memory = BoundedSurrogate.apply(pre, cap)
+        else:
+            memory = torch.minimum(torch.relu(pre), cap)
         if self.quantize:
             scaled = memory / theta
             output = theta * (scaled + (torch.round(scaled) - scaled).detach())

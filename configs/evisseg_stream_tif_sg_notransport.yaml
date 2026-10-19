@@ -24,7 +24,7 @@ NET:
     quantize: true             # false = 直接汇报实数 M（对照）
     transport: false           # false = 不搬运，严格等于反射累积器（对照）
     k_init: 0.05               # 参考值 k 初值（softplus），单位是校准后的驱动（q99 正电流 = 1）
-    surrogate: true            # 反射 relu 用代理梯度 1/(1+|x|)^2，防止通道死亡后不可恢复（前向不变）
+    surrogate: true            # 0 处反射与 D*theta 处截断都用代理梯度（前向不变）：不激活的通道、到顶的元素仍能学
   state_mode: carry            # carry | reset_each_window
   norm: none
   v_threshold: 1.0             # TIF 中只决定 theta 初值 = v_threshold / levels（量程 D*theta = 1）与增益校准目标

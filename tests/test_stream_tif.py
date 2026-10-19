@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dataset.stream_source import TorchWindowSource  # noqa: E402
 from model.evspsegnet_stream import (LAYER_NAMES, TIF_DEFAULTS, EvSpSegNetStream,  # noqa: E402
                                      calibrate_gains, estimate_operations, tif_settings)
-from model.lif2d_stream import ReflectSurrogate, StreamingTIF2d, inverse_softplus  # noqa: E402
+from model.lif2d_stream import BoundedSurrogate, StreamingTIF2d, inverse_softplus  # noqa: E402
 from test_stream_layerwise import (CFG, CHUNKS, H, Q99, SMALL, W, max_error, rel_error,  # noqa: E402
                                    synthetic_sequence)
 
@@ -413,13 +413,16 @@ class TIFNetworkTests(unittest.TestCase):
 
 
 class TIFFixTests(unittest.TestCase):
-    def test_reflect_surrogate_forward_and_gradient(self):
-        x = torch.tensor([-2.0, -0.5, 0.0, 0.3, 1.5], dtype=torch.float64, requires_grad=True)
-        y = ReflectSurrogate.apply(x)
-        self.assertEqual(max_error(y, torch.clamp(x, min=0.0)), 0.0)
+    def test_bounded_surrogate_forward_and_gradient(self):
+        x = torch.tensor([[-2.0, -0.5, 0.0, 0.3, 1.0, 1.5, 3.0]], dtype=torch.float64, requires_grad=True)
+        cap = torch.tensor([[1.0]], dtype=torch.float64, requires_grad=True)
+        y = BoundedSurrogate.apply(x, cap)
+        self.assertEqual(max_error(y, torch.clamp(x, 0.0, 1.0)), 0.0)
         y.sum().backward()
-        expected = torch.tensor([1 / 9.0, 1 / 2.25, 1.0, 1.0, 1.0], dtype=torch.float64)
+        # 下方 1/(1+|x|)^2；区间内 1；上方 1/(1+(x-cap))^2（x = cap 处取上方公式，等于 1）
+        expected = torch.tensor([[1 / 9.0, 1 / 2.25, 1.0, 1.0, 1.0, 1 / 2.25, 1 / 9.0]], dtype=torch.float64)
         self.assertLess(max_error(x.grad, expected), 1e-12)
+        self.assertEqual(float(cap.grad), 3.0)                         # 触顶的 3 个元素（1.0、1.5、3.0）
 
     def test_dead_channel_gets_gradient_only_with_surrogate(self):
         # 全程负驱动 = 通道不激活：普通反射下它的输入与参考值 k 收不到梯度；代理梯度下仍能学
@@ -437,6 +440,23 @@ class TIFFixTests(unittest.TestCase):
             grads[surrogate] = (float(current.grad.abs().max()), float(n.k_raw.grad.abs().max()))
         self.assertEqual(grads[False], (0.0, 0.0))
         self.assertGreater(min(grads[True]), 0.0)
+        # 全程强驱动 = 一直到顶：普通截断下输入收不到梯度（只剩 theta）；代理梯度下输入仍有梯度
+        top = {}
+        for surrogate in (False, True):
+            n = tif_neuron(2, transport=False, surrogate=surrogate)
+            current = torch.full((1, 2, 4, 4), 50.0, dtype=torch.float64, requires_grad=True)
+            state, outs = None, []
+            for _ in range(3):
+                out, state, _ = n(current, state)
+                outs.append(out)
+            outs = torch.stack(outs)
+            _, _, theta = coefficients(n)
+            self.assertLess(max_error(outs, (7 * theta).expand_as(outs)), 1e-12)   # 前向相同：都到顶
+            outs.sum().backward()
+            top[surrogate] = (float(current.grad.abs().max()), float(n.log_theta.grad.abs().max()))
+        self.assertEqual(top[False][0], 0.0)
+        self.assertGreater(top[True][0], 0.0)
+        self.assertGreater(min(top[False][1], top[True][1]), 0.0)
         # 有正有负的一般输入：两种反射前向逐位相同
         g = torch.Generator().manual_seed(9)
         current = torch.randn(2, 3, 5, 6, generator=g, dtype=torch.float64)
