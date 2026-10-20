@@ -1,14 +1,13 @@
-"""V5 TIF 神经元（StreamingTIF2d）与 TIF 网络的单元测试（CPU、float64 小网络，不需要数据集）。
+"""V5 TIF 神经元（StreamingTIF2d，10-19 起不再搬运）与 TIF 网络的单元测试（CPU、float64 小网络，不需要数据集）。
 
-    1. 定义：初值、零输入静息、None 与零状态相同、关闭搬运 = 反射累积器、量化电平、状态上界
-    2. 新息配对搬运（两侧限量）：守恒、非负、搬走的 <= 失去支持的记忆、搬来的 <= 新证据、同一位置不会同时
-       流出和流入、有支持的记忆不动、静默时原地保持、逐例数值（右移、亚像素、静默 + 噪声）、运动的点被跟随
-    3. forward_steps（含 keep 掩码）与逐窗 forward 等价（前向与梯度），2x2 配置
-    4. 诊断统计：|Δq| 与搬走比例与手算一致
-    5. 网络：配置校验、与 LIF 同种子初始化逐位相同、forward_chunk 与逐窗 forward 等价、增益校准、
-       运算量估计、完整训练 + 评估入口（2 轮合成数据）
-    6. 10-19 缺陷修正的三个开关：反射代理梯度（死通道仍有梯度）、搬运参考值、只在部分层搬运；
-       死通道统计与 TIF 语义的健康检查
+    1. 定义：初值、零输入静息、None 与零状态相同、反射累积器、量化电平、状态上界
+    2. 本地参照（TIF-R）：参照环安静时与 TIF 逐位相同（float32 / float64）、位置-尺度等变、
+       不大于保护区的持续目标不被吸收而成片背景被归一、参照环与偏差校正的手算核对、环内无参照格时不归一
+    3. forward_steps（含 keep 掩码）与逐窗 forward 等价（前向与梯度），参照开 / 关 × 量化开 / 关
+    4. 诊断统计：|Δq| 与手算一致；参照的局部增益统计
+    5. 网络：配置校验（已删除的搬运键）、与 LIF 同种子初始化逐位相同、forward_chunk 与逐窗 forward 等价、
+       增益校准、运算量估计、完整训练 + 评估入口（2 轮合成数据）
+    6. 两端代理梯度开关（BoundedSurrogate）；死通道统计与 TIF 语义的健康检查；配置文件只差该差的键
 误差一律用 (a - b).abs().max() 比较。
 """
 import copy
@@ -23,16 +22,16 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from dataset.stream_source import TorchWindowSource  # noqa: E402
-from model.evspsegnet_stream import (LAYER_NAMES, TIF_DEFAULTS, EvSpSegNetStream,  # noqa: E402
-                                     calibrate_gains, estimate_operations, tif_settings)
-from model.lif2d_stream import BoundedSurrogate, StreamingTIF2d, inverse_softplus  # noqa: E402
+from model.evspsegnet_stream import (LAYER_NAMES, REFERENCE_ELEMENTWISE_OPS, TIF_DEFAULTS,  # noqa: E402
+                                     EvSpSegNetStream, calibrate_gains, estimate_operations, tif_settings)
+from model.lif2d_stream import BoundedSurrogate, StreamingTIF2d, inverse_softplus, ring_kernel  # noqa: E402
 from test_stream_layerwise import (CFG, CHUNKS, H, Q99, SMALL, W, max_error, rel_error,  # noqa: E402
                                    synthetic_sequence)
 
 LIF_ARGS = dict(dt_ms=50.0, tau_init_ms=200.0, tau_min_ms=50.0, tau_max_ms=2000.0)
 # 小网络没有经过增益校准，驱动量级很小：调低参考值、阈值（即 theta），让每层都有活动
 ACTIVE_TIF = {"k_init": 1e-3}
-COMBOS = ((True, True), (False, True), (True, False), (False, False))     # (transport, quantize)
+COMBOS = ((True, True), (False, True), (True, False), (False, False))     # (reference, quantize)
 
 
 def tif_neuron(channels=3, v_threshold=1.0, **kw):
@@ -51,6 +50,41 @@ def coefficients(n):
     return (n.beta().double().view(view), n.k().double().view(view), n.theta().double().view(view))
 
 
+def zero_state(n, current):
+    """与 None 等价的显式零状态：TIF 为 M，TIF-R 为 (M, m1, m2, c)。"""
+    zero = torch.zeros_like(current)
+    if not n.reference:
+        return zero
+    return (zero, zero.clone(), zero.clone(),
+            torch.zeros(current.shape[0], current.shape[1], 1, 1, dtype=current.dtype))
+
+
+def sparse_points(generator, shape, spacing=4, scale=1.0):
+    """只在相距 spacing 的格点上有正值、其余为 0 的图：每个点的参照环（距离 2..3）里没有别的点。"""
+    out = torch.zeros(shape, dtype=torch.float64)
+    values = torch.rand(shape, generator=generator, dtype=torch.float64) * scale + 0.05
+    out[..., ::spacing, ::spacing] = values[..., ::spacing, ::spacing]
+    return out
+
+
+def manual_ring_mean(x):
+    """参照环平均的逐点手算（numpy，画面外不计格数；没有参照格时为 0）。"""
+    x = x.detach().numpy()
+    _, _, h, w = x.shape
+    out = np.zeros_like(x)
+    for i in range(h):
+        for j in range(w):
+            total, count = 0.0, 0
+            for di in range(-3, 4):
+                for dj in range(-3, 4):
+                    if max(abs(di), abs(dj)) <= 1 or not (0 <= i + di < h and 0 <= j + dj < w):
+                        continue
+                    total = total + x[:, :, i + di, j + dj]
+                    count += 1
+            out[:, :, i, j] = total / count if count else 0.0
+    return torch.from_numpy(out)
+
+
 class TIFDefinitionTests(unittest.TestCase):
     def test_initial_parameters(self):
         n = tif_neuron(3)
@@ -58,137 +92,156 @@ class TIFDefinitionTests(unittest.TestCase):
         self.assertLess(max_error(lam, torch.full_like(lam, float(np.exp(-0.25)))), 1e-6)
         self.assertLess(max_error(k, torch.full_like(k, 0.05)), 1e-6)
         self.assertLess(max_error(theta, torch.full_like(theta, 1.0 / 7)), 1e-6)
-        # 搬运没有可学参数：两种配置的参数都只有 a（tau）、k_raw、log_theta
-        for transport in (True, False):
-            names = sorted(name for name, _ in tif_neuron(3, transport=transport).named_parameters())
-            self.assertEqual(names, ["a", "k_raw", "log_theta"])
-        self.assertEqual([k for k in n.state_dict() if "neighbor" in k], [])     # 固定核与掩码不进 checkpoint
+        self.assertEqual(sorted(name for name, _ in n.named_parameters()), ["a", "k_raw", "log_theta"])
+        self.assertIsNone(n.tau_reference())
+        r = tif_neuron(3, reference=True)
+        self.assertEqual(sorted(name for name, _ in r.named_parameters()), ["a", "k_raw", "log_theta", "ref_a"])
+        self.assertLess(max_error(r.tau_reference(), r.tau()), 1e-12)          # 与 tau 同一参数化、同一初值
+        self.assertEqual([key for key in r.state_dict() if "ring" in key], [])  # 固定核不进 checkpoint
+        self.assertEqual(int(ring_kernel().sum()), 40)
         for value in (1e-3, 0.05, 2.0):
             self.assertAlmostEqual(float(F.softplus(torch.tensor(inverse_softplus(value), dtype=torch.float64))),
                                    value, places=12)
         with self.assertRaises(ValueError):
             tif_neuron(3, levels=0)
         with self.assertRaises(ValueError):
-            tif_neuron(3, transport="yes")
+            tif_neuron(3, reference="yes")
+        with self.assertRaises(TypeError):
+            tif_neuron(3, transport=False)                                      # 搬运已删除
 
     def test_rest_and_none_equals_zero_state(self):
-        n = tif_neuron(3)
-        zero = torch.zeros(2, 3, 4, 5, dtype=torch.float64)
-        for state in (None, zero):
-            out, memory, u = n(zero, state)
-            self.assertEqual(float(out.abs().max()), 0.0)
-            self.assertEqual(float(memory.abs().max()), 0.0)
-        current = torch.randn(2, 3, 4, 5, generator=torch.Generator().manual_seed(1), dtype=torch.float64)
-        a, b = n(current, None), n(current, zero)
-        for x, y in zip(a, b):
-            self.assertEqual(max_error(x, y), 0.0)
+        for reference in (False, True):
+            n = tif_neuron(3, reference=reference)
+            zero = torch.zeros(2, 3, 4, 5, dtype=torch.float64)
+            for state in (None, zero_state(n, zero)):
+                out, _, memory = n(zero, state)
+                self.assertEqual(float(out.abs().max()), 0.0)
+                self.assertEqual(float(memory.abs().max()), 0.0)
+            current = torch.randn(2, 3, 4, 5, generator=torch.Generator().manual_seed(1), dtype=torch.float64)
+            a, b = n(current, None), n(current, zero_state(n, current))
+            self.assertEqual(max_error(a[0], b[0]), 0.0, reference)
+            self.assertEqual(max_error(a[2], b[2]), 0.0, reference)
+            if reference:
+                for x, y in zip(a[1], b[1]):
+                    self.assertEqual(max_error(x, y), 0.0)
 
-    def test_transport_off_is_reflected_accumulator(self):
-        n = tif_neuron(3, transport=False)
+    def test_reflected_accumulator(self):
+        n = tif_neuron(3)
         g = torch.Generator().manual_seed(2)
         prev = random_map(g, (2, 3, 5, 6), scale=0.8)
         current = torch.randn(2, 3, 5, 6, generator=g, dtype=torch.float64)
         lam, k, theta = coefficients(n)
         expected = torch.minimum(torch.relu(lam * prev + (1 - lam) * (current - k)), 7 * theta)
-        _, memory, _ = n(current, prev)
+        _, state, memory = n(current, prev)
         self.assertLess(max_error(memory, expected), 1e-14)
+        self.assertIs(state, memory)                                           # 不启用参照时状态就是 M
 
     def test_quantized_levels_float_variant_and_bound(self):
         g = torch.Generator().manual_seed(3)
-        for quantize in (True, False):
-            n = tif_neuron(3, quantize=quantize)
-            _, _, theta = coefficients(n)
-            state = None
-            for _ in range(4):
-                current = random_map(g, (2, 3, 5, 6), scale=4.0)       # 大于量程的输入也有
-                out, state, _ = n(current, state)
-                self.assertTrue(bool((state <= 7 * theta + 1e-12).all()))
-                self.assertGreaterEqual(float(state.min()), 0.0)
-                if quantize:
-                    levels = out / theta
-                    self.assertLess(max_error(levels, torch.round(levels)), 1e-9)
-                    self.assertLess(max_error(out, theta * torch.round(state / theta)), 1e-12)
-                    self.assertGreaterEqual(float(levels.min()), 0.0)
-                    self.assertLessEqual(float(levels.max()), 7 + 1e-9)
-                else:
-                    self.assertEqual(max_error(out, state), 0.0)
-            self.assertGreater(float(state.max()), 0.0)
+        for reference in (False, True):
+            for quantize in (True, False):
+                n = tif_neuron(3, quantize=quantize, reference=reference)
+                _, _, theta = coefficients(n)
+                state = None
+                for _ in range(4):
+                    current = random_map(g, (2, 3, 5, 6), scale=4.0)       # 大于量程的输入也有
+                    out, state, memory = n(current, state)
+                    self.assertTrue(bool((memory <= 7 * theta + 1e-12).all()))
+                    self.assertGreaterEqual(float(memory.min()), 0.0)
+                    if quantize:
+                        levels = out / theta
+                        self.assertLess(max_error(levels, torch.round(levels)), 1e-9)
+                        self.assertLess(max_error(out, theta * torch.round(memory / theta)), 1e-12)
+                        self.assertLessEqual(float(levels.max()), 7 + 1e-9)
+                    else:
+                        self.assertEqual(max_error(out, memory), 0.0)
+                self.assertGreater(float(memory.max()), 0.0)
 
 
-class TransportTests(unittest.TestCase):
-    def test_conservation_nonnegative_one_way_and_caps(self):
-        n = tif_neuron(4)
-        for seed in range(20):
-            g = torch.Generator().manual_seed(seed)
-            memory = random_map(g, (2, 4, 9, 11))
-            support = random_map(g, (2, 4, 9, 11))
-            moved, outflow = n.transport_memory(memory, support)
-            # 每张图、每个通道各自守恒（补零边界，质量不会流出图外）
-            self.assertLess(max_error(moved.sum((2, 3)), memory.sum((2, 3))), 1e-12)
-            self.assertGreaterEqual(float(moved.min()), -1e-15)
-            surplus = torch.relu(memory - support)
-            self.assertTrue(bool((outflow <= surplus + 1e-15).all()))
-            inflow = moved - memory + outflow
-            self.assertGreaterEqual(float(inflow.min()), -1e-15)
-            self.assertTrue(bool((inflow <= torch.relu(support - memory) + 1e-15).all()))    # 搬来的 <= 新证据
-            self.assertEqual(int(((outflow > 1e-15) & (inflow > 1e-15)).sum()), 0)
-            self.assertGreater(float(outflow.sum()), 0.0)
+class ReferenceTests(unittest.TestCase):
+    def test_quiet_ring_equals_tif(self):
+        # 只有相距 4 格的稀疏点有输入：每个点的参照环里没有别的活动，TIF-R 与 TIF 逐位相同（多窗、跨窗累积；
+        # float32 与 float64 都要逐位相同）
+        g = torch.Generator().manual_seed(4)
+        for dtype in (torch.float64, torch.float32):
+            a, b = tif_neuron(2).to(dtype), tif_neuron(2, reference=True).to(dtype)
+            state_a = state_b = None
+            for _ in range(6):
+                current = sparse_points(g, (2, 2, 13, 17), scale=2.0).to(dtype)
+                out_a, state_a, mem_a = a(current, state_a)
+                out_b, state_b, mem_b = b(current, state_b)
+                self.assertEqual(max_error(out_a, out_b), 0.0, dtype)
+                self.assertEqual(max_error(mem_a, mem_b), 0.0, dtype)
+            self.assertGreater(float(mem_a.max()), 0.0)
+        # 参照环里一个格子也没有（1x2 的图）：同样不归一
+        tiny = (torch.rand(1, 2, 1, 2, generator=g, dtype=torch.float64) * 3).to(dtype)
+        self.assertEqual(max_error(a(tiny, None)[2], b(tiny, None)[2]), 0.0)
 
-    def test_worked_cases(self):
-        # 1 维逐例（记忆 0.8）：记忆搬多少，正好等于这一拍的变化能解释多少
-        n = tif_neuron(1)
-        cases = [([0, .8, 0, 0], [0, 0, .8, 0], [0, 0, .8, 0]),               # 右移一格：全部过去
-                 ([0, .8, 0, 0], [0, .4, .4, 0], [0, .4, .4, 0]),             # 亚像素：移走一半
-                 ([0, .8, 0, 0], [0, 0, .2, 0], [0, .6, .2, 0]),              # 静默一拍 + 噪声 0.2：只搬 0.2
-                 ([0, .8, 0, 0], [0, 0, .05, 0], [0, .75, .05, 0]),           # 弱噪声：只搬 0.05
-                 ([0, 0, .8, 0, 0], [0, .2, 0, .8, 0], [0, .16, 0, .64, 0]),  # 两处新证据：按比例
-                 ([0, .8, .3, 0], [0, 0, .3, 0], [0, .8, .3, 0]),             # 旁边是已被解释的静止背景：不吸
-                 ([0, .8, 0, 0, 0], [0, 0, 0, .8, 0], [0, .8, 0, 0, 0])]      # 跳两格：超出单步支撑，不动
-        for memory, support, expected in cases:
-            with self.subTest(memory=memory, support=support):
-                m = torch.tensor(memory, dtype=torch.float64).view(1, 1, 1, -1)
-                s = torch.tensor(support, dtype=torch.float64).view(1, 1, 1, -1)
-                moved, _ = n.transport_memory(m, s)
-                self.assertLess(max_error(moved.flatten(), torch.tensor(expected, dtype=torch.float64)), 1e-9)
-        # 两个源挤向同一个目的地：目的地收到的不超过它的新证据，其余留在源处
-        m = torch.zeros(1, 1, 3, 3, dtype=torch.float64)
-        m[0, 0, 0, 0] = m[0, 0, 0, 2] = 0.8
-        s = torch.zeros_like(m)
-        s[0, 0, 1, 1] = 0.8
-        moved, _ = n.transport_memory(m, s)
-        self.assertAlmostEqual(float(moved[0, 0, 1, 1]), 0.8, places=9)
-        self.assertAlmostEqual(float(moved[0, 0, 0, 0]), 0.4, places=9)
+    def test_local_reference_by_hand(self):
+        n = tif_neuron(2, reference=True)
+        g = torch.Generator().manual_seed(5)
+        _, _, theta, _, alpha = n._coefficients(torch.zeros(1, dtype=torch.float64))
+        i0 = torch.randn(1, 2, 6, 8, generator=g, dtype=torch.float64)
+        i1 = torch.randn(1, 2, 6, 8, generator=g, dtype=torch.float64) + 0.5
+        r0, stats0, gain0 = n.local_reference(i0, None, theta, alpha)
+        r1, stats1, gain1 = n.local_reference(i1, stats0, theta, alpha)
+        # 偏差校正：第一窗 m^ = I；第二窗 m^ = 按 (1 - alpha, 1) 加权的平均
+        w0 = 1.0 - alpha
+        for current, mean1, mean2, r, gain in (
+                (i0, i0, i0 * i0, r0, gain0),
+                (i1, (w0 * i0 + i1) / (w0 + 1), (w0 * i0 * i0 + i1 * i1) / (w0 + 1), r1, gain1)):
+            b = manual_ring_mean(mean1)
+            variance = torch.relu(manual_ring_mean(mean2) - b * b)
+            expected_gain = theta / torch.sqrt(theta * theta + variance)
+            self.assertLess(max_error(gain, expected_gain), 1e-12)
+            self.assertLess(max_error(r, (current - b) * expected_gain), 1e-12)
+        self.assertLess(max_error(stats1[2], (w0 * alpha + alpha).expand(1, -1, -1, -1)), 1e-15)
 
-    def test_supported_memory_stays_and_silence_holds(self):
-        n = tif_neuron(3)
+    def test_location_scale_equivariance(self):
+        # I' = A I + B（空间均匀）且 theta、k 同乘 A：M' = A M，电平相同
+        g = torch.Generator().manual_seed(6)
+        n1 = tif_neuron(3, reference=True)
+        n2 = copy.deepcopy(n1)
+        scale, shift = 2.5, 0.7
+        with torch.no_grad():
+            n2.log_theta.add_(float(np.log(scale)))
+            k2 = scale * n1.k()
+            n2.k_raw.copy_(k2 + torch.log(-torch.expm1(-k2)))
+        state1 = state2 = None
+        for _ in range(8):
+            current = torch.randn(2, 3, 11, 12, generator=g, dtype=torch.float64) * 0.6 + 0.3
+            out1, state1, mem1 = n1(current, state1)
+            out2, state2, mem2 = n2(scale * current + shift, state2)
+            self.assertLess(max_error(mem2 / scale, mem1), 1e-9)
+            self.assertLess(max_error(out2 / scale, out1), 1e-9)
+        self.assertGreater(float(mem1.max()), 0.0)
+
+    def test_guard_protects_small_persistent_target(self):
+        # 背景 1 + 0.3 N(0,1)；第 0 条流中心 1 个像素持续 +3（不大于保护区），第 1 条流中心 7x7 方块持续 +3
         g = torch.Generator().manual_seed(7)
-        memory = random_map(g, (1, 3, 8, 8))
-        for support in (memory.clone(), torch.zeros_like(memory)):        # 有支持 / 完全静默
-            moved, outflow = n.transport_memory(memory, support)
-            self.assertEqual(max_error(moved, memory), 0.0)
-            self.assertEqual(float(outflow.abs().max()), 0.0)
-
-    def test_moving_point_is_followed(self):
-        # 一个点每窗右移 1 格：搬运时记忆沿轨迹累积、身后几乎不留尾迹；不搬运时当前位置只有新证据，身后留下衰减的尾迹
-        final = {}
-        for transport in (True, False):
-            n = tif_neuron(1, levels=50, quantize=False, transport=transport)
-            state = None
-            for t in range(6):
-                current = torch.zeros(1, 1, 1, 12, dtype=torch.float64)
-                current[0, 0, 0, 2 + t] = 1.0
-                _, state, _ = n(current, state)
-            final[transport] = state[0, 0, 0]
-        on, off = final[True], final[False]
-        self.assertGreater(float(on[7]), 2.0 * float(off[7]))
-        self.assertLess(float(on[:7].sum()), 0.5 * float(off[:7].sum()))
+        n = tif_neuron(1, v_threshold=10.0, levels=100, quantize=False, reference=True)   # theta = 0.1，量程 10
+        target = torch.zeros(2, 1, 21, 21, dtype=torch.float64)
+        target[0, 0, 10, 10] = 3.0
+        target[1, 0, 7:14, 7:14] = 3.0
+        state, history = None, []
+        for _ in range(40):
+            current = 1.0 + 0.3 * torch.randn(2, 1, 21, 21, generator=g, dtype=torch.float64) + target
+            _, state, memory = n(current, state)
+            history.append(memory[:, 0, 10, 10].clone())
+        small_early, small_late = float(history[5][0]), float(history[-1][0])
+        self.assertGreater(small_early, 0.5)
+        self.assertGreater(small_late, 0.8 * small_early)                     # 持续 40 窗（2 s）也不被吸收
+        self.assertLess(float(history[-1][1]), 0.2 * small_late)              # 成片的方块内部被归一
+        background = memory[0, 0, :4, :4].mean()
+        self.assertLess(float(background), 0.2 * small_late)                  # 背景本身也被归一
 
 
 class TIFStepsTests(unittest.TestCase):
     def test_forward_steps_matches_forward_with_keep(self):
-        for transport, quantize in COMBOS:
-            with self.subTest(transport=transport, quantize=quantize):
-                n_a = tif_neuron(3, transport=transport, quantize=quantize)
+        from model.lif2d_stream import mask_state
+        for reference, quantize in COMBOS:
+            with self.subTest(reference=reference, quantize=quantize):
+                n_a = tif_neuron(3, reference=reference, quantize=quantize)
                 n_b = copy.deepcopy(n_a)
                 g = torch.Generator().manual_seed(11)
                 current = torch.randn(5, 2, 3, 6, 7, generator=g, dtype=torch.float64).clamp(min=-0.2) * 0.8
@@ -198,28 +251,30 @@ class TIFStepsTests(unittest.TestCase):
                 w_mem = torch.rand(current.shape, generator=g, dtype=torch.float64)
                 state, outs, mems = None, [], []
                 for t in range(5):
-                    prev = None if state is None else state * keep[t].view(-1, 1, 1, 1)
-                    out, state, mem = n_a(current[t], prev)
+                    out, state, mem = n_a(current[t], mask_state(state, keep, t))
                     outs.append(out)
                     mems.append(mem)
                 outs, mems = torch.stack(outs), torch.stack(mems)
                 outs_b, state_b, mems_b = n_b.forward_steps(current.clone(), None, True, True, keep=keep)
                 self.assertLess(max_error(outs, outs_b), 1e-12)
                 self.assertLess(max_error(mems, mems_b), 1e-12)
-                self.assertLess(max_error(state, state_b), 1e-12)
+                states_a = state if isinstance(state, tuple) else (state,)
+                states_b = state_b if isinstance(state_b, tuple) else (state_b,)
+                self.assertEqual(len(states_a), 4 if reference else 1)
+                for x, y in zip(states_a, states_b):
+                    self.assertLess(max_error(x, y), 1e-12)
                 ((outs * w_out).sum() + (mems * w_mem).sum()).backward()
                 ((outs_b * w_out).sum() + (mems_b * w_mem).sum()).backward()
                 for (name, pa), (_, pb) in zip(n_a.named_parameters(), n_b.named_parameters()):
                     self.assertIsNotNone(pa.grad, name)
                     self.assertTrue(bool(torch.isfinite(pa.grad).all()), name)
                     self.assertLess(max_error(pa.grad, pb.grad) / max(float(pa.grad.abs().max()), 1.0), 1e-10, name)
-                    if quantize or name != "log_theta":     # 不量化时 theta 只经上界起作用，没触顶时梯度为 0
+                    if quantize or reference or name != "log_theta":   # 不量化且不参照时 theta 只经上界起作用
                         self.assertGreater(float(pa.grad.abs().max()), 0.0, name)
                 # 不跨窗（reset）：每一步都从零开始
-                outs_r, _, mems_r = n_b.forward_steps(current, None, False, True)
+                _, _, mems_r = n_b.forward_steps(current, None, False, True)
                 for t in range(5):
-                    out_t, _, mem_t = n_b(current[t], None)
-                    self.assertLess(max_error(mems_r[t], mem_t), 1e-14)
+                    self.assertLess(max_error(mems_r[t], n_b(current[t], None)[2]), 1e-14)
 
     def test_statistics_match_manual_count(self):
         n = tif_neuron(2)
@@ -228,32 +283,42 @@ class TIFStepsTests(unittest.TestCase):
         n.start_stats()
         state, states = None, []
         for current in currents:
-            _, state, _ = n(current, state)
-            states.append(state)
+            _, state, memory = n(current, state)
+            states.append(memory)
         stats = n.stop_stats()
         self.assertFalse(n.collect_stats)
-        _, k, theta = coefficients(n)
+        _, _, theta = coefficients(n)
         levels = [torch.round(s / theta) for s in states]
         deltas = [levels[0]] + [levels[t] - levels[t - 1] for t in range(1, 4)]
         numel = 4.0 * states[0].numel()
         self.assertAlmostEqual(stats["message_abs_rate"], float(sum(d.abs().sum() for d in deltas)) / numel, places=12)
         self.assertAlmostEqual(stats["message_nonzero_rate"], float(sum(d.ne(0).sum() for d in deltas)) / numel,
                                places=12)
-        moved = mass = 0.0
-        for t in range(1, 4):
-            _, outflow = n.transport_memory(states[t - 1], torch.relu(currents[t] - k))
-            moved += float(outflow.sum())
-            mass += float(states[t - 1].sum())
-        self.assertAlmostEqual(stats["moved_mass_frac"], moved / mass, places=10)
         self.assertEqual(stats["windows"], 4)
-        self.assertGreater(stats["message_abs_rate"], 0.0)
-        self.assertGreater(stats["moved_mass_frac"], 0.0)
+        self.assertNotIn("reference_gain_mean", stats)
+        # 参照的局部增益统计
+        r = tif_neuron(2, reference=True)
+        _, _, theta, _, alpha = r._coefficients(currents[0])
+        stats_prev, gains = None, []
+        for current in currents:
+            _, stats_prev, gain = r.local_reference(current, stats_prev, theta, alpha)
+            gains.append(gain)
+        r.start_stats()
+        state = None
+        for current in currents:
+            _, state, _ = r(current, state)
+        stats = r.stop_stats()
+        gains = torch.stack(gains)
+        self.assertAlmostEqual(stats["reference_gain_mean"], float(gains.mean()), places=12)
+        self.assertAlmostEqual(stats["reference_normalized_frac"], float((gains < 0.5 ** 0.5).double().mean()),
+                               places=12)
+        self.assertTrue(0.0 < stats["reference_gain_mean"] < 1.0)
 
 
-def make_tif_net(merged=False, transport=True, quantize=True, seed=5, threshold=0.05, **extra):
+def make_tif_net(merged=False, reference=False, quantize=True, seed=5, threshold=0.05, **extra):
     """float64 小 TIF 网络；阈值（即 theta 初值）与参考值调低，让未校准的小网络各层都有活动。"""
     torch.manual_seed(seed)
-    tif = dict(ACTIVE_TIF, transport=transport, quantize=quantize, **extra)
+    tif = dict(ACTIVE_TIF, reference=reference, quantize=quantize, **extra)
     net = EvSpSegNetStream(channels=SMALL, neuron="tif", merged_decoder=merged, v_threshold=threshold,
                            tif=tif).double()
     # 输出量程 D*theta = threshold；与 graded 对照相同，把增益放大 1/threshold，让信号逐层保持量级
@@ -265,12 +330,17 @@ def make_tif_net(merged=False, transport=True, quantize=True, seed=5, threshold=
 class TIFNetworkTests(unittest.TestCase):
     def test_config_validation(self):
         self.assertEqual(tif_settings(None), TIF_DEFAULTS)
-        for bad in ({"unknown": 1}, {"levels": 0}, {"levels": 2.5}, {"quantize": "yes"}, {"transport": 1},
-                    {"k_init": 0.0}):
+        for bad in ({"unknown": 1}, {"levels": 0}, {"levels": 2.5}, {"quantize": "yes"}, {"reference": 1},
+                    {"k_init": 0.0}, {"surrogate": 1}):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 tif_settings(bad)
-        # 第 1 轮旧 checkpoint 的配置带 eps_init：可以加载，键被丢弃
-        self.assertEqual(tif_settings({"eps_init": 0.1, "transport": False}), dict(TIF_DEFAULTS, transport=False))
+        # 旧 checkpoint 的配置：不搬运时可以加载，已删除机制的键被丢弃
+        legacy = {"levels": 7, "quantize": True, "transport": False, "k_init": 0.05, "surrogate": False,
+                  "transport_ref_init": 0.0, "transport_layers": list(LAYER_NAMES), "eps_init": 0.1}
+        self.assertEqual(tif_settings(legacy), TIF_DEFAULTS)
+        for bad in ({"transport": True}, {"transport_ref_init": 0.05}, dict(legacy, transport=True)):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                tif_settings(bad)
         with self.assertRaises(ValueError):
             EvSpSegNetStream(channels=SMALL, neuron="lif", tif={"levels": 7})
         with self.assertRaises(ValueError):
@@ -278,34 +348,35 @@ class TIFNetworkTests(unittest.TestCase):
         net = EvSpSegNetStream(channels=SMALL, neuron="tif")
         self.assertTrue(net.is_tif and net.stateful and not net.spiking)
         self.assertEqual(net.tif_config, TIF_DEFAULTS)
+        net = EvSpSegNetStream(channels=SMALL, neuron="tif", tif={"reference": True})
+        self.assertTrue(all(block.neuron.reference for block in net.blocks()))
 
     def test_same_initialization_as_lif(self):
         torch.manual_seed(3)
         lif = EvSpSegNetStream(channels=SMALL, neuron="lif")
-        torch.manual_seed(3)
-        tif = EvSpSegNetStream(channels=SMALL, neuron="tif")
         lif_params = dict(lif.named_parameters())
-        for name, param in tif.named_parameters():
-            if name in lif_params:
-                self.assertEqual(max_error(param, lif_params[name]), 0.0, name)
-            else:
-                self.assertTrue(name.split(".")[-1] in ("k_raw", "log_theta"), name)
+        for reference in (False, True):
+            torch.manual_seed(3)
+            tif = EvSpSegNetStream(channels=SMALL, neuron="tif", tif={"reference": reference})
+            for name, param in tif.named_parameters():
+                if name in lif_params:
+                    self.assertEqual(max_error(param, lif_params[name]), 0.0, name)
+                else:
+                    self.assertTrue(name.split(".")[-1] in ("k_raw", "log_theta", "ref_a"), name)
 
     def test_forward_chunk_matches_step_forward(self):
         seq = synthetic_sequence()
         source = TorchWindowSource(seq, CFG, Q99, torch.device("cpu"), torch.float64)
-        fixes = {"surrogate": True, "transport_ref_init": 0.002,
-                 "transport_layers": ["enc2", "enc3", "enc4", "dec3", "dec2", "dec1"]}
-        cases = ([(False, t, q, {}) for t, q in COMBOS] + [(True, True, True, {})]
-                 + [(False, True, True, {"surrogate": True}), (False, True, True, fixes),
-                    (False, False, True, {"surrogate": True})])
-        for merged, transport, quantize, extra in cases:
+        cases = ([(False, r, q, {}) for r, q in COMBOS] + [(True, True, True, {}), (True, False, True, {})]
+                 + [(False, True, True, {"surrogate": True}), (False, False, True, {"surrogate": True})])
+        for merged, reference, quantize, extra in cases:
             for mode in ("carry", "reset_each_window"):
-                with self.subTest(merged=merged, transport=transport, quantize=quantize, extra=extra, mode=mode):
-                    self.check_pair(source, merged, transport, quantize, mode, extra)
+                with self.subTest(merged=merged, reference=reference, quantize=quantize, extra=extra, mode=mode):
+                    self.check_pair(source, merged, reference, quantize, mode, extra)
 
-    def check_pair(self, source, merged, transport, quantize, mode, extra=None):
-        net_a = make_tif_net(merged, transport, quantize, **(extra or {}))
+    def check_pair(self, source, merged, reference, quantize, mode, extra=None):
+        from model.lif2d_stream import state_tensors
+        net_a = make_tif_net(merged, reference, quantize, **(extra or {}))
         net_b = copy.deepcopy(net_a)
         g = torch.Generator().manual_seed(3)
         states, logits_a, outs_a, mems_a, chunk_states = None, [], [], [], []
@@ -333,7 +404,9 @@ class TIFNetworkTests(unittest.TestCase):
                 self.assertLess(rel_error(out_a, info["spikes"][layer]), 1e-10, LAYER_NAMES[layer])
                 self.assertLess(rel_error(mem_a, info["u_pre"][layer]), 1e-10, LAYER_NAMES[layer])
                 active[layer] += int((info["spikes"][layer] > 0).sum())
-            for a, b in zip(chunk_states[i], states):
+            a_tensors, b_tensors = list(state_tensors(chunk_states[i])), list(state_tensors(states))
+            self.assertEqual(len(a_tensors), len(b_tensors))
+            for a, b in zip(a_tensors, b_tensors):
                 self.assertLess(rel_error(a, b), 1e-10)
         logits_b = torch.cat(logits_b)
         self.assertLess(rel_error(logits_a, logits_b), 1e-10)
@@ -347,31 +420,35 @@ class TIFNetworkTests(unittest.TestCase):
             self.assertLess(max_error(pa.grad, pb.grad) / scale, 1e-9, name)
 
     def test_statistics_step_equals_chunk(self):
-        # 诊断统计只在评估（无梯度）时开启：逐窗与逐层两条路径统计相同，搬运在工作
+        # 诊断统计只在评估（无梯度）时开启：逐窗与逐层两条路径统计相同
         seq = synthetic_sequence()
         source = TorchWindowSource(seq, CFG, Q99, torch.device("cpu"), torch.float64)
-        net = make_tif_net()
-        stats = []
-        with torch.no_grad():
-            for chunked in (False, True):
-                net.start_tif_stats()
-                states = None
-                for start, end in CHUNKS:
-                    if chunked:
-                        x, events, _, _ = source.chunk(start, end)
-                        _, states, _ = net.forward_chunk(x, events, states)
-                    else:
-                        for k in range(start, end):
-                            x, events, _, _ = source.window(k)
-                            _, states, _ = net(x, events, states)
-                stats.append(net.stop_tif_stats())
-        for name in LAYER_NAMES:
-            for key in ("message_abs_rate", "message_nonzero_rate", "occupancy", "saturation", "moved_mass_frac"):
-                self.assertAlmostEqual(stats[0][name][key], stats[1][name][key], places=9, msg=(name, key))
-            self.assertEqual(stats[0][name]["windows"], CHUNKS[-1][1])
-            self.assertEqual(stats[1][name]["windows"], CHUNKS[-1][1])
-        self.assertGreater(max(stats[0][name]["moved_mass_frac"] for name in LAYER_NAMES), 0.0)
-        self.assertGreater(min(stats[0][name]["message_abs_rate"] for name in LAYER_NAMES), 0.0)
+        for reference in (False, True):
+            net = make_tif_net(reference=reference)
+            stats = []
+            with torch.no_grad():
+                for chunked in (False, True):
+                    net.start_tif_stats()
+                    states = None
+                    for start, end in CHUNKS:
+                        if chunked:
+                            x, events, _, _ = source.chunk(start, end)
+                            _, states, _ = net.forward_chunk(x, events, states)
+                        else:
+                            for k in range(start, end):
+                                x, events, _, _ = source.window(k)
+                                _, states, _ = net(x, events, states)
+                    stats.append(net.stop_tif_stats())
+            keys = ["message_abs_rate", "message_nonzero_rate", "occupancy", "saturation"]
+            if reference:
+                keys += ["reference_gain_mean", "reference_normalized_frac"]
+            for name in LAYER_NAMES:
+                for key in keys:
+                    self.assertAlmostEqual(stats[0][name][key], stats[1][name][key], places=9, msg=(name, key))
+                self.assertEqual(stats[0][name]["windows"], CHUNKS[-1][1])
+            self.assertGreater(min(stats[0][name]["message_abs_rate"] for name in LAYER_NAMES), 0.0)
+            if reference:
+                self.assertLess(min(stats[0][name]["reference_gain_mean"] for name in LAYER_NAMES), 1.0)
 
     def test_calibration_runs_with_tif(self):
         seq = synthetic_sequence(seed=2)
@@ -385,15 +462,16 @@ class TIFNetworkTests(unittest.TestCase):
             for _ in range(2):
                 yield windows()
 
-        gains = []
-        for _ in range(2):
-            torch.manual_seed(4)
-            net = EvSpSegNetStream(channels=SMALL, neuron="tif").double()
-            calibrate_gains(net, factory, 0.99, 64, 8, 0.05, 20.0, seed=5)
-            g = torch.cat([b.gain.gain().detach() for b in net.blocks()])
-            self.assertTrue(bool(((g >= 0.05 - 1e-6) & (g <= 20.0 + 1e-5)).all()))
-            gains.append(g)
-        self.assertEqual(max_error(gains[0], gains[1]), 0.0)
+        for reference in (False, True):
+            gains = []
+            for _ in range(2):
+                torch.manual_seed(4)
+                net = EvSpSegNetStream(channels=SMALL, neuron="tif", tif={"reference": reference}).double()
+                calibrate_gains(net, factory, 0.99, 64, 8, 0.05, 20.0, seed=5)
+                g = torch.cat([b.gain.gain().detach() for b in net.blocks()])
+                self.assertTrue(bool(((g >= 0.05 - 1e-6) & (g <= 20.0 + 1e-5)).all()))
+                gains.append(g)
+            self.assertEqual(max_error(gains[0], gains[1]), 0.0)
 
     def test_operation_estimate(self):
         rates = {name: 0.5 for name in LAYER_NAMES}
@@ -410,6 +488,16 @@ class TIFNetworkTests(unittest.TestCase):
                 self.assertEqual(ops["sop"], 0.0)
                 self.assertAlmostEqual(ops["mac"], ops["dense_ops"], delta=1e-3)
             self.assertGreater(ops["state_elements"], 0)
+            self.assertEqual(ops["tif"]["reference_elementwise_ops_per_window"], 0)
+        plain = estimate_operations(EvSpSegNetStream(channels=SMALL, neuron="tif"), H, W, rates, 100)
+        ref = estimate_operations(EvSpSegNetStream(channels=SMALL, neuron="tif", tif={"reference": True}),
+                                  H, W, rates, 100)
+        elements = plain["state_elements"]
+        self.assertEqual(ref["state_elements"], 3 * elements)
+        self.assertEqual(ref["tif"]["reference_elementwise_ops_per_window"], REFERENCE_ELEMENTWISE_OPS * elements)
+        self.assertEqual(ref["tif"]["elementwise_ops_per_window"] - plain["tif"]["elementwise_ops_per_window"],
+                         REFERENCE_ELEMENTWISE_OPS * elements)
+        self.assertEqual((ref["mac"], ref["sop"]), (plain["mac"], plain["sop"]))
 
 
 class TIFFixTests(unittest.TestCase):
@@ -428,7 +516,7 @@ class TIFFixTests(unittest.TestCase):
         # 全程负驱动 = 通道不激活：普通反射下它的输入与参考值 k 收不到梯度；代理梯度下仍能学
         grads = {}
         for surrogate in (False, True):
-            n = tif_neuron(2, transport=False, surrogate=surrogate)
+            n = tif_neuron(2, surrogate=surrogate)
             current = torch.full((1, 2, 4, 4), -1.0, dtype=torch.float64, requires_grad=True)
             state, outs = None, []
             for _ in range(3):
@@ -440,23 +528,6 @@ class TIFFixTests(unittest.TestCase):
             grads[surrogate] = (float(current.grad.abs().max()), float(n.k_raw.grad.abs().max()))
         self.assertEqual(grads[False], (0.0, 0.0))
         self.assertGreater(min(grads[True]), 0.0)
-        # 全程强驱动 = 一直到顶：普通截断下输入收不到梯度（只剩 theta）；代理梯度下输入仍有梯度
-        top = {}
-        for surrogate in (False, True):
-            n = tif_neuron(2, transport=False, surrogate=surrogate)
-            current = torch.full((1, 2, 4, 4), 50.0, dtype=torch.float64, requires_grad=True)
-            state, outs = None, []
-            for _ in range(3):
-                out, state, _ = n(current, state)
-                outs.append(out)
-            outs = torch.stack(outs)
-            _, _, theta = coefficients(n)
-            self.assertLess(max_error(outs, (7 * theta).expand_as(outs)), 1e-12)   # 前向相同：都到顶
-            outs.sum().backward()
-            top[surrogate] = (float(current.grad.abs().max()), float(n.log_theta.grad.abs().max()))
-        self.assertEqual(top[False][0], 0.0)
-        self.assertGreater(top[True][0], 0.0)
-        self.assertGreater(min(top[False][1], top[True][1]), 0.0)
         # 有正有负的一般输入：两种反射前向逐位相同
         g = torch.Generator().manual_seed(9)
         current = torch.randn(2, 3, 5, 6, generator=g, dtype=torch.float64)
@@ -467,61 +538,6 @@ class TIFFixTests(unittest.TestCase):
             out_b, state_b, _ = b(current, state_b)
             self.assertEqual(max_error(out_a, out_b), 0.0)
             self.assertEqual(max_error(state_a, state_b), 0.0)
-
-    def test_transport_reference(self):
-        n = tif_neuron(1, transport_ref_init=0.05)
-        self.assertEqual(sorted(name for name, _ in n.named_parameters()), ["a", "k_raw", "log_theta", "ref_raw"])
-        self.assertFalse(hasattr(tif_neuron(1, transport=False, transport_ref_init=0.05), "ref_raw"))
-        ref = n.ref().double().view(1, -1, 1, 1)
-        self.assertLess(abs(float(ref) - 0.05), 1e-6)
-
-        def run(memory, support):
-            m = torch.tensor(memory, dtype=torch.float64).view(1, 1, 1, -1)
-            s = torch.tensor(support, dtype=torch.float64).view(1, 1, 1, -1)
-            return n.transport_memory(m, s, ref)[0].flatten()
-        # 单拍小涨落（|新息| <= 参考值）不配对
-        self.assertEqual(max_error(run([0, .8, .3, 0], [0, .76, .34, 0]),
-                                   torch.tensor([0, .8, .3, 0.], dtype=torch.float64)), 0.0)
-        # 右移一格：超出参考值的部分搬走，参考值那一份留在原处
-        self.assertLess(max_error(run([0, .8, 0, 0], [0, 0, .8, 0]),
-                                  torch.tensor([0, .05, .75, 0], dtype=torch.float64)), 1e-6)
-        for seed in range(10):
-            g = torch.Generator().manual_seed(seed)
-            memory, support = random_map(g, (2, 1, 9, 11)), random_map(g, (2, 1, 9, 11))
-            moved, outflow = n.transport_memory(memory, support, ref)
-            inflow = moved - memory + outflow
-            d = support - memory
-            self.assertLess(max_error(moved.sum((2, 3)), memory.sum((2, 3))), 1e-12)
-            self.assertTrue(bool((outflow <= torch.relu(-d - ref) + 1e-15).all()))
-            self.assertTrue(bool((inflow <= torch.relu(d - ref) + 1e-15).all()))
-            self.assertGreaterEqual(float(moved.min()), -1e-15)
-
-    def test_transport_layers(self):
-        layers = ["enc2", "dec1"]
-        torch.manual_seed(3)
-        net = EvSpSegNetStream(channels=SMALL, neuron="tif",
-                               tif={"transport_layers": layers, "transport_ref_init": 0.05, "surrogate": True})
-        for name, block in zip(LAYER_NAMES, net.blocks()):
-            self.assertEqual(block.neuron.transport, name in layers, name)
-            self.assertEqual(hasattr(block.neuron, "ref_raw"), name in layers, name)
-            self.assertTrue(block.neuron.surrogate, name)
-        self.assertEqual(net.tif_config["transport_layers"], ("enc2", "dec1"))
-        torch.manual_seed(3)
-        lif = EvSpSegNetStream(channels=SMALL, neuron="lif")
-        lif_params = dict(lif.named_parameters())
-        for name, param in net.named_parameters():                     # 换神经元不消耗随机数
-            if name in lif_params:
-                self.assertEqual(max_error(param, lif_params[name]), 0.0, name)
-        off = EvSpSegNetStream(channels=SMALL, neuron="tif", tif={"transport": False, "transport_layers": layers})
-        self.assertFalse(any(block.neuron.transport for block in off.blocks()))
-        for bad in ([], ["enc5"], ["enc1", "enc1"], "enc1"):
-            with self.subTest(bad=bad), self.assertRaises(ValueError):
-                tif_settings({"transport_layers": bad})
-        for bad in ({"surrogate": 1}, {"transport_ref_init": -0.1}):
-            with self.subTest(bad=bad), self.assertRaises(ValueError):
-                tif_settings(bad)
-        ops = estimate_operations(net, H, W, {name: 0.5 for name in LAYER_NAMES}, 100)
-        self.assertEqual(ops["tif"]["transport_layers"], layers)
 
     def test_dead_channel_statistic(self):
         n = tif_neuron(3)
@@ -550,7 +566,7 @@ class TIFFixTests(unittest.TestCase):
 
 class TIFConfigTests(unittest.TestCase):
     def test_evflying_config_differs_from_v1_only_in_neuron(self):
-        # EV-Flying 上的 TIF（不搬运）：除 neuron / tif / save_root 外与 V1 的 EV-Flying 配置逐项相同
+        # EV-Flying 上的 TIF：除 neuron / tif / save_root 外与 V1 的 EV-Flying 配置逐项相同
         from utils.stream_common import load_flat_config
         v1 = load_flat_config("configs/evisseg_stream_v1_evflying.yaml")
         cfg = load_flat_config("configs/evisseg_stream_tif_notransport_evflying.yaml")
@@ -559,9 +575,27 @@ class TIFConfigTests(unittest.TestCase):
             if key not in ("neuron", "save_root"):
                 self.assertEqual(cfg[key], v1[key], key)
         self.assertEqual(cfg["neuron"], "tif")
-        tif = tif_settings(cfg["tif"])
-        self.assertEqual((tif["levels"], tif["transport"], tif["quantize"], tif["surrogate"]), (7, False, True, False))
+        self.assertEqual(tif_settings(cfg["tif"]), TIF_DEFAULTS)
         self.assertNotEqual(cfg["save_root"], v1["save_root"])
+
+    def test_tifr_configs_differ_only_in_reference(self):
+        import glob
+        from utils.stream_common import load_flat_config
+        roots = set()
+        for base, tifr in (("evisseg_stream_tif_notransport", "evisseg_stream_tifr"),
+                           ("evisseg_stream_tif_notransport_evflying", "evisseg_stream_tifr_evflying")):
+            a = load_flat_config("configs/%s.yaml" % base)
+            b = load_flat_config("configs/%s.yaml" % tifr)
+            self.assertEqual(set(a), set(b))
+            for key in a:
+                if key not in ("tif", "save_root"):
+                    self.assertEqual(a[key], b[key], (tifr, key))
+            self.assertEqual(tif_settings(b["tif"]), dict(tif_settings(a["tif"]), reference=True))
+            roots.update((a["save_root"], b["save_root"]))
+        self.assertEqual(len(roots), 4)
+        for path in glob.glob("configs/evisseg_stream_tif*.yaml"):                # 现存配置不再带搬运的键
+            tif = load_flat_config(path).get("tif") or {}
+            self.assertFalse(set(tif) & {"transport", "transport_ref_init", "transport_layers", "eps_init"}, path)
 
 
 class TIFEndToEndTests(unittest.TestCase):
@@ -596,7 +630,7 @@ class TIFEndToEndTests(unittest.TestCase):
                         neg += seq.n_events - int(seq.label.sum())
             stats = dict(q99=Q99.tolist(), train_pos=pos, train_neg=neg, pos_weight=min(neg / pos, 30.0))
             (root / "stats.json").write_text(json.dumps(stats), encoding="utf-8")
-            for config in ("evisseg_stream_tif", "evisseg_stream_tif_sg_ref", "evisseg_stream_tif_sg_noenc1"):
+            for config in ("evisseg_stream_tif_notransport", "evisseg_stream_tifr"):
                 run = root / config
                 cfg = load_flat_config("configs/%s.yaml" % config)
                 self.assertEqual((cfg["neuron"], cfg["trainer"], cfg["streams"], cfg["accumulate"]),
@@ -613,10 +647,9 @@ class TIFEndToEndTests(unittest.TestCase):
                 self.assertEqual(set(record["tif_parameters"]), set(LAYER_NAMES), config)
                 self.assertIn("theta_mean", record["tif_parameters"]["enc2"])
                 self.assertIn("dead_channel_frac", record["tif"]["dec3"])
-                if config.endswith("_ref"):
-                    self.assertIn("ref_mean", record["tif_parameters"]["enc2"])
-                if config.endswith("_noenc1"):
-                    self.assertEqual(record["tif"]["enc1"]["moved_mass_frac"], 0.0)
+                reference = config.endswith("tifr")
+                self.assertEqual("tau_ref_mean" in record["tif_parameters"]["enc2"], reference)
+                self.assertEqual("reference_gain_mean" in record["tif"]["enc2"], reference)
                 checkpoint = run / "best_val_iou_seed37.pt"
                 self.assertTrue(checkpoint.exists())
                 args = SimpleNamespace(checkpoint=str(checkpoint), device="cpu", mode="eval", split="val",
@@ -626,6 +659,7 @@ class TIFEndToEndTests(unittest.TestCase):
                 T.mode_eval(args, cfg)
                 result = json.loads((run / "eval_val_best_val_iou_seed37.json").read_text(encoding="utf-8"))
                 self.assertEqual(result["tif"]["levels"], 7)
+                self.assertEqual(result["tif"]["reference"], reference)
                 for mode in ("carry", "reset_each_window"):
                     self.assertEqual(set(result[mode]["tif"]), set(LAYER_NAMES))
                     self.assertIn("tif", result[mode]["operations"])

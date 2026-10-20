@@ -40,21 +40,27 @@ from utils.stream_common import gains_from_positive_samples
 
 LAYER_NAMES = ("enc1", "enc2", "enc3", "enc4", "dec3", "dec2", "dec1")
 DECODER_STAGES = (("up3", "dec3"), ("up2", "dec2"), ("up1", "dec1"))
-# surrogate / transport_ref_init / transport_layers 是 10-19 缺陷修正的开关，默认值 = 修正前的行为（旧配置逐位不变）
-TIF_DEFAULTS = {"levels": 7, "quantize": True, "transport": True, "k_init": 0.05,
-                "surrogate": False, "transport_ref_init": 0.0, "transport_layers": LAYER_NAMES}
-TIF_NEURON_KEYS = ("levels", "quantize", "transport", "k_init", "surrogate", "transport_ref_init")
-# 第 1 轮（10-19 前）的搬运规则带可学先验 eps；两侧限量配对之后不再使用，旧 checkpoint 配置里的这个键直接丢弃
-TIF_LEGACY_KEYS = ("eps_init",)
+REFERENCE_ELEMENTWISE_OPS = 53    # 本地参照每元素每窗的逐元素运算数（见 estimate_operations）
+# surrogate：10-19 两端代理梯度（实验失败，默认关）；reference：本地参照 TIF-R（Stream-SNN-Innovations.md 11.27）
+TIF_DEFAULTS = {"levels": 7, "quantize": True, "k_init": 0.05, "surrogate": False, "reference": False}
+TIF_NEURON_KEYS = ("levels", "quantize", "k_init", "surrogate", "reference")
+# 已删除的机制留在旧 checkpoint 配置里的键（10-19 删除搬运）：只接受"未启用"的取值，读入时丢弃
+TIF_REMOVED_KEYS = {"eps_init": None, "transport": False, "transport_ref_init": 0.0, "transport_layers": None}
 
 
 def tif_settings(tif):
-    """校验 TIF 配置字典并补全默认值；None 表示全部取默认（见 TIF_DEFAULTS）。"""
+    """校验 TIF 配置字典并补全默认值；None 表示全部取默认（见 TIF_DEFAULTS）。
+
+    旧配置里已删除机制的键：搬运必须是关闭的（transport: false、transport_ref_init: 0），否则报错；
+    eps_init、transport_layers 只在搬运时起作用，直接丢弃。
+    """
     if tif is None:
         tif = {}
     if not isinstance(tif, dict):
         raise ValueError("tif 必须为配置字典")
-    tif = {key: value for key, value in tif.items() if key not in TIF_LEGACY_KEYS}
+    if tif.get("transport", False) is not False or float(tif.get("transport_ref_init", 0.0)) != 0.0:
+        raise ValueError("TIF 的膜电位搬运已于 10-19 删除，不能构造或加载带搬运的配置")
+    tif = {key: value for key, value in tif.items() if key not in TIF_REMOVED_KEYS}
     unknown = set(tif) - set(TIF_DEFAULTS)
     if unknown:
         raise ValueError("未知 TIF 配置: %s" % sorted(unknown))
@@ -62,21 +68,12 @@ def tif_settings(tif):
     out.update(tif)
     if isinstance(out["levels"], bool) or int(out["levels"]) != out["levels"] or int(out["levels"]) < 1:
         raise ValueError("tif.levels 必须是 >= 1 的整数")
-    if not all(isinstance(out[key], bool) for key in ("quantize", "transport", "surrogate")):
-        raise ValueError("tif.quantize / tif.transport / tif.surrogate 必须为 YAML 布尔值")
+    if not all(isinstance(out[key], bool) for key in ("quantize", "surrogate", "reference")):
+        raise ValueError("tif.quantize / tif.surrogate / tif.reference 必须为 YAML 布尔值")
     value = float(out["k_init"])
     if not (np.isfinite(value) and value > 0):
         raise ValueError("tif.k_init 必须是有限正数")
     out["k_init"] = value
-    value = float(out["transport_ref_init"])
-    if not (np.isfinite(value) and value >= 0):
-        raise ValueError("tif.transport_ref_init 必须是有限非负数（0 = 不用搬运参考值）")
-    out["transport_ref_init"] = value
-    layers = out["transport_layers"]
-    if (not isinstance(layers, (list, tuple)) or not layers or len(set(layers)) != len(layers)
-            or any(name not in LAYER_NAMES for name in layers)):
-        raise ValueError("tif.transport_layers 必须是 enc1/enc2/enc3/enc4/dec3/dec2/dec1 的非空、无重复列表")
-    out["transport_layers"] = tuple(name for name in LAYER_NAMES if name in layers)
     out["levels"] = int(out["levels"])
     return out
 
@@ -158,7 +155,7 @@ class EvSpSegNetStream(nn.Module):
                    None 时使用构造参数中的默认值
         collect    True 时 info 返回每层的脉冲、u_pre、增益前电流（用于监控与校准）
         logits     [N] 每个事件的原始 logit
-        new_states 7 组状态：普通 LIF 为软复位后的 U，双仓为 (U, M)，TIF 为信念 M，ReLU 为 None
+        new_states 7 组状态：普通 LIF 为软复位后的 U，双仓为 (U, M)，TIF 为信念 M（启用本地参照时为 (M, m1, m2, c)），ReLU 为 None
     neuron="tif" 时 tif 为 TIF 配置字典（键见 TIF_DEFAULTS；None 取默认）；TIF 参数不消耗随机数，
     同种子下卷积与读出的初始化与 LIF 版本逐位相同。
     """
@@ -200,13 +197,6 @@ class EvSpSegNetStream(nn.Module):
             self.dec1 = block(c1 + c1, c1, 1)
         self.readout = nn.Sequential(nn.Linear(c1 + 2, readout_hidden), nn.ReLU(),
                                      nn.Linear(readout_hidden, 1))
-        if neuron_tif is not None and neuron_tif["transport"]:
-            # 不在 transport_layers 里的层换成不搬运的 TIF（构造 TIF 不消耗随机数，其余初始化不变）
-            for name in LAYER_NAMES:
-                if name not in self.tif_config["transport_layers"]:
-                    selected_block = getattr(self, name)
-                    selected_block.neuron = StreamingTIF2d(
-                        selected_block.out_ch, **dict(lif, **dict(neuron_tif, transport=False)))
         self.dual_memory_layers = ()
         if dual_memory is not None:
             if not isinstance(dual_memory, dict):
@@ -339,7 +329,7 @@ class EvSpSegNetStream(nn.Module):
         return self.neuron_kind == "tif"
 
     def start_tif_stats(self):
-        """开始累计各 TIF 层的诊断统计（消息率、电平占用、被搬走的质量比例）；非 TIF 网络不做任何事。"""
+        """开始累计各 TIF 层的诊断统计（消息率、电平占用；启用参照时还有局部增益）；非 TIF 网络不做任何事。"""
         if self.is_tif:
             for block in self.blocks():
                 block.neuron.start_stats()
@@ -809,23 +799,26 @@ def estimate_operations(net, height, width, firing_rates, events_per_window, inp
               "state_elements": state_elements if net.stateful else 0}
     if net.is_tif:
         cfg = net.tif_config
-        # 每个搬运层每元素约 28 次逐元素运算：三次 8 邻域求和 24 加 + 新息、配比、接收约 4 次（参考值再加 2 次）
-        transport_ops = 28 + (2 if cfg["transport_ref_init"] > 0 else 0)
-        transport_elements = sum(block.out_ch * state_size[name] for name, block in zip(LAYER_NAMES, net.blocks())
-                                 if block.neuron.transport)
         update_ops = 7 + (4 if cfg["quantize"] else 0)  # 驱动、EMA、截断约 7 次；量化与 Δq 约 4 次
+        # 本地参照每元素每窗：两个指数平均与平方 7、偏差校正 2、两张图的环形求和（7x7 与 3x3 方框可分离、相减）34、
+        # 除以格数 2、方差与增益 6、(I - b) * 增益 2，共约 53 次逐元素运算，另有 1 次开方
+        reference_ops = REFERENCE_ELEMENTWISE_OPS if cfg["reference"] else 0
         result["tif"] = {
-            "levels": cfg["levels"], "quantize": cfg["quantize"], "transport": cfg["transport"],
+            "levels": cfg["levels"], "quantize": cfg["quantize"], "reference": cfg["reference"],
             "message_payload_bits": int(math.ceil(math.log2(2 * cfg["levels"] + 1))),
             "sop_basis": "firing_rates 为每神经元每窗平均 |Δq|：SOP = 单位脉冲口径（每个单位电平变化一次突触累加）",
-            "elementwise_ops_per_window": transport_ops * transport_elements + update_ops * state_elements,
-            "transport_elementwise_ops_per_window": transport_ops * transport_elements,
-            "transport_layers": [name for name, block in zip(LAYER_NAMES, net.blocks()) if block.neuron.transport],
-            "surrogate": cfg["surrogate"], "transport_ref_init": cfg["transport_ref_init"],
+            "elementwise_ops_per_window": (update_ops + reference_ops) * state_elements,
+            "reference_elementwise_ops_per_window": reference_ops * state_elements,
+            "reference_sqrt_per_window": state_elements if cfg["reference"] else 0,
+            "reference_state_elements": 2 * state_elements if cfg["reference"] else 0,
+            "surrogate": cfg["surrogate"],
             "synaptic_accumulator_elements": state_elements,
             "included_in_mac_sop": False,
             "note": ("逐元素运算单列，未折算进 MAC/SOP；事件驱动实现按 Δ 网络做法为每个神经元保存一份突触累积，"
-                     "另列 synaptic_accumulator_elements；quantize=false 时层间是实数，全部按 MAC 计")}
+                     "另列 synaptic_accumulator_elements；quantize=false 时层间是实数，全部按 MAC 计；"
+                     "参照状态另有每 (流, 通道) 一个偏差校正量，忽略不计")}
+        if cfg["reference"]:
+            result["state_elements"] += 2 * state_elements
     if net.has_dual_memory:
         extra_by_layer = {name: getattr(net, name).out_ch * state_size[name] for name in net.dual_memory_layers}
         extra = sum(extra_by_layer.values())

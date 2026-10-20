@@ -1,12 +1,14 @@
-"""TIF 搬运诊断（只评估，不训练、不修改 checkpoint）：同一划分上并排运行几个 checkpoint，看搬运在哪里起作用、在哪里出错。
+"""TIF 诊断（只评估，不训练、不修改 checkpoint）：同一划分上并排运行几个 checkpoint，看误差出在哪里、机制是否按预期工作。
 
 用法（服务器，EV-UAV-v1 目录）：
-    python tools/diagnose_tif_transport.py --config configs/evisseg_stream_tif.yaml --split test --device cuda:0 \
-        --run tif2=log/stream_tif2_seed37/best_val_iou_seed37.pt \
-        --run notransport=log/stream_tif_notransport_seed37/best_val_iou_seed37.pt \
-        --out log/diagnose_tif_transport_test.json
+    python tools/diagnose_tif.py --config configs/evisseg_stream_tifr.yaml --split test --device cuda:0 \
+        --run tifr=log/stream_tifr_seed37/best_val_iou_seed37.pt \
+        --run tif=log/stream_tif_notransport_seed37/best_val_iou_seed37.pt \
+        --run v1=log/stream_v1_streams_b4n1_seed37/best_val_iou_seed37.pt \
+        --out log/diagnose_tifr_test.json
 前两个 --run 做逐序列配对比较（A - B）。网络结构、q99 取自 checkpoint；数据根目录与阈值等评估口径取自 --config。
 全部用 carry 模式逐窗执行（与 --mode eval 的 carry 相同），打印的 IoU 应与 eval_*.json 的 carry IoU 相同，用于核对。
+（10-19 删除搬运之前的版本叫 tools/diagnose_tif_transport.py，其中的搬运流量统计随搬运一起删除。）
 
 一、事件级（判正规则 prob >= threshold，与 window_confusion 相同）
   1. 逐序列 TP/FP/FN、IoU 与噪声密度（每窗负事件数）。
@@ -16,18 +18,18 @@
        far    其余                                                        远离目标（背景噪声、闪烁）
   3. 目标速度分层：每窗每个目标（target_id > 0）取正事件质心，速度 = 与上一窗质心的距离（像素/窗），
      上一窗没有该目标记为 new。每层给出召回 TP/(TP+FN) 与局部 IoU TP/(TP+FN+FP_near)，
-     FP_near = 距该目标本窗正事件 <= near_px 的 FP。各层一格的像素数：enc1/dec1 = 1，enc2/dec2 = 2，
-     enc3/dec3 = 4，enc4 = 8；搬运每窗每层最远一格。
-二、层内记忆相对目标的位置（只对 TIF 层；前向钩子只读，不改变任何输出）
-  按该层分辨率划分区域（本窗正事件映射到格子后外扩 1 格）：
+     FP_near = 距该目标本窗正事件 <= near_px 的 FP。
+二、层内状态相对目标的位置（只对 TIF 层；前向钩子只读，不改变任何输出）
+  按该层分辨率划分区域（本窗正事件映射到格子后外扩 1 格；一格 = enc1/dec1 1 px、enc2/dec2 2、enc3/dec3 4、enc4 8）：
        now    本窗目标所在格
        trail  前 trail_windows 窗目标所在格中、本窗不是目标的格
        bg     其余
-  记忆 M（本窗更新后）在三个区域的占比，以及密度比 = 占比 / 面积占比。
-  搬运层另外按区域统计：新证据 e、失去支持的记忆 m、流入、流出的占比，以及
-       fill  = 流入 / e   新证据中由搬运补上的比例（目标处明显高于背景，才说明搬运在跟随目标）
-       clear = 流出 / m   失去支持的记忆被搬走的比例（尾迹处高，说明搬运在清理尾迹）
-  搬运量用神经元自己的 transport_memory 重算，总流出与神经元的 moved 统计一致（单元测试核对）。
+  记忆 M（本窗更新后）在三个区域的占比，以及密度比 = 占比 / 面积占比（now 越高、trail 越低越好）。
+  启用本地参照（TIF-R）时另有各区域的平均局部增益 theta/sqrt(theta^2+v)（用神经元自己的 local_reference 重算），
+  与驱动对比度 = 区域平均驱动 / bg 平均驱动，参照前（I）与参照后（r）各一份：参照后 now 的对比度更高，
+  说明参照压下了背景而保留了目标。
+三、逐序列消息率：每个序列各层平均 |Δq|，以及它与每窗负事件数的秩相关（杂波越多消息越多 = 相关为正；
+  本地参照的预期是相关变弱）。
 """
 import os
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
@@ -58,7 +60,6 @@ REGIONS = ("now", "trail", "bg")
 FP_KINDS = ("near", "trail", "far")
 EVAL_KEYS = ("threshold", "pd_detT", "correct_thresh", "rolling_window", "segments", "timing_warmup_windows")
 DATA_KEYS = ("height", "width_px", "pad_height", "pad_width", "window_ms", "n_windows", "time_bins", "input_clip")
-FLOW_KEYS = ("evidence", "surplus", "inflow", "outflow")
 
 
 def parse_args(argv=None):
@@ -162,15 +163,15 @@ class TargetRegions(object):
 
 
 class LayerProbe(object):
-    """在每层 TIF 神经元上挂前向钩子，只读输入与输出，按区域累计记忆与搬运量。"""
+    """在每层 TIF 神经元上挂前向钩子，只读输入与输出，按区域累计记忆（启用参照时还有局部增益与驱动）。"""
 
     def __init__(self, net, regions):
         self.regions = regions
-        self.sums, self.transport, self.handles = {}, {}, []
+        self.sums, self.reference, self.handles = {}, {}, []
         for name in LAYER_NAMES:
             neuron = getattr(net, name).neuron
             if isinstance(neuron, StreamingTIF2d):
-                self.transport[name] = bool(neuron.transport)
+                self.reference[name] = bool(neuron.reference)
                 self.handles.append(neuron.register_forward_hook(self._hook(name)))
 
     def remove(self):
@@ -191,28 +192,23 @@ class LayerProbe(object):
         def hook(module, inputs, output):
             with torch.no_grad():
                 current, prev = inputs
-                memory = output[1]
+                memory = output[2]
                 now, trail = self.regions.masks(stride, memory.shape[-2], memory.shape[-1], memory.device)
                 masks = (now, trail, 1.0 - now - trail)
                 store = self.sums.setdefault(name, {})
                 self._add(store, "memory", memory, masks)
                 self._add(store, "area", None, masks, float(memory.shape[0] * memory.shape[1]))
-                if module.transport and prev is not None:
-                    _, k, _, _, ref = module._coefficients(current)
-                    support = torch.relu(current - k)
-                    carried, outflow = module.transport_memory(prev, support, ref)
-                    innovation = support - prev
-                    shift = 0.0 if ref is None else ref
-                    self._add(store, "prev", prev, masks)
-                    self._add(store, "evidence", torch.relu(innovation - shift), masks)
-                    self._add(store, "surplus", torch.relu(-innovation - shift), masks)
-                    self._add(store, "inflow", carried - prev + outflow, masks)
-                    self._add(store, "outflow", outflow, masks)
+                if module.reference:
+                    _, _, theta, _, alpha = module._coefficients(current)
+                    drive, _, gain = module.local_reference(current, module.split_state(prev)[1], theta, alpha)
+                    self._add(store, "gain", gain, masks)
+                    self._add(store, "raw", current, masks)
+                    self._add(store, "drive", drive, masks)
 
         return hook
 
     def summary(self):
-        """各层汇总：占比、密度比；搬运层另有 fill / clear / 搬走比例。"""
+        """各层汇总：占比、密度比；启用参照的层另有各区域局部增益与参照前后的驱动对比度。"""
         out = {}
         for name, store in self.sums.items():
             s = {key: float(value) for key, value in store.items()}
@@ -224,22 +220,22 @@ class LayerProbe(object):
                 t = total(key)
                 return s[key + "_" + region] / t if t > 0 else None
 
-            layer = {"transport": self.transport[name],
+            def mean(key, region):
+                area = s["area_" + region]
+                return s[key + "_" + region] / area if area > 0 else None
+
+            layer = {"reference": self.reference[name],
                      "memory_share": {r: share("memory", r) for r in REGIONS},
                      "area_share": {r: share("area", r) for r in REGIONS}}
             layer["memory_density"] = {r: (layer["memory_share"][r] / layer["area_share"][r]
                                            if layer["memory_share"][r] is not None and layer["area_share"][r] else None)
                                        for r in REGIONS}
-            if "prev_now" in s:
-                for key in FLOW_KEYS:
-                    layer[key + "_share"] = {r: share(key, r) for r in REGIONS}
-                layer["fill"] = {r: (s["inflow_" + r] / s["evidence_" + r] if s["evidence_" + r] > 0 else None)
-                                 for r in REGIONS}
-                layer["clear"] = {r: (s["outflow_" + r] / s["surplus_" + r] if s["surplus_" + r] > 0 else None)
-                                  for r in REGIONS}
-                layer["moved_mass_frac"] = total("outflow") / total("prev") if total("prev") > 0 else 0.0
-                layer["inflow_minus_outflow"] = total("inflow") - total("outflow")
-                layer["outflow_total"] = total("outflow")
+            if "gain_now" in s:
+                layer["gain_mean"] = {r: mean("gain", r) for r in REGIONS}
+                for key in ("raw", "drive"):
+                    bg = mean(key, "bg")
+                    layer[key + "_contrast"] = {r: (mean(key, r) / bg if bg and mean(key, r) is not None else None)
+                                                for r in REGIONS}
             out[name] = layer
         return out
 
@@ -404,6 +400,22 @@ def paired(name_a, a, name_b, b):
             "sequences": ranked}
 
 
+def message_vs_noise(seqs):
+    """各层（及 7 层平均）逐序列 |Δq| 与每窗负事件数的秩相关、全部序列的平均 |Δq|；非 TIF 网络返回空字典。"""
+    layers = [layer for layer in LAYER_NAMES if seqs and all(layer in s.get("message_abs_rate", {}) for s in seqs)]
+    if not layers:
+        return {}
+    noise = [s["neg_per_window"] for s in seqs]
+    out = {}
+    for layer in layers + ["mean"]:
+        if layer == "mean":
+            rates = [float(np.mean([s["message_abs_rate"][n] for n in layers])) for s in seqs]
+        else:
+            rates = [s["message_abs_rate"][layer] for s in seqs]
+        out[layer] = {"spearman_vs_neg_per_window": spearman(noise, rates), "mean_rate": float(np.mean(rates))}
+    return out
+
+
 def clean(obj):
     """把 NaN / inf 换成 None，保证 JSON 合法。"""
     if isinstance(obj, float):
@@ -444,12 +456,17 @@ def print_run(name, run):
             line = "     %-5s M %s / %s / %s  密度 %s %s" % (
                 layer, fmt(s["memory_share"]["now"]), fmt(s["memory_share"]["trail"]), fmt(s["memory_share"]["bg"]),
                 fmt(s["memory_density"]["now"], "%.1f"), fmt(s["memory_density"]["trail"], "%.1f"))
-            if "fill" in s:
-                line += " | 搬走 %s  fill now/trail/bg %s %s %s  clear %s %s %s  流入落在 now %s" % (
-                    fmt(s["moved_mass_frac"]), fmt(s["fill"]["now"]), fmt(s["fill"]["trail"]), fmt(s["fill"]["bg"]),
-                    fmt(s["clear"]["now"]), fmt(s["clear"]["trail"]), fmt(s["clear"]["bg"]),
-                    fmt(s["inflow_share"]["now"]))
+            if "gain_mean" in s:
+                line += " | 增益 now/trail/bg %s %s %s  对比度 now 参照前 %s 后 %s，trail 前 %s 后 %s" % (
+                    fmt(s["gain_mean"]["now"]), fmt(s["gain_mean"]["trail"]), fmt(s["gain_mean"]["bg"]),
+                    fmt(s["raw_contrast"]["now"], "%.1f"), fmt(s["drive_contrast"]["now"], "%.1f"),
+                    fmt(s["raw_contrast"]["trail"], "%.1f"), fmt(s["drive_contrast"]["trail"], "%.1f"))
             print(line)
+    if run.get("message_vs_noise"):
+        m = run["message_vs_noise"]
+        print("   逐序列 |Δq| 与每窗负事件数的秩相关（括号内为平均 |Δq|）: " + "  ".join(
+            "%s %s (%s)" % (k, fmt(v["spearman_vs_neg_per_window"], "%+.2f"), fmt(v["mean_rate"], "%.4f"))
+            for k, v in m.items()))
 
 
 def print_paired(p):
@@ -498,8 +515,11 @@ def main(argv=None):
         for i in range(n_seq):
             seq = dataset[i]
             for name, (net, train_cfg, q99, _) in loaded.items():
+                net.start_tif_stats()                       # 非 TIF 网络不做任何事
                 probs = run_sequence_probe(net, seq, train_cfg, q99, device, probes[name][0])
+                tif_stats = net.stop_tif_stats()
                 record = analyze_sequence(seq, probs, threshold, height, width, args.near_px, args.trail_windows)
+                record["message_abs_rate"] = {layer: v["message_abs_rate"] for layer, v in tif_stats.items() if v}
                 collected[name]["targets"] += record.pop("targets")
                 collected[name]["sequences"].append(record)
             print("[%d/%d] %s" % (i + 1, n_seq, seq.name), flush=True)
@@ -515,6 +535,7 @@ def main(argv=None):
             "fp_kinds": {k: sum(s["fp_" + k] for s in seqs) for k in FP_KINDS},
             "speed": speed_table(collected[name]["targets"]),
             "layers": probes[name][1].summary(),
+            "message_vs_noise": message_vs_noise(seqs),
             "sequences": seqs}
         probes[name][1].remove()
     if len(runs) >= 2:

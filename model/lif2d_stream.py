@@ -9,7 +9,7 @@
 每个 50 ms 窗口只调用一次神经元：5 个时间 bin 是输入通道，不是 SNN 时间步。
 三种神经元用于分离"脉冲"与"跨窗记忆"两个因素：StreamingLIF2d（有状态+二值）、
 StreamingGraded2d（有状态+实数）、ReLUNeuron（无状态+实数）。
-StreamingTIF2d 是 V5 的 TIF 神经元（信念 M 与"已告知"分离 + 新息配对搬运 + 多级变化汇报），见类说明。
+StreamingTIF2d 是 V5 的 TIF 神经元（信念 M 与"已告知"分离 + 有界证据累积 + 多级变化汇报；可选本地参照 TIF-R），见类说明。
 forward 逐窗调用（流式推理、增益校准）；forward_steps 一次处理一个片段的多个窗口（逐层时间并行训练），两者等价。
 """
 import math
@@ -253,58 +253,63 @@ def inverse_softplus(value):
     return value + math.log(-math.expm1(-value))
 
 
-class StreamingTIF2d(StreamingLIF2d):
-    """TIF 神经元（Transport–Integrate–and–Fire，V5 基础版 TIF-B，见 Stream-SNN-Innovations.md 第 11 节）。
+REFERENCE_RING = 7       # 参照环外边长（本层格子数）：7x7
+REFERENCE_GUARD = 3      # 保护区边长（含中心）：3x3，与本层 3x3 卷积的足迹相同
 
-    每个窗口、每个通道、每个像素（N8 = 3x3 邻域去掉中心的求和，补零边界）：
-        z   = I - k                               驱动；k = softplus(.) >= 0，低于 k 的输入不积累（CUSUM 式参考值）
-        d   = relu(z) - M_prev                    新息：当前证据能支持的记忆量减去已有记忆
-        e   = relu(d)                             记忆解释不了的新证据（可以接收）
-        m   = relu(-d)                            失去证据支持的记忆（可以搬走）
-        搬运：失去支持的记忆 m 只配给 8 邻域里的新证据 e；两侧限量（搬走的 <= m，搬来的 <= e），见 transport_memory
-        M~  = M_prev - 流出 + 流入                新息配对搬运：守恒、非负；搬走的 <= m，搬来的 <= e；
-                                                  有支持的记忆不动；没有可学参数、不估计速度、没有方向先验
-        M   = min(relu(lam * M~ + (1 - lam) * z), D * theta)    有界的泄漏证据累积（EMA 形式，稳态 M = z）
-        out = theta * round(M / theta)            多级汇报（round 用直通估计）；quantize=False 时 out = M
-    lam = exp(-dt/tau) 沿用 V1 的 tau 参数化；theta = exp(.) 逐通道可学（LSQ 式步长），初值 v_th / D，
-    使量程 D*theta 与增益校准的目标（q99 正电流 = v_th）一致。
-    状态只有 M（没有复位）；下游需要的整数消息是 Δq = q_t - q_{t-1}（q = round(M/theta)），
-    由 M 序列确定，这里不单独保存。关闭 transport 时严格等于反射累积器（消融用）。
-    state 为 None 与零状态数值相同。
-    forward(current, state) -> (out, M, M)：第三项对应 LIF 的 u_pre，最后一层用它做逐事件读出。
-    训练（forward_steps 且需要梯度）时每一步的神经元运算在反向时重算（梯度检查点），数学不变、只省显存：
-    否则每步要为反向保存约 11 张整幅中间图。
-    两个开关（默认关，旧配置的行为逐位不变；见 Stream-SNN-Innovations.md 11.9）：
-        surrogate=True           0 处反射与 D*theta 处截断都用代理梯度（BoundedSurrogate）：不激活的通道与到顶的元素
-                                 仍有梯度（第 1 轮观测到不量化时 dec3 过半通道 M 恒为 0、dec1 约 30% 元素到顶）；前向不变
-        transport_ref_init > 0   搬运参考值 delta = softplus(.)（逐通道可学，初值即该数）：e = relu(d - delta)、
-                                 m = relu(-d - delta)，幅度不超过 delta 的新息（单拍涨落）不参与配对
+
+def ring_kernel(dtype=torch.float32):
+    """参照环核 [1,1,R,R]：外边 R=7 的方框去掉中心 3x3 保护区，共 40 个参照格。"""
+    kernel = torch.ones(1, 1, REFERENCE_RING, REFERENCE_RING, dtype=dtype)
+    a = (REFERENCE_RING - REFERENCE_GUARD) // 2
+    kernel[:, :, a:a + REFERENCE_GUARD, a:a + REFERENCE_GUARD] = 0.0
+    return kernel
+
+
+class StreamingTIF2d(StreamingLIF2d):
+    """TIF 神经元（V5，见 Stream-SNN-Innovations.md 第 11 节；10-19 起不再搬运）。
+
+    每个窗口、每个通道、每个像素：
+        r   = I                                    reference=False（TIF 基础版）
+        r   = (I - b) * theta / sqrt(theta^2 + v)  reference=True（TIF-R：本地参照，见下）
+        z   = r - k                                k = softplus(.) >= 0（CUSUM 式漂移项）
+        M   = min(relu(lam * M_prev + (1 - lam) * z), D * theta)    有界的泄漏证据累积（EMA 形式，稳态 M = z）
+        out = theta * round(M / theta)             多级汇报（round 用直通估计）；quantize=False 时 out = M
+    lam = exp(-dt/tau) 沿用 V1 的 tau 参数化；theta = exp(.) 逐通道可学（LSQ 式步长），初值 v_th / D。
+    下游需要的整数消息是 Δq = q_t - q_{t-1}（q = round(M/theta)），由 M 序列确定，这里不单独保存。
+    state 为 None 与零状态数值相同。forward(current, state) -> (out, 新状态, M)：第三项对应 LIF 的 u_pre。
+
+    本地参照（reference=True，CA-CFAR 式的保护环参照，逐层、逐通道）：
+        m1, m2   每个像素驱动 I 与 I^2 的指数平均（时间常数 tau_r 逐通道可学，参数化与 tau 相同），
+                 c = 1 - (1 - alpha)^(t+1) 为偏差校正（Adam 式），m^ = m / c 是严格的加权平均
+        b, v     参照环（7x7 去掉中心 3x3）内 m1^ 的平均与 m2^ - b^2（截到 >= 0）：位置与方差
+                 中心 3x3 不进参照：不大于保护区的目标永远不会被自己的参照吸收；大于参照环的成片背景被归一
+        噪声底   theta（汇报分辨率）：参照环安静（b = v = 0）时 r = I，严格退化为 TIF；v >> theta^2 时
+                 r ≈ theta (I - b) / sqrt(v)，一个电平约等于一个本地标准差
+        参照包含本窗（同一时刻的参照格，与 CA-CFAR 相同）；环内没有参照格（小图边缘）时不归一
+    参照状态 (m1, m2, c) 与 M 一起作为状态：新状态为 (M, m1, m2, c)，c 的形状 [B,C,1,1]；零状态即"刚开始"。
+    训练（forward_steps 且需要梯度）时每一步的神经元运算在反向时重算（梯度检查点），数学不变、只省显存。
+    surrogate=True 时 0 处反射与 D*theta 处截断用代理梯度（BoundedSurrogate，10-19 实验失败，默认关）。
     """
 
     def __init__(self, channels, dt_ms, tau_init_ms, tau_min_ms, tau_max_ms, v_threshold,
-                 levels=7, quantize=True, transport=True, k_init=0.05, surrogate=False, transport_ref_init=0.0):
+                 levels=7, quantize=True, k_init=0.05, surrogate=False, reference=False):
         super(StreamingTIF2d, self).__init__(channels, dt_ms, tau_init_ms, tau_min_ms, tau_max_ms,
                                              v_threshold)
         if isinstance(levels, bool) or int(levels) != levels or int(levels) < 1:
             raise ValueError("TIF levels 必须是 >= 1 的整数")
-        if not isinstance(quantize, bool) or not isinstance(transport, bool) or not isinstance(surrogate, bool):
-            raise ValueError("TIF quantize / transport / surrogate 必须是布尔值")
-        transport_ref_init = float(transport_ref_init)
-        if not (math.isfinite(transport_ref_init) and transport_ref_init >= 0):
-            raise ValueError("TIF transport_ref_init 必须是有限非负数（0 表示不用参考值）")
+        if not all(isinstance(flag, bool) for flag in (quantize, surrogate, reference)):
+            raise ValueError("TIF quantize / surrogate / reference 必须是布尔值")
         self.levels = int(levels)
         self.quantize = quantize
-        self.transport = transport
         self.surrogate = surrogate
+        self.reference = reference
         self.k_raw = nn.Parameter(torch.full((channels,), inverse_softplus(k_init), dtype=torch.float32))
-        if transport and transport_ref_init > 0:
-            self.ref_raw = nn.Parameter(torch.full((channels,), inverse_softplus(transport_ref_init),
-                                                   dtype=torch.float32))
         self.log_theta = nn.Parameter(torch.full((channels,), math.log(float(v_threshold) / self.levels),
                                                  dtype=torch.float32))
-        kernel = torch.ones(channels, 1, 3, 3, dtype=torch.float32)
-        kernel[:, :, 1, 1] = 0.0
-        self.register_buffer("neighbor_kernel", kernel, persistent=False)
+        if reference:
+            self.ref_a = nn.Parameter(self.a.detach().clone())     # 参照时间常数：与 tau 同一参数化、同一初值
+            self.register_buffer("ring_kernel", ring_kernel(), persistent=False)
+        self._count_cache = {}
         self.collect_stats = False
         self._stats = {}
 
@@ -316,49 +321,67 @@ class StreamingTIF2d(StreamingLIF2d):
         """量化步长 theta > 0，形状 [C]。"""
         return torch.exp(self.log_theta)
 
-    def ref(self):
-        """搬运参考值 delta > 0，形状 [C]；没有启用时为 None。"""
-        return F.softplus(self.ref_raw) if hasattr(self, "ref_raw") else None
+    def tau_reference(self):
+        """参照的时间常数（毫秒），形状 [C]；没有启用参照时为 None。"""
+        if not self.reference:
+            return None
+        return self.tau_min_ms + (self.tau_max_ms - self.tau_min_ms) * torch.sigmoid(self.ref_a)
 
     def _coefficients(self, current):
         view = (1, -1, 1, 1)
         lam = self.beta().to(current.dtype).view(view)
         theta = self.theta().to(current.dtype).view(view)
-        ref = self.ref()
-        return (lam, self.k().to(current.dtype).view(view), theta, theta * self.levels,
-                None if ref is None else ref.to(current.dtype).view(view))
+        alpha = None
+        if self.reference:
+            alpha = (1.0 - torch.exp(-self.dt_ms / self.tau_reference())).to(current.dtype).view(view)
+        return lam, self.k().to(current.dtype).view(view), theta, theta * self.levels, alpha
 
-    def neighbor_sum(self, x):
-        """3x3 邻域（不含中心）求和，补零边界；逐通道 depthwise 卷积。"""
-        return F.conv2d(x, self.neighbor_kernel.to(x.dtype), padding=1, groups=x.shape[1])
+    def ring_count(self, height, width, dtype, device):
+        """每个位置参照环内的有效格数 [1,1,H,W]（画面外不计），按尺寸缓存；只是常数，不是状态。"""
+        key = (int(height), int(width), str(dtype), str(device))
+        if key not in self._count_cache:
+            ones = torch.ones(1, 1, height, width, dtype=dtype, device=device)
+            count = F.conv2d(ones, self.ring_kernel.to(dtype=dtype, device=device), padding=REFERENCE_RING // 2)
+            self._count_cache[key] = torch.clamp(count, min=1.0)    # 没有参照格时分子也为 0，参照为 0
+        return self._count_cache[key]
 
-    def transport_memory(self, memory, support, ref=None):
-        """新息配对搬运（两侧限量）。返回 (搬运后的记忆, 每个位置的流出量)。
+    def ring_mean(self, x):
+        """参照环平均：逐通道 7x7 去掉中心 3x3 的求和，再除以有效格数。"""
+        channels = int(x.shape[1])
+        kernel = self.ring_kernel.to(x.dtype).expand(channels, 1, REFERENCE_RING, REFERENCE_RING)
+        total = F.conv2d(x, kernel, padding=REFERENCE_RING // 2, groups=channels)
+        return total / self.ring_count(x.shape[-2], x.shape[-1], x.dtype, x.device)
 
-        输入 memory >= 0、support = relu(z) >= 0 [B,C,H,W]。原则：记忆搬多少，正好等于这一拍的变化能解释多少。
-          e = relu(support - memory) 记忆解释不了的新证据（可以接收），m = relu(memory - support) 失去支持的记忆（可以搬走）；
-          同一位置不会同时有 m 和 e。只在 8 邻域内搬（每拍最远一格），方向等权，没有可学参数、不估计速度。
-        一轮比例拟合（部分最优传输的两侧上限）：
-          源端：y 报出 min(m(y), D(y))，按 e 的比例分给邻格，r(y) = m(y) / max(D(y), m(y))，D = N8(e)；
-          目的地：x 最多收下 e(x)，接收比例 a(x) = 1 / max(1, N8(r)(x))，收不下的留在源处；
-          f(y->x) = r(y) e(x) a(x)  =>  流出(y) = r(y) N8(e a)(y) <= m(y)，流入(x) = e(x) min(1, N8(r)(x)) <= e(x)，
-          两式逐边相同，总量守恒。于是弱噪声最多只吸走与它等量的记忆，目标闪烁一拍时记忆基本留在原地。
-        ref（可选，[1,C,1,1]）为搬运参考值：只有超出 ref 的新息参与配对，以上性质对缩小后的 e、m 同样成立。
+    def local_reference(self, current, stats, theta, alpha):
+        """本地参照。返回 (r, 新参照状态 (m1, m2, c), 局部增益 theta/sqrt(theta^2+v))。
+
+        stats 为 None 表示刚开始（与零状态相同）：偏差校正后第一窗的 m^ 就是本窗的 I、I^2。
         """
-        innovation = support - memory
-        if ref is None:
-            evidence = torch.relu(innovation)
-            surplus = torch.relu(-innovation)
+        if stats is None:
+            m1 = alpha * current
+            m2 = alpha * (current * current)
+            c = alpha.expand(int(current.shape[0]), -1, -1, -1)
         else:
-            evidence = torch.relu(innovation - ref)
-            surplus = torch.relu(-innovation - ref)
-        demand = self.neighbor_sum(evidence)
-        offer = surplus / (torch.maximum(demand, surplus) + 1e-12)        # 1e-12 只防 0/0（此时分子为 0）
-        offered = self.neighbor_sum(offer)
-        accept = 1.0 / torch.clamp(offered, min=1.0)
-        outflow = offer * self.neighbor_sum(evidence * accept)
-        inflow = evidence * torch.clamp(offered, max=1.0)
-        return memory - outflow + inflow, outflow
+            m1_prev, m2_prev, c_prev = stats
+            m1 = (1.0 - alpha) * m1_prev + alpha * current
+            m2 = (1.0 - alpha) * m2_prev + alpha * (current * current)
+            c = (1.0 - alpha) * c_prev + alpha
+        both = self.ring_mean(torch.cat([m1 / c, m2 / c], 1))
+        channels = int(current.shape[1])
+        b, second = both[:, :channels], both[:, channels:]
+        variance = torch.relu(second - b * b)
+        # 方差恰为 0 处增益直接取 1：不依赖 theta / sqrt(theta^2) 的舍入（float32 的 CPU 开方不保证恰好为 theta）
+        gain = torch.where(variance > 0, theta / torch.sqrt(theta * theta + variance), torch.ones_like(variance))
+        return (current - b) * gain, (m1, m2, c), gain
+
+    @staticmethod
+    def split_state(state):
+        """状态 -> (M, 参照状态)；没有启用参照时参照状态为 None。"""
+        if state is None:
+            return None, None
+        if isinstance(state, tuple):
+            return state[0], tuple(state[1:])
+        return state, None
 
     def level(self, memory):
         """量化电平 q = round(M/theta)（整数值张量，不带梯度）；memory 为 None 时返回 None。"""
@@ -367,18 +390,17 @@ class StreamingTIF2d(StreamingLIF2d):
         theta = self.theta().to(memory.dtype).view(1, -1, 1, 1)
         return torch.round(memory.detach() / theta)
 
-    def _compute(self, current, prev, lam, k, theta, cap, ref):
-        """一个窗口的 TIF 运算，返回 (输出, 新记忆 M, 搬运流出量或 None)。"""
-        z = current - k
-        support = torch.relu(z)
-        outflow = None
-        if prev is None:
+    def _compute(self, current, memory_prev, stats_prev, lam, k, theta, cap, alpha):
+        """一个窗口的 TIF 运算，返回 (输出, 新记忆 M, 新参照状态或 None, 局部增益或 None)。"""
+        stats, gain = None, None
+        drive = current
+        if self.reference:
+            drive, stats, gain = self.local_reference(current, stats_prev, theta, alpha)
+        z = drive - k
+        if memory_prev is None:
             pre = (1.0 - lam) * z
         else:
-            carried = prev
-            if self.transport:
-                carried, outflow = self.transport_memory(prev, support, ref)
-            pre = lam * carried + (1.0 - lam) * z
+            pre = lam * memory_prev + (1.0 - lam) * z
         if self.surrogate:
             memory = BoundedSurrogate.apply(pre, cap)
         else:
@@ -388,26 +410,31 @@ class StreamingTIF2d(StreamingLIF2d):
             output = theta * (scaled + (torch.round(scaled) - scaled).detach())
         else:
             output = memory
-        return output, memory, outflow
+        return output, memory, stats, gain
 
-    def _checkpoint_body(self, current, prev, lam, k, theta, cap, ref):
-        output, memory, _ = self._compute(current, prev, lam, k, theta, cap, ref)
-        return output, memory
+    def _checkpoint_body(self, current, lam, k, theta, cap, alpha, memory_prev, *stats_prev):
+        output, memory, stats, _ = self._compute(current, memory_prev, stats_prev if stats_prev else None,
+                                                 lam, k, theta, cap, alpha)
+        return (output, memory) + (tuple(stats) if stats is not None else ())
 
-    def _step(self, current, prev, lam, k, theta, cap, ref, recompute=False):
+    def _step(self, current, prev, lam, k, theta, cap, alpha, recompute=False):
+        memory_prev, stats_prev = self.split_state(prev)
+        gain = None
         if recompute and prev is not None and torch.is_grad_enabled() and not self.collect_stats:
-            output, memory = checkpoint_utils.checkpoint(self._checkpoint_body, current, prev, lam, k, theta,
-                                                         cap, ref, preserve_rng_state=False)
-            outflow = None
+            outs = checkpoint_utils.checkpoint(self._checkpoint_body, current, lam, k, theta, cap, alpha,
+                                               memory_prev, *(stats_prev or ()), preserve_rng_state=False)
+            output, memory = outs[0], outs[1]
+            stats = tuple(outs[2:]) if self.reference else None
         else:
-            output, memory, outflow = self._compute(current, prev, lam, k, theta, cap, ref)
+            output, memory, stats, gain = self._compute(current, memory_prev, stats_prev, lam, k, theta, cap,
+                                                        alpha)
         if self.collect_stats:
-            self._accumulate(memory, prev, outflow)
-        return output, memory
+            self._accumulate(memory, memory_prev, gain, theta)
+        new_state = memory if stats is None else (memory,) + tuple(stats)
+        return output, new_state, memory
 
     def forward(self, current, state):
-        output, memory = self._step(current, state, *self._coefficients(current))
-        return output, memory, memory
+        return self._step(current, state, *self._coefficients(current))
 
     def forward_steps(self, current, state, carry=True, keep_u_pre=True, keep=None):
         """按时间顺序处理一个片段的 T 个窗口，与连续调用 forward T 次数学等价（接口同 StreamingLIF2d）。"""
@@ -418,10 +445,10 @@ class StreamingTIF2d(StreamingLIF2d):
         outputs, memories = [], []
         for t in range(steps):
             prev = mask_state(state if carry else None, keep, t)
-            output, state = self._step(current[t], prev, *coefficients, recompute=True)
+            output, state, memory = self._step(current[t], prev, *coefficients, recompute=True)
             outputs.append(output)
             if keep_u_pre:
-                memories.append(state)
+                memories.append(memory)
         return torch.stack(outputs), state, (torch.stack(memories) if keep_u_pre else None)
 
     # ----- 诊断统计（只用于验证，不参与前向；训练时关闭） -----
@@ -431,17 +458,17 @@ class StreamingTIF2d(StreamingLIF2d):
         self._stats = {}
         self.collect_stats = True
 
-    def _accumulate(self, memory, prev, outflow):
+    def _accumulate(self, memory, memory_prev, gain, theta):
         with torch.no_grad():
             s = self._stats
             if not s:
                 zero = torch.zeros((), device=memory.device, dtype=torch.float64)
                 s.update(elements=0, windows=0, occupied=zero.clone(), saturated=zero.clone(),
                          level_sum=zero.clone(), message_abs=zero.clone(), message_nonzero=zero.clone(),
-                         mass=zero.clone(), moved=zero.clone(),
+                         gain_sum=zero.clone(), normalized=zero.clone(),
                          channel_active=torch.zeros(memory.shape[1], dtype=torch.bool, device=memory.device))
             q = self.level(memory)
-            q_prev = torch.zeros_like(q) if prev is None else self.level(prev)
+            q_prev = torch.zeros_like(q) if memory_prev is None else self.level(memory_prev)
             delta = q - q_prev
             s["elements"] += memory.numel()
             s["windows"] += 1
@@ -451,10 +478,9 @@ class StreamingTIF2d(StreamingLIF2d):
             s["level_sum"] += q.double().sum()
             s["message_abs"] += delta.abs().double().sum()
             s["message_nonzero"] += delta.ne(0).sum().double()
-            if prev is not None:
-                s["mass"] += prev.detach().double().sum()
-            if outflow is not None:
-                s["moved"] += outflow.detach().double().sum()
+            if gain is not None:
+                s["gain_sum"] += gain.detach().double().sum()
+                s["normalized"] += (gain < 0.5 ** 0.5).sum().double()     # 本地标准差 > theta 的元素
 
     def stop_stats(self):
         """停止累计并返回汇总（每个神经元每窗的平均值）；没有数据时返回空字典。
@@ -462,23 +488,26 @@ class StreamingTIF2d(StreamingLIF2d):
         message_abs_rate      平均 |Δq|（单位脉冲口径：每个单位电平变化 = 一次突触累加）
         message_nonzero_rate  Δq 非零的比例（graded 口径：一条消息携带一个小整数）
         level_mean / occupancy / saturation  电平均值、M>0 的比例、电平到顶（q = D）的比例
-        moved_mass_frac       搬运移走的记忆质量 / 搬运前的记忆总量（含背景涨落，不等于"在跟随目标"）
         dead_channel_frac     评估期间 M 始终为 0 的通道占比（死通道；不量化时与"从未发放"相同）
+        reference_gain_mean   （启用参照时）局部增益 theta/sqrt(theta^2+v) 的平均，1 = 没有归一
+        reference_normalized_frac  （启用参照时）本地标准差超过 theta（增益 < 1/sqrt(2)）的元素占比
         """
         self.collect_stats = False
         s = self._stats
         if not s:
             return {}
         n = float(max(s["elements"], 1))
-        mass = float(s["mass"])
-        return {"message_abs_rate": float(s["message_abs"]) / n,
-                "message_nonzero_rate": float(s["message_nonzero"]) / n,
-                "level_mean": float(s["level_sum"]) / n,
-                "occupancy": float(s["occupied"]) / n,
-                "saturation": float(s["saturated"]) / n,
-                "moved_mass_frac": (float(s["moved"]) / mass) if mass > 0 else 0.0,
-                "dead_channel_frac": 1.0 - float(s["channel_active"].double().mean()),
-                "windows": int(s["windows"])}
+        out = {"message_abs_rate": float(s["message_abs"]) / n,
+               "message_nonzero_rate": float(s["message_nonzero"]) / n,
+               "level_mean": float(s["level_sum"]) / n,
+               "occupancy": float(s["occupied"]) / n,
+               "saturation": float(s["saturated"]) / n,
+               "dead_channel_frac": 1.0 - float(s["channel_active"].double().mean()),
+               "windows": int(s["windows"])}
+        if self.reference:
+            out["reference_gain_mean"] = float(s["gain_sum"]) / n
+            out["reference_normalized_frac"] = float(s["normalized"]) / n
+        return out
 
 
 class ReLUNeuron(nn.Module):

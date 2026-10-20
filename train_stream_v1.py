@@ -223,7 +223,7 @@ def build_net(cfg, device):
 def design_version(net):
     """写入 run_config 与 checkpoint 的设计版本标记。"""
     if net.is_tif:
-        return "v5-tif"
+        return "v5-tifr" if net.tif_config["reference"] else "v5-tif"
     if net.has_subthreshold_residual:
         return "v1-subthreshold-residual"
     return "v1-dual-memory" if net.has_dual_memory else "v1-3"
@@ -483,7 +483,8 @@ def tau_statistics(net):
 
 
 def tif_parameter_statistics(net):
-    """TIF 各层参考值 k、量化步长 theta（启用时还有搬运参考值 ref）的最小/平均/最大值；非 TIF 网络返回空字典。"""
+    """TIF 各层参考值 k、量化步长 theta（启用本地参照时还有参照时间常数 tau_ref，毫秒）的最小/平均/最大值；
+    非 TIF 网络返回空字典。"""
     out = {}
     for name, block in zip(LAYER_NAMES, net.blocks()):
         neuron = block.neuron
@@ -491,8 +492,8 @@ def tif_parameter_statistics(net):
             continue
         with torch.no_grad():
             values = {"k": neuron.k(), "theta": neuron.theta()}
-            if neuron.ref() is not None:
-                values["ref"] = neuron.ref()
+            if neuron.reference:
+                values["tau_ref"] = neuron.tau_reference()
             out[name] = {}
             for key, value in values.items():
                 value = value.double().cpu()
@@ -1003,7 +1004,7 @@ def evaluate_split(net, cfg, q99, device, split, state_mode, names=None, full=Fa
     was_training = net.training
     net.eval()
     if monitor is not None:
-        net.start_tif_stats()                 # TIF 消息率与搬运比例；非 TIF 网络不做任何事
+        net.start_tif_stats()                 # TIF 消息率与局部增益；非 TIF 网络不做任何事
     with torch.no_grad():
         for i in range(len(dataset)):
             seq = dataset[i]
@@ -1139,9 +1140,9 @@ def mode_smoke(args, cfg):
     print(json.dumps(report, indent=2, ensure_ascii=False), flush=True)
     missing = out["missing_grads"]
     if cfg["state_mode"] == "reset_each_window":
-        # reset 模式下 U/M 都不跨窗读取，时间常数、双仓耦合参数与 TIF 搬运参考值没有梯度是预期行为。
+        # reset 模式下 U/M 都不跨窗读取，时间常数、双仓耦合参数与 TIF 参照时间常数没有梯度是预期行为。
         missing = [name for name in missing if not name.endswith(
-            (".neuron.a", ".neuron.memory_a", ".neuron.kappa_raw", ".neuron.ref_raw"))]
+            (".neuron.a", ".neuron.memory_a", ".neuron.kappa_raw", ".neuron.ref_a"))]
     if missing:
         raise RuntimeError("以下参数没有梯度: %s" % missing)
     print("SMOKE TEST FINISHED:", root, flush=True)
@@ -1300,8 +1301,9 @@ def mode_train(args, cfg):
         if record["tif"]:
             print("  [tif] 每窗 |Δq| " + " ".join("%s %.4f" % (n, record["tif"][n]["message_abs_rate"])
                                                   for n in LAYER_NAMES)
-                  + " | 搬走比例 " + " ".join("%s %.3f" % (n, record["tif"][n]["moved_mass_frac"])
-                                              for n in LAYER_NAMES), flush=True)
+                  + ("" if "reference_gain_mean" not in record["tif"]["enc1"] else
+                     " | 参照增益 " + " ".join("%s %.3f" % (n, record["tif"][n]["reference_gain_mean"])
+                                            for n in LAYER_NAMES)), flush=True)
         for w in record["warnings"]:
             print("  [health]", w, flush=True)
     summary = summarize_history(history, seed)

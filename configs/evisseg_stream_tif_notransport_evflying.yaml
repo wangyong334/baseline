@@ -18,7 +18,6 @@ NET:
   tif:
     levels: 7                  # D：汇报电平 0..D
     quantize: true
-    transport: false
     k_init: 0.05
   state_mode: carry
   norm: none

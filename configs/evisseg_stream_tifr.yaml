@@ -1,10 +1,5 @@
-# V5 TIF-B 基础版（Stream-SNN-Innovations.md 第 11 节）：TIF 神经元 = 信念 M 与"已告知"分离 + 新息配对搬运（两侧限量，无可学参数）+ 多级变化汇报
-# 与 V1（configs/evisseg_stream_v1.yaml + 标准 TBPTT B=4、n=1、k=16）只差神经元；同种子下卷积与读出的初始化逐位相同。
-# 2x2 对照的四个配置只差 tif.transport / tif.quantize：
-#   evisseg_stream_tif.yaml                   搬运开、量化开（本方法）
-#   evisseg_stream_tif_notransport.yaml       搬运关、量化开（检验搬运）
-#   evisseg_stream_tif_float.yaml             搬运开、不量化（检验 3 bit 汇报的代价）
-#   evisseg_stream_tif_float_notransport.yaml 搬运关、不量化
+# V5 TIF-R：TIF（不搬运）+ 本地参照（保护环 CA-CFAR 式，Stream-SNN-Innovations.md 11.27）
+# 与 configs/evisseg_stream_tif_notransport.yaml 只差 tif.reference 与 save_root（tests/test_stream_tif.py 核对）
 DATA:
   root: /media/stephen/nvme0n1/wy_data/datasets/EV-UAV-dataset
   stats_path: configs/stream_v1_train_stats.json   # 由 tools/stream_train_stats.py 生成
@@ -22,9 +17,9 @@ NET:
   neuron: tif
   tif:
     levels: 7                  # D：汇报电平 0..7（3 bit），消息 Δq ∈ {-7..7}
-    quantize: false            # false = 直接汇报实数 M（对照）
-    transport: true            # false = 不搬运，严格等于反射累积器（对照）
+    quantize: true             # false = 直接汇报实数 M（对照）
     k_init: 0.05               # 参考值 k 初值（softplus），单位是校准后的驱动（q99 正电流 = 1）
+    reference: true            # 本地参照：参照环（7x7 去掉中心 3x3）内的位置与方差，噪声底 = theta
   state_mode: carry            # carry | reset_each_window
   norm: none
   v_threshold: 1.0             # TIF 中只决定 theta 初值 = v_threshold / levels（量程 D*theta = 1）与增益校准目标
@@ -61,7 +56,7 @@ TRAIN:
   train_subset_every: 5
   eval_chunk: 32
   deterministic: true
-  save_root: log/stream_tif_float_seed37
+  save_root: log/stream_tifr_seed37
 
 EVAL:
   threshold: 0.9

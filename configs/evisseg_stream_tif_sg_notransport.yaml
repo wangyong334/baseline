@@ -1,9 +1,4 @@
-# V5 TIF-B 第 3 轮（缺陷修正，Stream-SNN-Innovations.md 11.9）：在两侧限量搬运的基础上加三个开关，每两个配置只差一项
-#   evisseg_stream_tif_sg_notransport.yaml  代理梯度，不搬运            对比第 1 轮不搬运：代理梯度的作用
-#   evisseg_stream_tif_sg.yaml              代理梯度，搬运              对比上一个：搬运的作用；对比第 2 轮搬运：代理梯度的作用
-#   evisseg_stream_tif_sg_ref.yaml          代理梯度，搬运 + 参考值     对比 sg：参考值能否挡住单拍涨落驱动的搬运
-#   evisseg_stream_tif_sg_noenc1.yaml       代理梯度，搬运但 enc1 不搬  对比 sg：第一层（原始事件、涨落最大）不搬运
-# 训练协议与 V1 / 第 1、2 轮完全相同（标准 TBPTT B=4、n=1、k=16，50 轮，种子 37）。
+# V5 TIF + 两端代理梯度（10-19 实验失败：梯度爆炸，见 Stream-SNN-Innovations.md 11.13；只作记录）
 DATA:
   root: /media/stephen/nvme0n1/wy_data/datasets/EV-UAV-dataset
   stats_path: configs/stream_v1_train_stats.json   # 由 tools/stream_train_stats.py 生成
@@ -22,7 +17,6 @@ NET:
   tif:
     levels: 7                  # D：汇报电平 0..7（3 bit），消息 Δq ∈ {-7..7}
     quantize: true             # false = 直接汇报实数 M（对照）
-    transport: false           # false = 不搬运，严格等于反射累积器（对照）
     k_init: 0.05               # 参考值 k 初值（softplus），单位是校准后的驱动（q99 正电流 = 1）
     surrogate: true            # 0 处反射与 D*theta 处截断都用代理梯度（前向不变）：不激活的通道、到顶的元素仍能学
   state_mode: carry            # carry | reset_each_window

@@ -1,10 +1,11 @@
-"""tools/diagnose_tif_transport.py 的单元测试（CPU，不需要数据集）。
+"""tools/diagnose_tif.py 的单元测试（CPU，不需要数据集）。
 
     1. 膨胀、近邻计数与暴力计算一致
     2. 手工序列：FP 三类（near / trail / far，含回看窗数）、目标速度分层、FN 计数
-    3. 层内钩子：挂上与不挂输出逐位相同、与 run_sequence 相同；搬运总流出与神经元自身统计一致；流入 = 流出；
-       各区域占比之和为 1
-    4. 入口：两个 checkpoint（搬运 / 不搬运）在合成数据上跑完，事件级计数与 run_sequence 相同，JSON 合法
+    3. 层内钩子：挂上与不挂输出逐位相同、与 run_sequence 相同；各区域占比之和为 1；
+       启用参照时重算的局部增益与神经元自身统计一致
+    4. 入口：两个 checkpoint（TIF-R / TIF）在合成数据上跑完，事件级计数与 run_sequence 相同，
+       逐序列消息率与神经元统计一致，JSON 合法
 """
 import json
 import os
@@ -22,7 +23,7 @@ from dataset import stream_windows as sw  # noqa: E402
 from model.evspsegnet_stream import LAYER_NAMES  # noqa: E402
 from test_stream_layerwise import CFG, H, Q99, SMALL, W, WINDOWS, synthetic_sequence  # noqa: E402
 from test_stream_tif import make_tif_net  # noqa: E402
-from tools import diagnose_tif_transport as D  # noqa: E402
+from tools import diagnose_tif as D  # noqa: E402
 from train_stream_v1 import build_net, run_sequence  # noqa: E402
 from utils.stream_common import load_flat_config  # noqa: E402
 
@@ -123,9 +124,9 @@ class ProbeTests(unittest.TestCase):
         seq = synthetic_sequence(seed=2)
         cfg = dict(CFG, input_device="cpu", execution="step")
         device = torch.device("cpu")
-        for extra in ({}, {"transport_ref_init": 0.02}, {"transport_layers": ["enc2", "dec1"]}):
-            with self.subTest(extra=extra):
-                net = make_tif_net(**extra).eval()
+        for reference in (False, True):
+            with self.subTest(reference=reference):
+                net = make_tif_net(reference=reference).eval()
                 with torch.no_grad():
                     _, confusion = run_sequence(net, seq, cfg, Q99, device, "carry")
                     plain = D.run_sequence_probe(net, seq, cfg, Q99, device, D.TargetRegions(4))
@@ -141,29 +142,26 @@ class ProbeTests(unittest.TestCase):
                 self.assertEqual([record["tp"], record["fp"], record["fn"]], confusion.sum(axis=0)[:3].tolist())
                 summary = probe.summary()
                 self.assertEqual(set(summary), set(LAYER_NAMES))
-                moved_any = False
                 for name in LAYER_NAMES:
                     s = summary[name]
+                    self.assertEqual(s["reference"], reference)
                     self.assertAlmostEqual(sum(s["memory_share"].values()), 1.0, places=9)
                     self.assertAlmostEqual(sum(s["area_share"].values()), 1.0, places=9)
                     self.assertGreater(s["area_share"]["now"], 0.0)
                     self.assertGreater(s["area_share"]["trail"], 0.0)
-                    if not s["transport"]:
-                        self.assertNotIn("fill", s)
-                        self.assertEqual(stats[name]["moved_mass_frac"], 0.0)
+                    if not reference:
+                        self.assertNotIn("gain_mean", s)
                         continue
-                    self.assertLess(abs(s["moved_mass_frac"] - stats[name]["moved_mass_frac"]), 1e-9)
-                    self.assertLess(abs(s["inflow_minus_outflow"]), 1e-9 * max(s["outflow_total"], 1.0))
-                    for key in D.FLOW_KEYS:
-                        self.assertAlmostEqual(sum(s[key + "_share"].values()), 1.0, places=9)
+                    # 按面积加权的三区增益平均 = 整层平均增益（神经元自己的统计）；合成序列的深层可能没有 bg 区
+                    regions = [r for r in D.REGIONS if s["area_share"][r] > 0]
+                    weighted = sum(s["gain_mean"][r] * s["area_share"][r] for r in regions)
+                    self.assertLess(abs(weighted - stats[name]["reference_gain_mean"]), 1e-9, name)
                     for region in D.REGIONS:
-                        for key in ("fill", "clear"):
-                            value = s[key][region]
-                            self.assertTrue(value is None or -1e-9 <= value <= 1 + 1e-9, (name, key, region, value))
-                    moved_any = moved_any or s["moved_mass_frac"] > 0
-                self.assertTrue(moved_any)
-                expected = list(extra.get("transport_layers", LAYER_NAMES))
-                self.assertEqual([n for n in LAYER_NAMES if summary[n]["transport"]], expected)
+                        value = s["gain_mean"][region]
+                        self.assertEqual(value is None, region not in regions, (name, region))
+                        self.assertTrue(value is None or 0.0 < value <= 1.0, (name, region))
+                    if "bg" in regions:
+                        self.assertAlmostEqual(s["raw_contrast"]["bg"], 1.0, places=9)
 
 
 class EntryTests(unittest.TestCase):
@@ -176,12 +174,12 @@ class EntryTests(unittest.TestCase):
                 loc = np.stack((seq.x, seq.y, seq.t), axis=1)
                 norm = np.column_stack((loc, seq.p, seq.label, seq.target_id))
                 np.savez(root / "val" / ("seq_%d.npz" % seed), ev_loc=loc, evs_norm=norm)
-            base = load_flat_config("configs/evisseg_stream_tif.yaml")
+            base = load_flat_config("configs/evisseg_stream_tifr.yaml")
             base.update(root=str(root), channels=list(SMALL), height=H, width_px=W, pad_height=H, pad_width=W,
                         n_windows=WINDOWS, threshold=0.5)
             paths = {}
-            for name, transport in (("tif", True), ("none", False)):
-                cfg = dict(base, tif=dict(base["tif"], transport=transport, k_init=1e-3))
+            for name, reference in (("tifr", True), ("tif", False)):
+                cfg = dict(base, tif=dict(base["tif"], reference=reference, k_init=1e-3))
                 torch.manual_seed(3)
                 net = build_net(cfg, torch.device("cpu"))
                 for block in net.blocks():
@@ -196,7 +194,7 @@ class EntryTests(unittest.TestCase):
             out = root / "diag.json"
             argv = ["--config", str(yaml_path), "--split", "val", "--device", "cpu", "--near-px", "1",
                     "--trail-windows", "3", "--out", str(out),
-                    "--run", "tif=%s" % paths["tif"], "--run", "none=%s" % paths["none"]]
+                    "--run", "tifr=%s" % paths["tifr"], "--run", "tif=%s" % paths["tif"]]
             import contextlib
             import io
             with contextlib.redirect_stdout(io.StringIO()):
@@ -204,18 +202,24 @@ class EntryTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     D.main(argv)                                                  # 不覆盖已有结果
             saved = json.loads(out.read_text(encoding="utf-8"))
-            self.assertEqual(saved["paired"]["a"], "tif")
-            self.assertEqual(len(saved["runs"]["tif"]["sequences"]), 2)
-            self.assertTrue(saved["runs"]["tif"]["layers"]["enc1"]["transport"])
-            self.assertFalse(saved["runs"]["none"]["layers"]["enc1"]["transport"])
-            for name in ("tif", "none"):
+            self.assertEqual(saved["paired"]["a"], "tifr")
+            self.assertEqual(len(saved["runs"]["tifr"]["sequences"]), 2)
+            self.assertTrue(saved["runs"]["tifr"]["layers"]["enc1"]["reference"])
+            self.assertFalse(saved["runs"]["tif"]["layers"]["enc1"]["reference"])
+            self.assertEqual(set(saved["runs"]["tif"]["message_vs_noise"]), set(LAYER_NAMES) | {"mean"})
+            for name in ("tifr", "tif"):
                 net, train_cfg, q99, _ = D.load_run(str(paths[name]), dict(base, threshold=0.5), torch.device("cpu"))
                 total = np.zeros(3, dtype=np.int64)
-                for seed in (6, 7):
+                for i, seed in enumerate((6, 7)):
                     seq = sw.load_npz_events(str(root / "val" / ("seq_%d.npz" % seed)), H, W, 50, WINDOWS, 5)
                     with torch.no_grad():
+                        net.start_tif_stats()
                         _, confusion = run_sequence(net, seq, train_cfg, q99, torch.device("cpu"), "carry")
+                        stats = net.stop_tif_stats()
                     total += confusion.sum(axis=0)[:3]
+                    rates = report["runs"][name]["sequences"][i]["message_abs_rate"]
+                    for layer in LAYER_NAMES:
+                        self.assertAlmostEqual(rates[layer], stats[layer]["message_abs_rate"], places=12)
                 t = report["runs"][name]["totals"]
                 self.assertEqual([t["tp"], t["fp"], t["fn"]], total.tolist(), name)
 
