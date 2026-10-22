@@ -456,7 +456,8 @@ class TIFEndToEndTests(unittest.TestCase):
                         neg += seq.n_events - int(seq.label.sum())
             stats = dict(q99=Q99.tolist(), train_pos=pos, train_neg=neg, pos_weight=min(neg / pos, 30.0))
             (root / "stats.json").write_text(json.dumps(stats), encoding="utf-8")
-            for config in ("evisseg_stream_tif_notransport", "evisseg_stream_tif_adapt3", "evisseg_stream_tif_comm"):
+            for config in ("evisseg_stream_tif_notransport", "evisseg_stream_tif_adapt3", "evisseg_stream_tif_comm",
+                           "evisseg_stream_tif_comm_peak"):
                 run = root / config
                 cfg = load_flat_config("configs/%s.yaml" % config)
                 self.assertEqual((cfg["neuron"], cfg["trainer"], cfg["streams"], cfg["accumulate"]),
@@ -490,6 +491,8 @@ class TIFEndToEndTests(unittest.TestCase):
                 T.mode_eval(args, cfg)
                 result = json.loads((run / "eval_val_best_val_iou_seed37.json").read_text(encoding="utf-8"))
                 self.assertEqual(result["tif"]["levels"], 7)
+                self.assertIn("sop_per_window", result["carry"])                   # 单窗 SOP 分布（12.21）
+                self.assertNotIn("per_window_rate", result["carry"]["tif"]["enc1"])
                 for mode in ("carry", "reset_each_window"):
                     self.assertEqual(set(result[mode]["tif"]), set(LAYER_NAMES))
                     self.assertIn("tif", result[mode]["operations"])

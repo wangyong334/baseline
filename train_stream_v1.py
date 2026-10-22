@@ -38,7 +38,7 @@ from model.evspsegnet_stream import (LAYER_NAMES, EvSpSegNetStream, calibrate_ga
                                      count_parameters, estimate_operations, tif_settings)
 from model.lif2d_stream import (StreamingLIF2d, StreamingDualMemoryLIF2d, StreamingTIF2d,  # noqa: E402
                                 detach_states)
-from utils.comm_budget import CommBudget  # noqa: E402
+from utils.comm_budget import CommBudget, window_sop_summary  # noqa: E402
 from utils.stream_common import (health_warnings, linear_epoch_lr, load_flat_config,  # noqa: E402
                                  make_chunks, select_subset, subset_due, summarize_history)
 from utils.stream_metrics import (SWEEP_THRESHOLDS, FastRoc, first_detection_latencies, iou_from_counts,  # noqa: E402
@@ -1033,7 +1033,7 @@ def evaluate_split(net, cfg, q99, device, split, state_mode, names=None, full=Fa
     was_training = net.training
     net.eval()
     if monitor is not None:
-        net.start_tif_stats()                 # TIF 消息率与电平统计；非 TIF 网络不做任何事
+        net.start_tif_stats(per_window=True)  # TIF 消息率与电平统计（含逐窗，用于单窗 SOP 分布）；非 TIF 网络不做任何事
     with torch.no_grad():
         for i in range(len(dataset)):
             seq = dataset[i]
@@ -1068,6 +1068,13 @@ def evaluate_split(net, cfg, q99, device, split, state_mode, names=None, full=Fa
         if monitor.residual_summary():
             result["subthreshold_diagnostics"] = monitor.residual_summary()
         if tif_stats:
+            # 单窗 SOP 的分布（峰值带宽约束的检验口径，12.21）；逐窗列表用完即删，不写进结果
+            if net.tif_config["quantize"]:
+                window_sop = window_sop_summary(net, tif_stats, int(cfg["pad_height"]), int(cfg["pad_width"]))
+                if window_sop is not None:
+                    result["sop_per_window"] = window_sop
+            for layer in tif_stats.values():
+                layer.pop("per_window_rate", None)
             result["tif"] = tif_stats
     if full:
         pd, fa = roc.result()
@@ -1311,8 +1318,9 @@ def mode_train(args, cfg):
             sub = evaluate_split(net, cfg, q99, device, "train", cfg["state_mode"], names=subset)
         taus = tau_statistics(net)
         if comm_record is not None and val.get("tif"):
-            # 只作对照、不参与优化：验证集上按评估口径算的 SOP（训练估计与它的差 = 训练集与验证集的分布差）
+            # 只作对照、不参与优化：验证集上按评估口径算的 SOP 与单窗 SOP 的 p95（训练估计与它的差 = 分布差）
             comm_record["val_sop"] = float(comm.sop({n: val["tif"][n]["message_abs_rate"] for n in LAYER_NAMES}))
+            comm_record["val_sop_p95"] = (val.get("sop_per_window") or {}).get("p95")
         record = {"epoch": epoch, "seed": seed, "lr": lr, "loss_per_event": loss_sum / max(event_sum, 1),
                   "val_iou": val["iou"], "val_acc": val["acc"],
                   "train_subset_iou": sub["iou"] if sub else None, "train_subset_acc": sub["acc"] if sub else None,
@@ -1352,9 +1360,14 @@ def mode_train(args, cfg):
                                                 for n in LAYER_NAMES
                                                 if "baseline_level_mean" in record["tif"][n])), flush=True)
         if comm_record is not None:
-            print("  [comm] 训练中 SOP 估计 %.4g / 预算 %.4g（验证集 %.4g）| mu %.4f -> %.4f | 超预算的更新 %.0f%%" % (
-                comm_record["sop_est_mean"] or 0.0, comm_record["budget"], comm_record.get("val_sop") or 0.0,
-                comm_record["mu_start"], comm_record["mu_end"], 100.0 * comm_record["over_budget_frac"]), flush=True)
+            print("  [comm %s] 训练中 SOP 估计 %.4g / 预算 %.4g（验证集均值 %.4g、单窗 p95 %.4g）| mu %.4f -> %.4f | "
+                  "超预算的更新 %.0f%%%s" % (
+                      comm_record["mode"], comm_record["sop_est_mean"] or 0.0, comm_record["budget"],
+                      comm_record.get("val_sop") or 0.0, comm_record.get("val_sop_p95") or 0.0,
+                      comm_record["mu_start"], comm_record["mu_end"], 100.0 * comm_record["over_budget_frac"],
+                      "" if comm_record["mode"] != "peak" else " | 违约窗 %.1f%%（目标 <= %.0f%%）、训练单窗 p95 %.4g" % (
+                          100.0 * (comm_record["violation_mean"] or 0.0), 100.0 * comm_record["alpha"],
+                          comm_record["sop_window_p95"] or 0.0)), flush=True)
         for w in record["warnings"]:
             print("  [health]", w, flush=True)
     summary = summarize_history(history, seed)

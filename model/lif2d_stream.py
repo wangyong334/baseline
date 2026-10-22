@@ -423,9 +423,10 @@ class StreamingTIF2d(StreamingLIF2d):
 
     # ----- 诊断统计（只用于验证，不参与前向；训练时关闭） -----
 
-    def start_stats(self):
-        """开始累计诊断统计（清空旧值）。"""
+    def start_stats(self, per_window=False):
+        """开始累计诊断统计（清空旧值）。per_window=True 时另记每窗（每个样本）的 |Δq| 率，供单窗 SOP 分布用。"""
         self._stats = {}
+        self._per_window = [] if per_window else None
         self.collect_stats = True
 
     def _accumulate(self, memory, prev, baseline):
@@ -448,6 +449,8 @@ class StreamingTIF2d(StreamingLIF2d):
             s["level_sum"] += q.double().sum()
             s["message_abs"] += delta.abs().double().sum()
             s["message_nonzero"] += delta.ne(0).sum().double()
+            if getattr(self, "_per_window", None) is not None:
+                self._per_window.extend((delta.abs().flatten(1).sum(1).double() / float(memory[0].numel())).tolist())
             if baseline is not None:
                 theta = self.theta().to(baseline.dtype).view(1, -1, 1, 1)
                 s["baseline_sum"] += (torch.relu(baseline) / theta).double().sum()
@@ -475,6 +478,9 @@ class StreamingTIF2d(StreamingLIF2d):
                "windows": int(s["windows"])}
         if self.adapt:
             out["baseline_level_mean"] = float(s["baseline_sum"]) / n
+        if getattr(self, "_per_window", None) is not None:
+            out["per_window_rate"] = list(self._per_window)
+            self._per_window = None
         return out
 
 

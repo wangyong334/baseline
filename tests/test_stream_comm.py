@@ -8,6 +8,8 @@ CPU、float64 小网络，不需要数据集。
     3. 对偶上升：超预算时 mu 增大、低于预算时减小且不小于 0；mu = 0 时 chunk_loss 返回 None
     4. train_streams：预算充足（mu 保持 0）时与关闭逐位相同；超预算时 mu 增大、参数轨迹改变；冒烟式 mu > 0 无漏梯度
     5. 配置文件：与基础版只差通信预算两项与 save_root
+    6. peak 模式（每窗峰值带宽的机会约束，12.21）：逐窗率的平均 = message_rates；只罚超出预算的窗；对偶按违约比例；
+       评估的逐窗 |Δq| 与单窗 SOP 分布；约束不紧时与关闭逐位相同；配置只差两项
 """
 import copy
 import os
@@ -23,7 +25,9 @@ from dataset.stream_source import TorchWindowSource  # noqa: E402
 from model.evspsegnet_stream import LAYER_NAMES, EvSpSegNetStream, estimate_operations  # noqa: E402
 from test_stream_layerwise import CFG, H, Q99, SMALL, W, synthetic_sequence  # noqa: E402
 from test_stream_tif import make_tif_net  # noqa: E402
-from utils.comm_budget import CommBudget, message_rates  # noqa: E402
+import numpy as np  # noqa: E402
+from utils.comm_budget import (CommBudget, message_rates, sop_coefficients, window_rates,  # noqa: E402
+                               window_sop_summary)
 
 CPU = torch.device("cpu")
 POS_WEIGHT = 4.0
@@ -151,13 +155,13 @@ class MessageRateTests(unittest.TestCase):
 class DualAscentTests(unittest.TestCase):
     def test_dual_update(self):
         comm = CommBudget(100.0, 0.1, [1.0] * 7)
-        comm._block = [(150.0, 1.0), (250.0, 1.0)]                          # 平均 200 = 预算的 2 倍
+        comm._block = [(150.0, 1.0, 0.0), (250.0, 1.0, 0.0)]                          # 平均 200 = 预算的 2 倍
         comm.end_update()
         self.assertAlmostEqual(comm.mu, 0.1)
-        comm._block = [(300.0, 1.0), (0.0, 3.0)]                            # 按有效窗加权：平均 75 < 预算
+        comm._block = [(300.0, 1.0, 0.0), (0.0, 3.0, 0.0)]                            # 按有效窗加权：平均 75 < 预算
         comm.end_update()
         self.assertAlmostEqual(comm.mu, 0.075)
-        comm._block = [(0.0, 1.0)]
+        comm._block = [(0.0, 1.0, 0.0)]
         comm.end_update()
         self.assertEqual(comm.mu, 0.0)                                     # 不小于 0
         s = comm.summary()
@@ -202,6 +206,133 @@ class TrainStreamsCommTests(unittest.TestCase):
         self.assertEqual(out_b["comm"]["over_budget_frac"], 1.0)
         self.assertTrue(any(not torch.equal(pa, pb) for pa, pb in zip(net_a.parameters(), net_b.parameters())))
         self.assertEqual(out_b["missing_grads"], [])
+
+
+class PeakModeTests(unittest.TestCase):
+    """comm_budget_mode: peak（每窗峰值带宽的机会约束，12.21）。"""
+
+    def make_memories(self, net, scale):
+        g = torch.Generator().manual_seed(7)
+        memories = []
+        for block in net.blocks():
+            theta = block.neuron.theta().detach().double().view(1, 1, -1, 1, 1)
+            x = torch.rand(4, 2, block.out_ch, 3, 3, generator=g, dtype=torch.float64) * scale
+            memories.append((x * theta).requires_grad_(True))
+        return memories
+
+    def test_window_rates_average_to_message_rates(self):
+        net = make_tif_net()
+        memories = self.make_memories(net, 4.0)
+        valid = torch.tensor([[1.0, 0.0], [1, 1], [1, 1], [0, 1]], dtype=torch.float64)
+        per_window = window_rates(net, memories, None, None)
+        means = message_rates(net, memories, None, None, valid)
+        for w, m in zip(per_window, means):
+            self.assertEqual(tuple(w.shape), (4, 2))
+            self.assertAlmostEqual(float((w * valid).sum() / valid.sum()), float(m), places=12)
+
+    def test_only_windows_over_budget_are_penalized(self):
+        net = make_tif_net()
+        memories = self.make_memories(net, 4.0)
+        comm = CommBudget.from_config(stream_cfg(comm_budget_sop=1.0, comm_budget_mode="peak"), net)
+        per_window = comm.sop([r.detach() for r in window_rates(net, memories, None, None)])
+        comm.budget = float(per_window.median())                           # 约一半的窗超出预算
+        comm.mu = 1.0
+        loss = comm.chunk_loss(net, memories, None, None, 1)
+        expected = torch.relu(per_window / comm.budget - 1.0).mean()
+        self.assertAlmostEqual(float(loss), float(expected), places=10)
+        loss.backward()
+        over = per_window > comm.budget
+        for memory in memories:
+            g = memory.grad.flatten(2).abs().sum(2)                        # [T, B]
+            # 未超出预算的窗：只有作为下一窗的"上一窗"时才可能有梯度；最后一窗未超出时一定为 0
+            if not bool(over[-1].any()):
+                self.assertEqual(float(g[-1].sum()), 0.0)
+        comm.end_update()
+        violation = float(over.double().mean())
+        self.assertAlmostEqual(comm.mu, max(0.0, 1.0 + comm.dual_lr * (violation - 0.05)))
+        s = comm.summary()
+        self.assertEqual(s["mode"], "peak")
+        self.assertAlmostEqual(s["violation_mean"], violation)
+        self.assertIsNotNone(s["sop_window_p95"])
+
+    def test_peak_dual_and_validation(self):
+        comm = CommBudget(100.0, 0.1, [1.0] * 7, mode="peak", alpha=0.1)
+        comm._block = [(80.0, 10.0, 3.0)]                                  # 违约 30% > alpha 10%
+        comm.end_update()
+        self.assertAlmostEqual(comm.mu, 0.02)
+        comm._block = [(50.0, 10.0, 0.0)]                                  # 无违约：每次回落 0.1 * 0.1 = 0.01
+        comm.end_update()
+        self.assertAlmostEqual(comm.mu, 0.01)
+        comm._block = [(50.0, 10.0, 0.0)]
+        comm.end_update()
+        comm._block = [(50.0, 10.0, 0.0)]
+        comm.end_update()
+        self.assertEqual(comm.mu, 0.0)                                     # 不小于 0
+        for bad in (dict(mode="max"), dict(alpha=0.0), dict(alpha=1.0)):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                CommBudget(100.0, 0.1, [1.0] * 7, **bad)
+
+    def test_evaluation_window_distribution(self):
+        # 评估口径：逐窗 |Δq| 率（stop_stats 的 per_window_rate）-> 单窗 SOP 分布；均值等于按平均率算的 SOP
+        net = make_tif_net().eval()
+        seq = synthetic_sequence(0)
+        source = TorchWindowSource(seq, CFG, Q99, CPU, torch.float64)
+        with torch.no_grad():
+            net.start_tif_stats(per_window=True)
+            states = None
+            for k in range(12):
+                x, events, _, _ = source.window(k)
+                _, states, _ = net(x, events, states)
+            stats = net.stop_tif_stats()
+        for name in LAYER_NAMES:
+            self.assertEqual(len(stats[name]["per_window_rate"]), 12)
+            self.assertAlmostEqual(float(np.mean(stats[name]["per_window_rate"])), stats[name]["message_abs_rate"],
+                                   places=12)
+        summary = window_sop_summary(net, stats, H, W)
+        base, coef = sop_coefficients(net, H, W)
+        mean_sop = base + sum(c * stats[n]["message_abs_rate"] for c, n in zip(coef, LAYER_NAMES))
+        self.assertAlmostEqual(summary["mean"], mean_sop, delta=1e-6 * max(mean_sop, 1.0))
+        self.assertLessEqual(summary["p95"], summary["max"])
+        self.assertEqual(summary["windows"], 12)
+        with torch.no_grad():
+            net.start_tif_stats()
+            net(source.window(0)[0], source.window(0)[1], None)
+            self.assertNotIn("per_window_rate", net.stop_tif_stats()["enc1"])      # 默认不记逐窗
+
+    def test_train_streams_peak(self):
+        data = [synthetic_sequence(seed) for seed in (0, 1, 2)]
+        lengths = [seq.n_windows for seq in data]
+        plan = [(0, [(0, 12)]), (1, [(1, 12), (2, 12)])]
+        net_a = make_tif_net()
+        net_b, net_c = copy.deepcopy(net_a), copy.deepcopy(net_a)
+        opts = [torch.optim.SGD(n.parameters(), lr=0.05) for n in (net_a, net_b, net_c)]
+        T.train_streams(net_a, data, lengths, opts[0], stream_cfg(), Q99, POS_WEIGHT, CPU, None, plan=plan)
+        slack = CommBudget.from_config(stream_cfg(comm_budget_sop=1e30, comm_budget_mode="peak"), net_b)
+        T.train_streams(net_b, data, lengths, opts[1], stream_cfg(), Q99, POS_WEIGHT, CPU, None, plan=plan, comm=slack)
+        self.assertEqual(slack.mu, 0.0)
+        for pa, pb in zip(net_a.parameters(), net_b.parameters()):
+            self.assertTrue(torch.equal(pa, pb))                            # 约束不紧时与关闭逐位相同
+        tight = CommBudget.from_config(stream_cfg(comm_budget_sop=1.0, comm_budget_mode="peak"), net_c)
+        tight.mu = 0.5
+        out = T.train_streams(net_c, data, lengths, opts[2], stream_cfg(), Q99, POS_WEIGHT, CPU, None, plan=plan,
+                              comm=tight)
+        self.assertGreater(tight.mu, 0.5)
+        self.assertEqual(out["comm"]["violation_mean"], 1.0)
+        self.assertTrue(any(not torch.equal(pa, pc) for pa, pc in zip(net_a.parameters(), net_c.parameters())))
+        self.assertEqual(out["missing_grads"], [])
+
+    def test_peak_config(self):
+        from utils.stream_common import load_flat_config
+        a = load_flat_config("configs/evisseg_stream_tif_comm.yaml")
+        b = load_flat_config("configs/evisseg_stream_tif_comm_peak.yaml")
+        self.assertEqual(set(b) - set(a), {"comm_budget_mode", "comm_peak_alpha"})
+        for key in a:
+            if key != "save_root":
+                self.assertEqual(a[key], b[key], key)
+        self.assertNotEqual(a["save_root"], b["save_root"])
+        self.assertEqual((b["comm_budget_mode"], b["comm_peak_alpha"]), ("peak", 0.05))
+        self.assertEqual(CommBudget.from_config(dict(stream_cfg(), **{k: b[k] for k in b if k.startswith("comm")}),
+                                                make_tif_net()).mode, "peak")
 
 
 class CommConfigTests(unittest.TestCase):

@@ -361,11 +361,11 @@ class EvSpSegNetStream(nn.Module):
     def is_tif(self):
         return self.neuron_kind == "tif"
 
-    def start_tif_stats(self):
-        """开始累计各 TIF 层的诊断统计（消息率、电平占用）；非 TIF 网络不做任何事。"""
+    def start_tif_stats(self, per_window=False):
+        """开始累计各 TIF 层的诊断统计（消息率、电平占用；per_window 时另记逐窗 |Δq| 率）；非 TIF 网络不做任何事。"""
         if self.is_tif:
             for block in self.blocks():
-                block.neuron.start_stats()
+                block.neuron.start_stats(per_window)
 
     def stop_tif_stats(self):
         """停止累计并返回 {层名: 统计}；非 TIF 网络返回空字典。"""
