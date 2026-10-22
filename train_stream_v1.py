@@ -38,6 +38,7 @@ from model.evspsegnet_stream import (LAYER_NAMES, EvSpSegNetStream, calibrate_ga
                                      count_parameters, estimate_operations, tif_settings)
 from model.lif2d_stream import (StreamingLIF2d, StreamingDualMemoryLIF2d, StreamingTIF2d,  # noqa: E402
                                 detach_states)
+from utils.comm_budget import CommBudget  # noqa: E402
 from utils.stream_common import (health_warnings, linear_epoch_lr, load_flat_config,  # noqa: E402
                                  make_chunks, select_subset, subset_due, summarize_history)
 from utils.stream_metrics import (SWEEP_THRESHOLDS, FastRoc, first_detection_latencies, iou_from_counts,  # noqa: E402
@@ -46,7 +47,7 @@ from utils.stream_metrics import (SWEEP_THRESHOLDS, FastRoc, first_detection_lat
 
 SOURCE_FILES = ("train_stream_v1.py", "dataset/stream_windows.py", "dataset/ev_uav_stream.py",
                 "dataset/stream_source.py", "model/lif2d_stream.py", "model/evspsegnet_stream.py",
-                "utils/stream_common.py", "utils/stream_metrics.py", "utils/eval.py")
+                "utils/stream_common.py", "utils/stream_metrics.py", "utils/eval.py", "utils/comm_budget.py")
 EXECUTIONS = ("step", "layer")
 TRAINERS = ("sequence", "streams")
 
@@ -223,8 +224,6 @@ def build_net(cfg, device):
 def design_version(net):
     """写入 run_config 与 checkpoint 的设计版本标记。"""
     if net.is_tif:
-        if net.tif_config["hysteresis"]:
-            return "v5-tif-hysteresis"
         if net.tif_config["adapt"]:
             return "v5-tif-input-adapt"
         return "v5-tif"
@@ -837,7 +836,17 @@ def assemble_streams(sources, pieces, steps, cfg, device, dtype):
     return x, events, labels, keep
 
 
-def train_streams(net, dataset, lengths, optimizer, cfg, q99, pos_weight, device, rng, max_chunks=None, plan=None):
+def stream_valid(pieces, steps, device, dtype):
+    """[T,B]：该流在片段内该窗有录像为 1，空窗（流错开起点、流尾补齐）为 0。"""
+    valid = torch.zeros((steps, len(pieces)), dtype=dtype, device=device)
+    for b, stream in enumerate(pieces):
+        for _, lo, hi, offset, _ in stream:
+            valid[offset:offset + (hi - lo), b] = 1
+    return valid
+
+
+def train_streams(net, dataset, lengths, optimizer, cfg, q99, pos_weight, device, rng, max_chunks=None, plan=None,
+                  comm=None):
     """标准有状态 TBPTT（一轮）：B 条并行流一起前向 k 窗、反向 k 窗，每 n 个片段更新一次参数。
 
     状态跨片段延续，片段边界 detach（只切梯度、保留数值）；某条流开始新录像时只清零该流状态（keep 掩码）。
@@ -845,7 +854,9 @@ def train_streams(net, dataset, lengths, optimizer, cfg, q99, pos_weight, device
     （与梯度累加的常规做法相同；事件数只读窗口边界、不经过网络，所以可以在反传前算好）。
     因此 n=1 即逐片段更新（原 per_chunk），B=1 且 n = 录像窗数 / k 时即原 per_sequence。没有事件的片段不反传。
     推理不受影响，仍是整段连续。max_chunks 只供冒烟和计时截断；plan 只供测试指定分配。
-    返回字段与 train_sequence 相同（steps = 参数更新次数，grad_norms 为各次更新的平均），另有 chunks。
+    comm 为 utils.comm_budget.CommBudget（通信预算训练，乘子 mu 跨轮延续）或 None（关闭，与原训练逐位相同）。
+    返回字段与 train_sequence 相同（steps = 参数更新次数，grad_norms 为各次更新的平均），另有 chunks；
+    开启通信预算时另有 comm（CommBudget.summary()）。
     """
     k, n_streams, accumulate = int(cfg["tbptt_k"]), int(cfg["streams"]), int(cfg["accumulate"])
     if speed_options(cfg)[0] != "layer":
@@ -862,6 +873,8 @@ def train_streams(net, dataset, lengths, optimizer, cfg, q99, pos_weight, device
     weight = torch.tensor([pos_weight], dtype=dtype, device=device)
     clip = float(cfg["grad_clip"])
     loss_sum, events_total, updates, grad_acc, total_norms, missing = 0.0, 0, 0, {}, [], []
+    if comm is not None:
+        comm.start_epoch()
     states = None
     optimizer.zero_grad(set_to_none=True)
     for first in range(0, n_chunks, accumulate):
@@ -870,10 +883,17 @@ def train_streams(net, dataset, lengths, optimizer, cfg, q99, pos_weight, device
                            for pieces in block for stream in pieces for index, lo, hi, _, _ in stream)
         for offset, pieces in enumerate(block):
             x, events, labels, keep = assemble_streams(sources, pieces, k, cfg, device, dtype)
-            logits, states, _ = net.forward_chunk(x, events, states, keep=keep)
+            prev_states = states
+            logits, states, info = net.forward_chunk(x, events, states, keep=keep, collect=comm is not None)
             if labels.numel():
                 chunk_loss = F.binary_cross_entropy_with_logits(logits, labels, pos_weight=weight, reduction="sum")
-                (chunk_loss / float(block_events)).backward()
+                total = chunk_loss / float(block_events)
+                if comm is not None:
+                    penalty = comm.chunk_loss(net, info["u_pre"], prev_states, keep, len(block),
+                                              stream_valid(pieces, k, device, dtype))
+                    if penalty is not None:
+                        total = total + penalty
+                total.backward()
                 value = float(chunk_loss.detach())
                 if not math.isfinite(value):
                     raise RuntimeError("损失出现非有限值: 片段 %d" % (first + offset))
@@ -892,11 +912,16 @@ def train_streams(net, dataset, lengths, optimizer, cfg, q99, pos_weight, device
             for key, value in norms.items():
                 grad_acc[key] = grad_acc.get(key, 0.0) + value
             updates += 1
+            if comm is not None:
+                comm.end_update()                                    # 对偶上升
         optimizer.zero_grad(set_to_none=True)
-    return {"loss_sum": loss_sum, "events": events_total,
-            "grad_norms": {key: value / max(updates, 1) for key, value in grad_acc.items()},
-            "missing_grads": missing, "steps": updates, "chunks": n_chunks,
-            "grad_total_norms": total_norms, "clipped_steps": sum(1 for v in total_norms if v > clip)}
+    out = {"loss_sum": loss_sum, "events": events_total,
+           "grad_norms": {key: value / max(updates, 1) for key, value in grad_acc.items()},
+           "missing_grads": missing, "steps": updates, "chunks": n_chunks,
+           "grad_total_norms": total_norms, "clipped_steps": sum(1 for v in total_norms if v > clip)}
+    if comm is not None:
+        out["comm"] = comm.summary()
+    return out
 
 
 def count_nonzero_input(stats, x):
@@ -1112,8 +1137,12 @@ def mode_smoke(args, cfg):
         # B 条流各一条录像，跑 2 个片段（32 窗 / k=16），覆盖拼批、按流清零、更新
         smoke_set = EvUAVStream(cfg["root"], "train", cfg, names[:max(int(cfg["streams"]), 1)])
         lengths = [int(smoke_set[i].n_windows) for i in range(len(smoke_set))]
+        comm = CommBudget.from_config(cfg, net)
+        if comm is not None:
+            comm.mu = 1.0                       # 冒烟时让惩罚项真正参与反传
         out = train_streams(net, smoke_set, lengths, optimizer, cfg, q99, pos_weight, device,
-                            np.random.RandomState(int(cfg["seed"])), max_chunks=max(1, 32 // int(cfg["tbptt_k"])))
+                            np.random.RandomState(int(cfg["seed"])), max_chunks=max(1, 32 // int(cfg["tbptt_k"])),
+                            comm=comm)
     else:
         out = train_sequence(net, seq, optimizer, cfg, q99, pos_weight, device,
                              np.random.RandomState(int(cfg["seed"])), max_windows=32)
@@ -1224,6 +1253,13 @@ def mode_train(args, cfg):
         if metrics_path.exists():
             raise RuntimeError("输出目录已有 metrics.jsonl，请换目录或使用 --resume")
         run_calibration(net, cfg, q99, device, root)
+    comm = CommBudget.from_config(cfg, net)          # 通信预算训练（utils/comm_budget.py）；未配置时为 None
+    if comm is not None:
+        if history and history[-1].get("comm"):
+            comm.mu = float(history[-1]["comm"]["mu_end"])                  # 续训：乘子接着上一轮
+        print("通信预算训练：SOP 预算 %.4g /窗，对偶步长 %g，各层系数 %s" % (
+            comm.budget, comm.dual_lr, " ".join("%s %.3g" % (n, c) for n, c in zip(LAYER_NAMES, comm.coef))),
+            flush=True)
     subset = select_subset(train_file_names(cfg), int(cfg["train_subset_size"]), seed + 2000)
     train_set = EvUAVStream(cfg["root"], "train", cfg)
     execution, input_device = speed_options(cfg)
@@ -1248,10 +1284,12 @@ def mode_train(args, cfg):
         net.train()
         loss_sum, event_sum, grad_acc, n_seq = 0.0, 0, {}, 0
         total_norms, clipped_steps, updates = [], 0, 0
+        comm_record = None
         if trainer == "streams":
-            out = train_streams(net, train_set, lengths, optimizer, cfg, q99, pos_weight, device, rng)
+            out = train_streams(net, train_set, lengths, optimizer, cfg, q99, pos_weight, device, rng, comm=comm)
             loss_sum, event_sum, grad_acc, n_seq = out["loss_sum"], out["events"], out["grad_norms"], 1
             total_norms, clipped_steps, updates = out["grad_total_norms"], out["clipped_steps"], out["steps"]
+            comm_record = out.get("comm")
         else:
             loader = make_sequence_loader(train_set, True, seed * 1000 + epoch, cfg["num_workers"])
             for seq in loader:
@@ -1272,6 +1310,9 @@ def mode_train(args, cfg):
         if subset_due(epoch, epochs, int(cfg.get("train_subset_every", 1))):
             sub = evaluate_split(net, cfg, q99, device, "train", cfg["state_mode"], names=subset)
         taus = tau_statistics(net)
+        if comm_record is not None and val.get("tif"):
+            # 只作对照、不参与优化：验证集上按评估口径算的 SOP（训练估计与它的差 = 训练集与验证集的分布差）
+            comm_record["val_sop"] = float(comm.sop({n: val["tif"][n]["message_abs_rate"] for n in LAYER_NAMES}))
         record = {"epoch": epoch, "seed": seed, "lr": lr, "loss_per_event": loss_sum / max(event_sum, 1),
                   "val_iou": val["iou"], "val_acc": val["acc"],
                   "train_subset_iou": sub["iou"] if sub else None, "train_subset_acc": sub["acc"] if sub else None,
@@ -1287,6 +1328,7 @@ def mode_train(args, cfg):
                   "tif": val.get("tif", {}), "tif_parameters": tif_parameter_statistics(net),
                   "subthreshold_diagnostics": val.get("subthreshold_diagnostics", {}),
                   "subthreshold_parameters": subthreshold_parameter_statistics(net),
+                  "comm": comm_record,
                   "warnings": health_warnings(health_layer_stats(val["layers"], val.get("tif")), taus, grad_mean)}
         with metrics_path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record) + "\n")
@@ -1309,6 +1351,10 @@ def mode_train(args, cfg):
                      " | 基线/theta " + " ".join("%s %.3f" % (n, record["tif"][n]["baseline_level_mean"])
                                                 for n in LAYER_NAMES
                                                 if "baseline_level_mean" in record["tif"][n])), flush=True)
+        if comm_record is not None:
+            print("  [comm] 训练中 SOP 估计 %.4g / 预算 %.4g（验证集 %.4g）| mu %.4f -> %.4f | 超预算的更新 %.0f%%" % (
+                comm_record["sop_est_mean"] or 0.0, comm_record["budget"], comm_record.get("val_sop") or 0.0,
+                comm_record["mu_start"], comm_record["mu_end"], 100.0 * comm_record["over_budget_frac"]), flush=True)
         for w in record["warnings"]:
             print("  [health]", w, flush=True)
     summary = summarize_history(history, seed)

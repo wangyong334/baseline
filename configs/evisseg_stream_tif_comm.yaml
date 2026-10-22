@@ -1,5 +1,5 @@
-# V5 TIF + 滞回汇报 hysteresis（Stream-SNN-Innovations.md 12.8~12.9）：|M/theta - q_prev| < 1 时不改汇报电平
-# 除 tif.hysteresis 与 save_root 外与 evisseg_stream_tif_notransport.yaml 逐项相同（tests/test_stream_tif_hyst.py 核对）
+# V5 TIF + 通信预算训练（损失函数层，Stream-SNN-Innovations.md 12.13~12.14）：约束训练中的 SOP 估计 <= 预算，
+# 拉格朗日乘子按对偶上升自动调节；神经元与前向完全不变。除 TRAIN 的两项与 save_root 外与 evisseg_stream_tif_notransport.yaml 相同
 DATA:
   root: /media/stephen/nvme0n1/wy_data/datasets/EV-UAV-dataset
   stats_path: configs/stream_v1_train_stats.json   # 由 tools/stream_train_stats.py 生成
@@ -19,7 +19,6 @@ NET:
     levels: 7                  # D：汇报电平 0..7（3 bit），消息 Δq ∈ {-7..7}
     quantize: true             # false = 直接汇报实数 M（对照）
     k_init: 0.05               # 参考值 k 初值（softplus），单位是校准后的驱动（q99 正电流 = 1）
-    hysteresis: true           # 滞回汇报：死区为开区间 1 级，消除电平分界处的抖动消息
   state_mode: carry            # carry | reset_each_window
   norm: none
   v_threshold: 1.0             # TIF 中只决定 theta 初值 = v_threshold / levels（量程 D*theta = 1）与增益校准目标
@@ -48,6 +47,8 @@ TRAIN:
   accumulate: 1
   optimizer_step: per_sequence # 只对 trainer=sequence 生效
   grad_clip: 1.0
+  comm_budget_sop: 17150000.0   # SOP 预算/窗 = V1（LIF，同数据同训练）在 EV-UAV val 上的 SOP 1.715e7：不比 LIF 多发消息
+  comm_dual_lr: 0.01            # 乘子 mu 的对偶上升步长（每次参数更新，按相对超出量）
   pos_weight_cap: 30.0
   train_subset_size: 24
   num_workers: 2
@@ -56,7 +57,7 @@ TRAIN:
   train_subset_every: 5
   eval_chunk: 32
   deterministic: true
-  save_root: log/stream_tif_hyst_seed37
+  save_root: log/stream_tif_comm_seed37
 
 EVAL:
   threshold: 0.9

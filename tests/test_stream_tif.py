@@ -190,8 +190,9 @@ class TIFNetworkTests(unittest.TestCase):
                   "transport_ref_init": 0.0, "transport_layers": list(LAYER_NAMES), "eps_init": 0.1}
         self.assertEqual(tif_settings(legacy), TIF_DEFAULTS)
         self.assertEqual(tif_settings(dict(legacy, reference=False)), TIF_DEFAULTS)   # 10-22 删除的本地参照
+        self.assertEqual(tif_settings(dict(legacy, hysteresis=False)), TIF_DEFAULTS)  # 10-22 删除的滞回汇报
         for bad in ({"transport": True}, {"transport_ref_init": 0.05}, dict(legacy, transport=True),
-                    {"reference": True}):
+                    {"reference": True}, {"hysteresis": True}):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 tif_settings(bad)
         with self.assertRaises(ValueError):
@@ -455,7 +456,7 @@ class TIFEndToEndTests(unittest.TestCase):
                         neg += seq.n_events - int(seq.label.sum())
             stats = dict(q99=Q99.tolist(), train_pos=pos, train_neg=neg, pos_weight=min(neg / pos, 30.0))
             (root / "stats.json").write_text(json.dumps(stats), encoding="utf-8")
-            for config in ("evisseg_stream_tif_notransport", "evisseg_stream_tif_adapt3", "evisseg_stream_tif_hyst"):
+            for config in ("evisseg_stream_tif_notransport", "evisseg_stream_tif_adapt3", "evisseg_stream_tif_comm"):
                 run = root / config
                 cfg = load_flat_config("configs/%s.yaml" % config)
                 self.assertEqual((cfg["neuron"], cfg["trainer"], cfg["streams"], cfg["accumulate"]),
@@ -472,6 +473,7 @@ class TIFEndToEndTests(unittest.TestCase):
                 self.assertEqual(set(record["tif_parameters"]), set(LAYER_NAMES), config)
                 self.assertIn("theta_mean", record["tif_parameters"]["enc2"])
                 self.assertIn("dead_channel_frac", record["tif"]["dec3"])
+                self.assertEqual(record["comm"] is not None, "comm_budget_sop" in cfg, config)   # 通信预算训练（12.14）
                 adapt = bool(cfg["tif"].get("adapt", False))                     # 工作点自校准（12.1）
                 self.assertEqual("tau_b_mean" in record["tif_parameters"]["enc1"], adapt, config)
                 only = ("enc1",) if adapt else ()

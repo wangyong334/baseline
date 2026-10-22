@@ -9,7 +9,7 @@
 每个 50 ms 窗口只调用一次神经元：5 个时间 bin 是输入通道，不是 SNN 时间步。
 三种神经元用于分离"脉冲"与"跨窗记忆"两个因素：StreamingLIF2d（有状态+二值）、
 StreamingGraded2d（有状态+实数）、ReLUNeuron（无状态+实数）。
-StreamingTIF2d 是 V5 的 TIF 神经元（信念 M 与"已告知"分离 + 有界证据累积 + 多级变化汇报；可选输入层自校准 adapt、滞回汇报 hysteresis），见类说明。
+StreamingTIF2d 是 V5 的 TIF 神经元（信念 M 与"已告知"分离 + 有界证据累积 + 多级变化汇报；可选输入层自校准 adapt），见类说明。
 forward 逐窗调用（流式推理、增益校准）；forward_steps 一次处理一个片段的多个窗口（逐层时间并行训练），两者等价。
 """
 import math
@@ -267,11 +267,8 @@ class StreamingTIF2d(StreamingLIF2d):
         限制在 [adapt_tau_min_ms, adapt_tau_max_ms]。平稳输入下 M -> 0，与背景水平无关；只减正的基线。
         w = 0（None 或清零的状态）时不减基线，所以第 1 窗与 reset 模式下与 adapt=False 完全相同。
         10-22 在全部 7 层上做（基线从 0 开始 / 偏差校正两版）已否定并删除：深层失去尺度约束而漂移（12.5）。
-    hysteresis（12.8~12.9，需 quantize=True，不与 adapt 同用）：滞回汇报。x = M/theta，q 为上次汇报的电平，
-        |x - q_prev| < 1 时保持 q（不发消息），否则 q = round(x)。这是"对新息设死区、接收端保持"的远程估计最优结构，
-        死区固定为开区间 1 级（eta = 1/2，事件相机规则）：消除电平分界处的无界抖动，消息事件数 <= 2 * TV(x)；
-        误差 |x - q| < 1；开区间保证 M 回到 0 时汇报必回到 0（不会卡在 1 级）。q 不带梯度，输出仍用直通估计。
-    状态：默认为 M；adapt=True 时为 (M, b, w)；hysteresis=True 时为 (M, q)。
+    10-22 的滞回汇报（hysteresis）已删除：只看精度的训练下会被学习抵消（12.12~12.13）。
+    状态：默认为 M；adapt=True 时为 (M, b, w)。
     None 与零状态数值相同。
     forward(current, state) -> (out, new_state, M)：第三项对应 LIF 的 u_pre。
     训练（forward_steps 且需要梯度）时每一步的神经元运算在反向时重算（梯度检查点），数学不变、只省显存。
@@ -280,21 +277,17 @@ class StreamingTIF2d(StreamingLIF2d):
 
     def __init__(self, channels, dt_ms, tau_init_ms, tau_min_ms, tau_max_ms, v_threshold,
                  levels=7, quantize=True, k_init=0.05, surrogate=False,
-                 adapt=False, adapt_tau_init_ms=2000.0, adapt_tau_min_ms=1000.0, adapt_tau_max_ms=10000.0,
-                 hysteresis=False):
+                 adapt=False, adapt_tau_init_ms=2000.0, adapt_tau_min_ms=1000.0, adapt_tau_max_ms=10000.0):
         super(StreamingTIF2d, self).__init__(channels, dt_ms, tau_init_ms, tau_min_ms, tau_max_ms,
                                              v_threshold)
         if isinstance(levels, bool) or int(levels) != levels or int(levels) < 1:
             raise ValueError("TIF levels 必须是 >= 1 的整数")
-        if not all(isinstance(flag, bool) for flag in (quantize, surrogate, adapt, hysteresis)):
-            raise ValueError("TIF quantize / surrogate / adapt / hysteresis 必须是布尔值")
-        if hysteresis and (adapt or not quantize):
-            raise ValueError("TIF hysteresis 需要 quantize=True，且不与 adapt 同用")
+        if not all(isinstance(flag, bool) for flag in (quantize, surrogate, adapt)):
+            raise ValueError("TIF quantize / surrogate / adapt 必须是布尔值")
         self.levels = int(levels)
         self.quantize = quantize
         self.surrogate = surrogate
         self.adapt = adapt
-        self.hysteresis = hysteresis
         self.k_raw = nn.Parameter(torch.full((channels,), inverse_softplus(k_init), dtype=torch.float32))
         self.log_theta = nn.Parameter(torch.full((channels,), math.log(float(v_threshold) / self.levels),
                                                  dtype=torch.float32))
@@ -332,13 +325,9 @@ class StreamingTIF2d(StreamingLIF2d):
         return coefficients
 
     def split_state(self, state):
-        """状态 -> (M, b, w)；没有的项为 None。hysteresis=True 时第二项为上次汇报的电平 q。"""
+        """状态 -> (M, b, w)；没有的项为 None。"""
         if state is None:
             return None, None, None
-        if self.hysteresis:
-            if not isinstance(state, tuple) or len(state) != 2:
-                raise ValueError("hysteresis=True 的 TIF 状态应为 (M, q)，新序列使用 None")
-            return state[0], state[1], None
         if not self.adapt:
             if isinstance(state, tuple):
                 raise ValueError("adapt=False 的 TIF 状态应为张量 M")
@@ -376,23 +365,6 @@ class StreamingTIF2d(StreamingLIF2d):
             pre = lam * prev + (1.0 - lam) * z
         return self._report(pre, theta, cap)
 
-    def _compute_hysteresis(self, current, prev, level_prev, lam, k, theta, cap):
-        """hysteresis=True 的一个窗口，返回 (输出, 新 M, 新汇报电平 q)。prev 与 level_prev 同为 None 或同为张量。"""
-        z = current - k
-        pre = (1.0 - lam) * z if prev is None else lam * prev + (1.0 - lam) * z
-        if self.surrogate:
-            memory = BoundedSurrogate.apply(pre, cap)
-        else:
-            memory = torch.minimum(torch.relu(pre), cap)
-        scaled = memory / theta
-        nearest = torch.round(scaled.detach())
-        if level_prev is None:
-            level = torch.where(scaled.detach().abs() < 1, torch.zeros_like(nearest), nearest)   # q_prev = 0
-        else:
-            level = torch.where((scaled.detach() - level_prev).abs() < 1, level_prev, nearest)
-        output = theta * (scaled + (level - scaled).detach())
-        return output, memory, level
-
     def _compute_adapt(self, current, prev, baseline, weight, lam, k, theta, cap, alpha):
         """adapt=True 的一个窗口，返回 (输出, 新 M, 新 b, 新 w)。参照 b/w；w = 0 时 b = 0，参照为 0。"""
         if prev is None:
@@ -410,18 +382,8 @@ class StreamingTIF2d(StreamingLIF2d):
     def _step(self, current, state, coefficients, recompute=False):
         prev, baseline, weight = self.split_state(state)
         checkpointed = recompute and prev is not None and torch.is_grad_enabled() and not self.collect_stats
-        reference, level, level_prev = baseline, None, None
-        if self.hysteresis:
-            level_prev = baseline
-            args = (current, prev, level_prev) + tuple(coefficients)
-            if checkpointed:
-                output, memory, level = checkpoint_utils.checkpoint(self._compute_hysteresis, *args,
-                                                                    preserve_rng_state=False)
-            else:
-                output, memory, level = self._compute_hysteresis(*args)
-            new_state = (memory, level)
-            reference = None
-        elif self.adapt:
+        reference = baseline
+        if self.adapt:
             args = (current, prev, baseline, weight) + tuple(coefficients)
             if checkpointed:
                 output, memory, baseline, weight = checkpoint_utils.checkpoint(self._compute_adapt, *args,
@@ -438,7 +400,7 @@ class StreamingTIF2d(StreamingLIF2d):
                 output, memory = self._compute(*args)
             new_state = memory
         if self.collect_stats:
-            self._accumulate(memory, prev, reference, level, level_prev)
+            self._accumulate(memory, prev, reference)
         return output, new_state, memory
 
     def forward(self, current, state):
@@ -466,7 +428,7 @@ class StreamingTIF2d(StreamingLIF2d):
         self._stats = {}
         self.collect_stats = True
 
-    def _accumulate(self, memory, prev, baseline, level=None, level_prev=None):
+    def _accumulate(self, memory, prev, baseline):
         with torch.no_grad():
             s = self._stats
             if not s:
@@ -475,12 +437,8 @@ class StreamingTIF2d(StreamingLIF2d):
                          level_sum=zero.clone(), message_abs=zero.clone(), message_nonzero=zero.clone(),
                          baseline_sum=zero.clone(),
                          channel_active=torch.zeros(memory.shape[1], dtype=torch.bool, device=memory.device))
-            if self.hysteresis:                      # 实际汇报的电平（滞回后），不是 round(M/theta)
-                q = level
-                q_prev = torch.zeros_like(q) if level_prev is None else level_prev
-            else:
-                q = self.level(memory)
-                q_prev = torch.zeros_like(q) if prev is None else self.level(prev)
+            q = self.level(memory)
+            q_prev = torch.zeros_like(q) if prev is None else self.level(prev)
             delta = q - q_prev
             s["elements"] += memory.numel()
             s["windows"] += 1
