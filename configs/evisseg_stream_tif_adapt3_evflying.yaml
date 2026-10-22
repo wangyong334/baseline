@@ -1,5 +1,5 @@
-# V5 TIF + 输入层工作点自校准（Stream-SNN-Innovations.md 12.5）：只有 enc1 减去偏差校正的慢基线，其余 6 层为基础版 TIF
-# 除 tif.adapt_layers 与 save_root 外与 evisseg_stream_tif_adapt2_evflying.yaml 逐项相同（tests/test_stream_tif_adapt.py 核对）
+# V5 TIF + 输入层工作点自校准（Stream-SNN-Innovations.md 12.5、12.10）：只有 enc1 减去偏差校正的慢基线，其余 6 层为基础版 TIF
+# 除 tif 的 adapt 各项与 save_root 外与 evisseg_stream_tif_notransport_evflying.yaml 逐项相同（tests/test_stream_tif_adapt.py 核对）
 DATA:
   root: /media/stephen/nvme0n1/wy_data/datasets/evflying_x4
   stats_path: configs/stream_v1_evflying_x4_stats.json   # 由 tools/stream_train_stats.py 用本配置生成（只用训练集）
@@ -23,8 +23,8 @@ NET:
     adapt_tau_init_ms: 2000.0  # 基线时间常数 tau_b 初值（40 窗）
     adapt_tau_min_ms: 1000.0   # 下界：远大于运动目标在一个位置的停留时间
     adapt_tau_max_ms: 10000.0
-    adapt_debias: true         # 偏差校正：第 2 窗起参照就是输入均值，消除基线从 0 追直流的热身过程
-    adapt_layers: [enc1]       # 只在输入层：深层只做减法会失去尺度约束（12.5）
+    adapt_debias: true         # 必须为 true：偏差校正，第 2 窗起参照就是输入均值
+    adapt_layers: [enc1]       # 必须为 [enc1]：只在输入层，深层只做减法会失去尺度约束（12.5）
   state_mode: carry
   norm: none
   v_threshold: 1.0

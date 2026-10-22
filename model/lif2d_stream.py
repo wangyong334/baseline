@@ -9,7 +9,7 @@
 每个 50 ms 窗口只调用一次神经元：5 个时间 bin 是输入通道，不是 SNN 时间步。
 三种神经元用于分离"脉冲"与"跨窗记忆"两个因素：StreamingLIF2d（有状态+二值）、
 StreamingGraded2d（有状态+实数）、ReLUNeuron（无状态+实数）。
-StreamingTIF2d 是 V5 的 TIF 神经元（信念 M 与"已告知"分离 + 有界证据累积 + 多级变化汇报；可选工作点自校准 adapt），见类说明。
+StreamingTIF2d 是 V5 的 TIF 神经元（信念 M 与"已告知"分离 + 有界证据累积 + 多级变化汇报；可选输入层自校准 adapt、滞回汇报 hysteresis），见类说明。
 forward 逐窗调用（流式推理、增益校准）；forward_steps 一次处理一个片段的多个窗口（逐层时间并行训练），两者等价。
 """
 import math
@@ -257,24 +257,21 @@ class StreamingTIF2d(StreamingLIF2d):
     """TIF 神经元（V5 基础版，见 Stream-SNN-Innovations.md 第 11、12 节；10-19 删除搬运、10-22 删除本地参照 TIF-R）。
 
     每个窗口、每个通道、每个像素：
-        z   = I - k - relu(b_prev)                 k = softplus(.) >= 0（CUSUM 式漂移项）；b 只在 adapt=True 时存在
+        z   = I - k - relu(b_hat)                  k = softplus(.) >= 0（CUSUM 式漂移项）；b_hat 只在 adapt=True 时存在
         M   = min(relu(lam * M_prev + (1 - lam) * z), D * theta)    有界的泄漏证据累积（EMA 形式，稳态 M = z）
         out = theta * round(M / theta)             多级汇报（round 用直通估计）；quantize=False 时 out = M
-        b   = alpha * b_prev + (1 - alpha) * I     adapt=True：对自身输入的慢基线（只由输入驱动，不从 M 反馈）
     lam = exp(-dt/tau) 沿用 V1 的 tau 参数化；theta = exp(.) 逐通道可学（LSQ 式步长），初值 v_th / D。
-    adapt（工作点自校准，12.1）：alpha = exp(-dt/tau_b)，tau_b 逐通道可学并限制在 [adapt_tau_min_ms, adapt_tau_max_ms]。
-        z 用上一窗的基线（当前输入不参与自己的参照）。平稳输入下 b -> 均值 mu，z -> -k - relu(mu) + mu <= -k，
-        M -> 0，与背景水平无关（P5）。只减正的基线：均值为负的通道本来就不积累，行为与 adapt=False 相同。
-        b 从 0 开始（不做偏差校正），所以流开头和 reset 模式下与 adapt=False 完全相同。
-    adapt_debias（12.4，需 adapt=True）：偏差校正的基线（self-starting CUSUM）。另存权重 w = alpha*w + (1-alpha)，
-        形状 [B,C,1,1]，参照改为 b_hat = b / w：第 2 窗起就是到目前为止的输入均值，再过渡为指数遗忘，
-        消除"b 从 0 追直流"的热身过程（直流大时热身可超过录像长度）。w = 0（None 或清零的状态）时不减基线，
-        所以第 1 窗与 reset 模式下仍与 adapt=False 完全相同，None 与零状态仍等价。
+    adapt（输入层工作点自校准，12.10；网络只在 enc1 打开，属事件表示层的补充项）：偏差校正的慢基线
+        （self-starting CUSUM）。b = alpha*b + (1-alpha)*I，w = alpha*w + (1-alpha)（形状 [B,C,1,1]），
+        b_hat = b_prev / w_prev 为到上一窗为止输入的（指数遗忘）均值；alpha = exp(-dt/tau_b)，tau_b 逐通道可学，
+        限制在 [adapt_tau_min_ms, adapt_tau_max_ms]。平稳输入下 M -> 0，与背景水平无关；只减正的基线。
+        w = 0（None 或清零的状态）时不减基线，所以第 1 窗与 reset 模式下与 adapt=False 完全相同。
+        10-22 在全部 7 层上做（基线从 0 开始 / 偏差校正两版）已否定并删除：深层失去尺度约束而漂移（12.5）。
     hysteresis（12.8~12.9，需 quantize=True，不与 adapt 同用）：滞回汇报。x = M/theta，q 为上次汇报的电平，
         |x - q_prev| < 1 时保持 q（不发消息），否则 q = round(x)。这是"对新息设死区、接收端保持"的远程估计最优结构，
         死区固定为开区间 1 级（eta = 1/2，事件相机规则）：消除电平分界处的无界抖动，消息事件数 <= 2 * TV(x)；
         误差 |x - q| < 1；开区间保证 M 回到 0 时汇报必回到 0（不会卡在 1 级）。q 不带梯度，输出仍用直通估计。
-    状态：adapt=False 时为 M；adapt=True 时为 (M, b)；adapt_debias=True 时为 (M, b, w)；hysteresis=True 时为 (M, q)。
+    状态：默认为 M；adapt=True 时为 (M, b, w)；hysteresis=True 时为 (M, q)。
     None 与零状态数值相同。
     forward(current, state) -> (out, new_state, M)：第三项对应 LIF 的 u_pre。
     训练（forward_steps 且需要梯度）时每一步的神经元运算在反向时重算（梯度检查点），数学不变、只省显存。
@@ -284,22 +281,19 @@ class StreamingTIF2d(StreamingLIF2d):
     def __init__(self, channels, dt_ms, tau_init_ms, tau_min_ms, tau_max_ms, v_threshold,
                  levels=7, quantize=True, k_init=0.05, surrogate=False,
                  adapt=False, adapt_tau_init_ms=2000.0, adapt_tau_min_ms=1000.0, adapt_tau_max_ms=10000.0,
-                 adapt_debias=False, hysteresis=False):
+                 hysteresis=False):
         super(StreamingTIF2d, self).__init__(channels, dt_ms, tau_init_ms, tau_min_ms, tau_max_ms,
                                              v_threshold)
         if isinstance(levels, bool) or int(levels) != levels or int(levels) < 1:
             raise ValueError("TIF levels 必须是 >= 1 的整数")
-        if not all(isinstance(flag, bool) for flag in (quantize, surrogate, adapt, adapt_debias, hysteresis)):
-            raise ValueError("TIF quantize / surrogate / adapt / adapt_debias / hysteresis 必须是布尔值")
+        if not all(isinstance(flag, bool) for flag in (quantize, surrogate, adapt, hysteresis)):
+            raise ValueError("TIF quantize / surrogate / adapt / hysteresis 必须是布尔值")
         if hysteresis and (adapt or not quantize):
             raise ValueError("TIF hysteresis 需要 quantize=True，且不与 adapt 同用")
-        if adapt_debias and not adapt:
-            raise ValueError("TIF adapt_debias 需要 adapt=True")
         self.levels = int(levels)
         self.quantize = quantize
         self.surrogate = surrogate
         self.adapt = adapt
-        self.adapt_debias = adapt_debias
         self.hysteresis = hysteresis
         self.k_raw = nn.Parameter(torch.full((channels,), inverse_softplus(k_init), dtype=torch.float32))
         self.log_theta = nn.Parameter(torch.full((channels,), math.log(float(v_threshold) / self.levels),
@@ -338,8 +332,7 @@ class StreamingTIF2d(StreamingLIF2d):
         return coefficients
 
     def split_state(self, state):
-        """状态 -> (M, b, w)；没有的项为 None（adapt=False 时 b、w 为 None，未开 adapt_debias 时 w 为 None）。
-        hysteresis=True 时第二项为上次汇报的电平 q。"""
+        """状态 -> (M, b, w)；没有的项为 None。hysteresis=True 时第二项为上次汇报的电平 q。"""
         if state is None:
             return None, None, None
         if self.hysteresis:
@@ -350,10 +343,9 @@ class StreamingTIF2d(StreamingLIF2d):
             if isinstance(state, tuple):
                 raise ValueError("adapt=False 的 TIF 状态应为张量 M")
             return state, None, None
-        size = 3 if self.adapt_debias else 2
-        if not isinstance(state, tuple) or len(state) != size:
-            raise ValueError("TIF 状态应为 %s，新序列使用 None" % ("(M, b, w)" if self.adapt_debias else "(M, b)"))
-        return tuple(state) + (None,) * (3 - size)
+        if not isinstance(state, tuple) or len(state) != 3:
+            raise ValueError("adapt=True 的 TIF 状态应为 (M, b, w)，新序列使用 None")
+        return tuple(state)
 
     def level(self, memory):
         """量化电平 q = round(M/theta)（整数值张量，不带梯度）；memory 为 None 时返回 None。"""
@@ -401,19 +393,8 @@ class StreamingTIF2d(StreamingLIF2d):
         output = theta * (scaled + (level - scaled).detach())
         return output, memory, level
 
-    def _compute_adapt(self, current, prev, baseline, lam, k, theta, cap, alpha):
-        """一个窗口的 TIF 运算（adapt=True），返回 (输出, 新记忆 M, 新基线 b)。prev 与 baseline 同为 None 或同为张量。"""
-        if prev is None:
-            pre = (1.0 - lam) * (current - k)
-            new_baseline = (1.0 - alpha) * current
-        else:
-            pre = lam * prev + (1.0 - lam) * (current - k - torch.relu(baseline))
-            new_baseline = alpha * baseline + (1.0 - alpha) * current
-        output, memory = self._report(pre, theta, cap)
-        return output, memory, new_baseline
-
-    def _compute_debias(self, current, prev, baseline, weight, lam, k, theta, cap, alpha):
-        """adapt_debias=True 的一个窗口，返回 (输出, 新 M, 新 b, 新 w)。参照 b/w；w = 0 时 b = 0，参照为 0。"""
+    def _compute_adapt(self, current, prev, baseline, weight, lam, k, theta, cap, alpha):
+        """adapt=True 的一个窗口，返回 (输出, 新 M, 新 b, 新 w)。参照 b/w；w = 0 时 b = 0，参照为 0。"""
         if prev is None:
             pre = (1.0 - lam) * (current - k)
             new_baseline = (1.0 - alpha) * current
@@ -440,24 +421,15 @@ class StreamingTIF2d(StreamingLIF2d):
                 output, memory, level = self._compute_hysteresis(*args)
             new_state = (memory, level)
             reference = None
-        elif self.adapt_debias:
+        elif self.adapt:
             args = (current, prev, baseline, weight) + tuple(coefficients)
             if checkpointed:
-                output, memory, baseline, weight = checkpoint_utils.checkpoint(self._compute_debias, *args,
+                output, memory, baseline, weight = checkpoint_utils.checkpoint(self._compute_adapt, *args,
                                                                                preserve_rng_state=False)
             else:
-                output, memory, baseline, weight = self._compute_debias(*args)
+                output, memory, baseline, weight = self._compute_adapt(*args)
             new_state = (memory, baseline, weight)
             reference = baseline / weight.clamp(min=1e-12)
-        elif self.adapt:
-            args = (current, prev, baseline) + tuple(coefficients)
-            if checkpointed:
-                output, memory, baseline = checkpoint_utils.checkpoint(self._compute_adapt, *args,
-                                                                       preserve_rng_state=False)
-            else:
-                output, memory, baseline = self._compute_adapt(*args)
-            new_state = (memory, baseline)
-            reference = baseline
         else:
             args = (current, prev) + tuple(coefficients)
             if checkpointed:
@@ -529,7 +501,7 @@ class StreamingTIF2d(StreamingLIF2d):
         message_nonzero_rate  Δq 非零的比例（graded 口径：一条消息携带一个小整数）
         level_mean / occupancy / saturation  电平均值、M>0 的比例、电平到顶（q = D）的比例
         dead_channel_frac     评估期间 M 始终为 0 的通道占比（死通道；不量化时与"从未发放"相同）
-        baseline_level_mean   adapt=True：基线 relu(b)（adapt_debias 时为 relu(b/w)）的平均值，以 theta 为单位
+        baseline_level_mean   adapt=True：基线 relu(b/w) 的平均值，以 theta 为单位
         """
         self.collect_stats = False
         s = self._stats
@@ -595,7 +567,7 @@ class ChannelGain(nn.Module):
 def mask_state(state, keep, t):
     """多流训练：第 t 窗按 keep[t]（形状 [B]）逐流保留或清零上一状态；keep 为 None 或状态为 None 时原样返回。
 
-    支持单个张量 [B,...]、双仓的 (U, M) 与自校准 TIF 的 (M, b)。乘 0 后的零状态与 None 数值相同，并在此截断梯度。
+    支持单个张量 [B,...]、双仓的 (U, M) 与 TIF 的 (M, b, w)、(M, q)。乘 0 后的零状态与 None 数值相同，并在此截断梯度。
     """
     if state is None or keep is None:
         return state

@@ -41,16 +41,17 @@ from utils.stream_common import gains_from_positive_samples
 LAYER_NAMES = ("enc1", "enc2", "enc3", "enc4", "dec3", "dec2", "dec1")
 DECODER_STAGES = (("up3", "dec3"), ("up2", "dec2"), ("up1", "dec1"))
 # surrogate：10-19 两端代理梯度（实验失败，默认关）
-# adapt：工作点自校准（对自身输入的慢基线，Stream-SNN-Innovations.md 12.1），默认关；关时与基础版逐位相同
-# adapt_debias：偏差校正的基线（12.4，需 adapt），默认关；关时与 10-22 第一版 adapt 逐位相同
-# adapt_layers：哪些层做自校准（12.5）；None = 全部 7 层（前两版的做法），其余层就是基础版 TIF
+# adapt：输入层工作点自校准（只在 enc1 打开，偏差校正的慢基线，Stream-SNN-Innovations.md 12.10），默认关；
+#   关时与基础版逐位相同。属事件表示层的补充项（第 3 项移交事件表示层，12.7）
+# adapt_debias / adapt_layers：只为读入第三版（evisseg_stream_tif_adapt3）的配置保留，取值必须是 true / [enc1]；
+#   10-22 在全部 7 层上做的两版（基线从 0 开始、偏差校正）已否定并删除，不能再构造（12.5、12.10）
 # hysteresis：滞回汇报（12.8~12.9，死区为开区间 1 级），默认关；关时与基础版逐位相同
 TIF_DEFAULTS = {"levels": 7, "quantize": True, "k_init": 0.05, "surrogate": False,
                 "adapt": False, "adapt_tau_init_ms": 2000.0, "adapt_tau_min_ms": 1000.0, "adapt_tau_max_ms": 10000.0,
-                "adapt_debias": False, "adapt_layers": None, "hysteresis": False}
+                "hysteresis": False}
 TIF_NEURON_KEYS = ("levels", "quantize", "k_init", "surrogate",
-                   "adapt", "adapt_tau_init_ms", "adapt_tau_min_ms", "adapt_tau_max_ms", "adapt_debias",
-                   "hysteresis")
+                   "adapt", "adapt_tau_init_ms", "adapt_tau_min_ms", "adapt_tau_max_ms", "hysteresis")
+TIF_ADAPT_LAYERS = ("enc1",)
 TIF_ADAPT_TAU_KEYS = ("adapt_tau_min_ms", "adapt_tau_init_ms", "adapt_tau_max_ms")
 # 已删除的机制留在旧 checkpoint 配置里的键（10-19 删除搬运，10-22 删除本地参照）：只接受"未启用"的取值，读入时丢弃
 TIF_REMOVED_KEYS = {"eps_init": None, "transport": False, "transport_ref_init": 0.0, "transport_layers": None,
@@ -72,6 +73,13 @@ def tif_settings(tif):
     if tif.get("reference", False) is not False:
         raise ValueError("TIF 的本地参照（TIF-R）已于 10-22 删除，不能构造或加载带参照的配置")
     tif = {key: value for key, value in tif.items() if key not in TIF_REMOVED_KEYS}
+    debias, layers = tif.pop("adapt_debias", None), tif.pop("adapt_layers", None)
+    if tif.get("adapt", False) is True:
+        if debias is not True or layers is None or list(layers) != list(TIF_ADAPT_LAYERS):
+            raise ValueError("tif.adapt 现在只表示 enc1 上的偏差校正自校准：配置须写 adapt_debias: true、"
+                             "adapt_layers: [enc1]（全部 7 层的两版已于 10-22 否定并删除）")
+    elif debias not in (None, False) or layers is not None:
+        raise ValueError("tif.adapt_debias / tif.adapt_layers 只能与 tif.adapt: true 同用")
     unknown = set(tif) - set(TIF_DEFAULTS)
     if unknown:
         raise ValueError("未知 TIF 配置: %s" % sorted(unknown))
@@ -79,18 +87,10 @@ def tif_settings(tif):
     out.update(tif)
     if isinstance(out["levels"], bool) or int(out["levels"]) != out["levels"] or int(out["levels"]) < 1:
         raise ValueError("tif.levels 必须是 >= 1 的整数")
-    if not all(isinstance(out[key], bool) for key in ("quantize", "surrogate", "adapt", "adapt_debias", "hysteresis")):
-        raise ValueError("tif.quantize / tif.surrogate / tif.adapt / tif.adapt_debias / tif.hysteresis 必须为 YAML 布尔值")
+    if not all(isinstance(out[key], bool) for key in ("quantize", "surrogate", "adapt", "hysteresis")):
+        raise ValueError("tif.quantize / tif.surrogate / tif.adapt / tif.hysteresis 必须为 YAML 布尔值")
     if out["hysteresis"] and (out["adapt"] or not out["quantize"]):
         raise ValueError("tif.hysteresis 需要 tif.quantize: true，且不与 tif.adapt 同用")
-    if out["adapt_debias"] and not out["adapt"]:
-        raise ValueError("tif.adapt_debias 需要 tif.adapt: true")
-    if out["adapt_layers"] is not None:
-        layers = out["adapt_layers"]
-        if (not out["adapt"] or not isinstance(layers, (list, tuple)) or not layers
-                or any(n not in LAYER_NAMES for n in layers) or len(set(layers)) != len(layers)):
-            raise ValueError("tif.adapt_layers 需要 tif.adapt: true，且为 enc1..dec1 的非空、无重复列表")
-        out["adapt_layers"] = [n for n in LAYER_NAMES if n in layers]
     taus = [float(out[key]) for key in TIF_ADAPT_TAU_KEYS]
     if not (all(np.isfinite(taus)) and 0 < taus[0] < taus[1] < taus[2]):
         raise ValueError("需要 0 < tif.adapt_tau_min_ms < tif.adapt_tau_init_ms < tif.adapt_tau_max_ms")
@@ -204,13 +204,13 @@ class EvSpSegNetStream(nn.Module):
                       else {key: self.tif_config[key] for key in TIF_NEURON_KEYS})
         self.tif_adapt_layers = ()
         if self.tif_config is not None and self.tif_config["adapt"]:
-            self.tif_adapt_layers = tuple(self.tif_config["adapt_layers"] or LAYER_NAMES)
+            self.tif_adapt_layers = TIF_ADAPT_LAYERS
 
         def layer_tif(name):
             # 不在 adapt_layers 里的层就是基础版 TIF（TIF 参数不消耗随机数，初始化与层的选择无关）
             if neuron_tif is None or name in self.tif_adapt_layers:
                 return neuron_tif
-            return dict(neuron_tif, adapt=False, adapt_debias=False)
+            return dict(neuron_tif, adapt=False)
 
         block = lambda name, i, o, s: SpikingConvBlock(i, o, s, neuron, norm, lif, layer_tif(name))  # noqa: E731
         self.enc1 = block("enc1", in_channels, c1, 1)
@@ -837,14 +837,14 @@ def estimate_operations(net, height, width, firing_rates, events_per_window, inp
         update_ops = 7 + (4 if cfg["quantize"] else 0)  # 驱动、EMA、截断约 7 次；量化与 Δq 约 4 次
         adapt_elements = sum(block.out_ch * state_size[name]
                              for name, block in zip(LAYER_NAMES, net.blocks()) if name in net.tif_adapt_layers)
-        adapt_ops = 4 + (1 if cfg["adapt_debias"] else 0)   # 基线 EMA 两乘一加、relu 与减法；偏差校正多一次除法
+        adapt_ops = 5                                       # 基线 EMA 两乘一加、relu 与减法、偏差校正的一次除法
         result["state_elements"] += adapt_elements          # 自校准层每个神经元多一个基线 b
         if cfg["hysteresis"]:
             update_ops += 2                                 # 滞回：一次比较、一次选择
             result["state_elements"] += state_elements      # 每个神经元多存上次汇报的电平 q（3 bit 整数）
         result["tif"] = {
             "adapt_layers": list(net.tif_adapt_layers), "adapt_state_elements": adapt_elements,
-            "adapt": cfg["adapt"], "adapt_debias": cfg["adapt_debias"], "hysteresis": cfg["hysteresis"],
+            "adapt": cfg["adapt"], "hysteresis": cfg["hysteresis"],
             "levels": cfg["levels"], "quantize": cfg["quantize"],
             "message_payload_bits": int(math.ceil(math.log2(2 * cfg["levels"] + 1))),
             "sop_basis": "firing_rates 为每神经元每窗平均 |Δq|：SOP = 单位脉冲口径（每个单位电平变化一次突触累加）",

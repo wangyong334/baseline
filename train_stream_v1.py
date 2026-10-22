@@ -226,7 +226,7 @@ def design_version(net):
         if net.tif_config["hysteresis"]:
             return "v5-tif-hysteresis"
         if net.tif_config["adapt"]:
-            return "v5-tif-adapt-debias" if net.tif_config["adapt_debias"] else "v5-tif-adapt"
+            return "v5-tif-input-adapt"
         return "v5-tif"
     if net.has_subthreshold_residual:
         return "v1-subthreshold-residual"
