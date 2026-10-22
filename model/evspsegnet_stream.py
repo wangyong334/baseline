@@ -41,8 +41,14 @@ from utils.stream_common import gains_from_positive_samples
 LAYER_NAMES = ("enc1", "enc2", "enc3", "enc4", "dec3", "dec2", "dec1")
 DECODER_STAGES = (("up3", "dec3"), ("up2", "dec2"), ("up1", "dec1"))
 # surrogate：10-19 两端代理梯度（实验失败，默认关）
-TIF_DEFAULTS = {"levels": 7, "quantize": True, "k_init": 0.05, "surrogate": False}
-TIF_NEURON_KEYS = ("levels", "quantize", "k_init", "surrogate")
+# adapt：工作点自校准（对自身输入的慢基线，Stream-SNN-Innovations.md 12.1），默认关；关时与基础版逐位相同
+# adapt_debias：偏差校正的基线（12.4，需 adapt），默认关；关时与 10-22 第一版 adapt 逐位相同
+TIF_DEFAULTS = {"levels": 7, "quantize": True, "k_init": 0.05, "surrogate": False,
+                "adapt": False, "adapt_tau_init_ms": 2000.0, "adapt_tau_min_ms": 1000.0, "adapt_tau_max_ms": 10000.0,
+                "adapt_debias": False}
+TIF_NEURON_KEYS = ("levels", "quantize", "k_init", "surrogate",
+                   "adapt", "adapt_tau_init_ms", "adapt_tau_min_ms", "adapt_tau_max_ms", "adapt_debias")
+TIF_ADAPT_TAU_KEYS = ("adapt_tau_min_ms", "adapt_tau_init_ms", "adapt_tau_max_ms")
 # 已删除的机制留在旧 checkpoint 配置里的键（10-19 删除搬运，10-22 删除本地参照）：只接受"未启用"的取值，读入时丢弃
 TIF_REMOVED_KEYS = {"eps_init": None, "transport": False, "transport_ref_init": 0.0, "transport_layers": None,
                     "reference": False}
@@ -70,8 +76,14 @@ def tif_settings(tif):
     out.update(tif)
     if isinstance(out["levels"], bool) or int(out["levels"]) != out["levels"] or int(out["levels"]) < 1:
         raise ValueError("tif.levels 必须是 >= 1 的整数")
-    if not all(isinstance(out[key], bool) for key in ("quantize", "surrogate")):
-        raise ValueError("tif.quantize / tif.surrogate 必须为 YAML 布尔值")
+    if not all(isinstance(out[key], bool) for key in ("quantize", "surrogate", "adapt", "adapt_debias")):
+        raise ValueError("tif.quantize / tif.surrogate / tif.adapt / tif.adapt_debias 必须为 YAML 布尔值")
+    if out["adapt_debias"] and not out["adapt"]:
+        raise ValueError("tif.adapt_debias 需要 tif.adapt: true")
+    taus = [float(out[key]) for key in TIF_ADAPT_TAU_KEYS]
+    if not (all(np.isfinite(taus)) and 0 < taus[0] < taus[1] < taus[2]):
+        raise ValueError("需要 0 < tif.adapt_tau_min_ms < tif.adapt_tau_init_ms < tif.adapt_tau_max_ms")
+    out.update(zip(TIF_ADAPT_TAU_KEYS, taus))
     value = float(out["k_init"])
     if not (np.isfinite(value) and value > 0):
         raise ValueError("tif.k_init 必须是有限正数")
@@ -157,7 +169,7 @@ class EvSpSegNetStream(nn.Module):
                    None 时使用构造参数中的默认值
         collect    True 时 info 返回每层的脉冲、u_pre、增益前电流（用于监控与校准）
         logits     [N] 每个事件的原始 logit
-        new_states 7 组状态：普通 LIF 为软复位后的 U，双仓为 (U, M)，TIF 为信念 M，ReLU 为 None
+        new_states 7 组状态：普通 LIF 为软复位后的 U，双仓为 (U, M)，TIF 为信念 M（adapt 时为 (M, b)），ReLU 为 None
     neuron="tif" 时 tif 为 TIF 配置字典（键见 TIF_DEFAULTS；None 取默认）；TIF 参数不消耗随机数，
     同种子下卷积与读出的初始化与 LIF 版本逐位相同。
     """
@@ -802,7 +814,11 @@ def estimate_operations(net, height, width, firing_rates, events_per_window, inp
     if net.is_tif:
         cfg = net.tif_config
         update_ops = 7 + (4 if cfg["quantize"] else 0)  # 驱动、EMA、截断约 7 次；量化与 Δq 约 4 次
+        if cfg["adapt"]:
+            update_ops += 4 + (1 if cfg["adapt_debias"] else 0)   # 基线 EMA 两乘一加、relu 与减法；偏差校正多一次除法
+            result["state_elements"] += state_elements   # 每个神经元多一个基线 b
         result["tif"] = {
+            "adapt": cfg["adapt"], "adapt_debias": cfg["adapt_debias"],
             "levels": cfg["levels"], "quantize": cfg["quantize"],
             "message_payload_bits": int(math.ceil(math.log2(2 * cfg["levels"] + 1))),
             "sop_basis": "firing_rates 为每神经元每窗平均 |Δq|：SOP = 单位脉冲口径（每个单位电平变化一次突触累加）",

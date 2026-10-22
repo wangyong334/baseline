@@ -9,7 +9,7 @@
 每个 50 ms 窗口只调用一次神经元：5 个时间 bin 是输入通道，不是 SNN 时间步。
 三种神经元用于分离"脉冲"与"跨窗记忆"两个因素：StreamingLIF2d（有状态+二值）、
 StreamingGraded2d（有状态+实数）、ReLUNeuron（无状态+实数）。
-StreamingTIF2d 是 V5 的 TIF 神经元（信念 M 与"已告知"分离 + 有界证据累积 + 多级变化汇报），见类说明。
+StreamingTIF2d 是 V5 的 TIF 神经元（信念 M 与"已告知"分离 + 有界证据累积 + 多级变化汇报；可选工作点自校准 adapt），见类说明。
 forward 逐窗调用（流式推理、增益校准）；forward_steps 一次处理一个片段的多个窗口（逐层时间并行训练），两者等价。
 """
 import math
@@ -254,33 +254,56 @@ def inverse_softplus(value):
 
 
 class StreamingTIF2d(StreamingLIF2d):
-    """TIF 神经元（V5 基础版，见 Stream-SNN-Innovations.md 第 11 节；10-19 删除搬运、10-22 删除本地参照 TIF-R）。
+    """TIF 神经元（V5 基础版，见 Stream-SNN-Innovations.md 第 11、12 节；10-19 删除搬运、10-22 删除本地参照 TIF-R）。
 
     每个窗口、每个通道、每个像素：
-        z   = I - k                                k = softplus(.) >= 0（CUSUM 式漂移项）：低于 k 的驱动不积累
+        z   = I - k - relu(b_prev)                 k = softplus(.) >= 0（CUSUM 式漂移项）；b 只在 adapt=True 时存在
         M   = min(relu(lam * M_prev + (1 - lam) * z), D * theta)    有界的泄漏证据累积（EMA 形式，稳态 M = z）
         out = theta * round(M / theta)             多级汇报（round 用直通估计）；quantize=False 时 out = M
+        b   = alpha * b_prev + (1 - alpha) * I     adapt=True：对自身输入的慢基线（只由输入驱动，不从 M 反馈）
     lam = exp(-dt/tau) 沿用 V1 的 tau 参数化；theta = exp(.) 逐通道可学（LSQ 式步长），初值 v_th / D。
-    状态只有 M（发放不复位）；下游需要的整数消息是 Δq = q_t - q_{t-1}（q = round(M/theta)），由 M 序列确定。
-    state 为 None 与零状态数值相同。forward(current, state) -> (out, M, M)：第三项对应 LIF 的 u_pre。
+    adapt（工作点自校准，12.1）：alpha = exp(-dt/tau_b)，tau_b 逐通道可学并限制在 [adapt_tau_min_ms, adapt_tau_max_ms]。
+        z 用上一窗的基线（当前输入不参与自己的参照）。平稳输入下 b -> 均值 mu，z -> -k - relu(mu) + mu <= -k，
+        M -> 0，与背景水平无关（P5）。只减正的基线：均值为负的通道本来就不积累，行为与 adapt=False 相同。
+        b 从 0 开始（不做偏差校正），所以流开头和 reset 模式下与 adapt=False 完全相同。
+    adapt_debias（12.4，需 adapt=True）：偏差校正的基线（self-starting CUSUM）。另存权重 w = alpha*w + (1-alpha)，
+        形状 [B,C,1,1]，参照改为 b_hat = b / w：第 2 窗起就是到目前为止的输入均值，再过渡为指数遗忘，
+        消除"b 从 0 追直流"的热身过程（直流大时热身可超过录像长度）。w = 0（None 或清零的状态）时不减基线，
+        所以第 1 窗与 reset 模式下仍与 adapt=False 完全相同，None 与零状态仍等价。
+    状态：adapt=False 时为 M；adapt=True 时为 (M, b)；adapt_debias=True 时为 (M, b, w)。None 与零状态数值相同。
+    forward(current, state) -> (out, new_state, M)：第三项对应 LIF 的 u_pre。
     训练（forward_steps 且需要梯度）时每一步的神经元运算在反向时重算（梯度检查点），数学不变、只省显存。
     surrogate=True 时 0 处反射与 D*theta 处截断用代理梯度（BoundedSurrogate，10-19 实验失败，默认关）。
     """
 
     def __init__(self, channels, dt_ms, tau_init_ms, tau_min_ms, tau_max_ms, v_threshold,
-                 levels=7, quantize=True, k_init=0.05, surrogate=False):
+                 levels=7, quantize=True, k_init=0.05, surrogate=False,
+                 adapt=False, adapt_tau_init_ms=2000.0, adapt_tau_min_ms=1000.0, adapt_tau_max_ms=10000.0,
+                 adapt_debias=False):
         super(StreamingTIF2d, self).__init__(channels, dt_ms, tau_init_ms, tau_min_ms, tau_max_ms,
                                              v_threshold)
         if isinstance(levels, bool) or int(levels) != levels or int(levels) < 1:
             raise ValueError("TIF levels 必须是 >= 1 的整数")
-        if not all(isinstance(flag, bool) for flag in (quantize, surrogate)):
-            raise ValueError("TIF quantize / surrogate 必须是布尔值")
+        if not all(isinstance(flag, bool) for flag in (quantize, surrogate, adapt, adapt_debias)):
+            raise ValueError("TIF quantize / surrogate / adapt / adapt_debias 必须是布尔值")
+        if adapt_debias and not adapt:
+            raise ValueError("TIF adapt_debias 需要 adapt=True")
         self.levels = int(levels)
         self.quantize = quantize
         self.surrogate = surrogate
+        self.adapt = adapt
+        self.adapt_debias = adapt_debias
         self.k_raw = nn.Parameter(torch.full((channels,), inverse_softplus(k_init), dtype=torch.float32))
         self.log_theta = nn.Parameter(torch.full((channels,), math.log(float(v_threshold) / self.levels),
                                                  dtype=torch.float32))
+        if adapt:
+            taus = (float(adapt_tau_min_ms), float(adapt_tau_init_ms), float(adapt_tau_max_ms))
+            if not (all(math.isfinite(v) for v in taus) and 0 < taus[0] < taus[1] < taus[2]):
+                raise ValueError("TIF adapt 需要 0 < adapt_tau_min_ms < adapt_tau_init_ms < adapt_tau_max_ms")
+            self.adapt_tau_min_ms, self.adapt_tau_max_ms = taus[0], taus[2]
+            frac = (taus[1] - taus[0]) / (taus[2] - taus[0])
+            self.adapt_a = nn.Parameter(torch.full((channels,), math.log(frac / (1.0 - frac)),
+                                                   dtype=torch.float32))
         self.collect_stats = False
         self._stats = {}
 
@@ -292,11 +315,32 @@ class StreamingTIF2d(StreamingLIF2d):
         """量化步长 theta > 0，形状 [C]。"""
         return torch.exp(self.log_theta)
 
+    def adapt_tau(self):
+        """基线时间常数 tau_b（毫秒），形状 [C]；只在 adapt=True 时可用。"""
+        return self.adapt_tau_min_ms + (self.adapt_tau_max_ms - self.adapt_tau_min_ms) * torch.sigmoid(self.adapt_a)
+
     def _coefficients(self, current):
         view = (1, -1, 1, 1)
         lam = self.beta().to(current.dtype).view(view)
         theta = self.theta().to(current.dtype).view(view)
-        return lam, self.k().to(current.dtype).view(view), theta, theta * self.levels
+        coefficients = (lam, self.k().to(current.dtype).view(view), theta, theta * self.levels)
+        if self.adapt:
+            alpha = torch.exp(-self.dt_ms / self.adapt_tau()).to(current.dtype).view(view)
+            coefficients = coefficients + (alpha,)
+        return coefficients
+
+    def split_state(self, state):
+        """状态 -> (M, b, w)；没有的项为 None（adapt=False 时 b、w 为 None，未开 adapt_debias 时 w 为 None）。"""
+        if state is None:
+            return None, None, None
+        if not self.adapt:
+            if isinstance(state, tuple):
+                raise ValueError("adapt=False 的 TIF 状态应为张量 M")
+            return state, None, None
+        size = 3 if self.adapt_debias else 2
+        if not isinstance(state, tuple) or len(state) != size:
+            raise ValueError("TIF 状态应为 %s，新序列使用 None" % ("(M, b, w)" if self.adapt_debias else "(M, b)"))
+        return tuple(state) + (None,) * (3 - size)
 
     def level(self, memory):
         """量化电平 q = round(M/theta)（整数值张量，不带梯度）；memory 为 None 时返回 None。"""
@@ -305,13 +349,8 @@ class StreamingTIF2d(StreamingLIF2d):
         theta = self.theta().to(memory.dtype).view(1, -1, 1, 1)
         return torch.round(memory.detach() / theta)
 
-    def _compute(self, current, prev, lam, k, theta, cap):
-        """一个窗口的 TIF 运算，返回 (输出, 新记忆 M)。"""
-        z = current - k
-        if prev is None:
-            pre = (1.0 - lam) * z
-        else:
-            pre = lam * prev + (1.0 - lam) * z
+    def _report(self, pre, theta, cap):
+        """截断到 [0, D*theta] 并量化，返回 (输出, 新记忆 M)。"""
         if self.surrogate:
             memory = BoundedSurrogate.apply(pre, cap)
         else:
@@ -323,19 +362,75 @@ class StreamingTIF2d(StreamingLIF2d):
             output = memory
         return output, memory
 
-    def _step(self, current, prev, lam, k, theta, cap, recompute=False):
-        if recompute and prev is not None and torch.is_grad_enabled() and not self.collect_stats:
-            output, memory = checkpoint_utils.checkpoint(self._compute, current, prev, lam, k, theta, cap,
-                                                         preserve_rng_state=False)
+    def _compute(self, current, prev, lam, k, theta, cap):
+        """一个窗口的 TIF 运算（adapt=False），返回 (输出, 新记忆 M)。"""
+        z = current - k
+        if prev is None:
+            pre = (1.0 - lam) * z
         else:
-            output, memory = self._compute(current, prev, lam, k, theta, cap)
+            pre = lam * prev + (1.0 - lam) * z
+        return self._report(pre, theta, cap)
+
+    def _compute_adapt(self, current, prev, baseline, lam, k, theta, cap, alpha):
+        """一个窗口的 TIF 运算（adapt=True），返回 (输出, 新记忆 M, 新基线 b)。prev 与 baseline 同为 None 或同为张量。"""
+        if prev is None:
+            pre = (1.0 - lam) * (current - k)
+            new_baseline = (1.0 - alpha) * current
+        else:
+            pre = lam * prev + (1.0 - lam) * (current - k - torch.relu(baseline))
+            new_baseline = alpha * baseline + (1.0 - alpha) * current
+        output, memory = self._report(pre, theta, cap)
+        return output, memory, new_baseline
+
+    def _compute_debias(self, current, prev, baseline, weight, lam, k, theta, cap, alpha):
+        """adapt_debias=True 的一个窗口，返回 (输出, 新 M, 新 b, 新 w)。参照 b/w；w = 0 时 b = 0，参照为 0。"""
+        if prev is None:
+            pre = (1.0 - lam) * (current - k)
+            new_baseline = (1.0 - alpha) * current
+            new_weight = (1.0 - alpha).expand(current.shape[0], -1, -1, -1)
+        else:
+            reference = torch.relu(baseline) / weight.clamp(min=1e-12)
+            pre = lam * prev + (1.0 - lam) * (current - k - reference)
+            new_baseline = alpha * baseline + (1.0 - alpha) * current
+            new_weight = alpha * weight + (1.0 - alpha)
+        output, memory = self._report(pre, theta, cap)
+        return output, memory, new_baseline, new_weight
+
+    def _step(self, current, state, coefficients, recompute=False):
+        prev, baseline, weight = self.split_state(state)
+        checkpointed = recompute and prev is not None and torch.is_grad_enabled() and not self.collect_stats
+        reference = baseline
+        if self.adapt_debias:
+            args = (current, prev, baseline, weight) + tuple(coefficients)
+            if checkpointed:
+                output, memory, baseline, weight = checkpoint_utils.checkpoint(self._compute_debias, *args,
+                                                                               preserve_rng_state=False)
+            else:
+                output, memory, baseline, weight = self._compute_debias(*args)
+            new_state = (memory, baseline, weight)
+            reference = baseline / weight.clamp(min=1e-12)
+        elif self.adapt:
+            args = (current, prev, baseline) + tuple(coefficients)
+            if checkpointed:
+                output, memory, baseline = checkpoint_utils.checkpoint(self._compute_adapt, *args,
+                                                                       preserve_rng_state=False)
+            else:
+                output, memory, baseline = self._compute_adapt(*args)
+            new_state = (memory, baseline)
+            reference = baseline
+        else:
+            args = (current, prev) + tuple(coefficients)
+            if checkpointed:
+                output, memory = checkpoint_utils.checkpoint(self._compute, *args, preserve_rng_state=False)
+            else:
+                output, memory = self._compute(*args)
+            new_state = memory
         if self.collect_stats:
-            self._accumulate(memory, prev)
-        return output, memory
+            self._accumulate(memory, prev, reference)
+        return output, new_state, memory
 
     def forward(self, current, state):
-        output, memory = self._step(current, state, *self._coefficients(current))
-        return output, memory, memory
+        return self._step(current, state, self._coefficients(current))
 
     def forward_steps(self, current, state, carry=True, keep_u_pre=True, keep=None):
         """按时间顺序处理一个片段的 T 个窗口，与连续调用 forward T 次数学等价（接口同 StreamingLIF2d）。"""
@@ -346,10 +441,10 @@ class StreamingTIF2d(StreamingLIF2d):
         outputs, memories = [], []
         for t in range(steps):
             prev = mask_state(state if carry else None, keep, t)
-            output, state = self._step(current[t], prev, *coefficients, recompute=True)
+            output, state, memory = self._step(current[t], prev, coefficients, recompute=True)
             outputs.append(output)
             if keep_u_pre:
-                memories.append(state)
+                memories.append(memory)
         return torch.stack(outputs), state, (torch.stack(memories) if keep_u_pre else None)
 
     # ----- 诊断统计（只用于验证，不参与前向；训练时关闭） -----
@@ -359,13 +454,14 @@ class StreamingTIF2d(StreamingLIF2d):
         self._stats = {}
         self.collect_stats = True
 
-    def _accumulate(self, memory, prev):
+    def _accumulate(self, memory, prev, baseline):
         with torch.no_grad():
             s = self._stats
             if not s:
                 zero = torch.zeros((), device=memory.device, dtype=torch.float64)
                 s.update(elements=0, windows=0, occupied=zero.clone(), saturated=zero.clone(),
                          level_sum=zero.clone(), message_abs=zero.clone(), message_nonzero=zero.clone(),
+                         baseline_sum=zero.clone(),
                          channel_active=torch.zeros(memory.shape[1], dtype=torch.bool, device=memory.device))
             q = self.level(memory)
             q_prev = torch.zeros_like(q) if prev is None else self.level(prev)
@@ -378,6 +474,9 @@ class StreamingTIF2d(StreamingLIF2d):
             s["level_sum"] += q.double().sum()
             s["message_abs"] += delta.abs().double().sum()
             s["message_nonzero"] += delta.ne(0).sum().double()
+            if baseline is not None:
+                theta = self.theta().to(baseline.dtype).view(1, -1, 1, 1)
+                s["baseline_sum"] += (torch.relu(baseline) / theta).double().sum()
 
     def stop_stats(self):
         """停止累计并返回汇总（每个神经元每窗的平均值）；没有数据时返回空字典。
@@ -386,19 +485,23 @@ class StreamingTIF2d(StreamingLIF2d):
         message_nonzero_rate  Δq 非零的比例（graded 口径：一条消息携带一个小整数）
         level_mean / occupancy / saturation  电平均值、M>0 的比例、电平到顶（q = D）的比例
         dead_channel_frac     评估期间 M 始终为 0 的通道占比（死通道；不量化时与"从未发放"相同）
+        baseline_level_mean   adapt=True：基线 relu(b)（adapt_debias 时为 relu(b/w)）的平均值，以 theta 为单位
         """
         self.collect_stats = False
         s = self._stats
         if not s:
             return {}
         n = float(max(s["elements"], 1))
-        return {"message_abs_rate": float(s["message_abs"]) / n,
-                "message_nonzero_rate": float(s["message_nonzero"]) / n,
-                "level_mean": float(s["level_sum"]) / n,
-                "occupancy": float(s["occupied"]) / n,
-                "saturation": float(s["saturated"]) / n,
-                "dead_channel_frac": 1.0 - float(s["channel_active"].double().mean()),
-                "windows": int(s["windows"])}
+        out = {"message_abs_rate": float(s["message_abs"]) / n,
+               "message_nonzero_rate": float(s["message_nonzero"]) / n,
+               "level_mean": float(s["level_sum"]) / n,
+               "occupancy": float(s["occupied"]) / n,
+               "saturation": float(s["saturated"]) / n,
+               "dead_channel_frac": 1.0 - float(s["channel_active"].double().mean()),
+               "windows": int(s["windows"])}
+        if self.adapt:
+            out["baseline_level_mean"] = float(s["baseline_sum"]) / n
+        return out
 
 
 class ReLUNeuron(nn.Module):
@@ -448,7 +551,7 @@ class ChannelGain(nn.Module):
 def mask_state(state, keep, t):
     """多流训练：第 t 窗按 keep[t]（形状 [B]）逐流保留或清零上一状态；keep 为 None 或状态为 None 时原样返回。
 
-    支持单个张量 [B,...] 与双仓的 (U, M)。乘 0 后的零状态与 None 数值相同，并在此截断梯度。
+    支持单个张量 [B,...]、双仓的 (U, M) 与自校准 TIF 的 (M, b)。乘 0 后的零状态与 None 数值相同，并在此截断梯度。
     """
     if state is None or keep is None:
         return state
