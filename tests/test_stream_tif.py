@@ -455,7 +455,7 @@ class TIFEndToEndTests(unittest.TestCase):
             stats = dict(q99=Q99.tolist(), train_pos=pos, train_neg=neg, pos_weight=min(neg / pos, 30.0))
             (root / "stats.json").write_text(json.dumps(stats), encoding="utf-8")
             for config in ("evisseg_stream_tif_notransport", "evisseg_stream_tif_adapt", "evisseg_stream_tif_adapt2",
-                           "evisseg_stream_tif_adapt3"):
+                           "evisseg_stream_tif_adapt3", "evisseg_stream_tif_hyst"):
                 run = root / config
                 cfg = load_flat_config("configs/%s.yaml" % config)
                 self.assertEqual((cfg["neuron"], cfg["trainer"], cfg["streams"], cfg["accumulate"]),

@@ -1,0 +1,69 @@
+# V5 TIF + 滞回汇报 hysteresis（Stream-SNN-Innovations.md 12.8~12.9）：|M/theta - q_prev| < 1 时不改汇报电平
+# 除 tif.hysteresis 与 save_root 外与 evisseg_stream_tif_notransport_evflying.yaml 逐项相同（tests/test_stream_tif_hyst.py 核对）
+DATA:
+  root: /media/stephen/nvme0n1/wy_data/datasets/evflying_x4
+  stats_path: configs/stream_v1_evflying_x4_stats.json   # 由 tools/stream_train_stats.py 用本配置生成（只用训练集）
+  window_ms: 50
+  n_windows: 0             # 0 = 按录像自身长度（t_max // 50 + 1）
+  time_bins: 5
+  height: 180
+  width_px: 320
+  pad_height: 184          # 3 次 stride=2 下采样，对齐到 8 的倍数；只补下侧
+  pad_width: 320
+  input_clip: 3.0          # X = clip(log1p(C)/q99, 0, 3)
+
+NET:
+  channels: [12, 24, 48, 48]
+  neuron: tif
+  tif:
+    levels: 7                  # D：汇报电平 0..D
+    quantize: true
+    k_init: 0.05
+    hysteresis: true           # 滞回汇报：死区为开区间 1 级，消除电平分界处的抖动消息
+  state_mode: carry
+  norm: none
+  v_threshold: 1.0
+  tau_init_ms: 200.0
+  tau_min_ms: 50.0
+  tau_max_ms: 2000.0
+  readout_hidden: 32
+
+CALIB:
+  calib_sequences: 8
+  calib_windows: 32
+  calib_samples_per_channel: 2048
+  calib_min_positive: 1024
+  calib_quantile: 0.99
+  calib_gain_min: 0.05
+  calib_gain_max: 20.0
+
+TRAIN:
+  seed: 37
+  # 轮数规则：总更新次数与 EV-UAV 上已验证的配方（B=4、n=1、50 轮 x 约 251 次 = 约 12550 次）相当；
+  # EV-Flying 训练集 17 条录像 50418 窗，B=4、k=16 每轮约 790 次更新 -> 16 轮
+  epochs: 16
+  lr: 0.001
+  lr_end: 0.0001
+  tbptt_k: 16
+  trainer: streams             # 标准有状态 TBPTT：B 条并行流，每 n 个片段更新一次（10-16 定稿 B=4、n=1、k=16）
+  streams: 4
+  accumulate: 1
+  optimizer_step: per_sequence # 只对 trainer=sequence 生效
+  grad_clip: 1.0
+  pos_weight_cap: 30.0
+  train_subset_size: 4         # 训练集只有 17 条长录像，取 4 条做训练子集评估
+  num_workers: 2
+  execution: layer
+  input_device: gpu
+  train_subset_every: 5
+  eval_chunk: 32
+  deterministic: true
+  save_root: log/stream_tif_hyst_evflying_x4_seed37
+
+EVAL:
+  threshold: 0.9
+  pd_detT: 50
+  correct_thresh: 0.0001
+  rolling_window: 10
+  segments: [[0, 15], [64, 79], [144, 159]]
+  timing_warmup_windows: 20

@@ -223,6 +223,8 @@ def build_net(cfg, device):
 def design_version(net):
     """写入 run_config 与 checkpoint 的设计版本标记。"""
     if net.is_tif:
+        if net.tif_config["hysteresis"]:
+            return "v5-tif-hysteresis"
         if net.tif_config["adapt"]:
             return "v5-tif-adapt-debias" if net.tif_config["adapt_debias"] else "v5-tif-adapt"
         return "v5-tif"
