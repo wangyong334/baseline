@@ -1,6 +1,5 @@
-# V5 TIF 基础版（不搬运；10-19 搬运已删除，见 Stream-SNN-Innovations.md 11.15、11.21）：信念 M 与汇报分离 + 有界证据累积 + 多级变化汇报
+# V5 TIF 基础版（10-19 删除搬运、10-22 删除本地参照，见 Stream-SNN-Innovations.md 11.15、11.21、11.29）：信念 M 与汇报分离 + 有界证据累积 + 多级变化汇报
 # 与 V1（configs/evisseg_stream_v1.yaml + 标准 TBPTT B=4、n=1、k=16）只差神经元；同种子下卷积与读出的初始化逐位相同。
-# 本地参照版 TIF-R 见 configs/evisseg_stream_tifr.yaml（与本配置只差 tif.reference 与 save_root）
 DATA:
   root: /media/stephen/nvme0n1/wy_data/datasets/EV-UAV-dataset
   stats_path: configs/stream_v1_train_stats.json   # 由 tools/stream_train_stats.py 生成
