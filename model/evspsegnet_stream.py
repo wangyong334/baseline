@@ -43,9 +43,10 @@ DECODER_STAGES = (("up3", "dec3"), ("up2", "dec2"), ("up1", "dec1"))
 # surrogate：10-19 两端代理梯度（实验失败，默认关）
 # adapt：工作点自校准（对自身输入的慢基线，Stream-SNN-Innovations.md 12.1），默认关；关时与基础版逐位相同
 # adapt_debias：偏差校正的基线（12.4，需 adapt），默认关；关时与 10-22 第一版 adapt 逐位相同
+# adapt_layers：哪些层做自校准（12.5）；None = 全部 7 层（前两版的做法），其余层就是基础版 TIF
 TIF_DEFAULTS = {"levels": 7, "quantize": True, "k_init": 0.05, "surrogate": False,
                 "adapt": False, "adapt_tau_init_ms": 2000.0, "adapt_tau_min_ms": 1000.0, "adapt_tau_max_ms": 10000.0,
-                "adapt_debias": False}
+                "adapt_debias": False, "adapt_layers": None}
 TIF_NEURON_KEYS = ("levels", "quantize", "k_init", "surrogate",
                    "adapt", "adapt_tau_init_ms", "adapt_tau_min_ms", "adapt_tau_max_ms", "adapt_debias")
 TIF_ADAPT_TAU_KEYS = ("adapt_tau_min_ms", "adapt_tau_init_ms", "adapt_tau_max_ms")
@@ -80,6 +81,12 @@ def tif_settings(tif):
         raise ValueError("tif.quantize / tif.surrogate / tif.adapt / tif.adapt_debias 必须为 YAML 布尔值")
     if out["adapt_debias"] and not out["adapt"]:
         raise ValueError("tif.adapt_debias 需要 tif.adapt: true")
+    if out["adapt_layers"] is not None:
+        layers = out["adapt_layers"]
+        if (not out["adapt"] or not isinstance(layers, (list, tuple)) or not layers
+                or any(n not in LAYER_NAMES for n in layers) or len(set(layers)) != len(layers)):
+            raise ValueError("tif.adapt_layers 需要 tif.adapt: true，且为 enc1..dec1 的非空、无重复列表")
+        out["adapt_layers"] = [n for n in LAYER_NAMES if n in layers]
     taus = [float(out[key]) for key in TIF_ADAPT_TAU_KEYS]
     if not (all(np.isfinite(taus)) and 0 < taus[0] < taus[1] < taus[2]):
         raise ValueError("需要 0 < tif.adapt_tau_min_ms < tif.adapt_tau_init_ms < tif.adapt_tau_max_ms")
@@ -191,24 +198,34 @@ class EvSpSegNetStream(nn.Module):
                    tau_max_ms=tau_max_ms, v_threshold=v_threshold)
         neuron_tif = (None if self.tif_config is None
                       else {key: self.tif_config[key] for key in TIF_NEURON_KEYS})
-        block = lambda i, o, s: SpikingConvBlock(i, o, s, neuron, norm, lif, neuron_tif)  # noqa: E731
-        self.enc1 = block(in_channels, c1, 1)
-        self.enc2 = block(c1, c2, 2)
-        self.enc3 = block(c2, c3, 2)
-        self.enc4 = block(c3, c4, 2)
+        self.tif_adapt_layers = ()
+        if self.tif_config is not None and self.tif_config["adapt"]:
+            self.tif_adapt_layers = tuple(self.tif_config["adapt_layers"] or LAYER_NAMES)
+
+        def layer_tif(name):
+            # 不在 adapt_layers 里的层就是基础版 TIF（TIF 参数不消耗随机数，初始化与层的选择无关）
+            if neuron_tif is None or name in self.tif_adapt_layers:
+                return neuron_tif
+            return dict(neuron_tif, adapt=False, adapt_debias=False)
+
+        block = lambda name, i, o, s: SpikingConvBlock(i, o, s, neuron, norm, lif, layer_tif(name))  # noqa: E731
+        self.enc1 = block("enc1", in_channels, c1, 1)
+        self.enc2 = block("enc2", c1, c2, 2)
+        self.enc3 = block("enc3", c2, c3, 2)
+        self.enc4 = block("enc4", c3, c4, 2)
         if merged_decoder:
             # ConvT4x4/s2/p1 负责深层脉冲，解码卷积只接跳连脉冲；两路电流在神经元内相加
             upsample = lambda i, o: nn.ConvTranspose2d(i, o, 4, stride=2, padding=1, bias=False)  # noqa: E731
-            self.up3, self.dec3 = upsample(c4, c3), block(c3, c3, 1)
-            self.up2, self.dec2 = upsample(c3, c2), block(c2, c2, 1)
-            self.up1, self.dec1 = upsample(c2, c1), block(c1, c1, 1)
+            self.up3, self.dec3 = upsample(c4, c3), block("dec3", c3, c3, 1)
+            self.up2, self.dec2 = upsample(c3, c2), block("dec2", c2, c2, 1)
+            self.up1, self.dec1 = upsample(c2, c1), block("dec1", c1, c1, 1)
         else:
             self.up3 = nn.ConvTranspose2d(c4, c3, 2, stride=2, bias=False)
-            self.dec3 = block(c3 + c3, c3, 1)
+            self.dec3 = block("dec3", c3 + c3, c3, 1)
             self.up2 = nn.ConvTranspose2d(c3, c2, 2, stride=2, bias=False)
-            self.dec2 = block(c2 + c2, c2, 1)
+            self.dec2 = block("dec2", c2 + c2, c2, 1)
             self.up1 = nn.ConvTranspose2d(c2, c1, 2, stride=2, bias=False)
-            self.dec1 = block(c1 + c1, c1, 1)
+            self.dec1 = block("dec1", c1 + c1, c1, 1)
         self.readout = nn.Sequential(nn.Linear(c1 + 2, readout_hidden), nn.ReLU(),
                                      nn.Linear(readout_hidden, 1))
         self.dual_memory_layers = ()
@@ -814,15 +831,17 @@ def estimate_operations(net, height, width, firing_rates, events_per_window, inp
     if net.is_tif:
         cfg = net.tif_config
         update_ops = 7 + (4 if cfg["quantize"] else 0)  # 驱动、EMA、截断约 7 次；量化与 Δq 约 4 次
-        if cfg["adapt"]:
-            update_ops += 4 + (1 if cfg["adapt_debias"] else 0)   # 基线 EMA 两乘一加、relu 与减法；偏差校正多一次除法
-            result["state_elements"] += state_elements   # 每个神经元多一个基线 b
+        adapt_elements = sum(block.out_ch * state_size[name]
+                             for name, block in zip(LAYER_NAMES, net.blocks()) if name in net.tif_adapt_layers)
+        adapt_ops = 4 + (1 if cfg["adapt_debias"] else 0)   # 基线 EMA 两乘一加、relu 与减法；偏差校正多一次除法
+        result["state_elements"] += adapt_elements          # 自校准层每个神经元多一个基线 b
         result["tif"] = {
+            "adapt_layers": list(net.tif_adapt_layers), "adapt_state_elements": adapt_elements,
             "adapt": cfg["adapt"], "adapt_debias": cfg["adapt_debias"],
             "levels": cfg["levels"], "quantize": cfg["quantize"],
             "message_payload_bits": int(math.ceil(math.log2(2 * cfg["levels"] + 1))),
             "sop_basis": "firing_rates 为每神经元每窗平均 |Δq|：SOP = 单位脉冲口径（每个单位电平变化一次突触累加）",
-            "elementwise_ops_per_window": update_ops * state_elements,
+            "elementwise_ops_per_window": update_ops * state_elements + adapt_ops * adapt_elements,
             "surrogate": cfg["surrogate"],
             "synaptic_accumulator_elements": state_elements,
             "included_in_mac_sop": False,

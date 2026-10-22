@@ -1,0 +1,72 @@
+# V5 TIF + 输入层工作点自校准（Stream-SNN-Innovations.md 12.5）：只有 enc1 减去偏差校正的慢基线，其余 6 层为基础版 TIF
+# 除 tif.adapt_layers 与 save_root 外与 evisseg_stream_tif_adapt2.yaml 逐项相同（tests/test_stream_tif_adapt.py 核对）
+DATA:
+  root: /media/stephen/nvme0n1/wy_data/datasets/EV-UAV-dataset
+  stats_path: configs/stream_v1_train_stats.json   # 由 tools/stream_train_stats.py 生成
+  window_ms: 50
+  n_windows: 160
+  time_bins: 5
+  height: 260
+  width_px: 346
+  pad_height: 264          # 3 次 stride=2 下采样，对齐到 8 的倍数；只补右侧和下侧
+  pad_width: 352
+  input_clip: 3.0          # X = clip(log1p(C)/q99, 0, 3)
+
+NET:
+  channels: [12, 24, 48, 48]
+  neuron: tif
+  tif:
+    levels: 7                  # D：汇报电平 0..7（3 bit），消息 Δq ∈ {-7..7}
+    quantize: true             # false = 直接汇报实数 M（对照）
+    k_init: 0.05               # 参考值 k 初值（softplus），单位是校准后的驱动（q99 正电流 = 1）
+    adapt: true                # 工作点自校准：k 之外再减去自身输入的慢基线 relu(b)
+    adapt_tau_init_ms: 2000.0  # 基线时间常数 tau_b 初值（40 窗）
+    adapt_tau_min_ms: 1000.0   # 下界：远大于运动目标在一个位置的停留时间
+    adapt_tau_max_ms: 10000.0
+    adapt_debias: true         # 偏差校正：第 2 窗起参照就是输入均值，消除基线从 0 追直流的热身过程
+    adapt_layers: [enc1]       # 只在输入层：深层只做减法会失去尺度约束（12.5）
+  state_mode: carry            # carry | reset_each_window
+  norm: none
+  v_threshold: 1.0             # TIF 中只决定 theta 初值 = v_threshold / levels（量程 D*theta = 1）与增益校准目标
+  tau_init_ms: 200.0           # lam0 = exp(-50/200) ≈ 0.779
+  tau_min_ms: 50.0
+  tau_max_ms: 2000.0
+  readout_hidden: 32
+
+CALIB:
+  calib_sequences: 8
+  calib_windows: 32
+  calib_samples_per_channel: 2048
+  calib_min_positive: 1024
+  calib_quantile: 0.99
+  calib_gain_min: 0.05
+  calib_gain_max: 20.0
+
+TRAIN:
+  seed: 37
+  epochs: 50
+  lr: 0.001
+  lr_end: 0.0001               # 按 epoch 线性衰减
+  tbptt_k: 16
+  trainer: streams             # 标准有状态 TBPTT：B 条并行流，每 n 个片段更新一次（10-16 定稿 B=4、n=1、k=16）
+  streams: 4
+  accumulate: 1
+  optimizer_step: per_sequence # 只对 trainer=sequence 生效
+  grad_clip: 1.0
+  pos_weight_cap: 30.0
+  train_subset_size: 24
+  num_workers: 2
+  execution: layer
+  input_device: gpu
+  train_subset_every: 5
+  eval_chunk: 32
+  deterministic: true
+  save_root: log/stream_tif_adapt3_seed37
+
+EVAL:
+  threshold: 0.9
+  pd_detT: 50
+  correct_thresh: 0.0001
+  rolling_window: 10
+  segments: [[0, 15], [64, 79], [144, 159]]
+  timing_warmup_windows: 20

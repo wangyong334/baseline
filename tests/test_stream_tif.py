@@ -454,7 +454,8 @@ class TIFEndToEndTests(unittest.TestCase):
                         neg += seq.n_events - int(seq.label.sum())
             stats = dict(q99=Q99.tolist(), train_pos=pos, train_neg=neg, pos_weight=min(neg / pos, 30.0))
             (root / "stats.json").write_text(json.dumps(stats), encoding="utf-8")
-            for config in ("evisseg_stream_tif_notransport", "evisseg_stream_tif_adapt", "evisseg_stream_tif_adapt2"):
+            for config in ("evisseg_stream_tif_notransport", "evisseg_stream_tif_adapt", "evisseg_stream_tif_adapt2",
+                           "evisseg_stream_tif_adapt3"):
                 run = root / config
                 cfg = load_flat_config("configs/%s.yaml" % config)
                 self.assertEqual((cfg["neuron"], cfg["trainer"], cfg["streams"], cfg["accumulate"]),
@@ -472,7 +473,11 @@ class TIFEndToEndTests(unittest.TestCase):
                 self.assertIn("theta_mean", record["tif_parameters"]["enc2"])
                 self.assertIn("dead_channel_frac", record["tif"]["dec3"])
                 adapt = bool(cfg["tif"].get("adapt", False))                     # 工作点自校准（12.1）
-                self.assertEqual("tau_b_mean" in record["tif_parameters"]["enc2"], adapt, config)
+                self.assertEqual("tau_b_mean" in record["tif_parameters"]["enc1"], adapt, config)
+                only = (cfg["tif"].get("adapt_layers") or LAYER_NAMES) if adapt else ()
+                for name in LAYER_NAMES:                                          # 只有自校准层有 tau_b 与基线
+                    self.assertEqual("tau_b_mean" in record["tif_parameters"][name], name in only, (config, name))
+                    self.assertEqual("baseline_level_mean" in record["tif"][name], name in only, (config, name))
                 self.assertEqual("baseline_level_mean" in record["tif"]["enc1"], adapt, config)
                 checkpoint = run / "best_val_iou_seed37.pt"
                 self.assertTrue(checkpoint.exists())

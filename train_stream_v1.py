@@ -1305,7 +1305,8 @@ def mode_train(args, cfg):
                                                   for n in LAYER_NAMES)
                   + ("" if "baseline_level_mean" not in record["tif"]["enc1"] else
                      " | 基线/theta " + " ".join("%s %.3f" % (n, record["tif"][n]["baseline_level_mean"])
-                                                for n in LAYER_NAMES)), flush=True)
+                                                for n in LAYER_NAMES
+                                                if "baseline_level_mean" in record["tif"][n])), flush=True)
         for w in record["warnings"]:
             print("  [health]", w, flush=True)
     summary = summarize_history(history, seed)

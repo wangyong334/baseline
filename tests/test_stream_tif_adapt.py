@@ -6,6 +6,7 @@
     4. 网络：配置校验、同种子下其余参数与基础版逐位相同、forward_chunk 与逐窗等价（carry / reset）、
        reset 模式下与 adapt=False 输出逐位相同、统计与运算量、配置文件只差 adapt 四项与 save_root
     5. adapt_debias（12.4）：参照等于历史加权均值、无热身过程、None/零状态/reset/片段等价、关闭时与第一版相同
+    6. adapt_layers（12.5）：只有所选层自校准、其余层与基础版相同、运算量只计所选层、配置只差该差的键
 """
 import copy
 import os
@@ -384,6 +385,73 @@ class DebiasTests(unittest.TestCase):
         self.assertTrue(all(len(s) == 2 for s in sa))
 
 
+class AdaptLayersTests(unittest.TestCase):
+    """adapt_layers（12.5）：只在所选层做自校准，其余层为基础版 TIF。"""
+
+    def test_validation(self):
+        self.assertIsNone(TIF_DEFAULTS["adapt_layers"])
+        self.assertEqual(tif_settings({"adapt": True, "adapt_layers": ["dec1", "enc1"]})["adapt_layers"],
+                         ["enc1", "dec1"])
+        for bad in ({"adapt_layers": ["enc1"]}, {"adapt": True, "adapt_layers": []},
+                    {"adapt": True, "adapt_layers": ["enc5"]}, {"adapt": True, "adapt_layers": ["enc1", "enc1"]},
+                    {"adapt": True, "adapt_layers": "enc1"}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                tif_settings(bad)
+
+    def test_only_selected_layers_adapt(self):
+        torch.manual_seed(3)
+        plain = dict(EvSpSegNetStream(channels=SMALL, neuron="tif").named_parameters())
+        torch.manual_seed(3)
+        net = EvSpSegNetStream(channels=SMALL, neuron="tif",
+                               tif={"adapt": True, "adapt_debias": True, "adapt_layers": ["enc1"]})
+        self.assertEqual(net.tif_adapt_layers, ("enc1",))
+        for name, block in zip(LAYER_NAMES, net.blocks()):
+            self.assertEqual(block.neuron.adapt, name == "enc1", name)
+            self.assertEqual(block.neuron.adapt_debias, name == "enc1", name)
+        for name, param in net.named_parameters():
+            if name in plain:
+                self.assertEqual(max_error(param, plain[name]), 0.0, name)
+            else:
+                self.assertEqual(name, "enc1.neuron.adapt_a")
+        self.assertEqual(EvSpSegNetStream(channels=SMALL, neuron="tif", tif={"adapt": True}).tif_adapt_layers,
+                         LAYER_NAMES)                                  # None = 全部层（前两版）
+        self.assertEqual(EvSpSegNetStream(channels=SMALL, neuron="tif").tif_adapt_layers, ())
+
+    def test_deep_layers_equal_plain_and_chunk_matches_step(self):
+        seq = synthetic_sequence()
+        source = TorchWindowSource(seq, CFG, Q99, torch.device("cpu"), torch.float64)
+        helper = base.TIFNetworkTests("test_forward_chunk_matches_step_forward")
+        extra = dict(FAST, adapt=True, adapt_debias=True, adapt_layers=["enc1"])
+        for mode in ("carry", "reset_each_window"):
+            with self.subTest(mode=mode):
+                helper.check_pair(source, False, True, mode, extra)
+        net = make_tif_net(**extra)
+        with torch.no_grad():
+            net.start_tif_stats()
+            states = None
+            for k in range(CHUNKS[-1][1]):
+                x, events, _, _ = source.window(k)
+                _, states, _ = net(x, events, states)
+            stats = net.stop_tif_stats()
+        self.assertEqual(len(states[0]), 3)
+        self.assertTrue(all(torch.is_tensor(s) for s in states[1:]))     # 深层状态仍是张量 M
+        self.assertIn("baseline_level_mean", stats["enc1"])
+        self.assertTrue(all("baseline_level_mean" not in stats[n] for n in LAYER_NAMES[1:]))
+
+    def test_operation_estimate_counts_selected_layers(self):
+        rates = {name: 0.5 for name in LAYER_NAMES}
+        plain = estimate_operations(EvSpSegNetStream(channels=SMALL, neuron="tif"), H, W, rates, 100)
+        net = EvSpSegNetStream(channels=SMALL, neuron="tif",
+                               tif={"adapt": True, "adapt_debias": True, "adapt_layers": ["enc1"]})
+        ops = estimate_operations(net, H, W, rates, 100)
+        enc1 = ops["tif"]["adapt_state_elements"]
+        self.assertEqual(enc1, net.enc1.out_ch * H * W)
+        self.assertEqual(ops["state_elements"], plain["state_elements"] + enc1)
+        self.assertEqual(ops["tif"]["elementwise_ops_per_window"],
+                         plain["tif"]["elementwise_ops_per_window"] + 5 * enc1)
+        self.assertEqual(ops["tif"]["adapt_layers"], ["enc1"])
+
+
 class AdaptConfigTests(unittest.TestCase):
     def test_configs_differ_only_in_adapt(self):
         from utils.stream_common import load_flat_config
@@ -419,6 +487,20 @@ class AdaptConfigTests(unittest.TestCase):
                 self.assertNotEqual(a["save_root"], b["save_root"])
                 ta, tb = tif_settings(a["tif"]), tif_settings(b["tif"])
                 self.assertEqual(dict(ta, adapt_debias=True), tb)
+
+    def test_input_layer_configs_differ_only_in_layers(self):
+        from utils.stream_common import load_flat_config
+        for base_path, new in (("configs/evisseg_stream_tif_adapt2.yaml", "configs/evisseg_stream_tif_adapt3.yaml"),
+                               ("configs/evisseg_stream_tif_adapt2_evflying.yaml",
+                                "configs/evisseg_stream_tif_adapt3_evflying.yaml")):
+            with self.subTest(new=new):
+                a, b = load_flat_config(base_path), load_flat_config(new)
+                self.assertEqual(set(a), set(b))
+                for key in a:
+                    if key not in ("tif", "save_root"):
+                        self.assertEqual(a[key], b[key], key)
+                self.assertNotEqual(a["save_root"], b["save_root"])
+                self.assertEqual(dict(tif_settings(a["tif"]), adapt_layers=["enc1"]), tif_settings(b["tif"]))
 
 
 if __name__ == "__main__":
