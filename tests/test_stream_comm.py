@@ -349,5 +349,25 @@ class CommConfigTests(unittest.TestCase):
         self.assertEqual((b["comm_budget_sop"], b["comm_dual_lr"]), (17150000.0, 0.01))
 
 
+class ValidationConfigTests(unittest.TestCase):
+    def test_validation_configs_change_one_key(self):
+        # 12.23 的验证实验：每份配置只改一个训练键（另加 save_root）
+        from utils.stream_common import load_flat_config
+        cases = (("evisseg_stream_tif_notransport.yaml", "evisseg_stream_tif_notransport_acc2.yaml", "accumulate", 2),
+                 ("evisseg_stream_tif_comm.yaml", "evisseg_stream_tif_comm_acc2.yaml", "accumulate", 2),
+                 ("evisseg_stream_tif_comm.yaml", "evisseg_stream_tif_comm_dlr001.yaml", "comm_dual_lr", 0.001),
+                 ("evisseg_stream_tif_comm_peak.yaml", "evisseg_stream_tif_comm_peak_dlr001.yaml", "comm_dual_lr", 0.001))
+        roots = set()
+        for base_name, new_name, key, value in cases:
+            with self.subTest(new=new_name):
+                a = load_flat_config("configs/" + base_name)
+                b = load_flat_config("configs/" + new_name)
+                self.assertEqual(set(a), set(b))
+                diff = {k for k in a if a[k] != b[k]}
+                self.assertEqual(diff, {key, "save_root"})
+                self.assertEqual(b[key], value)
+                roots.add(b["save_root"])
+        self.assertEqual(len(roots), 4)
+
 if __name__ == "__main__":
     unittest.main()
