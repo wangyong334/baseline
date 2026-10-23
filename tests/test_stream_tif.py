@@ -456,7 +456,7 @@ class TIFEndToEndTests(unittest.TestCase):
                         neg += seq.n_events - int(seq.label.sum())
             stats = dict(q99=Q99.tolist(), train_pos=pos, train_neg=neg, pos_weight=min(neg / pos, 30.0))
             (root / "stats.json").write_text(json.dumps(stats), encoding="utf-8")
-            for config in ("evisseg_stream_tif_notransport", "evisseg_stream_tif_adapt3", "evisseg_stream_tif_comm",
+            for config in ("evisseg_stream_tif_notransport", "evisseg_stream_tif_adapt3",
                            "evisseg_stream_tif_comm_peak"):
                 run = root / config
                 cfg = load_flat_config("configs/%s.yaml" % config)
@@ -475,6 +475,9 @@ class TIFEndToEndTests(unittest.TestCase):
                 self.assertIn("theta_mean", record["tif_parameters"]["enc2"])
                 self.assertIn("dead_channel_frac", record["tif"]["dec3"])
                 self.assertEqual(record["comm"] is not None, "comm_budget_sop" in cfg, config)   # 通信预算训练（12.14）
+                if record["comm"] is not None:                                    # 峰值约束，合并口径（12.32）
+                    self.assertEqual((record["comm"]["mode"], record["comm"]["accounting"]), ("peak", "merged"))
+                    self.assertIsNotNone(record["comm"]["val_sop_p95"])
                 adapt = bool(cfg["tif"].get("adapt", False))                     # 工作点自校准（12.1）
                 self.assertEqual("tau_b_mean" in record["tif_parameters"]["enc1"], adapt, config)
                 only = ("enc1",) if adapt else ()
