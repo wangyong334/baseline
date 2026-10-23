@@ -1,0 +1,17 @@
+# V6 第一版：自定时判决神经元的滞后读出头（Stream-SNN-Innovations.md 13.12），EV-UAV
+# 骨干 = V5 定型版（BIR + 每窗消息数峰值约束），冻结；只训练滞后读出头。数据路径与评测口径来自 base_config
+LAG:
+  base_config: configs/evisseg_stream_tif_comm_peak.yaml
+  backbone_checkpoint: log/stream_tif_commpeak_msg_seed37/best_val_iou_seed37.pt
+  lag_variants: [pixel, multiscale]   # pixel = 只读原像素 dec1（静止假设对照，E1）；multiscale = 另读粗层与 enc4 邻域（E2）
+  lags: 5                     # D：最多再读 5 窗（250 ms，与 V2/V3 相同）
+  lag_hidden: 32              # 与 V5 读出头相同
+  # 轮数规则：总更新次数约 5000（EV-UAV 训练集 99 x 160 窗，B=4、片段 16 窗 -> 每轮约 248 次更新）
+  lag_epochs: 20
+  lag_lr: 0.001
+  lag_lr_end: 0.0001          # 按 epoch 线性衰减
+  lag_grad_clip: 1.0
+  lag_streams: 4              # 与 V5 训练相同的多流排布
+  lag_chunk: 16
+  lag_eval_chunk: 32          # 训练中验证（逐片段执行）每次处理的窗数
+  lag_save_root: log/stream_lag_v6a_seed37
