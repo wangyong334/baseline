@@ -1,5 +1,5 @@
-# V5 BIR（tif）+ 通信预算训练，每窗峰值带宽约束（Stream-SNN-Innovations.md 12.21、12.32）：每个窗、每条流的 SOP 超过预算的比例 <= alpha
-# SOP 按部署用的电流合并解码器口径计（comm_accounting: merged）；训练仍用原形式，评估前用 tools/convert_to_merged_decoder.py 换算。除 TRAIN 的 comm_* 五项与 save_root 外与 evisseg_stream_tif_notransport.yaml 相同
+# V5 BIR（tif）+ 通信预算训练：每窗消息数的峰值约束（Stream-SNN-Innovations.md 12.21、12.35）：每个窗、每条流发出的消息数超过预算的比例 <= alpha
+# 约束量与能耗口径无关，能耗只在评估环节计算。除 TRAIN 的 comm_* 四项与 save_root 外与 evisseg_stream_tif_notransport.yaml 相同
 DATA:
   root: /media/stephen/nvme0n1/wy_data/datasets/EV-UAV-dataset
   stats_path: configs/stream_v1_train_stats.json   # 由 tools/stream_train_stats.py 生成
@@ -47,11 +47,10 @@ TRAIN:
   accumulate: 1
   optimizer_step: per_sequence # 只对 trainer=sequence 生效
   grad_clip: 1.0
-  comm_budget_sop: 42960000.0   # 单窗 SOP 上限 = V1（LIF）合并解码器在 EV-UAV val 上的平均 SOP 4.296e7（12.32）
+  comm_budget_messages: 157700.0  # 每窗消息数上限 = V1（LIF）在 EV-UAV val 上每窗发出的平均脉冲数 157734（enc1~dec2）
   comm_dual_lr: 0.01            # 乘子 mu 的对偶上升步长（每次参数更新）
-  comm_budget_mode: peak        # 每窗峰值带宽（机会约束）；平均预算 mean 已删除（12.32）
-  comm_accounting: merged       # SOP 系数按合并解码器求（部署口径），与预算同口径
-  comm_peak_alpha: 0.05         # 允许超出预算的窗口比例：单窗 SOP 的第 95 百分位不超过 LIF 的平均 SOP
+  comm_budget_mode: peak        # 每窗峰值约束（机会约束）；平均预算 mean 已删除（12.32）
+  comm_peak_alpha: 0.05         # 允许超出预算的窗口比例：每窗消息数的第 95 百分位不超过 LIF 的平均脉冲数
   pos_weight_cap: 30.0
   train_subset_size: 24
   num_workers: 2
@@ -60,7 +59,7 @@ TRAIN:
   train_subset_every: 5
   eval_chunk: 32
   deterministic: true
-  save_root: log/stream_tif_commpeak_merged_seed37
+  save_root: log/stream_tif_commpeak_msg_seed37
 
 EVAL:
   threshold: 0.9

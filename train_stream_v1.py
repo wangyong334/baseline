@@ -35,10 +35,10 @@ from dataset.ev_uav_stream import EvUAVStream, make_sequence_loader, window_to_d
 from dataset.stream_source import INPUT_DEVICES, make_window_source  # noqa: E402
 from dataset.stream_windows import num_input_channels, refill_by_index  # noqa: E402
 from model.evspsegnet_stream import (LAYER_NAMES, EvSpSegNetStream, calibrate_gains,  # noqa: E402
-                                     count_parameters, estimate_operations, tif_settings)
+                                     count_parameters, estimate_operations, tif_settings, window_sop_summary)
 from model.lif2d_stream import (StreamingLIF2d, StreamingDualMemoryLIF2d, StreamingTIF2d,  # noqa: E402
                                 detach_states)
-from utils.comm_budget import CommBudget, window_sop_summary  # noqa: E402
+from utils.comm_budget import CommBudget, mean_messages, window_message_summary  # noqa: E402
 from utils.stream_common import (health_warnings, linear_epoch_lr, load_flat_config,  # noqa: E402
                                  make_chunks, select_subset, subset_due, summarize_history)
 from utils.stream_metrics import (SWEEP_THRESHOLDS, FastRoc, first_detection_latencies, iou_from_counts,  # noqa: E402
@@ -314,6 +314,7 @@ class LayerMonitor(object):
         always_on_frac       发放窗口占比 > 90% 的神经元占比（饱和）
         u_abs_max            |U_pre| 最大值
         big_membrane_frac    |U_pre| > 10*阈值 的元素占比
+        neurons              本层神经元数（每个样本），取自实际张量；每窗脉冲数 = firing_rate * neurons
     ReLU 版本把"激活 > 0"视为发放。
     """
 
@@ -422,6 +423,7 @@ class LayerMonitor(object):
                                         .float().mean()),
                 "u_abs_max": float(d["u_abs_max"]),
                 "big_membrane_frac": float(d["big"]) / max(d["elements"], 1),
+                "neurons": int(d["neuron_windows"].numel()),
             }
             if name in self.memory_data:
                 m = self.memory_data[name]
@@ -1006,7 +1008,7 @@ def run_sequence(net, seq, cfg, q99, device, state_mode, monitor=None, timer=Non
 
 
 def evaluate_split(net, cfg, q99, device, split, state_mode, names=None, full=False,
-                   collect_layers=False, dump_dir=None, reset_every=0, reset_offset=0, sop_coefficients=None):
+                   collect_layers=False, dump_dir=None, reset_every=0, reset_offset=0):
     """在一个划分（或其子集）上评估。
 
     主指标 IoU/ACC 调用原仓库 utils/eval.py 的 evaluate_iou_and_accuracy（全局拼接口径）；
@@ -1017,8 +1019,6 @@ def evaluate_split(net, cfg, q99, device, split, state_mode, names=None, full=Fa
     dump_dir 不为空时，把每个序列的逐事件预测保存为 NPZ（字段与原仓库诊断文件一致：
     locs [batch,x,y,t]、labels、probabilities，另加 target_id），文件顺序与原 NPZ 一致。
     reset_every / reset_offset 原样传给 run_sequence（周期清零，记忆长度诊断）。
-    sop_coefficients 为 (base, [c_l]) 或 None：单窗 SOP 分布用的系数；None 时按网络自身结构
-    （训练中的验证传入通信预算的合并口径系数，使 p95 与预算同口径）。
     """
     from utils.eval import evalute        # 延迟导入：该模块依赖 cv2/pandas，只在评估时需要
 
@@ -1070,15 +1070,23 @@ def evaluate_split(net, cfg, q99, device, split, state_mode, names=None, full=Fa
         if monitor.residual_summary():
             result["subthreshold_diagnostics"] = monitor.residual_summary()
         if tif_stats:
-            # 单窗 SOP 的分布（峰值带宽约束的检验口径，12.21）；逐窗列表用完即删，不写进结果
+            # 逐窗分布；逐窗列表用完即删，不写进结果
+            #   messages_per_window  每窗实际发出的消息数（通信约束的检验口径，与能耗无关，12.35）
+            #   sop_per_window       单窗 SOP（按网络自身结构的能耗口径，只用于报告，12.21）
             if net.tif_config["quantize"]:
-                window_sop = window_sop_summary(net, tif_stats, int(cfg["pad_height"]), int(cfg["pad_width"]),
-                                                sop_coefficients)
+                window_msg = window_message_summary(net, tif_stats)
+                if window_msg is not None:
+                    result["messages_per_window"] = window_msg
+                window_sop = window_sop_summary(net, tif_stats, int(cfg["pad_height"]), int(cfg["pad_width"]))
                 if window_sop is not None:
                     result["sop_per_window"] = window_sop
             for layer in tif_stats.values():
                 layer.pop("per_window_rate", None)
             result["tif"] = tif_stats
+        # 每窗实际发出的消息数的平均（TIF 为发送层 |Δq| 之和，LIF 为发送层脉冲数之和；同结构 LIF 的值即通信预算）
+        messages = mean_messages(net, result["layers"], result.get("tif"))
+        if messages is not None:
+            result["messages_mean"] = messages
     if full:
         pd, fa = roc.result()
         tp, fp, fn, npos = (confusion_sum[:, j] for j in range(4))
@@ -1267,9 +1275,8 @@ def mode_train(args, cfg):
     if comm is not None:
         if history and history[-1].get("comm"):
             comm.mu = float(history[-1]["comm"]["mu_end"])                  # 续训：乘子接着上一轮
-        print("通信预算训练（峰值带宽，SOP 按合并解码器口径）：单窗 SOP 预算 %.4g，违约比例上限 %.0f%%，对偶步长 %g，"
-              "各层系数 %s" % (comm.budget, 100.0 * comm.alpha, comm.dual_lr,
-                            " ".join("%s %.3g" % (n, c) for n, c in zip(LAYER_NAMES, comm.coef))), flush=True)
+        print("通信预算训练（每窗消息数的峰值约束）：每窗消息预算 %.4g，违约比例上限 %.0f%%，对偶步长 %g，"
+              "发送层 %s" % (comm.budget, 100.0 * comm.alpha, comm.dual_lr, " ".join(net.message_layers())), flush=True)
     subset = select_subset(train_file_names(cfg), int(cfg["train_subset_size"]), seed + 2000)
     train_set = EvUAVStream(cfg["root"], "train", cfg)
     execution, input_device = speed_options(cfg)
@@ -1315,16 +1322,15 @@ def mode_train(args, cfg):
         train_seconds = time.perf_counter() - t0
         grad_mean = {k: v / max(n_seq, 1) for k, v in grad_acc.items()}
         grad_clip_stats = clip_statistics(total_norms, clipped_steps, float(cfg["grad_clip"]))
-        val = evaluate_split(net, cfg, q99, device, "val", cfg["state_mode"], collect_layers=True,
-                             sop_coefficients=None if comm is None else (comm.base, comm.coef))
+        val = evaluate_split(net, cfg, q99, device, "val", cfg["state_mode"], collect_layers=True)
         sub = None
         if subset_due(epoch, epochs, int(cfg.get("train_subset_every", 1))):
             sub = evaluate_split(net, cfg, q99, device, "train", cfg["state_mode"], names=subset)
         taus = tau_statistics(net)
         if comm_record is not None and val.get("tif"):
-            # 只作对照、不参与优化：验证集上与预算同口径（合并解码器）的平均 SOP 与单窗 SOP 的 p95
-            comm_record["val_sop"] = float(comm.sop({n: val["tif"][n]["message_abs_rate"] for n in LAYER_NAMES}))
-            comm_record["val_sop_p95"] = (val.get("sop_per_window") or {}).get("p95")
+            # 只作对照、不参与优化：验证集上每窗消息数的平均与 p95（与预算同口径）
+            comm_record["val_messages"] = val.get("messages_mean")
+            comm_record["val_messages_p95"] = (val.get("messages_per_window") or {}).get("p95")
         record = {"epoch": epoch, "seed": seed, "lr": lr, "loss_per_event": loss_sum / max(event_sum, 1),
                   "val_iou": val["iou"], "val_acc": val["acc"],
                   "train_subset_iou": sub["iou"] if sub else None, "train_subset_acc": sub["acc"] if sub else None,
@@ -1364,11 +1370,11 @@ def mode_train(args, cfg):
                                                 for n in LAYER_NAMES
                                                 if "baseline_level_mean" in record["tif"][n])), flush=True)
         if comm_record is not None:
-            print("  [comm 峰值/合并口径] 训练中 SOP 均值 %.4g、单窗 p95 %.4g / 预算 %.4g | 违约窗 %.1f%%（目标 <= %.0f%%）"
+            print("  [comm 每窗消息数] 训练中均值 %.4g、单窗 p95 %.4g / 预算 %.4g | 违约窗 %.1f%%（目标 <= %.0f%%）"
                   " | 验证集均值 %.4g、单窗 p95 %.4g | mu %.4f -> %.4f" % (
-                      comm_record["sop_est_mean"] or 0.0, comm_record["sop_window_p95"] or 0.0, comm_record["budget"],
-                      100.0 * (comm_record["violation_mean"] or 0.0), 100.0 * comm_record["alpha"],
-                      comm_record.get("val_sop") or 0.0, comm_record.get("val_sop_p95") or 0.0,
+                      comm_record["messages_est_mean"] or 0.0, comm_record["messages_window_p95"] or 0.0,
+                      comm_record["budget"], 100.0 * (comm_record["violation_mean"] or 0.0), 100.0 * comm_record["alpha"],
+                      comm_record.get("val_messages") or 0.0, comm_record.get("val_messages_p95") or 0.0,
                       comm_record["mu_start"], comm_record["mu_end"]), flush=True)
         for w in record["warnings"]:
             print("  [health]", w, flush=True)

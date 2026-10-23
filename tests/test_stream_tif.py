@@ -474,10 +474,10 @@ class TIFEndToEndTests(unittest.TestCase):
                 self.assertEqual(set(record["tif_parameters"]), set(LAYER_NAMES), config)
                 self.assertIn("theta_mean", record["tif_parameters"]["enc2"])
                 self.assertIn("dead_channel_frac", record["tif"]["dec3"])
-                self.assertEqual(record["comm"] is not None, "comm_budget_sop" in cfg, config)   # 通信预算训练（12.14）
-                if record["comm"] is not None:                                    # 峰值约束，合并口径（12.32）
-                    self.assertEqual((record["comm"]["mode"], record["comm"]["accounting"]), ("peak", "merged"))
-                    self.assertIsNotNone(record["comm"]["val_sop_p95"])
+                self.assertEqual(record["comm"] is not None, "comm_budget_messages" in cfg, config)   # 通信预算（12.35）
+                if record["comm"] is not None:                                    # 每窗消息数的峰值约束
+                    self.assertEqual((record["comm"]["mode"], record["comm"]["unit"]), ("peak", "messages"))
+                    self.assertIsNotNone(record["comm"]["val_messages_p95"])
                 adapt = bool(cfg["tif"].get("adapt", False))                     # 工作点自校准（12.1）
                 self.assertEqual("tau_b_mean" in record["tif_parameters"]["enc1"], adapt, config)
                 only = ("enc1",) if adapt else ()
@@ -494,7 +494,8 @@ class TIFEndToEndTests(unittest.TestCase):
                 T.mode_eval(args, cfg)
                 result = json.loads((run / "eval_val_best_val_iou_seed37.json").read_text(encoding="utf-8"))
                 self.assertEqual(result["tif"]["levels"], 7)
-                self.assertIn("sop_per_window", result["carry"])                   # 单窗 SOP 分布（12.21）
+                self.assertIn("sop_per_window", result["carry"])                   # 单窗 SOP 分布（能耗，只用于报告）
+                self.assertIn("messages_per_window", result["carry"])              # 每窗消息数（通信约束的检验口径）
                 self.assertNotIn("per_window_rate", result["carry"]["tif"]["enc1"])
                 for mode in ("carry", "reset_each_window"):
                     self.assertEqual(set(result[mode]["tif"]), set(LAYER_NAMES))

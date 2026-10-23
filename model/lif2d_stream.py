@@ -442,6 +442,7 @@ class StreamingTIF2d(StreamingLIF2d):
             q_prev = torch.zeros_like(q) if prev is None else self.level(prev)
             delta = q - q_prev
             s["elements"] += memory.numel()
+            s["neurons"] = int(memory[0].numel())          # 每个样本（每条流）的神经元数，取自实际张量
             s["windows"] += 1
             s["occupied"] += (memory > 0).sum().double()
             s["channel_active"] |= (memory > 0).flatten(2).any(2).any(0)
@@ -461,6 +462,7 @@ class StreamingTIF2d(StreamingLIF2d):
         message_abs_rate      平均 |Δq|（单位脉冲口径：每个单位电平变化 = 一次突触累加）
         message_nonzero_rate  Δq 非零的比例（graded 口径：一条消息携带一个小整数）
         level_mean / occupancy / saturation  电平均值、M>0 的比例、电平到顶（q = D）的比例
+        neurons               本层神经元数（每个样本），取自实际张量；每窗消息数 = message_abs_rate * neurons
         dead_channel_frac     评估期间 M 始终为 0 的通道占比（死通道；不量化时与"从未发放"相同）
         baseline_level_mean   adapt=True：基线 relu(b/w) 的平均值，以 theta 为单位
         """
@@ -475,7 +477,7 @@ class StreamingTIF2d(StreamingLIF2d):
                "occupancy": float(s["occupied"]) / n,
                "saturation": float(s["saturated"]) / n,
                "dead_channel_frac": 1.0 - float(s["channel_active"].double().mean()),
-               "windows": int(s["windows"])}
+               "windows": int(s["windows"]), "neurons": int(s["neurons"])}
         if self.adapt:
             out["baseline_level_mean"] = float(s["baseline_sum"]) / n
         if getattr(self, "_per_window", None) is not None:

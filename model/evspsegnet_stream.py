@@ -40,6 +40,9 @@ from utils.stream_common import gains_from_positive_samples
 
 LAYER_NAMES = ("enc1", "enc2", "enc3", "enc4", "dec3", "dec2", "dec1")
 DECODER_STAGES = (("up3", "dec3"), ("up2", "dec2"), ("up1", "dec1"))
+# 发出消息的层：输出（脉冲 / Δq）被其他层接收。dec1 的输出不被任何层接收（读出头读取的是 dec1 的 u_pre），不发消息。
+# 改动 forward / forward_chunk 的连接时必须同步修改；tests/test_stream_comm.py 用扰动逐层核对这一声明。
+MESSAGE_LAYERS = ("enc1", "enc2", "enc3", "enc4", "dec3", "dec2")
 # surrogate：10-19 两端代理梯度（实验失败，默认关）
 # adapt：输入层工作点自校准（只在 enc1 打开，偏差校正的慢基线，Stream-SNN-Innovations.md 12.10），默认关；
 #   关时与基础版逐位相同。属事件表示层的补充项（第 3 项移交事件表示层，12.7）
@@ -342,6 +345,10 @@ class EvSpSegNetStream(nn.Module):
         self.v_threshold = float(v_threshold)
         # 标记增益是否已校准；随 checkpoint 保存，评估时禁止重新校准
         self.register_buffer("gain_calibrated", torch.tensor(False))
+
+    def message_layers(self):
+        """发出消息的层名（见 MESSAGE_LAYERS）；通信预算与消息统计只通过这个接口得知网络连接。"""
+        return MESSAGE_LAYERS
 
     def blocks(self):
         """按前向拓扑顺序返回 7 个脉冲卷积单元（校准必须按这个顺序逐层进行）。"""
@@ -898,3 +905,27 @@ def estimate_operations(net, height, width, firing_rates, events_per_window, inp
                       "mac_event_driven 为事件驱动口径（enc1 只计非零输入），与基线稀疏卷积同口径")
     return result
 
+
+
+def window_sop_summary(net, tif_stats, height, width):
+    """评估（能耗口径，只用于报告）：由各层逐窗的 |Δq| 率（stop_stats 的 per_window_rate）算单窗 SOP 的分布。
+
+    SOP 对各层发放率是线性的：SOP = base + sum_l c_l * r_l，c_l 由 estimate_operations 对各层逐一把发放率置 1 求得，
+    与按网络自身结构的 estimate_operations 同口径。没有逐窗统计时返回 None。
+    """
+    if not tif_stats or any("per_window_rate" not in tif_stats.get(n, {}) for n in LAYER_NAMES):
+        return None
+    zero = {name: 0.0 for name in LAYER_NAMES}
+    base = estimate_operations(net, height, width, zero, 0.0)["sop"]
+    coef = []
+    for name in LAYER_NAMES:
+        rates = dict(zero)
+        rates[name] = 1.0
+        coef.append(estimate_operations(net, height, width, rates, 0.0)["sop"] - base)
+    rates = np.array([tif_stats[n]["per_window_rate"] for n in LAYER_NAMES], dtype=np.float64)   # [7, 窗数]
+    if rates.shape[1] == 0:
+        return None
+    values = base + np.asarray(coef, dtype=np.float64).dot(rates)
+    return {"windows": int(values.size), "mean": float(values.mean()), "p50": float(np.percentile(values, 50)),
+            "p95": float(np.percentile(values, 95)), "p99": float(np.percentile(values, 99)),
+            "max": float(values.max())}
