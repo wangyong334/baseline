@@ -12,6 +12,8 @@
            --dump 时导出逐事件、逐年龄的概率，供 tools/lag_publish.py 做自适应发布（在 val 上定规则，在 test 上报告）
 配置：configs/evisseg_stream_lag*.yaml 只有 LAG 一节，base_config 指向 V5 的配置（数据路径、评测口径），
 backbone_checkpoint 指向 V5 的权重；网络结构、q99、pos_weight 一律取自 checkpoint。
+V6b（13.15）：骨干换成带背景率通道的版本（DATA.background，dataset/background.py）时，读出头的出生窗特征另接
+事件像素在出生窗的 4 个背景率（birth_extra = 骨干读出头读的背景通道数）；背景先验 mu_ref 取自 checkpoint 并按其统计核对。
 """
 import os
 
@@ -31,6 +33,8 @@ import torch.nn.functional as F  # noqa: E402
 import train_stream_v1 as V5  # noqa: E402
 from dataset.ev_uav_stream import EvUAVStream  # noqa: E402
 from dataset.stream_source import make_window_source  # noqa: E402
+from dataset.background import resolve_background  # noqa: E402
+from model.evspsegnet_stream import trailing_channels_at_events  # noqa: E402
 from model.lag_readout import (LAG_VARIANTS, LagBuffer, LagReadout, birth_features, lag_logits,  # noqa: E402
                                lag_maps)
 from utils.lag_metrics import iou_acc_counts, split_report  # noqa: E402
@@ -40,7 +44,8 @@ REQUIRED_KEYS = ("base_config", "backbone_checkpoint", "lag_variants", "lags", "
                  "lag_lr", "lag_lr_end", "lag_grad_clip", "lag_streams", "lag_chunk", "lag_save_root")
 OPTIONAL_KEYS = ("lag_eval_chunk",)
 # checkpoint 与 base_config 必须一致的数据与输入键（保证读的是训练骨干时的同一数据集）
-DATA_KEYS = ("height", "width_px", "pad_height", "pad_width", "window_ms", "n_windows", "time_bins", "input_clip")
+DATA_KEYS = ("height", "width_px", "pad_height", "pad_width", "window_ms", "n_windows", "time_bins", "input_clip",
+             "background")
 EVAL_KEYS = ("threshold", "pd_detT", "correct_thresh", "rolling_window", "segments", "timing_warmup_windows")
 
 
@@ -114,16 +119,23 @@ def load_backbone(cfg, device, execution, input_device):
     for p in net.parameters():
         p.requires_grad_(False)
     stats = ckpt["stats"]
+    resolve_background(net_cfg, stats)                    # 背景先验与骨干训练时相同（只核对）
     q99 = np.asarray(stats["q99"], dtype=np.float32)
     pos_weight = min(float(stats["train_neg"]) / float(stats["train_pos"]), float(net_cfg["pos_weight_cap"]))
     return net, net_cfg, q99, pos_weight
 
 
-def make_readouts(cfg, net_cfg, device, dtype):
-    """每个 variant 一组滞后读出头（新模块在骨干构造之后创建，种子固定）。"""
+def make_readouts(cfg, net_cfg, device, dtype, birth_extra=0):
+    """每个 variant 一组滞后读出头（新模块在骨干构造之后创建，种子固定）。birth_extra = 骨干读出头读的背景通道数。"""
     torch.manual_seed(int(cfg["seed"]) + 6000)
-    return {v: LagReadout(tuple(net_cfg["channels"]), int(cfg["lags"]), v, int(cfg["lag_hidden"])).to(
-        device=device, dtype=dtype) for v in cfg["lag_variants"]}
+    return {v: LagReadout(tuple(net_cfg["channels"]), int(cfg["lags"]), v, int(cfg["lag_hidden"]),
+                          birth_extra=birth_extra).to(device=device, dtype=dtype) for v in cfg["lag_variants"]}
+
+
+def birth_background(net, x, events):
+    """事件像素在出生窗的背景率 [n, nb]（骨干不读背景时为 None）。"""
+    nb = int(net.readout_background)
+    return trailing_channels_at_events(x, events, nb) if nb else None
 
 
 def readout_parameters(readouts):
@@ -189,7 +201,8 @@ def train_epoch(net, readouts, dataset, lengths, optimizer, cfg, net_cfg, q99, p
                 t, b = events["t"], events["b"]
                 buffer.add(g=start + t, end=ends[t, b], b=b, y=events["y"], x=events["x"], p=events["p"],
                            t_local=events["t_local"], z0=logits,
-                           birth=birth_features(maps, t * len(plan) + b, events["y"], events["x"]),
+                           birth=birth_features(maps, t * len(plan) + b, events["y"], events["x"],
+                                                birth_background(net, x, events)),
                            label=labels, key=torch.zeros_like(t))
         groups = lag_logits(readouts, buffer, maps, start, k, len(plan))
         if groups:
@@ -270,7 +283,8 @@ def evaluate_sequence(net, readouts, seq, cfg, net_cfg, q99, device, execution):
             t = events["t"]
             buffer.add(g=start + t, end=torch.full_like(t, n_windows), b=events["b"], y=events["y"], x=events["x"],
                        p=events["p"], t_local=events["t_local"], z0=logits,
-                       birth=birth_features(maps, t + events["b"], events["y"], events["x"]),
+                       birth=birth_features(maps, t + events["b"], events["y"], events["x"],
+                                            birth_background(net, x, events)),
                        label=labels, key=torch.from_numpy(idx).to(device))
         for v, d, rows, logit in lag_logits(readouts, buffer, maps, start, end - start, 1):
             probs[v][d, rows["key"].cpu().numpy()] = torch.sigmoid(logit).float().cpu().numpy()
@@ -314,7 +328,7 @@ def quick_lag_iou(net, readouts, dataset, cfg, net_cfg, q99, device):
 
 def save_readout(path, readout, epoch, score, cfg):
     torch.save({"model": readout.state_dict(), "variant": readout.variant, "lags": readout.lags,
-                "epoch": epoch, "score": score, "config": cfg,
+                "birth_extra": readout.birth_extra, "epoch": epoch, "score": score, "config": cfg,
                 "backbone_sha256": file_sha256(cfg["backbone_checkpoint"])}, str(path))
 
 
@@ -323,7 +337,7 @@ def mode_smoke(args, cfg):
     device = torch.device(args.device)
     net, net_cfg, q99, pos_weight = load_backbone(cfg, device, "layer", "gpu")
     dtype = next(net.parameters()).dtype
-    readouts = make_readouts(cfg, net_cfg, device, dtype)
+    readouts = make_readouts(cfg, net_cfg, device, dtype, net.readout_background)
     optimizer = torch.optim.Adam([p for r in readouts.values() for p in r.parameters()], lr=float(cfg["lag_lr"]))
     names = sorted(n for n in os.listdir(os.path.join(cfg["root"], "train")) if n.endswith(".npz"))
     train_set = EvUAVStream(cfg["root"], "train", net_cfg, names[:int(cfg["lag_streams"])])
@@ -374,7 +388,7 @@ def mode_train(args, cfg):
     device = torch.device(args.device)
     net, net_cfg, q99, pos_weight = load_backbone(cfg, device, "layer", "gpu")
     dtype = next(net.parameters()).dtype
-    readouts = make_readouts(cfg, net_cfg, device, dtype)
+    readouts = make_readouts(cfg, net_cfg, device, dtype, net.readout_background)
     root = Path(cfg["lag_save_root"])
     root.mkdir(parents=True, exist_ok=True)
     metrics_path = root / "metrics.jsonl"
@@ -438,11 +452,13 @@ def mode_eval(args, cfg):
     out_path = root / ("eval_lag_%s.json" % args.split)
     if out_path.exists() and not args.overwrite:
         raise RuntimeError("结果已存在: %s（使用 --overwrite 覆盖）" % out_path)
-    readouts, epochs = make_readouts(cfg, net_cfg, device, dtype), {}
+    readouts, epochs = make_readouts(cfg, net_cfg, device, dtype, net.readout_background), {}
     for v, r in readouts.items():
         ckpt = torch.load(str(root / ("best_lag_%s.pt" % v)), map_location=device)
         if ckpt["backbone_sha256"] != file_sha256(cfg["backbone_checkpoint"]):
             raise RuntimeError("读出头训练时的骨干与当前 backbone_checkpoint 不是同一个文件")
+        if int(ckpt.get("birth_extra", 0)) != r.birth_extra:
+            raise RuntimeError("读出头的出生窗背景维数与骨干不一致")
         r.load_state_dict(ckpt["model"])
         r.eval()
         epochs[v] = int(ckpt["epoch"])

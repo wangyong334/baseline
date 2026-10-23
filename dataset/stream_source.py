@@ -7,13 +7,17 @@
          （"gpu" 指网络所在设备；单元测试里设备是 CPU，同一份代码照样运行）
 
 接口:
-    window(k)          -> (x [1,C,H,W], events{b,y,x,p,t_local}, labels [N], idx numpy [N])   供逐窗 forward
-    chunk(start, end)  -> (x [T,1,C,H,W], events{t,b,y,x,p,t_local}, labels [N], idx numpy [N]) 供 forward_chunk
+    window(k, fresh=False)          -> (x [1,C,H,W], events{b,y,x,p,t_local}, labels [N], idx numpy [N])   供逐窗 forward
+    chunk(start, end, fresh=False)  -> (x [T,1,C,H,W], events{t,b,y,x,p,t_local}, labels [N], idx numpy [N]) 供 forward_chunk
 事件按窗口先后、窗内按时间稳定排序排列；idx 是这些事件在 NPZ 文件中的原始下标，用于回填预测。
+C = 12 个计数通道；开启 DATA.background 时在后面再接 4 个背景率通道（dataset/background.py，V6b）。
+背景通道带跨窗状态：同一来源必须按时间顺序取窗；fresh=True 表示从这一窗起按新录像处理（与网络状态的清零同步，
+多流训练里由 assemble_streams 按 new_start 传入）。不开背景时 fresh 不起任何作用，输出与原实现逐位相同。
 """
 import numpy as np
 import torch
 
+from dataset.background import make_background_track
 from dataset.ev_uav_stream import window_to_device
 from dataset.stream_windows import normalization_table, num_input_channels
 
@@ -47,14 +51,21 @@ class NumpyWindowSource(object):
     def __init__(self, seq, cfg, q99, device, dtype=torch.float32):
         self.seq, self.cfg, self.q99 = seq, cfg, q99
         self.device, self.dtype = device, dtype
+        self.background = make_background_track(cfg, device)
 
-    def window(self, k):
-        x, events, labels, idx = window_to_device(self.seq, k, self.q99, self.cfg, self.device)
+    def window(self, k, fresh=False):
+        if self.background is None:
+            x, events, labels, idx = window_to_device(self.seq, k, self.q99, self.cfg, self.device)
+        else:
+            x, events, labels, idx, counts = window_to_device(self.seq, k, self.q99, self.cfg, self.device,
+                                                              return_counts=True)
+            whole = torch.from_numpy(counts[:2].astype(np.float32)).to(self.device)      # 整窗正 / 负极性计数
+            x = torch.cat([x, self.background.encode(whole.unsqueeze(0), k, fresh)], 1)
         x, events, labels = _cast(x, events, labels, self.dtype)
         return x, events, labels, idx
 
-    def chunk(self, start, end):
-        parts = [self.window(k) for k in range(start, end)]
+    def chunk(self, start, end, fresh=False):
+        parts = [self.window(k, fresh=fresh and k == start) for k in range(start, end)]
         x = torch.stack([part[0] for part in parts])
         events = {key: torch.cat([part[1][key] for part in parts]) for key in ("b", "y", "x", "p", "t_local")}
         events["t"] = torch.cat([torch.full((int(part[2].shape[0]),), i, dtype=torch.long, device=self.device)
@@ -101,8 +112,9 @@ class TorchWindowSource(object):
         self.table = upload(table.reshape(-1), torch.float32)
         self.table_base = upload(np.arange(self.channels, dtype=np.int64) * (self.n_sat + 1),
                                  torch.long).view(1, 1, self.channels, 1, 1)
+        self.background = make_background_track(cfg, device)
 
-    def chunk(self, start, end):
+    def chunk(self, start, end, fresh=False):
         a, b = int(self.bounds[start]), int(self.bounds[end])
         steps = int(end) - int(start)
         if steps <= 0:
@@ -116,13 +128,16 @@ class TorchWindowSource(object):
                               accumulate=True)
         lookup = counts.to(torch.long).clamp_(max=self.n_sat).view(steps, 1, self.channels, self.height, self.width)
         x = self.table[lookup + self.table_base]
+        if self.background is not None:
+            whole = counts.view(steps, self.channels, self.height, self.width)[:, :2]   # 整窗正 / 负极性计数
+            x = torch.cat([x, self.background.encode(whole, start, fresh).unsqueeze(1)], 2)
         events = {"t": self.window_of[a:b] - int(start),
                   "b": torch.zeros(b - a, dtype=torch.long, device=self.device),
                   "y": self.y[a:b], "x": self.x[a:b], "p": self.p[a:b], "t_local": self.t_local[a:b]}
         x, events, labels = _cast(x, events, self.label[a:b], self.dtype)
         return x, events, labels, self.order[a:b]
 
-    def window(self, k):
-        x, events, labels, idx = self.chunk(k, k + 1)
+    def window(self, k, fresh=False):
+        x, events, labels, idx = self.chunk(k, k + 1, fresh)
         del events["t"]
         return x[0], events, labels, idx

@@ -8,6 +8,7 @@ import os
 import numpy as np
 import torch
 
+from dataset.background import background_enabled
 from dataset.stream_windows import build_window_input, load_npz_events
 
 
@@ -63,17 +64,22 @@ def make_sequence_loader(dataset, shuffle, seed, num_workers):
                                        collate_fn=first_item_collate, generator=generator)
 
 
-def window_to_device(seq, k, q99, cfg, device):
-    """把序列的第 k 个窗口转换成网络输入。
+def window_to_device(seq, k, q99, cfg, device, return_counts=False):
+    """把序列的第 k 个窗口转换成网络输入（12 个计数通道）。
 
-    输出: (x, events, labels, idx)
+    输出: (x, events, labels, idx)；return_counts=True 时另返回 numpy 计数 [12, pad_height, pad_width]
         x       float32 [1, 12, pad_height, pad_width]
         events  字典 b/y/x (long [N])、p/t_local (float [N])，N 为本窗事件数（可为 0）
         labels  float32 [N]
         idx     numpy 原始事件下标，用于把预测回填到文件顺序
+    开启背景率通道（DATA.background）时，背景通道需要跨窗状态，只能由 dataset/stream_source.py 的数据来源按时间顺序构造；
+    这里直接调用（不取计数）会报错，避免静默地少 4 个通道。
     """
-    inp, idx = build_window_input(seq, k, q99, cfg["time_bins"], cfg["pad_height"],
-                                  cfg["pad_width"], cfg["input_clip"])
+    if not return_counts and background_enabled(cfg):
+        raise ValueError("开启 background 时请用 dataset.stream_source.make_window_source 按时间顺序构造输入")
+    built = build_window_input(seq, k, q99, cfg["time_bins"], cfg["pad_height"],
+                               cfg["pad_width"], cfg["input_clip"], return_counts=return_counts)
+    inp, idx = built[0], built[1]
     x = torch.from_numpy(inp).unsqueeze(0).to(device)
     n = int(idx.shape[0])
     events = {
@@ -84,4 +90,6 @@ def window_to_device(seq, k, q99, cfg, device):
         "t_local": torch.from_numpy(seq.t_local[idx]).to(device),
     }
     labels = torch.from_numpy(seq.label[idx]).to(device)
+    if return_counts:
+        return x, events, labels, idx, built[2]
     return x, events, labels, idx

@@ -29,7 +29,8 @@ from train_stream_v1 import build_net, write_json  # noqa: E402  先导入：它
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
-from dataset.ev_uav_stream import EvUAVStream, window_to_device  # noqa: E402
+from dataset.ev_uav_stream import EvUAVStream  # noqa: E402
+from dataset.stream_source import NumpyWindowSource  # noqa: E402
 from model.evspsegnet_stream import count_parameters, merge_decoder_state_dict  # noqa: E402
 
 FLOAT64_TOLERANCE = 1e-9
@@ -80,9 +81,10 @@ def real_sequences(cfg, stats, split, n_sequences, n_windows, device):
     count = min(int(n_sequences), len(dataset))
 
     def windows_of(seq):
-        """按时间顺序产出一个序列的窗口输入。"""
+        """按时间顺序产出一个序列的窗口输入（逐窗 numpy 构造；带背景率通道时背景状态按时间顺序递推）。"""
+        source = NumpyWindowSource(seq, cfg, q99, device)
         for k in range(min(int(n_windows), seq.n_windows)):
-            x, events, _, _ = window_to_device(seq, k, q99, cfg, device)
+            x, events, _, _ = source.window(k)
             yield x, events
 
     def factory():

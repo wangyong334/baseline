@@ -1,0 +1,16 @@
+# V6b 在 EV-Flying ×4 上：除 base_config / backbone_checkpoint / lag_epochs / lag_save_root 外与 configs/evisseg_stream_lag_bg.yaml 相同
+LAG:
+  base_config: configs/evisseg_stream_tif_bg_evflying.yaml
+  backbone_checkpoint: log/stream_tif_bg_evflying_x4_seed37/best_val_iou_seed37.pt
+  lag_variants: [multiscale]   # V6a：pixel 与 multiscale 持平（13.15），只留 multiscale（读得更多、不比 pixel 差）
+  lags: 5
+  lag_hidden: 32
+  # 轮数规则：总更新次数约 5000（EV-Flying 训练集 50418 窗，B=4、片段 16 窗 -> 每轮约 790 次更新）
+  lag_epochs: 6
+  lag_lr: 0.001
+  lag_lr_end: 0.0001
+  lag_grad_clip: 1.0
+  lag_streams: 4
+  lag_chunk: 16
+  lag_eval_chunk: 32
+  lag_save_root: log/stream_lag_v6b_evflying_x4_seed37

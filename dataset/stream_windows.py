@@ -223,17 +223,19 @@ def normalization_table(q99, clip_max, max_entries=1 << 22):
     return np.ascontiguousarray(table), n_sat
 
 
-def build_window_input(seq, k, q99, time_bins, pad_height, pad_width, clip_max):
+def build_window_input(seq, k, q99, time_bins, pad_height, pad_width, clip_max, return_counts=False):
     """构造第 k 个窗口的网络输入与读出所需的逐事件数据。
 
-    输出: (inp, idx)
-        inp  float32 [C, pad_height, pad_width] 归一化后的 12 通道输入
-        idx  该窗口事件的原始下标（按时间稳定排序），用于逐事件读出和回填
+    输出: (inp, idx)；return_counts=True 时为 (inp, idx, counts)
+        inp     float32 [C, pad_height, pad_width] 归一化后的 12 通道输入
+        idx     该窗口事件的原始下标（按时间稳定排序），用于逐事件读出和回填
+        counts  int64 [C, pad_height, pad_width] 归一化之前的计数（背景率通道要用整窗计数，见 dataset/background.py）
     """
     idx = seq.window_index(k)
     counts = count_channels(seq.x[idx], seq.y[idx], seq.p[idx], seq.inner_bin[idx],
                             time_bins, pad_height, pad_width)
-    return normalize_counts(counts, q99, clip_max), idx
+    inp = normalize_counts(counts, q99, clip_max)
+    return (inp, idx, counts) if return_counts else (inp, idx)
 
 
 def check_window_partition(seq, window_ms):

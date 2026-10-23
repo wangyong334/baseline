@@ -34,12 +34,12 @@ LAGS = 3
 NET_CFG = dict(CFG, input_device="cpu", execution="step", lags=LAGS, lag_eval_chunk=5)
 
 
-def random_readouts(seed=11, dtype=torch.float64):
+def random_readouts(seed=11, dtype=torch.float64, birth_extra=0):
     """两个 variant 的读出头，最后一层设成非零（否则 logit_d 恒等于 z0，测试测不出东西）。"""
     torch.manual_seed(seed)
     out = {}
     for v in ("pixel", "multiscale"):
-        r = LagReadout(SMALL, LAGS, v, hidden=8).to(dtype)
+        r = LagReadout(SMALL, LAGS, v, hidden=8, birth_extra=birth_extra).to(dtype)
         for head in r.heads:
             torch.nn.init.normal_(head[2].weight, std=0.5)
             torch.nn.init.normal_(head[2].bias, std=0.5)
@@ -134,13 +134,14 @@ class InferenceTests(unittest.TestCase):
     def setUp(self):
         import train_stream_lag as L
         self.L = L
+        self.cfg = NET_CFG
         self.net = make_tif_net(merged=False)
         self.net.eval()
         self.readouts = random_readouts()
 
     def run_eval(self, seq, execution):
         with torch.no_grad():
-            return self.L.evaluate_sequence(self.net, self.readouts, seq, NET_CFG, NET_CFG, Q99,
+            return self.L.evaluate_sequence(self.net, self.readouts, seq, self.cfg, self.cfg, Q99,
                                             torch.device("cpu"), execution)
 
     def test_step_layer_equal_and_d0_is_v5(self):
@@ -152,7 +153,7 @@ class InferenceTests(unittest.TestCase):
             self.assertLess(float(np.abs(step[v] - layer[v]).max()), 1e-6, v)
             self.assertFalse(np.allclose(step[v][1], step[v][0]), v)          # 读出头确实改变了分数
         with torch.no_grad():
-            probs, _ = T.run_sequence(self.net, seq, NET_CFG, Q99, torch.device("cpu"), "carry")
+            probs, _ = T.run_sequence(self.net, seq, self.cfg, Q99, torch.device("cpu"), "carry")
         self.assertTrue(np.array_equal(step["pixel"][0], probs))             # d = 0 与 V5 逐位相同
         self.assertTrue(np.array_equal(step["multiscale"][0], probs))
         self.assertTrue(np.array_equal(avail, np.minimum(LAGS, WINDOWS - 1 - win)))
@@ -183,7 +184,7 @@ class InferenceTests(unittest.TestCase):
         readouts = copy.deepcopy(self.readouts)
         params = [p for r in readouts.values() for p in r.parameters()]
         optimizer = torch.optim.SGD(params, lr=0.0)
-        cfg = dict(NET_CFG, lag_chunk=5, lag_streams=2, lag_grad_clip=1.0)
+        cfg = dict(self.cfg, lag_chunk=5, lag_streams=2, lag_grad_clip=1.0)
         collected = []
         original = L.lag_logits
 
@@ -371,7 +372,7 @@ class EndToEndTests(unittest.TestCase):
             dump = root / "lag" / "dump_val_multiscale.npz"
             prob, seqs, meta = P.load_dump(str(dump))
             self.assertEqual(prob.shape[0], 3)
-            deadline, margin, selection = P.choose_rule(prob, seqs, meta["threshold"], P.DEFAULT_MARGINS, 0.005)
+            deadline, margin, selection = P.choose_rule(prob, seqs, meta["threshold"], P.DEFAULT_MARGINS, 0.9)
             cfgp = {k: meta[k] for k in ("threshold", "pd_detT", "correct_thresh", "height", "width_px")}
             report = P.apply_rule(prob, seqs, cfgp, deadline, margin)
             self.assertGreaterEqual(report["iou"], selection["target_iou"] - 1e-12)

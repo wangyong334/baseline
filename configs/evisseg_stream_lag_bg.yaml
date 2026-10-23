@@ -1,0 +1,17 @@
+# V6b：滞后读出头 + 自适应发布，骨干换成带背景率通道的版本（Stream-SNN-Innovations.md 13.15），EV-UAV
+# 除 base_config / backbone_checkpoint / lag_variants / lag_save_root 外与 configs/evisseg_stream_lag.yaml 相同（测试核对）
+LAG:
+  base_config: configs/evisseg_stream_tif_bg.yaml
+  backbone_checkpoint: log/stream_tif_bg_seed37/best_val_iou_seed37.pt
+  lag_variants: [multiscale]   # V6a：pixel 与 multiscale 持平（13.15），只留 multiscale（读得更多、不比 pixel 差）
+  lags: 5                     # D：最多再读 5 窗（250 ms，与 V2/V3 相同）
+  lag_hidden: 32              # 与 V5 读出头相同
+  # 轮数规则：总更新次数约 5000（EV-UAV 训练集 99 x 160 窗，B=4、片段 16 窗 -> 每轮约 248 次更新）
+  lag_epochs: 20
+  lag_lr: 0.001
+  lag_lr_end: 0.0001          # 按 epoch 线性衰减
+  lag_grad_clip: 1.0
+  lag_streams: 4              # 与 V5 训练相同的多流排布
+  lag_chunk: 16
+  lag_eval_chunk: 32          # 训练中验证（逐片段执行）每次处理的窗数
+  lag_save_root: log/stream_lag_v6b_seed37

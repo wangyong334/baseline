@@ -31,9 +31,11 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 
-from dataset.ev_uav_stream import EvUAVStream, make_sequence_loader, window_to_device  # noqa: E402
-from dataset.stream_source import INPUT_DEVICES, make_window_source  # noqa: E402
-from dataset.stream_windows import num_input_channels, refill_by_index  # noqa: E402
+from dataset.background import (BACKGROUND_CHANNELS, background_enabled, input_channel_count,  # noqa: E402
+                                resolve_background)
+from dataset.ev_uav_stream import EvUAVStream, make_sequence_loader  # noqa: E402
+from dataset.stream_source import INPUT_DEVICES, NumpyWindowSource, make_window_source  # noqa: E402
+from dataset.stream_windows import refill_by_index  # noqa: E402
 from model.evspsegnet_stream import (LAYER_NAMES, EvSpSegNetStream, calibrate_gains,  # noqa: E402
                                      count_parameters, estimate_operations, tif_settings, window_sop_summary)
 from model.lif2d_stream import (StreamingLIF2d, StreamingDualMemoryLIF2d, StreamingTIF2d,  # noqa: E402
@@ -46,7 +48,7 @@ from utils.stream_metrics import (SWEEP_THRESHOLDS, FastRoc, first_detection_lat
                                   threshold_counts, window_confusion)
 
 SOURCE_FILES = ("train_stream_v1.py", "dataset/stream_windows.py", "dataset/ev_uav_stream.py",
-                "dataset/stream_source.py", "model/lif2d_stream.py", "model/evspsegnet_stream.py",
+                "dataset/stream_source.py", "dataset/background.py", "model/lif2d_stream.py", "model/evspsegnet_stream.py",
                 "utils/stream_common.py", "utils/stream_metrics.py", "utils/eval.py", "utils/comm_budget.py")
 EXECUTIONS = ("step", "layer")
 TRAINERS = ("sequence", "streams")
@@ -193,6 +195,7 @@ def load_stats(cfg):
     """读取训练集统计 JSON（由 tools/stream_train_stats.py 生成），返回 (stats, q99, pos_weight)。
 
     pos_weight 按规则 min(train_neg/train_pos, pos_weight_cap) 重新计算并与 JSON 核对。
+    开启背景率通道时，同时由训练集统计导出背景先验 mu_ref，写进 cfg["background_mu_ref"]（dataset/background.py）。
     """
     with open(cfg["stats_path"], "r", encoding="utf-8") as stream:
         stats = json.load(stream)
@@ -202,6 +205,7 @@ def load_stats(cfg):
     pos_weight = min(float(stats["train_neg"]) / float(stats["train_pos"]), float(cfg["pos_weight_cap"]))
     if abs(pos_weight - float(stats["pos_weight"])) > 1e-9:
         raise ValueError("统计文件中的 pos_weight 与当前 cap 规则不一致，请重新生成统计文件")
+    resolve_background(cfg, stats)
     return stats, q99, pos_weight
 
 
@@ -210,20 +214,23 @@ def build_net(cfg, device):
     if cfg.get("spiking_decoder", False):
         raise ValueError("spiking_decoder（ConvT 后加 LIF 的 10 层版本）已删除；请改用 merged_decoder")
     net = EvSpSegNetStream(
-        in_channels=2 + 2 * int(cfg["time_bins"]), channels=tuple(cfg["channels"]),
+        in_channels=input_channel_count(cfg), channels=tuple(cfg["channels"]),
         neuron=cfg["neuron"], norm=cfg["norm"], state_mode=cfg["state_mode"],
         readout_hidden=int(cfg["readout_hidden"]), dt_ms=float(cfg["window_ms"]),
         tau_init_ms=float(cfg["tau_init_ms"]), tau_min_ms=float(cfg["tau_min_ms"]),
         tau_max_ms=float(cfg["tau_max_ms"]), v_threshold=float(cfg["v_threshold"]),
         merged_decoder=cfg.get("merged_decoder", False), dual_memory=cfg.get("dual_memory"),
         subthreshold_residual=cfg.get("subthreshold_residual"),
-        tif=cfg.get("tif") if cfg["neuron"] == "tif" else None)
+        tif=cfg.get("tif") if cfg["neuron"] == "tif" else None,
+        readout_background=BACKGROUND_CHANNELS if background_enabled(cfg) else 0)
     return net.to(device)
 
 
 def design_version(net):
     """写入 run_config 与 checkpoint 的设计版本标记。"""
     if net.is_tif:
+        if net.readout_background:
+            return "v6-tif-background"
         if net.tif_config["adapt"]:
             return "v5-tif-input-adapt"
         return "v5-tif"
@@ -272,9 +279,10 @@ def calibration_factory(cfg, q99, device):
     n_windows = int(cfg["calib_windows"])
 
     def windows_of(seq):
-        """按时间顺序产出一个序列前 n_windows 个窗口的 (x, events)。"""
+        """按时间顺序产出一个序列前 n_windows 个窗口的 (x, events)（逐窗 numpy 构造，不开背景时即原 window_to_device）。"""
+        source = NumpyWindowSource(seq, cfg, q99, device)
         for k in range(min(n_windows, seq.n_windows)):
-            x, events, _, _ = window_to_device(seq, k, q99, cfg, device)
+            x, events, _, _ = source.window(k)
             yield x, events
 
     def factory():
@@ -811,13 +819,14 @@ class StreamSources(object):
 def assemble_streams(sources, pieces, steps, cfg, device, dtype):
     """把各流的片段组成拼成一个批：x [T,B,C,H,W]、events（b = 流号，t = 片段内窗号）、labels [N]、keep [T,B]。"""
     batch = len(pieces)
-    x = torch.zeros((steps, batch, num_input_channels(cfg["time_bins"]), int(cfg["pad_height"]),
+    x = torch.zeros((steps, batch, input_channel_count(cfg), int(cfg["pad_height"]),
                      int(cfg["pad_width"])), dtype=dtype, device=device)
     keep = torch.ones((steps, batch), dtype=dtype, device=device)
     parts, labels = {key: [] for key in ("t", "b", "y", "x", "p", "t_local")}, []
     for b, stream in enumerate(pieces):
         for index, lo, hi, offset, new_start in stream:
-            xs, events, lab, _ = sources.get(index).chunk(lo, hi)
+            # new_start：该流在这一窗开始新录像（网络状态由 keep 清零）；背景状态同步从先验开始
+            xs, events, lab, _ = sources.get(index).chunk(lo, hi, fresh=new_start)
             x[offset:offset + (hi - lo), b] = xs[:, 0]
             if new_start:
                 keep[offset, b] = 0
@@ -1016,6 +1025,7 @@ def evaluate_split(net, cfg, q99, device, split, state_mode, names=None, full=Fa
     传感器尺寸取 cfg 的 height / width_px，EV-UAV 即 260x346），并统计逐窗 IoU、分段 IoU、首次检出延迟、耗时、理论运算量。
     序列长度可以不同（n_windows<=0 时按录像自身长度）：逐窗统计按窗号对齐累加，较短的序列只贡献前面的窗。
     collect_layers=True 时统计每层发放与膜电位（训练中每轮验证也会用到，用于健康门槛）。
+    full=True 时另给 per_sequence：每条序列在阈值下的 tp / fp / fn / IoU 与事件数（定位极密序列等误差来源，V6b 判据要用）。
     dump_dir 不为空时，把每个序列的逐事件预测保存为 NPZ（字段与原仓库诊断文件一致：
     locs [batch,x,y,t]、labels、probabilities，另加 target_id），文件顺序与原 NPZ 一致。
     reset_every / reset_offset 原样传给 run_sequence（周期清零，记忆长度诊断）。
@@ -1031,7 +1041,7 @@ def evaluate_split(net, cfg, q99, device, split, state_mode, names=None, full=Fa
     input_stats = {"nonzero": 0, "elements": 0} if full else None
     confusion_sum = np.zeros((0, 4), dtype=np.int64)
     sweep = np.zeros((len(SWEEP_THRESHOLDS), 3), dtype=np.int64)
-    kept, total_events, total_windows = [], 0, 0
+    kept, total_events, total_windows, per_sequence = [], 0, 0, []
     was_training = net.training
     net.eval()
     if monitor is not None:
@@ -1045,6 +1055,10 @@ def evaluate_split(net, cfg, q99, device, split, state_mode, names=None, full=Fa
                 confusion_sum = np.concatenate(
                     [confusion_sum, np.zeros((confusion.shape[0] - confusion_sum.shape[0], 4), dtype=np.int64)])
             confusion_sum[:confusion.shape[0]] += confusion
+            s_tp, s_fp, s_fn = (int(confusion[:, j].sum()) for j in range(3))
+            per_sequence.append({"name": seq.name, "tp": s_tp, "fp": s_fp, "fn": s_fn,
+                                 "iou": iou_from_counts(s_tp, s_fp, s_fn) if s_tp + s_fp + s_fn else None,
+                                 "events": int(seq.n_events)})
             sweep += threshold_counts(probs, seq.label)
             total_events += seq.n_events
             total_windows += seq.n_windows
@@ -1108,6 +1122,7 @@ def evaluate_split(net, cfg, q99, device, split, state_mode, names=None, full=Fa
             "rolling_iou": [None if math.isnan(v) else v
                             for v in rolling_iou(tp, fp, fn, int(cfg["rolling_window"])).tolist()],
             "per_window": {"tp": tp.tolist(), "fp": fp.tolist(), "fn": fn.tolist(), "pos": npos.tolist()},
+            "per_sequence": per_sequence,
             "latency": summarize_latencies(records),
             "timing": timing,
             "input_nonzero_fraction": nonzero_fraction(input_stats),
@@ -1138,6 +1153,9 @@ def prepare_run(args, cfg, allow_existing=False):
         "device": torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu",
         "source_sha256": source_hashes()})
     print("参数量:", count_parameters(net), flush=True)
+    if background_enabled(cfg):
+        print("背景率通道：输入 %d 通道；背景先验 mu_ref = %.6g（训练集每像素、每窗、每极性的背景事件数）" % (
+            input_channel_count(cfg), cfg["background_mu_ref"]), flush=True)
     return device, stats, q99, pos_weight, net, root
 
 
@@ -1172,8 +1190,9 @@ def mode_smoke(args, cfg):
         net.eval()
         net.start_tif_stats()
         states = None
+        smoke_source = NumpyWindowSource(seq, cfg, q99, device)
         for k in range(32):
-            x, events, _, _ = window_to_device(seq, k, q99, cfg, device)
+            x, events, _, _ = smoke_source.window(k)
             _, states, info = net(x, events, states, collect=True)
             monitor.update(info)
         tif_stats = net.stop_tif_stats()
@@ -1253,6 +1272,9 @@ def mode_train(args, cfg):
             raise ValueError("续训 dual_memory 配置与 checkpoint 不一致，不能改变时间常数范围或读取上限")
         if ckpt["config"].get("subthreshold_residual") != cfg.get("subthreshold_residual"):
             raise ValueError("续训 subthreshold_residual 配置与 checkpoint 不一致")
+        if (ckpt["config"].get("background"), ckpt["config"].get("background_mu_ref")) != (
+                cfg.get("background"), cfg.get("background_mu_ref")):
+            raise ValueError("续训 background 配置（或由统计导出的背景先验）与 checkpoint 不一致")
         if ckpt["config"].get("neuron") != cfg.get("neuron") or (
                 cfg.get("neuron") == "tif"
                 and tif_settings(ckpt["config"].get("tif")) != tif_settings(cfg.get("tif"))):
@@ -1405,6 +1427,7 @@ def mode_eval(args, cfg):
     train_cfg["execution"], train_cfg["input_device"] = "step", "cpu"
     seed_everything(int(train_cfg["seed"]), bool(train_cfg["deterministic"]))
     q99 = np.asarray(ckpt["stats"]["q99"], dtype=np.float32)
+    resolve_background(train_cfg, ckpt["stats"])           # 背景先验与训练时相同（只核对，不重新统计）
     net = build_net(train_cfg, device)
     net.load_state_dict(ckpt["model"])
     if not bool(net.gain_calibrated):

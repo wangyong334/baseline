@@ -9,6 +9,8 @@
     up2   ConvT2x2 48->24 (S5)，与 S2 拼接 -> dec2 Conv3x3 48->24 -> 增益 -> LIF6  132x176
     up1   ConvT2x2 24->12 (S6)，与 S1 拼接 -> dec1 Conv3x3 24->12 -> 增益 -> LIF7  264x352
     读出  MLP([U_pre7(x,y), p, t_local]) -> 原始 logit（模型内不做 sigmoid）
+          readout_background = nb > 0 时（V6b，dataset/background.py）另读输入最后 nb 个通道（背景率）在事件像素处的值：
+          MLP([U_pre7(x,y), p, t_local, x[-nb:](x,y)])。背景率是这个事件的先验项，只有逐事件的读出能直接用上
 所有卷积 bias=False；默认不使用 BN/GN（零输入 -> 零电流）。
 原版的问题：ConvT 输出是实数，与跳连脉冲拼接后，解码卷积有一半输入是实数（只能按 MAC 计）。
 
@@ -189,8 +191,12 @@ class EvSpSegNetStream(nn.Module):
     def __init__(self, in_channels=12, channels=(12, 24, 48, 48), neuron="lif", norm="none",
                  state_mode="carry", readout_hidden=32, dt_ms=50.0, tau_init_ms=200.0,
                  tau_min_ms=50.0, tau_max_ms=2000.0, v_threshold=1.0, merged_decoder=False,
-                 dual_memory=None, subthreshold_residual=None, tif=None):
+                 dual_memory=None, subthreshold_residual=None, tif=None, readout_background=0):
         super(EvSpSegNetStream, self).__init__()
+        if (isinstance(readout_background, bool) or int(readout_background) != readout_background
+                or not 0 <= int(readout_background) < int(in_channels)):
+            raise ValueError("readout_background 必须是 0 到输入通道数之间的整数")
+        self.readout_background = int(readout_background)
         if state_mode not in ("carry", "reset_each_window"):
             raise ValueError("state_mode 必须是 carry 或 reset_each_window")
         if not isinstance(merged_decoder, bool):
@@ -231,7 +237,7 @@ class EvSpSegNetStream(nn.Module):
             self.dec2 = block("dec2", c2 + c2, c2, 1)
             self.up1 = nn.ConvTranspose2d(c2, c1, 2, stride=2, bias=False)
             self.dec1 = block("dec1", c1 + c1, c1, 1)
-        self.readout = nn.Sequential(nn.Linear(c1 + 2, readout_hidden), nn.ReLU(),
+        self.readout = nn.Sequential(nn.Linear(c1 + 2 + self.readout_background, readout_hidden), nn.ReLU(),
                                      nn.Linear(readout_hidden, 1))
         self.dual_memory_layers = ()
         if dual_memory is not None:
@@ -539,7 +545,7 @@ class EvSpSegNetStream(nn.Module):
             s7, n7, u7, i7 = self.dec1(torch.cat([deep1, s1], 1), prev[6])
         feat, residual_gate, residual_correction = self._event_features(
             u7, residual1, deep1, events)
-        logits = self._readout(feat, events)
+        logits = self._readout(feat, events, x)
         info = None
         if collect:
             info = {"spikes": [s1, s2, s3, s4, s5, s6, s7],
@@ -626,7 +632,7 @@ class EvSpSegNetStream(nn.Module):
                                    keep_u_pre=True)
         feat, residual_gate, residual_correction = self._event_features(
             u7, residual1, deep1, events)
-        logits = self._readout(feat, events)
+        logits = self._readout(feat, events, x)
         info = None
         if collect:
             info = {"spikes": [s1, s2, s3, s4, s5, s6, s7],
@@ -641,12 +647,14 @@ class EvSpSegNetStream(nn.Module):
                 info["memory"] = memories
         return logits, [n1, n2, n3, n4, n5, n6, n7], info
 
-    def _readout(self, feat, events):
-        """逐事件读出：MLP([膜电位特征, p, t_local]) -> 原始 logit [N]。"""
+    def _readout(self, feat, events, x=None):
+        """逐事件读出：MLP([膜电位特征, p, t_local(, 事件像素处的背景率)]) -> 原始 logit [N]。"""
         extra = torch.stack([events["p"].to(feat.dtype), events["t_local"].to(feat.dtype)], 1)
+        if self.readout_background:
+            extra = torch.cat([extra, trailing_channels_at_events(x, events, self.readout_background).to(feat.dtype)], 1)
         # 读出消融（只用于评估，不重新训练）：用来判断预测到底依赖哪一路信息
         #   none          正常
-        #   zero_extra    把 p 与 t_local 置零 -> 只剩网络特征；若性能不掉说明这两个标量没有泄漏
+        #   zero_extra    把 p 与 t_local（以及背景率）置零 -> 只剩网络特征；若性能不掉说明这几个标量没有泄漏
         #   zero_feature  把网络特征置零 -> 只剩 p 与 t_local；若性能仍高则说明标签可由它们直接推出
         if self.readout_ablation == "zero_extra":
             extra = torch.zeros_like(extra)
@@ -655,6 +663,18 @@ class EvSpSegNetStream(nn.Module):
         elif self.readout_ablation != "none":
             raise ValueError("未知的 readout_ablation: %s" % self.readout_ablation)
         return self.readout(torch.cat([feat, extra], 1)).squeeze(1)
+
+
+def trailing_channels_at_events(x, events, n):
+    """输入 x 最后 n 个通道在每个事件像素处的值 [N, n]。
+
+    x 为逐窗的 [B,C,H,W]（按 events 的 b 取）或片段的 [T,B,C,H,W]（按 t、b 取），与读出头取 dec1 特征的约定相同。
+    """
+    if x is None:
+        raise ValueError("读出需要读输入通道，但没有传入 x")
+    if x.dim() == 5:
+        return x[events["t"], events["b"], -int(n):, events["y"], events["x"]]
+    return x[events["b"], -int(n):, events["y"], events["x"]]
 
 
 def count_parameters(net):

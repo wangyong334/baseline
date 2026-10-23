@@ -1,7 +1,9 @@
 """V6 第一版：滞后读出头（自定时判决神经元的证据部分，Stream-SNN-Innovations.md 13.10~13.12）。
 
 对象：第 k 窗出生的事件，在第 k+d 窗（d = 1..D）再读一次网络状态，给出"它是不是目标"的新分数。
-    logit_d = z0 + head_d([此刻的状态特征, 出生窗的 dec1 特征, z0, p, t_local])
+    logit_d = z0 + head_d([此刻的状态特征, 出生窗的特征, z0, p, t_local])
+    出生窗的特征 = dec1 在事件原像素的 M；骨干带背景率通道时（V6b，birth_extra = 4）再接上事件像素在出生窗的背景率：
+    背景越密，未来窗里"碰巧"出现的支持越多，后续证据要按背景打折，只有读到背景率的头才能做到
     z0      V5 原读出头在出生窗给出的 logit（d = 0 就是它，不重算、不改变）
     head_d  每个滞后一个两层 MLP；最后一层零初始化，所以训练开始时 logit_d = z0（不比零等待差）
 此刻的状态特征（variant）：
@@ -66,19 +68,23 @@ def gather_map(feature_map, flat, y, x, stride):
 class LagReadout(nn.Module):
     """D 个滞后读出头（一个 variant）。
 
-    channels  骨干的 (c1, c2, c3, c4)；lags = D；hidden 为 MLP 隐层宽度（与 V5 读出头相同取 32）。
-    forward(d, now, birth, z0, p, t_local) -> logit_d [n]，d = 1..D。
+    channels  骨干的 (c1, c2, c3, c4)；lags = D；hidden 为 MLP 隐层宽度（与 V5 读出头相同取 32）；
+    birth_extra 出生窗特征里 dec1 之外的维数（骨干读出头读的背景率通道数，没有为 0）。
+    forward(d, now, birth, z0, p, t_local) -> logit_d [n]，d = 1..D；birth 为 [n, c1 + birth_extra]。
     """
 
-    def __init__(self, channels, lags=5, variant="pixel", hidden=32):
+    def __init__(self, channels, lags=5, variant="pixel", hidden=32, birth_extra=0):
         super(LagReadout, self).__init__()
         variant_layers(variant)
         if int(lags) < 1:
             raise ValueError("lags 必须 >= 1")
+        if isinstance(birth_extra, bool) or int(birth_extra) != birth_extra or int(birth_extra) < 0:
+            raise ValueError("birth_extra 必须是非负整数")
         c1, c2, c3, c4 = (int(c) for c in channels)
-        self.variant, self.lags, self.c1 = variant, int(lags), c1
+        self.variant, self.lags, self.c1, self.birth_extra = variant, int(lags), c1, int(birth_extra)
         self.now_dim = c1 if variant == "pixel" else c1 + c2 + c3 + 2 * c4
-        in_dim = self.now_dim + c1 + 3
+        self.birth_dim = c1 + self.birth_extra
+        in_dim = self.now_dim + self.birth_dim + 3
         self.heads = nn.ModuleList()
         for _ in range(self.lags):
             head = nn.Sequential(nn.Linear(in_dim, int(hidden)), nn.ReLU(), nn.Linear(int(hidden), 1))
@@ -102,9 +108,10 @@ class LagReadout(nn.Module):
         return z0 + self.heads[int(d) - 1](inp).squeeze(1)
 
 
-def birth_features(maps, flat, y, x):
-    """出生窗 dec1 在事件原像素的 M [n, c1]（与 V5 读出头读到的特征相同）。"""
-    return gather_map(maps["dec1"], flat, y, x, 1)
+def birth_features(maps, flat, y, x, extra=None):
+    """出生窗 dec1 在事件原像素的 M [n, c1]（与骨干读出头读到的特征相同）；extra 为 [n, e] 时接在后面（背景率）。"""
+    feat = gather_map(maps["dec1"], flat, y, x, 1)
+    return feat if extra is None else torch.cat([feat, extra.to(feat.dtype)], 1)
 
 
 class LagBuffer(object):
