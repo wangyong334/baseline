@@ -381,6 +381,22 @@ class CommConfigTests(unittest.TestCase):
         comm = CommBudget.from_config(dict(stream_cfg(), **{k: b[k] for k in comm_keys}), make_tif_net())
         self.assertEqual((comm.budget, comm.alpha), (157700.0, 0.05))
 
+    def test_evflying_peak_config(self):
+        # EV-Flying 版：与 EV-Flying 基础版只差 comm_* 四项与 save_root；预算为 V1 在 EV-Flying val 上的每窗平均脉冲数
+        from utils.stream_common import load_flat_config
+        a = load_flat_config("configs/evisseg_stream_tif_notransport_evflying.yaml")
+        b = load_flat_config("configs/evisseg_stream_tif_comm_peak_evflying.yaml")
+        e = load_flat_config("configs/evisseg_stream_tif_comm_peak.yaml")
+        comm_keys = {"comm_budget_messages", "comm_dual_lr", "comm_budget_mode", "comm_peak_alpha"}
+        self.assertEqual(set(b) - set(a), comm_keys)
+        for key in a:
+            if key != "save_root":
+                self.assertEqual(a[key], b[key], key)
+        self.assertEqual(b["save_root"], "log/stream_tif_commpeak_msg_evflying_x4_seed37")
+        self.assertEqual(b["comm_budget_messages"], 293200.0)
+        for key in comm_keys - {"comm_budget_messages"}:                # 除预算外与 EV-UAV 定型版相同
+            self.assertEqual(b[key], e[key], key)
+
     def test_every_budget_config_is_valid(self):
         # 现存配置中凡是开启通信预算的，都按消息数约束、不带旧键（旧配置已归档到 configs/_removed_comm_20261023/）
         import glob
