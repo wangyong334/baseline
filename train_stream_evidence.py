@@ -60,6 +60,7 @@ REQUIRED_KEYS = (
     "evidence_chunk", "evidence_eval_chunk", "evidence_save_root")
 FRONTEND_KEYS = ("fe_taus_ms", "fe_dipole_taus_ms", "fe_dipole_radius", "fe_features")
 DATA_KEYS = ("height", "width_px", "pad_height", "pad_width", "window_ms", "n_windows", "time_bins", "input_clip")
+CLOCK_KEYS = ("window_ms", "n_windows")         # joint 时 V5 参照可以用自己的时钟（例如 25 ms 实验对 50 ms 定型版）
 EVAL_KEYS = ("threshold", "pd_detT", "correct_thresh", "rolling_window", "segments", "timing_warmup_windows")
 
 
@@ -113,13 +114,15 @@ def file_sha256(path):
     return digest.hexdigest()
 
 
-def load_backbone(cfg, device, execution, input_device):
-    """载入并冻结 V5 定型权重。返回 (net, net_cfg, q99)；数据与输入键必须与 base_config 一致。"""
+def load_backbone(cfg, device, execution, input_device, own_clock=False):
+    """载入并冻结 V5 定型权重。返回 (net, net_cfg, q99)；数据与输入键必须与 base_config 一致。
+    own_clock=True（joint 的 V5 参照）时窗长与窗数可以不同：参照按它自己的切法运行（evaluate_sequence 的 reference）。"""
     ckpt = torch.load(cfg["backbone_checkpoint"], map_location=device)
     net_cfg = dict(ckpt["config"])
     if net_cfg.get("neuron") != "tif":
         raise ValueError("只接 V5 的 BIR（neuron: tif）骨干")
-    differ = [k for k in DATA_KEYS if net_cfg.get(k) != cfg.get(k)]
+    keys = [k for k in DATA_KEYS if not (own_clock and k in CLOCK_KEYS)]
+    differ = [k for k in keys if net_cfg.get(k) != cfg.get(k)]
     if differ:
         raise ValueError("checkpoint 与 base_config 的数据键不一致: %s" % differ)
     net_cfg["root"] = cfg["root"]
@@ -416,11 +419,9 @@ def evaluate_sequence(net, heads, seq, cfg, net_cfg, q99, device, execution, dec
     n, n_windows = seq.n_events, seq.n_windows
     run = EvidenceRun(decision_cfg(cfg, net_cfg), H, W, device, dtype) if decision else None
     own_v5 = not is_joint(cfg)
-    v5 = np.full(n, np.nan, dtype=np.float32) if (own_v5 or reference is not None) else None
-    ref_source = ref_states = None
+    v5 = np.full(n, np.nan, dtype=np.float32) if own_v5 else None
     if reference is not None:
-        ref_net, ref_cfg, ref_q99 = reference
-        ref_source = make_window_source(seq, ref_cfg, ref_q99, device, dtype)
+        v5 = reference_probs(reference, seq, device, dtype)
     net_parts = ([], [])
     nll_sum = 0.0
     net_states = None
@@ -443,13 +444,6 @@ def evaluate_sequence(net, heads, seq, cfg, net_cfg, q99, device, execution, dec
         idx = np.asarray(idx, dtype=np.int64)
         if own_v5 and idx.size:
             v5[idx] = torch.sigmoid(logits).float().cpu().numpy()
-        if ref_source is not None:
-            for k in range(start, end):
-                rx, rev, _, ridx = ref_source.window(k)
-                rlog, ref_states, _ = ref_net(rx, rev, ref_states)
-                ridx = np.asarray(ridx, dtype=np.int64)
-                if ridx.size:
-                    v5[ridx] = torch.sigmoid(rlog).float().cpu().numpy()
         mark, log_g = heads(u7.reshape((steps,) + tuple(u7.shape[2:])))
         target = pixel_counts(events["y"], events["x"], events["t"], steps, H, W, dtype, weight=labels)
         m = smoothed_target(target.view(steps, 1, 1, H, W), smooth).view(steps, 1, H, W)
@@ -470,6 +464,26 @@ def evaluate_sequence(net, heads, seq, cfg, net_cfg, q99, device, execution, dec
         return {"v5": v5, "probs": {"net": refill_by_index(n, *net_parts)}, "extra": {}, "nll": nll_sum}
     probs, extra = run.outputs(n)
     return {"v5": v5, "probs": probs, "extra": extra, "nll": nll_sum}
+
+
+def reference_probs(reference, seq, device, dtype):
+    """冻结的 V5 参照在一条录像上的零等待概率（文件顺序，逐窗执行，与 V5 正式评估同一路径）。
+    reference = (ref_net, ref_cfg, ref_q99[, ref_seq])：ref_seq 是同一录像按参照自己的时钟切窗的版本（时钟不同时由调用方给出），
+    没有时用 seq。两者是同一个文件，事件数必须相同。"""
+    ref_net, ref_cfg, ref_q99 = reference[:3]
+    ref_seq = reference[3] if len(reference) > 3 and reference[3] is not None else seq
+    if ref_seq.n_events != seq.n_events or ref_seq.name != seq.name:
+        raise RuntimeError("V5 参照的录像与当前录像不一致: %s / %s" % (ref_seq.name, seq.name))
+    source = make_window_source(ref_seq, ref_cfg, ref_q99, device, dtype)
+    out = np.full(ref_seq.n_events, np.nan, dtype=np.float32)
+    states = None
+    for k in range(ref_seq.n_windows):
+        x, events, _, idx = source.window(k)
+        logits, states, _ = ref_net(x, events, states)
+        idx = np.asarray(idx, dtype=np.int64)
+        if idx.size:
+            out[idx] = torch.sigmoid(logits).float().cpu().numpy()
+    return out
 
 
 def readout_names(cfg):
@@ -680,10 +694,17 @@ def mode_eval(args, cfg):
         if not bool(net.gain_calibrated):
             raise RuntimeError("checkpoint 中的增益未校准")
         net.eval()
-        ref_net, ref_cfg, ref_q99 = load_backbone(cfg, device, "step", "cpu")
+        ref_net, ref_cfg, ref_q99 = load_backbone(cfg, device, "step", "cpu", own_clock=True)
         reference = (ref_net, ref_cfg, ref_q99)
     dataset = EvUAVStream(cfg["root"], args.split, net_cfg)
+    ref_dataset = None
+    if reference is not None and any(reference[1][k] != net_cfg[k] for k in CLOCK_KEYS):
+        ref_dataset = EvUAVStream(cfg["root"], args.split, reference[1])      # 同一批录像，按 V5 参照自己的时钟切窗
+        print("V5 参照按自己的时钟运行：%s ms × %s 窗（本模型 %s ms × %s 窗）" % (
+            reference[1]["window_ms"], reference[1]["n_windows"], net_cfg["window_ms"], net_cfg["n_windows"]),
+            flush=True)
     window_ms = float(net_cfg["window_ms"])
+    group_ms = float(net_cfg["pd_detT"])          # 分组（第一拍、目标旁背景）按基准的 50 ms 评估帧定义，与窗长无关
     names = readout_names(cfg)
     seqs, v5, probs = [], [], {name: [] for name in names}
     ages, reasons = [], []
@@ -691,10 +712,11 @@ def mode_eval(args, cfg):
     with torch.no_grad():
         for i in range(len(dataset)):
             seq = dataset[i]
+            ref = None if reference is None else reference + ((ref_dataset[i] if ref_dataset is not None else None),)
             res = evaluate_sequence(net, heads, seq, cfg, net_cfg, q99, device, "step", frontend=frontend,
-                                    reference=reference)
+                                    reference=ref)
             seqs.append({"name": seq.name, "t": seq.t, "x": seq.x, "y": seq.y, "label": seq.label,
-                         "target_id": seq.target_id, "groups": event_groups(seq, window_ms)})
+                         "target_id": seq.target_id, "groups": event_groups(seq, group_ms)})
             v5.append(res["v5"])
             for name in names:
                 probs[name].append(res["probs"][name])
@@ -703,6 +725,7 @@ def mode_eval(args, cfg):
     seconds = time.perf_counter() - t0
     thr = float(net_cfg["threshold"])
     results = {"split": args.split, "backbone": cfg["evidence_backbone"], "input": cfg["evidence_input"],
+               "window_ms": window_ms, "reference_window_ms": float(reference[1]["window_ms"]) if reference else window_ms,
                "backbone_checkpoint": cfg["backbone_checkpoint"], "epoch": int(ckpt["epoch"]),
                "threshold": thr, "seconds": seconds, "v5": split_report(seqs, v5, net_cfg), "readouts": {},
                "publish": publish_summary([s["label"] for s in seqs], ages, reasons, int(cfg["publish_deadline"]),

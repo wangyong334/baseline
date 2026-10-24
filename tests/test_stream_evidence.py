@@ -26,6 +26,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from dataset import stream_windows as sw  # noqa: E402
 from dataset.stream_features import EventChunkSource, EvidenceFrontEnd  # noqa: E402
 from model.evidence_readout import BackgroundRate, EvidenceHeads, EvidenceRun, pixel_counts  # noqa: E402
 from model.evspsegnet_stream import EvSpSegNetStream  # noqa: E402
@@ -57,8 +58,8 @@ def decision_config(**overrides):
     return cfg
 
 
-def make_frontend(cfg):
-    return EvidenceFrontEnd(cfg["fe_taus_ms"], 50.0, cfg["fe_dipole_taus_ms"], cfg["fe_dipole_radius"], 500, 5000,
+def make_frontend(cfg, window_ms=50.0):
+    return EvidenceFrontEnd(cfg["fe_taus_ms"], window_ms, cfg["fe_dipole_taus_ms"], cfg["fe_dipole_radius"], 500, 5000,
                             0.01, 2, 0.001, 7, cfg["fe_features"], "adaptive")
 
 
@@ -362,6 +363,61 @@ class JointPathTests(unittest.TestCase):
             self.assertLess(float(np.abs(a["probs"][name] - b["probs"][name]).max()), 1e-6, name)
             self.assertTrue(np.array_equal(a["probs"][name], c["probs"][name]), name)
         self.assertTrue(np.array_equal(c["v5"], d["v5"]))
+
+
+class ClockTests(unittest.TestCase):
+    def test_w25_configs_keep_physical_quantities(self):
+        import train_stream_evidence as E
+        from utils.stream_common import load_flat_config
+        a = E.build_config("configs/evisseg_stream_evidence_joint.yaml")
+        b = E.build_config("configs/evisseg_stream_evidence_joint_w25.yaml")
+        r = a["window_ms"] / float(b["window_ms"])
+        self.assertEqual((a["window_ms"], b["window_ms"]), (50, 25))
+        self.assertEqual(a["window_ms"] * a["n_windows"], b["window_ms"] * b["n_windows"])          # 8 s
+        for key in ("tbptt_k", "eval_chunk", "calib_windows", "evidence_chunk", "evidence_eval_chunk",
+                    "publish_deadline", "bg_prior_windows", "rolling_window", "timing_warmup_windows"):
+            self.assertEqual(a[key] * r, b[key], key)                                               # 时长不变
+        for key in ("comm_budget_messages", "bg_prior", "bg_floor", "intensity_prior", "cusum_gate_eps"):
+            self.assertAlmostEqual(a[key] / r, b[key], places=12, msg=key)                         # 每窗的量减半
+        self.assertEqual([v * r for v in b["cusum_axis_velocities"]], a["cusum_axis_velocities"])   # 物理速度相同
+        self.assertEqual([d / r for d in b["readout_delays"] if d % r == 0], a["readout_delays"])
+        self.assertEqual(max(b["readout_delays"]) * b["window_ms"], max(a["readout_delays"]) * a["window_ms"])
+        self.assertEqual([[int(x * r), int(y * r + r - 1)] for x, y in a["segments"]], b["segments"])
+        same = ("fe_taus_ms", "fe_dipole_taus_ms", "fe_dipole_radius", "fe_features", "bg_fast_ms", "bg_slow_ms",
+                "bg_smooth_radius", "cusum_footprint", "cusum_track_tau_ms", "cusum_memory_gain", "fusion_weight",
+                "publish_upper", "publish_lower", "publish_collapse", "publish_gate", "publish_anchor", "head_hidden",
+                "mark_prior", "log_g_max", "tau_init_ms", "tau_min_ms", "tau_max_ms", "pd_detT", "threshold",
+                "evidence_epochs", "evidence_lr", "evidence_lr_end", "lr", "lr_end", "epochs", "streams")
+        for key in same:
+            self.assertEqual(a[key], b[key], key)
+        base25 = load_flat_config(b["base_config"])
+        self.assertEqual(base25["stats_path"], "configs/stream_v1_train_stats_w25.json")
+
+    def test_reference_runs_on_its_own_clock(self):
+        import train_stream_evidence as E
+        seq50 = synthetic_sequence(seed=9)
+        order, bounds = sw.split_windows(seq50.t, 25, 2 * WINDOWS)
+        bins, local = sw.time_bin_and_local(seq50.t, 25, 5)
+        seq25 = sw.StreamSequence(seq50.name, seq50.x, seq50.y, seq50.t, seq50.p, seq50.label, seq50.target_id,
+                                  bins, local, order, bounds)
+        cfg25 = decision_config(window_ms=25, evidence_backbone="joint", evidence_input="frontend",
+                                readout_delays=[1, 2, 3, 4, 5, 6], publish_deadline=6, **FE)
+        fe = make_frontend(cfg25, 25.0).double()
+        net = make_frontend_net(fe.n_features)
+        net.eval()
+        heads = random_heads().double()
+        ref = make_tif_net(merged=False)
+        ref.eval()
+        dev = torch.device("cpu")
+        with torch.no_grad():
+            joint = E.evaluate_sequence(net, heads, seq25, cfg25, cfg25, Q99, dev, "step", frontend=fe,
+                                        reference=(ref, decision_config(), Q99, seq50))
+            direct = E.evaluate_sequence(ref, heads, seq50, decision_config(), decision_config(), Q99, dev, "step")
+        self.assertTrue(np.array_equal(joint["v5"], direct["v5"]))
+        self.assertEqual(set(joint["probs"]), set(E.readout_names(cfg25)))
+        self.assertTrue(np.all(joint["extra"]["age_pub"] <= 6))
+        with self.assertRaises(RuntimeError):
+            E.reference_probs((ref, decision_config(), Q99, synthetic_sequence(seed=8)), seq25, dev, torch.float64)
 
 
 class ConfigTests(unittest.TestCase):

@@ -1,0 +1,60 @@
+# v6-2 第三轮：第二轮（V2 前端 + V5 结构骨干与两个头一起训练 50 轮）的 25 ms 时钟版，EV-UAV（10-24，用户定）
+# 目的：检验切小窗后未来证据（V2-1 融合读出、V3 自适应发布）的作用；对照组是 V6-3 分支的 V5 @ 25 ms。
+# 与 configs/evisseg_stream_evidence_joint.yaml 的差别只在按窗计的量，全部换成相同的物理量（窗长 50 -> 25 ms）：
+#   每像素每窗的量减半：bg_prior 0.01 -> 0.005、bg_floor 0.001 -> 0.0005、intensity_prior 2e-4 -> 1e-4、门控 ε 0.03 -> 0.015；
+#   先验伪窗数 2 -> 4（100 ms 不变）；速度假设（像素/窗）减半，7x7 = 49 个，物理速度与 50 ms 版相同；
+#   固定等待 1..5 -> 1..10 窗、发布期限 D 5 -> 10 窗（250 ms 不变）；训练片段 16 -> 32 窗、验证片段 32 -> 64 窗（时长不变）。
+#   毫秒常数（前端时间尺度、背景快慢常数、管道记忆 250 ms）、像素常数（足迹、偶极邻域）、nat 常数（裕量 a、b）不变。
+# backbone_checkpoint 只作 V5 参照（50 ms 定型版，评估时按它自己的 50 ms 切法另跑，给出纠正 / 破坏数的基准）。
+EVIDENCE:
+  base_config: configs/evisseg_stream_tif_comm_peak_w25.yaml
+  backbone_checkpoint: log/stream_tif_commpeak_msg_seed37/best_val_iou_seed37.pt
+  evidence_backbone: joint              # frozen 冻结 V5、只训练两个头 | joint 骨干与头一起从头训练
+  evidence_input: frontend             # frame V5 的 12 通道 | frontend V2 证据前端（只能配 joint）
+  # 两个头（v3 NET 节）
+  head_hidden: 16                      # 逐像素头的隐藏通道
+  mark_prior: 0.03                     # mark 头偏置初值 = logit(目标事件先验占比)
+  intensity_prior: 0.0001              # 强度头偏置初值 = log(每像素每窗目标事件数先验)
+  log_g_max: 8.0
+  loss_mark_weight: 1.0                # 逐事件 BCE（无 pos_weight）
+  loss_intensity_weight: 1.0           # 当前窗目标强度场的泊松负对数似然
+  loss_intensity_smooth: 3             # 目标计数先在 3x3 邻域内平均成强度场
+  # V2 证据前端（v3 FRONTEND 节）
+  fe_taus_ms: [20, 100, 500, 2000]     # 时间矩的时间尺度
+  fe_dipole_taus_ms: [100, 500]        # 极性偶极所用的时间尺度
+  fe_dipole_radius: 3                  # 偶极邻域 7x7
+  fe_features: [count, ratio, age, dipole]
+  # 背景强度 mu0（v3 FRONTEND 节；前端与判决层共用）
+  bg_fast_ms: 500                      # 快速估计（取 15x15 邻域平均，跟随成片杂波）
+  bg_slow_ms: 5000                     # 慢速逐像素估计（热像素、常亮闪烁）
+  bg_prior: 0.005                      # 背景先验：每像素每窗期望事件数
+  bg_prior_windows: 4                  # 先验的伪窗数
+  bg_floor: 0.0005                     # mu0 下限
+  bg_smooth_radius: 7
+  # 漂移 CUSUM 判决层（v3 CUSUM 节）
+  cusum_axis_velocities: [-2, -1, -0.5, 0, 0.5, 1, 2]   # 像素/窗（25 ms），二维网格 7x7 = 49 个假设，物理速度同 50 ms 版
+  cusum_footprint: 3
+  cusum_compensator: poisson
+  cusum_nb_kappa: null
+  cusum_aggregate: lme                 # 足迹内证据聚合：对像素间任意相关都成立
+  cusum_track_tau_ms: 250              # 管道强度记忆的时间常数
+  cusum_memory_gain: 1.0               # 非对称记忆 λ（1 = 原实现）
+  cusum_gate_eps: 0.015                # 预测门控 ε（V2 定稿 0.03 的一半：强度按每窗计）
+  readout_delays: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]     # fused_d 的固定等待窗数
+  fusion_weight: 1.0                   # 融合分数 = mark + w * F(d)
+  # V3 发布层（v3 PUBLISH 节；θ = logit(threshold)）
+  publish_deadline: 10                 # 最长等待 D（窗）
+  publish_upper: 1.0                   # 提前发布目标所需的裕量 a（nat）
+  publish_lower: 2.0                   # 提前发布背景所需的裕量 b（nat）
+  publish_collapse: linear             # 边界随年龄线性收拢到 θ
+  publish_gate: null                   # 不门控
+  publish_anchor: true                 # 锚定证据链
+  # 训练（骨干与两个头一起；多流排布、学习率、裁剪与 V5 相同；50 轮，与 V2 / V5 相同）
+  evidence_epochs: 50
+  evidence_lr: 0.001
+  evidence_lr_end: 0.0001              # 按 epoch 线性衰减
+  evidence_grad_clip: 1.0
+  evidence_streams: 4
+  evidence_chunk: 32
+  evidence_eval_chunk: 64              # 训练中验证（逐片段执行）每次处理的窗数
+  evidence_save_root: log/stream_evidence_v3joint_w25_seed37
