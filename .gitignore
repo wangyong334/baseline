@@ -10,6 +10,7 @@ References/
 .pytest_cache/
 CLAUDE/
 CLAUDE.md
+Stream-SNN-Innovations.md
 outputs/
 tmp/
 AGENTS.md
