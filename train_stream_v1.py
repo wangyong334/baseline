@@ -607,6 +607,7 @@ class WindowTimer(object):
         out.update({"total_ms_mean": float(total.mean()), "total_ms_median": float(np.median(total)),
                     "total_ms_p95": float(np.percentile(total, 95)),
                     "ms_per_160_windows": float(total.mean() * 160),
+                    "ms_per_8s": float(total.mean() * 8000.0 / float(window_ms)),   # 按实际窗长折算 8 s
                     "realtime_ok": bool(total.mean() < float(window_ms))})
         return out
 

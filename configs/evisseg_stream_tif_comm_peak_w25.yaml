@@ -1,0 +1,74 @@
+# V5 定型版（BIR + 每窗消息数的峰值约束）的 25 ms 时钟版（10-24，用户定：检验切小窗后未来证据的作用）
+# 与 configs/evisseg_stream_tif_comm_peak.yaml 的差别只在按窗计的量，全部换成相同的物理量：
+#   窗长 50 -> 25 ms、窗数 160 -> 320（8 s 不变）；窗内 5 个时间分箱（10 -> 5 ms）；
+#   TBPTT 片段 16 -> 32 窗（800 ms 不变）；验证片段 32 -> 64 窗；增益校准 32 -> 64 窗（1.6 s 不变）；
+#   每窗消息预算 157700 -> 78850（每秒预算不变）；逐窗统计的滚动窗 10 -> 20、分段与计时预热按窗号加倍；
+#   输入统计 q99 按 25 ms 窗重新生成（stats_path）。时间常数（tau）、阈值、评估帧 pd_detT = 50 ms 都是物理量，不变。
+DATA:
+  root: /media/stephen/nvme0n1/wy_data/datasets/EV-UAV-dataset
+  stats_path: configs/stream_v1_train_stats_w25.json   # 由 tools/stream_train_stats.py 生成
+  window_ms: 25
+  n_windows: 320
+  time_bins: 5
+  height: 260
+  width_px: 346
+  pad_height: 264          # 3 次 stride=2 下采样，对齐到 8 的倍数；只补右侧和下侧
+  pad_width: 352
+  input_clip: 3.0          # X = clip(log1p(C)/q99, 0, 3)
+
+NET:
+  channels: [12, 24, 48, 48]
+  neuron: tif
+  tif:
+    levels: 7                  # D：汇报电平 0..7（3 bit），消息 Δq ∈ {-7..7}
+    quantize: true             # false = 直接汇报实数 M（对照）
+    k_init: 0.05               # 参考值 k 初值（softplus），单位是校准后的驱动（q99 正电流 = 1）
+  state_mode: carry            # carry | reset_each_window
+  norm: none
+  v_threshold: 1.0             # TIF 中只决定 theta 初值 = v_threshold / levels（量程 D*theta = 1）与增益校准目标
+  tau_init_ms: 200.0           # lam0 = exp(-50/200) ≈ 0.779
+  tau_min_ms: 50.0
+  tau_max_ms: 2000.0
+  readout_hidden: 32
+
+CALIB:
+  calib_sequences: 8
+  calib_windows: 64
+  calib_samples_per_channel: 2048
+  calib_min_positive: 1024
+  calib_quantile: 0.99
+  calib_gain_min: 0.05
+  calib_gain_max: 20.0
+
+TRAIN:
+  seed: 37
+  epochs: 50
+  lr: 0.001
+  lr_end: 0.0001               # 按 epoch 线性衰减
+  tbptt_k: 32
+  trainer: streams             # 标准有状态 TBPTT：B 条并行流，每 n 个片段更新一次（10-16 定稿 B=4、n=1、k=16）
+  streams: 4
+  accumulate: 1
+  optimizer_step: per_sequence # 只对 trainer=sequence 生效
+  grad_clip: 1.0
+  comm_budget_messages: 78850.0   # 每窗消息数上限 = 50 ms 版预算 157700 的一半（每秒预算不变）
+  comm_dual_lr: 0.01            # 乘子 mu 的对偶上升步长（每次参数更新）
+  comm_budget_mode: peak        # 每窗峰值约束（机会约束）；平均预算 mean 已删除（12.32）
+  comm_peak_alpha: 0.05         # 允许超出预算的窗口比例：每窗消息数的第 95 百分位不超过 LIF 的平均脉冲数
+  pos_weight_cap: 30.0
+  train_subset_size: 24
+  num_workers: 2
+  execution: layer
+  input_device: gpu
+  train_subset_every: 5
+  eval_chunk: 64
+  deterministic: true
+  save_root: log/stream_tif_commpeak_msg_w25_seed37
+
+EVAL:
+  threshold: 0.9
+  pd_detT: 50
+  correct_thresh: 0.0001
+  rolling_window: 20
+  segments: [[0, 31], [128, 159], [288, 319]]
+  timing_warmup_windows: 40
