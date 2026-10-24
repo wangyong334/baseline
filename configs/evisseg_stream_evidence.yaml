@@ -1,9 +1,11 @@
 # v6-2：V2-1 判决层 + V3 发布层接到冻结的 V5 骨干上（检验"之前的方案在 V5 上是否还有效"），EV-UAV
-# 骨干 = V5 定型版（BIR + 每窗消息数的峰值约束），冻结；只训练 V2 的两个逐像素头（mark、log_g）。
+# 第一轮：骨干 = V5 定型版（BIR + 每窗消息数的峰值约束），冻结；只训练 V2 的两个逐像素头（mark、log_g）。
 # 下面判决层 / 发布层 / 背景的常数与 v3 分支 configs/evisseg_stream_v3.yaml 相同；位置级告警不接，只报四个指标。
 EVIDENCE:
   base_config: configs/evisseg_stream_tif_comm_peak.yaml
   backbone_checkpoint: log/stream_tif_commpeak_msg_seed37/best_val_iou_seed37.pt
+  evidence_backbone: frozen             # frozen 冻结 V5、只训练两个头 | joint 骨干与头一起从头训练
+  evidence_input: frame                # frame V5 的 12 通道 | frontend V2 证据前端（只能配 joint）
   # 两个头（v3 NET 节）
   head_hidden: 16                      # 逐像素头的隐藏通道
   mark_prior: 0.03                     # mark 头偏置初值 = logit(目标事件先验占比)

@@ -4,8 +4,9 @@
     2. 背景强度 mu0 与 v3 前端的公式相同；两个头的初值；目标计数
     3. 判决层接线：net = sigmoid(mark)；没有目标强度时 fused = net；不提前发布且不锚定时 pub 标签 = fused_d{D} 的标签；
        逐窗与逐片段两种执行一致
-    4. 训练路径：梯度只到两个头；损失与 v3 的 mark_loss / intensity_loss 相同
-    5. 配置；端到端（V5 小骨干训练 -> 冒烟 / 训练 / 评估）
+    4. 训练路径：frozen 时梯度只到两个头、joint 时到骨干与头；损失与 v3 的 mark_loss / intensity_loss 相同；
+       V2 前端的多流拼批与逐序列递推一致
+    5. 配置；端到端（V5 小骨干训练 -> frozen 与 joint + V2 前端的冒烟 / 训练 / 评估）
 """
 import contextlib
 import hashlib
@@ -25,19 +26,25 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from dataset.stream_features import EventChunkSource, EvidenceFrontEnd  # noqa: E402
 from model.evidence_readout import BackgroundRate, EvidenceHeads, EvidenceRun, pixel_counts  # noqa: E402
+from model.evspsegnet_stream import EvSpSegNetStream  # noqa: E402
 from test_stream_layerwise import CFG, H, Q99, SMALL, W, WINDOWS, synthetic_sequence  # noqa: E402
-from test_stream_tif import make_tif_net  # noqa: E402
+from test_stream_tif import ACTIVE_TIF, make_tif_net  # noqa: E402
 from utils.evidence_loss import intensity_loss, mark_loss  # noqa: E402
 
 V3_SHA256 = {"model/evidence_neuron.py": "45abb0fd7bc314d213c596aa8ef5bc1dfba09f5df7375bfaa78f2b4913783e6b",
              "model/publish_readout.py": "3b0bb081953730bf87478581f850746830e21c907ec00e399202b22a21d9ab1c",
-             "utils/evidence_loss.py": "7e289dcd58fed3850e65017f33a811491954a3fd6fb1e3b06627f40d1e147726"}
+             "utils/evidence_loss.py": "7e289dcd58fed3850e65017f33a811491954a3fd6fb1e3b06627f40d1e147726",
+             "dataset/stream_features.py": "50fb451169649bdb24df0e5e66c325924b2f5ceecf9637881c302230b3f34684"}
+FE = dict(fe_taus_ms=[20, 100, 500, 2000], fe_dipole_taus_ms=[100, 500], fe_dipole_radius=3,
+          fe_features=["count", "ratio", "age", "dipole"])
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def decision_config(**overrides):
     cfg = dict(CFG, input_device="cpu", execution="step", window_ms=50, height=H, width_px=W, seed=37,
+               evidence_backbone="frozen", evidence_input="frame",
                head_hidden=8, mark_prior=0.03, intensity_prior=2e-4, log_g_max=8.0, loss_mark_weight=1.0,
                loss_intensity_weight=1.0, loss_intensity_smooth=3, bg_fast_ms=500, bg_slow_ms=5000, bg_prior=0.01,
                bg_prior_windows=2, bg_floor=0.001, bg_smooth_radius=7,
@@ -48,6 +55,21 @@ def decision_config(**overrides):
                evidence_chunk=5, evidence_streams=2, evidence_grad_clip=1.0, evidence_eval_chunk=5, threshold=0.9)
     cfg.update(overrides)
     return cfg
+
+
+def make_frontend(cfg):
+    return EvidenceFrontEnd(cfg["fe_taus_ms"], 50.0, cfg["fe_dipole_taus_ms"], cfg["fe_dipole_radius"], 500, 5000,
+                            0.01, 2, 0.001, 7, cfg["fe_features"], "adaptive")
+
+
+def make_frontend_net(n_features, seed=5, threshold=0.05):
+    """与 test_stream_tif.make_tif_net 相同的小 TIF 网络，只是输入通道数为 V2 前端的特征数。"""
+    torch.manual_seed(seed)
+    net = EvSpSegNetStream(in_channels=n_features, channels=SMALL, neuron="tif", v_threshold=threshold,
+                           tif=dict(ACTIVE_TIF)).double()
+    for block in net.blocks():
+        block.gain.set_gain(torch.full((block.out_ch,), 1.0 / threshold, dtype=torch.float64))
+    return net
 
 
 def random_heads(seed=3, c1=None):
@@ -154,6 +176,63 @@ class DecisionWiringTests(unittest.TestCase):
         self.assertGreater(int(np.count_nonzero(extra["age_pub"] > 0)), 0)
 
 
+class V3CallOrderTests(unittest.TestCase):
+    def test_wiring_matches_v3_run_sequence(self):
+        """按 v3 train_stream_v2.run_sequence 的顺序重放（mu0 与本窗计数取自 V2 前端；TubeReadout / PublishUnits 原模块），
+        fused_d 与 pub 必须与 EvidenceRun 逐位相同。"""
+        from model.evidence_neuron import TubeReadout
+        from model.evidence_readout import build_cusum, build_rule
+        from model.publish_readout import PublishUnits
+        cfg = decision_config(**FE)
+        seq = synthetic_sequence(seed=11)
+        dev, dtype = torch.device("cpu"), torch.float64
+        fe = make_frontend(cfg).double()
+        chunk = EventChunkSource(seq, cfg, dev, dtype).chunk(0, WINDOWS)
+        _, _, mu0, total = fe.run_chunk(fe.init_state(1, H, W, dev, dtype), chunk)
+        rng = np.random.RandomState(4)
+        log_g = torch.from_numpy(rng.normal(-1.5, 1.5, (WINDOWS, 1, 1, H, W)))
+        ev, idx = chunk["events"], np.asarray(chunk["idx"])
+        marks = torch.from_numpy(rng.normal(0, 3, int(ev["t"].shape[0])))
+        t_np = ev["t"].numpy()
+        run = EvidenceRun(cfg, H, W, dev, dtype)
+        for k in range(WINDOWS):
+            sel = np.flatnonzero(t_np == k)
+            s = torch.from_numpy(sel)
+            run.step(k, log_g[k], marks[s], ev["y"][s], ev["x"][s], idx[sel])
+        probs, extra = run.outputs(seq.n_events)
+        cusum = build_cusum(cfg)
+        state = cusum.init_state(1, H, W, dev, dtype)
+        readout = TubeReadout(cusum, cfg["readout_delays"])
+        units = PublishUnits(cusum, build_rule(cfg), anchor=True)
+        info, prev = {}, None
+        fused = {d: np.full(seq.n_events, np.nan) for d in cfg["readout_delays"]}
+        z_pub = np.full(seq.n_events, np.nan)
+
+        def take(results):
+            for key, d, scores, _ in results:
+                part, logit = info[key]
+                fused[d][part] = torch.sigmoid(logit + scores).float().numpy()
+
+        def publish(records):
+            for key, pos, _, z, _, _, _ in records:
+                z_pub[info[key][0][pos.numpy()]] = z.numpy()
+
+        for k in range(WINDOWS):
+            sel = np.flatnonzero(t_np == k)
+            s = torch.from_numpy(sel)
+            b, y, x, logit = torch.zeros_like(ev["y"][s]), ev["y"][s], ev["x"][s], marks[s]
+            state, _, _ = cusum.step(state, total[k], mu0[k], prev)
+            info[k] = (idx[sel], logit)
+            take(readout.step(state, k, b, y, x, k))
+            publish(units.step(state, k, b, y, x, k, logit, cusum.support_field(total[k])))
+            prev = log_g[k]
+        take(readout.flush())
+        publish(units.flush())
+        for d in cfg["readout_delays"]:
+            self.assertTrue(np.array_equal(probs["fused_d%d" % d], fused[d].astype(np.float32)), d)
+        self.assertTrue(np.array_equal(extra["z_pub"], z_pub.astype(np.float32)))
+
+
 class TrainingPathTests(unittest.TestCase):
     def test_losses_match_v3_and_gradients_only_reach_heads(self):
         import train_stream_v1 as T
@@ -207,6 +286,84 @@ class TrainingPathTests(unittest.TestCase):
         self.assertTrue(np.array_equal(a["extra"]["age_pub"], b["extra"]["age_pub"]))
 
 
+class JointPathTests(unittest.TestCase):
+    def test_frontend_streams_match_sequential_frontend(self):
+        import train_stream_v1 as T
+        import train_stream_evidence as E
+        seqs = [synthetic_sequence(seed=s) for s in (3, 4, 5)]
+        cfg = decision_config(**FE)
+        fe = make_frontend(cfg).double()
+        plan = [(1, [(0, WINDOWS), (2, WINDOWS)]), (3, [(1, WINDOWS)])]
+        dev = torch.device("cpu")
+        feeder = E.FrontendStreams(seqs, cfg, fe, dev, torch.float64)
+        frames = T.StreamSources(seqs, cfg, Q99, dev, torch.float64)
+        reference = {}
+        for i, seq in enumerate(seqs):
+            state = fe.init_state(1, H, W, dev, torch.float64)
+            _, feats, _, _ = fe.run_chunk(state, EventChunkSource(seq, cfg, dev, torch.float64).chunk(0, WINDOWS))
+            reference[i] = feats[:, 0]
+        for c in range(6):
+            pieces = T.stream_pieces(plan, c * 5, c * 5 + 5)
+            x, events, labels, keep = feeder.assemble(pieces, 5)
+            _, ev5, lab5, keep5 = T.assemble_streams(frames, pieces, 5, cfg, dev, torch.float64)
+            self.assertTrue(torch.equal(keep, keep5))
+            self.assertTrue(torch.equal(labels, lab5))
+            for key in ("t", "b", "y", "x"):
+                self.assertTrue(torch.equal(events[key], ev5[key]), key)
+            for b, stream in enumerate(pieces):
+                covered = set()
+                for index, lo, hi, offset, _ in stream:
+                    self.assertTrue(torch.allclose(x[offset:offset + hi - lo, b], reference[index][lo:hi],
+                                                   atol=1e-12))
+                    covered |= set(range(offset, offset + hi - lo))
+                for t in set(range(5)) - covered:
+                    self.assertEqual(float(x[t, b].abs().sum()), 0.0)
+
+    def test_joint_gradients_reach_backbone_and_heads(self):
+        import train_stream_evidence as E
+        from utils.comm_budget import CommBudget
+        seqs = [synthetic_sequence(seed=s) for s in (3, 4, 5)]
+        cfg = decision_config(evidence_backbone="joint", evidence_input="frontend", **FE)
+        fe = make_frontend(cfg).double()
+        net = make_frontend_net(fe.n_features)
+        heads = random_heads().double()
+        plan = [(1, [(0, WINDOWS), (2, WINDOWS)]), (3, [(1, WINDOWS)])]
+        comm = CommBudget(1.0, 0.01, 0.05)
+        comm.mu = 0.5
+        opt = torch.optim.SGD(list(net.parameters()) + list(heads.parameters()), lr=0.0)
+        out = E.train_epoch(net, heads, seqs, None, opt, cfg, cfg, Q99, torch.device("cpu"),
+                            np.random.RandomState(0), frontend=fe, comm=comm, plan=plan)
+        self.assertGreater(out["updates"], 0)
+        self.assertIn("comm", out)
+        self.assertTrue(all(p.grad is not None for p in heads.parameters()))
+        lacking = [n for n, p in net.named_parameters() if p.grad is None and not n.startswith("readout.")]
+        self.assertEqual(lacking, [])
+        self.assertTrue(all(p.grad is None for n, p in net.named_parameters() if n.startswith("readout.")))
+
+    def test_frontend_step_and_layer_inference_agree(self):
+        import train_stream_evidence as E
+        cfg = decision_config(evidence_backbone="joint", evidence_input="frontend", **FE)
+        fe = make_frontend(cfg).double()
+        net = make_frontend_net(fe.n_features)
+        net.eval()
+        heads = random_heads().double()
+        seq = synthetic_sequence(seed=9)
+        dev = torch.device("cpu")
+        with torch.no_grad():
+            a = E.evaluate_sequence(net, heads, seq, cfg, cfg, Q99, dev, "step", frontend=fe)
+            b = E.evaluate_sequence(net, heads, seq, cfg, cfg, Q99, dev, "layer", frontend=fe)
+            ref = make_tif_net(merged=False)
+            ref.eval()
+            c = E.evaluate_sequence(net, heads, seq, cfg, cfg, Q99, dev, "step", frontend=fe,
+                                    reference=(ref, cfg, Q99))
+            d = E.evaluate_sequence(ref, heads, seq, decision_config(), cfg, Q99, dev, "step")
+        self.assertIsNone(a["v5"])
+        for name in a["probs"]:
+            self.assertLess(float(np.abs(a["probs"][name] - b["probs"][name]).max()), 1e-6, name)
+            self.assertTrue(np.array_equal(a["probs"][name], c["probs"][name]), name)
+        self.assertTrue(np.array_equal(c["v5"], d["v5"]))
+
+
 class ConfigTests(unittest.TestCase):
     def test_config_matches_v3_decision_constants(self):
         import train_stream_evidence as E
@@ -223,6 +380,16 @@ class ConfigTests(unittest.TestCase):
                     "mark_prior": 0.03, "intensity_prior": 0.0002, "log_g_max": 8.0, "loss_intensity_smooth": 3}
         for key, value in expected.items():
             self.assertEqual(cfg[key], value, key)
+        self.assertEqual((cfg["evidence_backbone"], cfg["evidence_input"]), ("frozen", "frame"))
+        joint = E.build_config("configs/evisseg_stream_evidence_joint.yaml")
+        self.assertEqual((joint["evidence_backbone"], joint["evidence_input"]), ("joint", "frontend"))
+        self.assertEqual(joint["evidence_epochs"], 50)
+        for key, value in dict(expected, **FE).items():
+            self.assertEqual(joint[key], value, key)
+        a = load_flat_config("configs/evisseg_stream_evidence.yaml")
+        b = load_flat_config("configs/evisseg_stream_evidence_joint.yaml")
+        self.assertEqual({k for k in set(a) | set(b) if a.get(k) != b.get(k)},
+                         {"evidence_backbone", "evidence_input", "evidence_epochs", "evidence_save_root"} | set(FE))
 
 
 class EndToEndTests(unittest.TestCase):
@@ -285,6 +452,23 @@ class EndToEndTests(unittest.TestCase):
             self.assertTrue(all(item["equal"] for item in result["v5_vs_reference"].values()), result["v5_vs_reference"])
             self.assertEqual(set(result["readouts"]), {"net", "fused_d1", "fused_d2", "fused_d3", "pub"})
             self.assertEqual(len(result["publish"]["age_hist_target"]), 4)
+            joint = load_flat_config("configs/evisseg_stream_evidence_joint.yaml")
+            joint.update({k: ev[k] for k in ev if k not in ("evidence_backbone", "evidence_input",
+                                                            "evidence_epochs", "evidence_save_root")})
+            joint.update(evidence_epochs=2, evidence_save_root=str(root / "joint"))
+            joint_path = root / "joint.yaml"
+            joint_path.write_text(yaml.safe_dump({"EVIDENCE": joint}), encoding="utf-8")
+            jcfg = E.build_config(str(joint_path))
+            E.mode_smoke(SimpleNamespace(device="cpu"), jcfg)
+            E.mode_train(SimpleNamespace(device="cpu"), jcfg)
+            self.assertTrue((root / "joint" / "best_joint.pt").exists())
+            self.assertTrue((root / "joint" / "calibration.json").exists())
+            E.mode_eval(SimpleNamespace(device="cpu", split="val", reference=str(reference), overwrite=True), jcfg)
+            jres = json.loads((root / "joint" / "eval_evidence_val.json").read_text(encoding="utf-8"))
+            self.assertTrue(all(item["equal"] for item in jres["v5_vs_reference"].values()),
+                            jres["v5_vs_reference"])
+            self.assertEqual(jres["v5"]["iou"], result["v5"]["iou"])
+            self.assertEqual(jres["input"], "frontend")
 
 
 if __name__ == "__main__":
