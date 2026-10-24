@@ -341,6 +341,37 @@ class JointPathTests(unittest.TestCase):
         self.assertEqual(lacking, [])
         self.assertTrue(all(p.grad is None for n, p in net.named_parameters() if n.startswith("readout.")))
 
+    def test_stream_groups_give_the_same_gradients(self):
+        """2 条流分 2 组反传、梯度累加，与 2 条一起算的梯度相同（含消息约束、跨片段的状态）。"""
+        import train_stream_evidence as E
+        from utils.comm_budget import CommBudget
+        seqs = [synthetic_sequence(seed=s) for s in (3, 4, 5)]
+        plan = [(1, [(0, WINDOWS), (2, WINDOWS)]), (3, [(1, WINDOWS)])]
+        grads = {}
+        for groups in (1, 2):
+            cfg = decision_config(evidence_backbone="joint", evidence_input="frontend", evidence_stream_groups=groups,
+                                  **FE)
+            fe = make_frontend(cfg).double()
+            net = make_frontend_net(fe.n_features)
+            heads = random_heads().double()
+            comm = CommBudget(1.0, 0.01, 0.05)
+            comm.mu = 0.5
+            opt = torch.optim.SGD(list(net.parameters()) + list(heads.parameters()), lr=0.0)
+            out = E.train_epoch(net, heads, seqs, None, opt, cfg, cfg, Q99, torch.device("cpu"),
+                                np.random.RandomState(0), frontend=fe, comm=comm, plan=plan, max_chunks=3)
+            self.assertEqual(out["stream_groups"], groups)
+            grads[groups] = ({n: p.grad.clone() for n, p in net.named_parameters() if p.grad is not None},
+                             {n: p.grad.clone() for n, p in heads.named_parameters()}, out, comm.mu)
+        for part in (0, 1):
+            self.assertEqual(set(grads[1][part]), set(grads[2][part]))
+            for name, g in grads[1][part].items():
+                self.assertTrue(torch.allclose(g, grads[2][part][name], rtol=1e-9, atol=1e-12), name)
+        for key in ("bce_sum", "nll_sum", "events", "updates"):
+            self.assertAlmostEqual(grads[1][2][key], grads[2][2][key], places=8, msg=key)
+        self.assertAlmostEqual(grads[1][3], grads[2][3], places=12)
+        with self.assertRaises(ValueError):
+            E.stream_groups(2, 3)
+
     def test_frontend_step_and_layer_inference_agree(self):
         import train_stream_evidence as E
         cfg = decision_config(evidence_backbone="joint", evidence_input="frontend", **FE)

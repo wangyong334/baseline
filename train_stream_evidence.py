@@ -59,6 +59,7 @@ REQUIRED_KEYS = (
     "evidence_epochs", "evidence_lr", "evidence_lr_end", "evidence_grad_clip", "evidence_streams",
     "evidence_chunk", "evidence_eval_chunk", "evidence_save_root")
 FRONTEND_KEYS = ("fe_taus_ms", "fe_dipole_taus_ms", "fe_dipole_radius", "fe_features")
+OPTIONAL_KEYS = ("evidence_stream_groups",)     # 显存不够时把每块的流分组反传（梯度不变），缺省 1
 DATA_KEYS = ("height", "width_px", "pad_height", "pad_width", "window_ms", "n_windows", "time_bins", "input_clip")
 CLOCK_KEYS = ("window_ms", "n_windows")         # joint 时 V5 参照可以用自己的时钟（例如 25 ms 实验对 50 ms 定型版）
 EVAL_KEYS = ("threshold", "pd_detT", "correct_thresh", "rolling_window", "segments", "timing_warmup_windows")
@@ -84,6 +85,7 @@ def build_config(path):
     frontend = ev["evidence_input"] == "frontend"
     allowed = set(REQUIRED_KEYS) | (set(FRONTEND_KEYS) if frontend else set())
     missing = [k for k in sorted(allowed) if k not in ev]
+    allowed |= set(OPTIONAL_KEYS)
     unknown = sorted(set(ev) - allowed)
     if missing or unknown:
         raise ValueError("EVIDENCE 配置缺少 %s，多出 %s" % (missing, unknown))
@@ -95,6 +97,7 @@ def build_config(path):
         raise ValueError("EVIDENCE 配置与 base_config 有同名键: %s" % clash)
     if int(ev["evidence_epochs"]) < 1 or not ev["readout_delays"] or min(int(d) for d in ev["readout_delays"]) < 1:
         raise ValueError("需要 evidence_epochs >= 1，readout_delays 非空且都 >= 1")
+    stream_groups(int(ev["evidence_streams"]), ev.get("evidence_stream_groups", 1))
     if int(ev["publish_deadline"]) != max(int(d) for d in ev["readout_delays"]):
         raise ValueError("publish_deadline 应等于最长的固定等待（与 V3 相同：D = 5）")
     cfg = dict(base)
@@ -334,10 +337,22 @@ def head_losses(heads, u7, events, labels, valid, smooth):
     return bce, nll
 
 
+def stream_groups(n_streams, groups):
+    """把 B 条流按顺序分成 groups 个连续的组，返回 [(lo, hi), ...]（每组至少一条流）。"""
+    groups = int(groups)
+    if groups < 1 or groups > int(n_streams):
+        raise ValueError("evidence_stream_groups 必须在 1..流数（%d）之间，收到 %d" % (int(n_streams), groups))
+    edges = np.linspace(0, int(n_streams), groups + 1).round().astype(int)
+    return [(int(a), int(b)) for a, b in zip(edges[:-1], edges[1:])]
+
+
 def train_epoch(net, heads, dataset, lengths, optimizer, cfg, net_cfg, q99, device, rng, frontend=None, comm=None,
                 max_chunks=None, plan=None):
     """一轮：B 条流逐块前向。frozen 时骨干无梯度、只更新两个头；joint 时骨干与头一起更新，另加 V5 的消息约束。
-    损失 = (w_mark * BCE + w_int * NLL) / 本块事件数（+ 消息约束项）；没有事件的块不更新（与 V5 相同）。"""
+    损失 = (w_mark * BCE + w_int * NLL) / 本块事件数（+ 消息约束项）；没有事件的块不更新（与 V5 相同）。
+    evidence_stream_groups = G > 1 时（显存不够用）：每块的 B 条流分成 G 组依次前向、反向，梯度累加后更新一次。
+    各条流在前向中互不影响，损失按整块的事件数归一、消息约束按整块的有效窗数归一，所以梯度与 G = 1 相同
+    （标准的梯度累积，只有浮点求和顺序不同）；显存约为 1/G，计算量不变。"""
     joint = is_joint(cfg)
     k, n_streams = int(cfg["evidence_chunk"]), int(cfg["evidence_streams"])
     if plan is None:
@@ -352,8 +367,9 @@ def train_epoch(net, heads, dataset, lengths, optimizer, cfg, net_cfg, q99, devi
     w_mark, w_int = float(cfg["loss_mark_weight"]), float(cfg["loss_intensity_weight"])
     smooth, clip = int(cfg["loss_intensity_smooth"]), float(cfg["evidence_grad_clip"])
     params = list(heads.parameters()) + (list(net.parameters()) if joint else [])
+    bounds = stream_groups(len(plan), min(int(cfg.get("evidence_stream_groups", 1)), len(plan)))
     stats = {"bce_sum": 0.0, "nll_sum": 0.0, "events": 0}
-    net_states, updates = None, 0
+    group_states, updates = [None] * len(bounds), 0
     if comm is not None:
         comm.start_epoch()
     heads.train()
@@ -364,39 +380,50 @@ def train_epoch(net, heads, dataset, lengths, optimizer, cfg, net_cfg, q99, devi
         pieces = V5.stream_pieces(plan, start, start + k)
         x, events, labels, keep = feeder.assemble(pieces, k)
         valid = V5.stream_valid(pieces, k, device, dtype)
-        prev_states = net_states
-        if joint:
-            _, net_states, info = net.forward_chunk(x, events, net_states, keep=keep, collect=True)
-        else:
-            with torch.no_grad():
-                _, net_states, info = net.forward_chunk(x, events, net_states, keep=keep, collect=True)
         n = int(labels.numel())
+        total_valid = float(valid.sum())
         if n:
-            bce, nll = head_losses(heads, info["u_pre"][DEC1], events, labels, valid, smooth)
-            loss = (w_mark * bce + w_int * nll) / float(n)
-            if comm is not None:
-                penalty = comm.chunk_loss(net, info["u_pre"], prev_states, keep, 1, valid)
-                if penalty is not None:
-                    loss = loss + penalty
-            if not math.isfinite(float(loss.detach())):
-                raise RuntimeError("损失出现非有限值: 块 %d" % c)
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+        for g, (lo, hi) in enumerate(bounds):
+            if len(bounds) == 1:
+                xg, ev, lab, keep_g, valid_g = x, events, labels, keep, valid
+            else:
+                sel = (events["b"] >= lo) & (events["b"] < hi)
+                ev = {key: value[sel] for key, value in events.items()}
+                ev["b"] = ev["b"] - lo
+                xg, lab = x[:, lo:hi].contiguous(), labels[sel]
+                keep_g, valid_g = keep[:, lo:hi].contiguous(), valid[:, lo:hi].contiguous()
+            prev_states = group_states[g]
+            if joint:
+                _, states, info = net.forward_chunk(xg, ev, prev_states, keep=keep_g, collect=True)
+            else:
+                with torch.no_grad():
+                    _, states, info = net.forward_chunk(xg, ev, prev_states, keep=keep_g, collect=True)
+            if n:
+                bce, nll = head_losses(heads, info["u_pre"][DEC1], ev, lab, valid_g, smooth)
+                loss = (w_mark * bce + w_int * nll) / float(n)
+                if comm is not None:
+                    penalty = comm.chunk_loss(net, info["u_pre"], prev_states, keep_g, 1, valid_g)
+                    if penalty is not None:                 # 组内按本组有效窗数归一 -> 换算成按整块有效窗数归一
+                        loss = loss + penalty * (float(valid_g.sum()) / total_valid)
+                if not math.isfinite(float(loss.detach())):
+                    raise RuntimeError("损失出现非有限值: 块 %d 组 %d" % (c, g))
+                loss.backward()
+                stats["bce_sum"] += float(bce.detach())
+                stats["nll_sum"] += float(nll.detach())
+            group_states[g] = V5.detach_states(states) if joint else states
+        if n:
             torch.nn.utils.clip_grad_norm_(params, clip)
             optimizer.step()
             updates += 1
             if comm is not None:
                 comm.end_update()
-            stats["bce_sum"] += float(bce.detach())
-            stats["nll_sum"] += float(nll.detach())
             stats["events"] += n
-        if joint:
-            net_states = V5.detach_states(net_states)
         for stream in pieces:
             for index, lo, hi, _, _ in stream:
                 if (index, hi) in item_ends:
                     feeder.release(index)
-    stats.update(chunks=n_chunks, updates=updates)
+    stats.update(chunks=n_chunks, updates=updates, stream_groups=len(bounds))
     if comm is not None:
         stats["comm"] = comm.summary()
     return stats
@@ -634,9 +661,10 @@ def mode_train(args, cfg):
     val_set = EvUAVStream(cfg["root"], "val", net_cfg)
     lengths = [int(train_set[i].n_windows) for i in range(len(train_set))]
     seed, epochs = int(cfg["seed"]), int(cfg["evidence_epochs"])
-    print("V2/V3 判决层接 V5：骨干 %s、输入 %s（%d 通道），头参数 %d | 训练集 %d 条录像 %d 窗，%d 条流、块 %d 窗%s" % (
+    print("V2/V3 判决层接 V5：骨干 %s、输入 %s（%d 通道），头参数 %d | 训练集 %d 条录像 %d 窗，%d 条流（分 %d 组反传）、块 %d 窗%s" % (
         cfg["evidence_backbone"], cfg["evidence_input"], input_channels(cfg, frontend), head_parameters(heads),
-        len(lengths), sum(lengths), int(cfg["evidence_streams"]), int(cfg["evidence_chunk"]),
+        len(lengths), sum(lengths), int(cfg["evidence_streams"]), int(cfg.get("evidence_stream_groups", 1)),
+        int(cfg["evidence_chunk"]),
         "" if comm is None else "，消息约束：每窗预算 %.4g、违约比例上限 %.0f%%" % (comm.budget, 100 * comm.alpha)),
         flush=True)
     best = -float("inf")

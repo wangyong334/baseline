@@ -4,6 +4,7 @@
 #   每像素每窗的量减半：bg_prior 0.01 -> 0.005、bg_floor 0.001 -> 0.0005、intensity_prior 2e-4 -> 1e-4、门控 ε 0.03 -> 0.015；
 #   先验伪窗数 2 -> 4（100 ms 不变）；速度假设（像素/窗）减半，7x7 = 49 个，物理速度与 50 ms 版相同；
 #   固定等待 1..5 -> 1..10 窗、发布期限 D 5 -> 10 窗（250 ms 不变）；训练片段 16 -> 32 窗、验证片段 32 -> 64 窗（时长不变）。
+#   32 窗片段显存不够（冒烟 OOM）：4 条流分 2 组反传、梯度累加，梯度与 4 条一起算相同（标准梯度累积）。
 #   毫秒常数（前端时间尺度、背景快慢常数、管道记忆 250 ms）、像素常数（足迹、偶极邻域）、nat 常数（裕量 a、b）不变。
 # backbone_checkpoint 只作 V5 参照（50 ms 定型版，评估时按它自己的 50 ms 切法另跑，给出纠正 / 破坏数的基准）。
 EVIDENCE:
@@ -56,5 +57,6 @@ EVIDENCE:
   evidence_grad_clip: 1.0
   evidence_streams: 4
   evidence_chunk: 32
+  evidence_stream_groups: 2            # 显存：每块的 4 条流分 2 组依次反传、梯度累加后更新一次（梯度与不分组相同）
   evidence_eval_chunk: 64              # 训练中验证（逐片段执行）每次处理的窗数
   evidence_save_root: log/stream_evidence_v3joint_w25_seed37
