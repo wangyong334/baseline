@@ -48,6 +48,7 @@ TRAIN:
   tbptt_k: 32
   trainer: streams             # 标准有状态 TBPTT：B 条并行流，每 n 个片段更新一次（10-16 定稿 B=4、n=1、k=16）
   streams: 4
+  stream_groups: 2             # 显存分组：k=32 时 4 条流一起反传超出 24 GB；分 2 组依次反传，梯度与不分组相同
   accumulate: 1
   optimizer_step: per_sequence # 只对 trainer=sequence 生效
   grad_clip: 1.0

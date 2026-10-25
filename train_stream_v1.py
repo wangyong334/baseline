@@ -150,6 +150,7 @@ def build_config(args):
         raise ValueError("stream_layout 必须是 %s 之一" % (STREAM_LAYOUTS,))
     if int(cfg["streams"]) < 1 or int(cfg["accumulate"]) < 1:
         raise ValueError("streams 与 accumulate 必须 >= 1")
+    stream_groups(int(cfg["streams"]), int(cfg.get("stream_groups", 1)))
     if cfg["trainer"] == "streams" and cfg.get("execution", "step") != "layer":
         raise ValueError("trainer=streams 需要 execution=layer")
     speed_options(cfg)
@@ -848,6 +849,24 @@ def stream_valid(pieces, steps, device, dtype):
     return valid
 
 
+def stream_groups(n_streams, groups):
+    """把 B 条流按顺序分成 groups 个连续的组，返回 [(lo, hi), ...]（每组至少一条流；与 v6-2 相同）。"""
+    groups = int(groups)
+    if groups < 1 or groups > int(n_streams):
+        raise ValueError("stream_groups 必须在 1..流数（%d）之间，收到 %d" % (int(n_streams), groups))
+    edges = np.linspace(0, int(n_streams), groups + 1).round().astype(int)
+    return [(int(a), int(b)) for a, b in zip(edges[:-1], edges[1:])]
+
+
+def select_streams(x, events, labels, keep, valid, lo, hi):
+    """从一个 [k,B] 片段中取出第 lo..hi-1 条流（事件的流号改成组内编号）。"""
+    sel = (events["b"] >= lo) & (events["b"] < hi)
+    ev = {key: value[sel] for key, value in events.items()}
+    ev["b"] = ev["b"] - lo
+    return (x[:, lo:hi].contiguous(), ev, labels[sel], keep[:, lo:hi].contiguous(),
+            valid[:, lo:hi].contiguous())
+
+
 def train_streams(net, dataset, lengths, optimizer, cfg, q99, pos_weight, device, rng, max_chunks=None, plan=None,
                   comm=None):
     """标准有状态 TBPTT（一轮）：B 条并行流一起前向 k 窗、反向 k 窗，每 n 个片段更新一次参数。
@@ -857,6 +876,9 @@ def train_streams(net, dataset, lengths, optimizer, cfg, q99, pos_weight, device
     （与梯度累加的常规做法相同；事件数只读窗口边界、不经过网络，所以可以在反传前算好）。
     因此 n=1 即逐片段更新（原 per_chunk），B=1 且 n = 录像窗数 / k 时即原 per_sequence。没有事件的片段不反传。
     推理不受影响，仍是整段连续。max_chunks 只供冒烟和计时截断；plan 只供测试指定分配。
+    stream_groups = G > 1 时（显存不够用，例如 25 ms 的 k=32）：每个片段的 B 条流分成 G 组依次前向、反向，
+    梯度累加后照常更新。各条流在前向中互不影响，BCE 按整次更新的事件数归一、消息约束按整片段的有效窗数归一，
+    所以梯度与 G = 1 相同（标准的梯度累积，只有浮点求和顺序不同）；显存约为 1/G，计算量不变。
     comm 为 utils.comm_budget.CommBudget（通信预算训练，乘子 mu 跨轮延续）或 None（关闭，与原训练逐位相同）。
     返回字段与 train_sequence 相同（steps = 参数更新次数，grad_norms 为各次更新的平均），另有 chunks；
     开启通信预算时另有 comm（CommBudget.summary()）。
@@ -878,7 +900,8 @@ def train_streams(net, dataset, lengths, optimizer, cfg, q99, pos_weight, device
     loss_sum, events_total, updates, grad_acc, total_norms, missing = 0.0, 0, 0, {}, [], []
     if comm is not None:
         comm.start_epoch()
-    states = None
+    bounds = stream_groups(len(plan), min(int(cfg.get("stream_groups", 1)), len(plan)))
+    group_states = [None] * len(bounds)
     optimizer.zero_grad(set_to_none=True)
     for first in range(0, n_chunks, accumulate):
         block = [stream_pieces(plan, c * k, (c + 1) * k) for c in range(first, min(first + accumulate, n_chunks))]
@@ -886,23 +909,33 @@ def train_streams(net, dataset, lengths, optimizer, cfg, q99, pos_weight, device
                            for pieces in block for stream in pieces for index, lo, hi, _, _ in stream)
         for offset, pieces in enumerate(block):
             x, events, labels, keep = assemble_streams(sources, pieces, k, cfg, device, dtype)
-            prev_states = states
-            logits, states, info = net.forward_chunk(x, events, states, keep=keep, collect=comm is not None)
-            if labels.numel():
-                chunk_loss = F.binary_cross_entropy_with_logits(logits, labels, pos_weight=weight, reduction="sum")
-                total = chunk_loss / float(block_events)
-                if comm is not None:
-                    penalty = comm.chunk_loss(net, info["u_pre"], prev_states, keep, len(block),
-                                              stream_valid(pieces, k, device, dtype))
-                    if penalty is not None:
-                        total = total + penalty
-                total.backward()
-                value = float(chunk_loss.detach())
-                if not math.isfinite(value):
-                    raise RuntimeError("损失出现非有限值: 片段 %d" % (first + offset))
-                loss_sum += value
-                events_total += int(labels.numel())
-            states = detach_states(states)
+            valid = stream_valid(pieces, k, device, dtype)
+            total_valid = float(valid.sum())
+            for g, (lo, hi) in enumerate(bounds):
+                if len(bounds) == 1:
+                    xg, ev, lab, keep_g, valid_g = x, events, labels, keep, valid
+                else:
+                    xg, ev, lab, keep_g, valid_g = select_streams(x, events, labels, keep, valid, lo, hi)
+                prev_states = group_states[g]
+                logits, states, info = net.forward_chunk(xg, ev, prev_states, keep=keep_g, collect=comm is not None)
+                if labels.numel():                          # 与不分组相同：整个片段没有事件时不反传
+                    terms = []
+                    if lab.numel():
+                        chunk_loss = F.binary_cross_entropy_with_logits(logits, lab, pos_weight=weight,
+                                                                        reduction="sum")
+                        value = float(chunk_loss.detach())
+                        if not math.isfinite(value):
+                            raise RuntimeError("损失出现非有限值: 片段 %d 组 %d" % (first + offset, g))
+                        terms.append(chunk_loss / float(block_events))
+                        loss_sum += value
+                        events_total += int(lab.numel())
+                    if comm is not None:
+                        penalty = comm.chunk_loss(net, info["u_pre"], prev_states, keep_g, len(block), valid_g)
+                        if penalty is not None:             # 组内按本组有效窗数归一 -> 换算成按整片段有效窗数归一
+                            terms.append(penalty * (float(valid_g.sum()) / total_valid))
+                    if terms:
+                        sum(terms).backward()
+                group_states[g] = detach_states(states)
             for stream in pieces:
                 for index, lo, hi, _, _ in stream:
                     if (index, hi) in item_ends:
@@ -1289,6 +1322,9 @@ def mode_train(args, cfg):
         print("标准 TBPTT：%d 条并行流（排法 %s）、k=%d、每 %d 个片段更新一次（每次更新 %d 窗）| 训练集 %d 条录像 %d 窗" % (
             int(cfg["streams"]), cfg.get("stream_layout", "greedy"), int(cfg["tbptt_k"]), int(cfg["accumulate"]),
             int(cfg["streams"]) * int(cfg["tbptt_k"]) * int(cfg["accumulate"]), len(lengths), sum(lengths)), flush=True)
+        if int(cfg.get("stream_groups", 1)) > 1:
+            print("显存分组：每个片段的 %d 条流分 %d 组依次前向、反向，梯度累加后更新（梯度与不分组相同）" % (
+                int(cfg["streams"]), int(cfg["stream_groups"])), flush=True)
     print("执行方式 %s | 输入构造 %s | 训练子集每 %d 轮评估 | 验证片段 %d 窗" % (
         execution, input_device, int(cfg.get("train_subset_every", 1)), int(cfg.get("eval_chunk", 32))), flush=True)
     for epoch in range(start_epoch, epochs):
@@ -1340,6 +1376,7 @@ def mode_train(args, cfg):
                   "peak_memory_gib": peak_memory_gib(device), "grad_norms": grad_mean,
                   "grad_clip_stats": grad_clip_stats, "tbptt_k": int(cfg["tbptt_k"]),
                   "trainer": trainer, "streams": int(cfg.get("streams", 1)), "accumulate": int(cfg.get("accumulate", 1)),
+                  "stream_groups": int(cfg.get("stream_groups", 1)),
                   "stream_layout": cfg.get("stream_layout", "greedy"),
                   "updates": updates,
                   "val_threshold_sweep": val["threshold_sweep"],

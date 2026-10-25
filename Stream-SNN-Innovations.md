@@ -4462,3 +4462,4 @@ EV-UAV，阈值 0.9；V5 参照一行与 V5 正式评估完全相同。按 val n
   - 新增 `configs/evisseg_stream_tif_comm_peak_w25.yaml`，与 v6-2 的同名基础配置完全相同；输出 `log/stream_tif_commpeak_msg_w25_seed37`；q99 用 `configs/stream_v1_train_stats_w25.json`。
   - `train_stream_v1.py` 只加了一个计时字段 `ms_per_8s`（按实际窗长折算 8 s），训练和精度路径不变。
   - 新增 `tests/test_stream_w25.py`：配置与 50 ms 版只差时钟量；25 ms 端到端训练与评估。本地 189 项通过。
+  - 10-25：第一次训练在第 1 个片段 OOM（卡 2，PyTorch 已占 21.6 GiB）。显存主要是骨干 B×k 窗的稠密激活，与窗长无关，k 从 16 翻到 32 后 V5 单独也装不下。把 v6-2 的分组回传移进 `train_streams`（`stream_groups`，默认 1，50 ms 及以前的配置不变；w25 配置设 2）。测试核对分组与不分组训练结果相同（消息约束开启、跨片段状态、某组整片段无事件、accumulate=2），本地 214 项通过。改到卡 0 重跑。
