@@ -145,6 +145,64 @@ class ProbeTests(unittest.TestCase):
             self.assertGreater(s["area_share"]["trail"], 0.0)
 
 
+class ErrorDiagnosisTests(unittest.TestCase):
+    def test_auc_and_best_threshold_match_brute_force(self):
+        rng = np.random.RandomState(0)
+        scores = np.round(rng.rand(200), 2).astype(np.float32)          # 有并列
+        labels = (rng.rand(200) < 0.3).astype(np.float32)
+        pos, neg = scores[labels == 1], scores[labels == 0]
+        brute = np.mean([(p > n) + 0.5 * (p == n) for p in pos for n in neg])
+        self.assertAlmostEqual(D.rank_auc(scores, labels), brute, places=10)
+        best, thr = D.best_threshold_iou(scores, labels)
+        ious = []
+        for t in np.unique(scores):
+            pred = scores >= t
+            tp = int((pred & (labels == 1)).sum())
+            ious.append((tp / float(int(pred.sum()) + int(((~pred) & (labels == 1)).sum())), float(t)))
+        self.assertAlmostEqual(best, max(ious)[0], places=10)
+        self.assertAlmostEqual(thr, max(ious, key=lambda v: (v[0], -v[1]))[1], places=6)
+        self.assertIsNone(D.rank_auc(scores, np.zeros(200)))
+        self.assertEqual(D.best_threshold_iou(scores, np.zeros(200)), (None, None))
+
+    def test_local_density_matches_brute_force(self):
+        rng = np.random.RandomState(1)
+        xs, ys = rng.randint(0, 9, 60), rng.randint(0, 7, 60)
+        got = D.local_density(xs, ys, 7, 9)
+        brute = [int(((abs(xs - x) <= 2) & (abs(ys - y) <= 2)).sum()) for x, y in zip(xs, ys)]
+        self.assertEqual(got.tolist(), brute)
+
+    def test_sequence_record_totals_and_layer_saturation(self):
+        seq = synthetic_sequence(seed=2)
+        cfg = dict(CFG, input_device="cpu", execution="step")
+        device = torch.device("cpu")
+        net = make_tif_net().eval()
+        regions = D.TargetRegions(4)
+        probe = D.LayerProbe(net, regions)
+        with torch.no_grad():
+            probe.start_sequence()
+            probs = D.run_sequence_probe(net, seq, cfg, Q99, device, regions)
+        record = D.analyze_sequence(seq, probs, cfg["threshold"], H, W, 1, 4)
+        layers = probe.sequence_summary()
+        probe.remove()
+        density = np.asarray(record["density"])
+        self.assertEqual(density[:, :3].sum(axis=0).tolist(), [record["tp"], record["fp"], record["fn"]])
+        self.assertEqual(int(density[:, 3].sum()), int((seq.label != 1).sum()))
+        windows = np.asarray(record["per_window"])
+        self.assertEqual(windows.shape, (seq.n_windows, 4))
+        self.assertEqual(windows[:, 1:].sum(axis=0).tolist(), [record["tp"], record["fp"], record["fn"]])
+        self.assertLessEqual(record["iou"], record["best_iou"] + 1e-12)
+        for name in LAYER_NAMES:
+            s = layers[name]
+            self.assertEqual(len(s["bg_series"]), seq.n_windows)
+            for region in D.REGIONS:
+                frac = s["saturated_fraction"][region]
+                self.assertTrue(frac is None or 0.0 <= frac <= 1.0)
+            for region in D.REGIONS:            # 小画面的粗层上背景面积可能为 0（None）
+                level = s["mean_level"][region]
+                self.assertTrue(level is None or 0.0 <= level <= getattr(net, name).neuron.levels + 1e-6)
+        self.assertEqual(set(probe.summary()), set(LAYER_NAMES))
+
+
 class EntryTests(unittest.TestCase):
     def test_main_two_checkpoints(self):
         with tempfile.TemporaryDirectory() as directory:

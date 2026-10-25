@@ -25,6 +25,13 @@
        bg     其余
   记忆 M（本窗更新后）在三个区域的占比，以及密度比 = 占比 / 面积占比（now 越高、trail 越低越好）。
 三、逐序列消息率：每个序列各层平均 |Δq|，以及它与每窗负事件数的秩相关（杂波越多消息越多 = 相关为正）。
+四、错误诊断（10-24 增加，只作诊断、不作报告指标）：
+  1. 每条序列的可分性：AUC（目标事件的分数高于背景事件的概率）；最优阈值 IoU（本序列上最好的单一阈值能到多少）。
+     IoU@0.9 远低于最优阈值 IoU 而 AUC 高 = 工作点漂移；两者都低 = 网络输出里目标与背景本身分不开。
+  2. 按局部密度分档的 TP / FP / FN：局部密度 = 同一窗内以该事件为中心 5x5 像素里的事件数（含自己）。
+  3. 层内饱和：每层每个区域（now / trail / bg）记忆顶到上限（M >= D*theta）的神经元比例与平均电平 M/theta，
+     整个划分汇总，并且逐序列给出；逐窗给出背景区的饱和比例与平均电平（看失败是一开始就有还是随时间累积）。
+  4. 逐窗计数：每窗负事件数、TP、FP、FN。
 """
 import os
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
@@ -53,6 +60,9 @@ STRIDE = dict(enc1=1, enc2=2, enc3=4, enc4=8, dec3=4, dec2=2, dec1=1)
 SPEED_EDGES = (0.0, 0.5, 1.0, 2.0, 4.0, 8.0, math.inf)
 REGIONS = ("now", "trail", "bg")
 FP_KINDS = ("near", "trail", "far")
+DENSITY_EDGES = (1, 2, 4, 8, 16, 32, 64, math.inf)   # 5x5 邻域内的事件数（含自己）
+DENSITY_RADIUS = 2
+SATURATION_TOL = 1e-4                               # M >= (1 - tol) * D * theta 记为饱和
 EVAL_KEYS = ("threshold", "pd_detT", "correct_thresh", "rolling_window", "segments", "timing_warmup_windows")
 DATA_KEYS = ("height", "width_px", "pad_height", "pad_width", "window_ms", "n_windows", "time_bins", "input_clip")
 
@@ -158,11 +168,15 @@ class TargetRegions(object):
 
 
 class LayerProbe(object):
-    """在每层 TIF 神经元上挂前向钩子，只读输出，按区域累计记忆。"""
+    """在每层 TIF 神经元上挂前向钩子，只读输出，按区域累计记忆、饱和（M >= D*theta）与电平 M/theta。
+
+    整个划分的累计在 sums；start_sequence() 之后另记本序列的累计与逐窗背景区序列，sequence_summary() 取出。
+    """
 
     def __init__(self, net, regions):
         self.regions = regions
         self.sums, self.handles = {}, []
+        self.seq_sums, self.series = {}, {}
         for name in LAYER_NAMES:
             neuron = getattr(net, name).neuron
             if isinstance(neuron, StreamingTIF2d):
@@ -172,6 +186,9 @@ class LayerProbe(object):
         for handle in self.handles:
             handle.remove()
         self.handles = []
+
+    def start_sequence(self):
+        self.seq_sums, self.series = {}, {}
 
     @staticmethod
     def _add(store, key, value, masks, scale=1.0):
@@ -188,16 +205,26 @@ class LayerProbe(object):
                 memory = output[2]
                 now, trail = self.regions.masks(stride, memory.shape[-2], memory.shape[-1], memory.device)
                 masks = (now, trail, 1.0 - now - trail)
-                store = self.sums.setdefault(name, {})
-                self._add(store, "memory", memory, masks)
-                self._add(store, "area", None, masks, float(memory.shape[0] * memory.shape[1]))
+                theta = module.theta().to(memory.dtype).view(1, -1, 1, 1)
+                level = memory / theta
+                saturated = (level >= module.levels * (1.0 - SATURATION_TOL)).to(memory.dtype)
+                neurons = float(memory.shape[0] * memory.shape[1])
+                for store in (self.sums.setdefault(name, {}), self.seq_sums.setdefault(name, {})):
+                    self._add(store, "memory", memory, masks)
+                    self._add(store, "area", None, masks, neurons)
+                    self._add(store, "saturated", saturated, masks)
+                    self._add(store, "level", level, masks)
+                bg = masks[2]
+                bg_area = bg.sum() * neurons
+                self.series.setdefault(name, []).append(torch.stack([
+                    (saturated * bg).sum() / bg_area.clamp(min=1.0), (level * bg).sum() / bg_area.clamp(min=1.0)]))
 
         return hook
 
-    def summary(self):
-        """各层汇总：记忆与面积在三个区域的占比、密度比。"""
+    @staticmethod
+    def _summarize(sums):
         out = {}
-        for name, store in self.sums.items():
+        for name, store in sums.items():
             s = {key: float(value) for key, value in store.items()}
 
             def total(key):
@@ -207,12 +234,29 @@ class LayerProbe(object):
                 t = total(key)
                 return s[key + "_" + region] / t if t > 0 else None
 
+            def per_area(key, region):
+                a = s["area_" + region]
+                return s[key + "_" + region] / a if a > 0 else None
+
             layer = {"memory_share": {r: share("memory", r) for r in REGIONS},
-                     "area_share": {r: share("area", r) for r in REGIONS}}
+                     "area_share": {r: share("area", r) for r in REGIONS},
+                     "saturated_fraction": {r: per_area("saturated", r) for r in REGIONS},
+                     "mean_level": {r: per_area("level", r) for r in REGIONS}}
             layer["memory_density"] = {r: (layer["memory_share"][r] / layer["area_share"][r]
                                            if layer["memory_share"][r] is not None and layer["area_share"][r] else None)
                                        for r in REGIONS}
             out[name] = layer
+        return out
+
+    def summary(self):
+        """整个划分的各层汇总：记忆与面积在三个区域的占比、密度比、饱和比例、平均电平。"""
+        return self._summarize(self.sums)
+
+    def sequence_summary(self):
+        """本序列的各层汇总（同 summary），另加逐窗背景区的饱和比例与平均电平 bg_series [[饱和, 电平], ...]。"""
+        out = self._summarize(self.seq_sums)
+        for name, rows in self.series.items():
+            out[name]["bg_series"] = [[float(a), float(b)] for a, b in torch.stack(rows).cpu().tolist()]
         return out
 
 
@@ -266,19 +310,74 @@ def count_near(fx, fy, tx, ty, radius):
     return int(local[fy[box] - y0, fx[box] - x0].sum())
 
 
+def rank_auc(scores, labels):
+    """AUC = P(目标事件的分数 > 背景事件的分数)，并列算一半（Mann-Whitney U / (n1*n0)）；某一类为空时返回 None。"""
+    scores = np.asarray(scores, dtype=np.float64)
+    pos = np.asarray(labels) == 1
+    n1, n0 = int(pos.sum()), int((~pos).sum())
+    if n1 == 0 or n0 == 0:
+        return None
+    ranks = average_ranks(scores)
+    return float((ranks[pos].sum() - n1 * (n1 - 1) / 2.0) / (n1 * n0))
+
+
+def best_threshold_iou(probs, labels):
+    """本序列上最好的单一阈值能达到的 IoU（判正规则 prob >= 阈值），返回 (IoU, 阈值)；没有正事件时为 (None, None)。
+    只作诊断：判断错误来自工作点（阈值）还是来自可分性，不作报告指标。"""
+    probs = np.asarray(probs, dtype=np.float32)
+    pos = np.asarray(labels) == 1
+    n_pos = int(pos.sum())
+    if n_pos == 0:
+        return None, None
+    order = np.argsort(-probs, kind="mergesort")
+    p, y = probs[order], pos[order]
+    tp, fp = np.cumsum(y), np.cumsum(~y)
+    last = np.r_[p[1:] != p[:-1], True]            # 同分的一组只在组末取值（阈值 = 该分数，组内全部判正）
+    iou = tp[last] / (n_pos + fp[last]).astype(np.float64)
+    best = int(np.argmax(iou))
+    return float(iou[best]), float(p[last][best])
+
+
+def local_density(xs, ys, height, width, radius=DENSITY_RADIUS):
+    """同一窗内以每个事件为中心 (2r+1)^2 像素里的事件数（含自己），返回与 xs 同长的整数数组。"""
+    counts = np.zeros((height + 2 * radius + 1, width + 2 * radius + 1), dtype=np.int64)
+    np.add.at(counts, (ys + radius + 1, xs + radius + 1), 1)
+    integral = counts.cumsum(0).cumsum(1)
+    y0, x0, y1, x1 = ys, xs, ys + 2 * radius + 1, xs + 2 * radius + 1
+    return integral[y1, x1] - integral[y0, x1] - integral[y1, x0] + integral[y0, x0]
+
+
+def density_rows(table):
+    """按局部密度分档的计数表 -> 每档 {bin, tp, fp, fn, neg, iou}。table[i] = [tp, fp, fn, neg]。"""
+    rows = []
+    for (lo, hi), (tp, fp, fn, neg) in zip(zip(DENSITY_EDGES[:-1], DENSITY_EDGES[1:]), table):
+        rows.append({"bin": "%g-%g" % (lo, hi), "tp": int(tp), "fp": int(fp), "fn": int(fn), "neg": int(neg),
+                     "iou": iou_from_counts(int(tp), int(fp), int(fn)) if tp + fp + fn else None})
+    return rows
+
+
 def analyze_sequence(seq, probs, threshold, height, width, near_px, trail_windows):
-    """一个序列的事件级统计：TP/FP/FN、FP 三类、每窗每个目标的速度与 TP/FN/FP_near。"""
+    """一个序列的事件级统计：TP/FP/FN、FP 三类、每窗每个目标的速度与 TP/FN/FP_near；
+    另有可分性（AUC、最优阈值 IoU）、按局部密度分档的计数、逐窗计数 [负事件, TP, FP, FN]。"""
     pred = probs >= float(threshold)
     pos = seq.label == 1
     counts = np.zeros(3, dtype=np.int64)
     kinds = dict.fromkeys(FP_KINDS, 0)
     history = deque(maxlen=int(trail_windows))
     last, targets = {}, []
+    density = np.zeros((len(DENSITY_EDGES) - 1, 4), dtype=np.int64)
+    per_window = []
     for k in range(seq.n_windows):
         idx = seq.window_index(k)
         pk, dk = pos[idx], pred[idx]
         xs, ys = seq.x[idx], seq.y[idx]
-        counts += np.asarray(window_confusion(probs[idx], seq.label[idx], threshold)[:3], dtype=np.int64)
+        window = np.asarray(window_confusion(probs[idx], seq.label[idx], threshold)[:3], dtype=np.int64)
+        counts += window
+        per_window.append([int((~pk).sum())] + [int(v) for v in window])
+        if idx.size:
+            dbin = np.searchsorted(DENSITY_EDGES, local_density(xs, ys, height, width), side="right") - 1
+            for j, mask in enumerate((pk & dk, ~pk & dk, pk & ~dk, ~pk)):
+                density[:, j] += np.bincount(dbin[mask], minlength=density.shape[0])[:density.shape[0]]
         pos_map = np.zeros((height, width), dtype=bool)
         pos_map[ys[pk], xs[pk]] = True
         near = dilate(pos_map, near_px)
@@ -305,12 +404,18 @@ def analyze_sequence(seq, probs, threshold, height, width, near_px, trail_window
                              "fp_near": count_near(fx, fy, xs[sel], ys[sel], near_px)})
     tp, fp, fn = (int(v) for v in counts)
     n_windows = max(seq.n_windows, 1)
+    best_iou, best_thr = best_threshold_iou(probs, seq.label)
+    p32 = np.asarray(probs, dtype=np.float32)
+    quant = lambda v: [float(q) for q in np.quantile(v, (0.1, 0.5, 0.9))] if v.size else None  # noqa: E731
     return {"name": seq.name, "windows": seq.n_windows,
             "events_per_window": seq.n_events / float(n_windows),
             "neg_per_window": float((~pos).sum()) / n_windows, "pos_per_window": float(pos.sum()) / n_windows,
             "pos_without_target": int((pos & (seq.target_id <= 0)).sum()),
             "tp": tp, "fp": fp, "fn": fn, "iou": iou_from_counts(tp, fp, fn),
             "fp_near": kinds["near"], "fp_trail": kinds["trail"], "fp_far": kinds["far"],
+            "auc": rank_auc(p32, seq.label), "best_iou": best_iou, "best_threshold": best_thr,
+            "prob_quantiles_target": quant(p32[pos]), "prob_quantiles_background": quant(p32[~pos]),
+            "density": density.tolist(), "per_window": per_window,
             "targets": targets}
 
 
@@ -429,15 +534,30 @@ def print_run(name, run):
             if layer not in run["layers"]:
                 continue
             s = run["layers"][layer]
-            line = "     %-5s M %s / %s / %s  密度 %s %s" % (
+            line = "     %-5s M %s / %s / %s  密度 %s %s | 饱和 now %s bg %s | 平均电平 now %s bg %s" % (
                 layer, fmt(s["memory_share"]["now"]), fmt(s["memory_share"]["trail"]), fmt(s["memory_share"]["bg"]),
-                fmt(s["memory_density"]["now"], "%.1f"), fmt(s["memory_density"]["trail"], "%.1f"))
+                fmt(s["memory_density"]["now"], "%.1f"), fmt(s["memory_density"]["trail"], "%.1f"),
+                fmt(s["saturated_fraction"]["now"]), fmt(s["saturated_fraction"]["bg"]),
+                fmt(s["mean_level"]["now"], "%.2f"), fmt(s["mean_level"]["bg"], "%.2f"))
             print(line)
     if run.get("message_vs_noise"):
         m = run["message_vs_noise"]
         print("   逐序列 |Δq| 与每窗负事件数的秩相关（括号内为平均 |Δq|）: " + "  ".join(
             "%s %s (%s)" % (k, fmt(v["spearman_vs_neg_per_window"], "%+.2f"), fmt(v["mean_rate"], "%.4f"))
             for k, v in m.items()))
+    if run.get("density"):
+        print("   局部密度（5x5 内事件数）  TP  FP  FN  负事件  IoU")
+        for row in run["density"]:
+            print("     %-8s %8d %7d %7d %9d  %s" % (row["bin"], row["tp"], row["fp"], row["fn"], row["neg"],
+                                                 fmt(row["iou"], "%.4f")))
+    seqs = sorted(run["sequences"], key=lambda s: s["iou"] if s["iou"] is not None else 1.0)
+    print("   逐序列（按 IoU 升序）  负事件/窗  IoU    AUC    最优阈值IoU(阈值)  FP     FN    背景饱和 enc1/dec1")
+    for s in seqs:
+        layers = s.get("layers") or {}
+        sat = [fmt((layers.get(n) or {}).get("saturated_fraction", {}).get("bg"), "%.3f") for n in ("enc1", "dec1")]
+        print("     %-24s %8.0f  %s  %s  %s(%s)  %6d %6d  %s/%s" % (
+            s["name"], s["neg_per_window"], fmt(s["iou"], "%.4f"), fmt(s["auc"], "%.4f"), fmt(s["best_iou"], "%.4f"),
+            fmt(s["best_threshold"], "%.3f"), s["fp"], s["fn"], sat[0], sat[1]))
 
 
 def print_paired(p):
@@ -487,9 +607,11 @@ def main(argv=None):
             seq = dataset[i]
             for name, (net, train_cfg, q99, _) in loaded.items():
                 net.start_tif_stats()                       # 非 TIF 网络不做任何事
+                probes[name][1].start_sequence()
                 probs = run_sequence_probe(net, seq, train_cfg, q99, device, probes[name][0])
                 tif_stats = net.stop_tif_stats()
                 record = analyze_sequence(seq, probs, threshold, height, width, args.near_px, args.trail_windows)
+                record["layers"] = probes[name][1].sequence_summary()
                 record["message_abs_rate"] = {layer: v["message_abs_rate"] for layer, v in tif_stats.items() if v}
                 record["speed"] = speed_table(record["targets"])      # 逐序列的速度分层（区分慢目标与噪声密集序列）
                 collected[name]["targets"] += record.pop("targets")
@@ -506,6 +628,7 @@ def main(argv=None):
             "totals": {"tp": tp, "fp": fp, "fn": fn, "iou": iou_from_counts(tp, fp, fn)},
             "fp_kinds": {k: sum(s["fp_" + k] for s in seqs) for k in FP_KINDS},
             "speed": speed_table(collected[name]["targets"]),
+            "density": density_rows(np.sum([s["density"] for s in seqs], axis=0)),
             "layers": probes[name][1].summary(),
             "message_vs_noise": message_vs_noise(seqs),
             "sequences": seqs}
