@@ -33,13 +33,12 @@ import torch.nn.functional as F  # noqa: E402
 
 from dataset.ev_uav_stream import EvUAVStream, make_sequence_loader, window_to_device  # noqa: E402
 from dataset.stream_source import INPUT_DEVICES, make_window_source  # noqa: E402
-from dataset.noise_aug import NoiseAugment, noise_aug_settings  # noqa: E402
+from dataset.noise_aug import NoiseAugment, inject_background_noise, noise_aug_settings  # noqa: E402
 from dataset.stream_windows import num_input_channels, refill_by_index  # noqa: E402
 from model.evspsegnet_stream import (LAYER_NAMES, EvSpSegNetStream, calibrate_gains,  # noqa: E402
                                      count_parameters, estimate_operations, tif_settings, window_sop_summary)
 from model.lif2d_stream import (StreamingLIF2d, StreamingDualMemoryLIF2d, StreamingTIF2d,  # noqa: E402
                                 detach_states)
-from utils.cfar_constraint import CfarConstraint  # noqa: E402
 from utils.comm_budget import CommBudget, mean_messages, window_message_summary  # noqa: E402
 from utils.stream_common import (health_warnings, linear_epoch_lr, load_flat_config,  # noqa: E402
                                  make_chunks, select_subset, subset_due, summarize_history)
@@ -86,6 +85,10 @@ def parse_args():
     parser.add_argument("--subthreshold-ablation",
                         choices=("none", "vertical_off", "skip_off", "all_off"), default="none",
                         help="仅 eval：同权重关闭亚阈值残差的纵向路径、事件跳连或两者")
+    parser.add_argument("--eval-noise-load", type=float, default=0.0,
+                        help="仅 eval：测试时注入齐次泊松背景噪声，强度用 5x5 邻域每窗的随机巧合负荷 L 表示"
+                             "（L = 25 x 每像素每窗的噪声率；L = 1 是巧合的物理分界）。0 = 不注入")
+    parser.add_argument("--eval-noise-seed", type=int, default=0, help="仅 eval：注入噪声的随机种子")
     parser.add_argument("--dump-dir", default=None,
                         help="eval 模式：把训练时状态模式下的逐事件预测按序列保存为 NPZ，供 tools/verify_predictions.py 独立核验")
     parser.add_argument("--reset-every", type=int, default=0,
@@ -853,7 +856,7 @@ def stream_valid(pieces, steps, device, dtype):
 
 
 def train_streams(net, dataset, lengths, optimizer, cfg, q99, pos_weight, device, rng, max_chunks=None, plan=None,
-                  comm=None, cfar=None):
+                  comm=None):
     """标准有状态 TBPTT（一轮）：B 条并行流一起前向 k 窗、反向 k 窗，每 n 个片段更新一次参数。
 
     状态跨片段延续，片段边界 detach（只切梯度、保留数值）；某条流开始新录像时只清零该流状态（keep 掩码）。
@@ -886,8 +889,6 @@ def train_streams(net, dataset, lengths, optimizer, cfg, q99, pos_weight, device
     loss_sum, events_total, updates, grad_acc, total_norms, missing = 0.0, 0, 0, {}, [], []
     if comm is not None:
         comm.start_epoch()
-    if cfar is not None:                 # E2 分环境恒虚警约束（utils/cfar_constraint.py）；None 时与原来逐位相同
-        cfar.start_epoch()
     states = None
     optimizer.zero_grad(set_to_none=True)
     for first in range(0, n_chunks, accumulate):
@@ -904,10 +905,6 @@ def train_streams(net, dataset, lengths, optimizer, cfg, q99, pos_weight, device
                 if comm is not None:
                     penalty = comm.chunk_loss(net, info["u_pre"], prev_states, keep, len(block),
                                               stream_valid(pieces, k, device, dtype))
-                    if penalty is not None:
-                        total = total + penalty
-                if cfar is not None:
-                    penalty = cfar.chunk_loss(logits, labels, events, k, len(pieces), block_events)
                     if penalty is not None:
                         total = total + penalty
                 total.backward()
@@ -931,8 +928,6 @@ def train_streams(net, dataset, lengths, optimizer, cfg, q99, pos_weight, device
             updates += 1
             if comm is not None:
                 comm.end_update()                                    # 对偶上升
-            if cfar is not None:
-                cfar.end_update()
         optimizer.zero_grad(set_to_none=True)
     out = {"loss_sum": loss_sum, "events": events_total,
            "grad_norms": {key: value / max(updates, 1) for key, value in grad_acc.items()},
@@ -942,8 +937,6 @@ def train_streams(net, dataset, lengths, optimizer, cfg, q99, pos_weight, device
         out["comm"] = comm.summary()
     if augment is not None:
         out["noise_aug"] = augment.summary()
-    if cfar is not None:
-        out["cfar"] = cfar.summary()
     return out
 
 
@@ -1028,6 +1021,20 @@ def run_sequence(net, seq, cfg, q99, device, state_mode, monitor=None, timer=Non
     return probs, confusion
 
 
+def eval_noise(seq, cfg, index):
+    """鲁棒性评估（Inn 13.51）：cfg 里有 eval_noise_load > 0 时，给第 index 个序列注入齐次泊松背景噪声（标签 0）。
+
+    噪声率 = L / 25（每像素每窗，ON / OFF 各半）；每个序列用固定种子（eval_noise_seed x 1000 + index），
+    carry / reset 两次评估、不同模型之间注入的噪声逐事件相同。L = 0 时原样返回。
+    """
+    load = float(cfg.get("eval_noise_load", 0.0) or 0.0)
+    if load <= 0:
+        return seq
+    rng = np.random.RandomState(int(cfg.get("eval_noise_seed", 0)) * 1000 + int(index))
+    return inject_background_noise(seq, load / 25.0, int(cfg["height"]), int(cfg["width_px"]), int(cfg["window_ms"]),
+                                   int(seq.bounds.shape[0]) - 1, int(cfg["time_bins"]), rng)
+
+
 def evaluate_split(net, cfg, q99, device, split, state_mode, names=None, full=False,
                    collect_layers=False, dump_dir=None, reset_every=0, reset_offset=0):
     """在一个划分（或其子集）上评估。
@@ -1059,7 +1066,7 @@ def evaluate_split(net, cfg, q99, device, split, state_mode, names=None, full=Fa
         net.start_tif_stats(per_window=True)  # TIF 消息率与电平统计（含逐窗，用于单窗 SOP 分布）；非 TIF 网络不做任何事
     with torch.no_grad():
         for i in range(len(dataset)):
-            seq = dataset[i]
+            seq = eval_noise(dataset[i], cfg, i)
             probs, confusion = run_sequence(net, seq, cfg, q99, device, state_mode, monitor, timer,
                                             input_stats, reset_every, reset_offset)
             if confusion.shape[0] > confusion_sum.shape[0]:
@@ -1179,12 +1186,9 @@ def mode_smoke(args, cfg):
         comm = CommBudget.from_config(cfg, net)
         if comm is not None:
             comm.mu = 1.0                       # 冒烟时让惩罚项真正参与反传
-        cfar = CfarConstraint.from_config(cfg)
-        if cfar is not None:
-            cfar.mu[1:] = 1.0                   # 冒烟时让 CFAR 惩罚项真正参与反传
         out = train_streams(net, smoke_set, lengths, optimizer, cfg, q99, pos_weight, device,
                             np.random.RandomState(int(cfg["seed"])), max_chunks=max(1, 32 // int(cfg["tbptt_k"])),
-                            comm=comm, cfar=cfar)
+                            comm=comm)
     else:
         out = train_sequence(net, seq, optimizer, cfg, q99, pos_weight, device,
                              np.random.RandomState(int(cfg["seed"])), max_windows=32)
@@ -1301,12 +1305,6 @@ def mode_train(args, cfg):
             comm.mu = float(history[-1]["comm"]["mu_end"])                  # 续训：乘子接着上一轮
         print("通信预算训练（每窗消息数的峰值约束）：每窗消息预算 %.4g，违约比例上限 %.0f%%，对偶步长 %g，"
               "发送层 %s" % (comm.budget, 100.0 * comm.alpha, comm.dual_lr, " ".join(net.message_layers())), flush=True)
-    cfar = CfarConstraint.from_config(cfg)           # E2 分环境恒虚警约束；未配置时为 None
-    if cfar is not None:
-        if history and history[-1].get("cfar"):
-            cfar.mu = np.asarray(history[-1]["cfar"]["mu_end"], dtype=np.float64)    # 续训：乘子接着上一轮
-        print("分环境恒虚警约束：负荷分层 %s，对偶步长 %g，温度 %g，阈值 %g" % (
-            list(cfar.edges), cfar.dual_lr, cfar.temperature, float(cfg["threshold"])), flush=True)
     subset = select_subset(train_file_names(cfg), int(cfg["train_subset_size"]), seed + 2000)
     train_set = EvUAVStream(cfg["root"], "train", cfg)
     execution, input_device = speed_options(cfg)
@@ -1332,21 +1330,13 @@ def mode_train(args, cfg):
         loss_sum, event_sum, grad_acc, n_seq = 0.0, 0, {}, 0
         total_norms, clipped_steps, updates = [], 0, 0
         comm_record = None
-        cfar_record = None
         if trainer == "streams":
-            out = train_streams(net, train_set, lengths, optimizer, cfg, q99, pos_weight, device, rng, comm=comm,
-                                cfar=cfar)
+            out = train_streams(net, train_set, lengths, optimizer, cfg, q99, pos_weight, device, rng, comm=comm)
             loss_sum, event_sum, grad_acc, n_seq = out["loss_sum"], out["events"], out["grad_norms"], 1
             total_norms, clipped_steps, updates = out["grad_total_norms"], out["clipped_steps"], out["steps"]
             comm_record = out.get("comm")
             if out.get("noise_aug") is not None:
                 print("  noise_aug: %s" % json.dumps(out["noise_aug"]), flush=True)
-            cfar_record = out.get("cfar")
-            if cfar_record is not None:
-                print("  [cfar] 各层负事件误报率 %s | mu %s | 负事件占比 %s" % (
-                    " ".join("-" if v is None else "%.3f%%" % (100 * v) for v in cfar_record["fpr_end"]),
-                    " ".join("%.3f" % v for v in cfar_record["mu_end"]),
-                    " ".join("%.2f" % v for v in cfar_record["neg_share"])), flush=True)
         else:
             loader = make_sequence_loader(train_set, True, seed * 1000 + epoch, cfg["num_workers"])
             for seq in loader:
@@ -1387,7 +1377,6 @@ def mode_train(args, cfg):
                   "subthreshold_diagnostics": val.get("subthreshold_diagnostics", {}),
                   "subthreshold_parameters": subthreshold_parameter_statistics(net),
                   "comm": comm_record,
-                  "cfar": cfar_record,
                   "warnings": health_warnings(health_layer_stats(val["layers"], val.get("tif")), taus, grad_mean)}
         with metrics_path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record) + "\n")
@@ -1478,6 +1467,13 @@ def mode_eval(args, cfg):
         if train_cfg["state_mode"] != "carry":
             raise ValueError("周期清零只对 carry 训练的模型有意义")
         suffix += "_reset_every%d" % reset_every + ("_offset%d" % reset_offset if reset_offset else "")
+    noise_load = float(getattr(args, "eval_noise_load", 0.0) or 0.0)
+    if noise_load < 0:
+        raise ValueError("--eval-noise-load 不能为负")
+    if noise_load > 0:
+        train_cfg["eval_noise_load"] = noise_load
+        train_cfg["eval_noise_seed"] = int(getattr(args, "eval_noise_seed", 0))
+        suffix += "_noiseL%g_seed%d" % (noise_load, train_cfg["eval_noise_seed"])
     out_path = Path(args.checkpoint).parent / ("eval_%s_%s%s.json" % (
         args.split, Path(args.checkpoint).stem, suffix))
     if out_path.exists() and not args.overwrite:
@@ -1486,6 +1482,7 @@ def mode_eval(args, cfg):
                "threshold": float(train_cfg["threshold"]), "tbptt_k": int(train_cfg["tbptt_k"]),
                "trained_state_mode": train_cfg["state_mode"], "neuron": train_cfg["neuron"],
                "readout_ablation": args.readout_ablation, "dual_memory": train_cfg.get("dual_memory"),
+               "eval_noise_load": noise_load, "eval_noise_seed": int(train_cfg.get("eval_noise_seed", 0)),
                "subthreshold_residual": train_cfg.get("subthreshold_residual"),
                "tif": net.tif_config, "tif_parameters": tif_parameter_statistics(net),
                "subthreshold_ablation": subthreshold_ablation,

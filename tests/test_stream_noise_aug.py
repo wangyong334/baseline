@@ -105,6 +105,23 @@ class TrainTests(unittest.TestCase):
         self.assertTrue(np.isfinite(noisy["loss_sum"]))
 
 
+class EvalNoiseTests(unittest.TestCase):
+    def test_eval_noise_is_deterministic_and_off_by_default(self):
+        cfg = dict(AUG_CFG)
+        seq = synthetic_sequence(2)
+        self.assertIs(T.eval_noise(seq, cfg, 0), seq)                      # 未配置：原样返回
+        cfg.update(eval_noise_load=12.5, eval_noise_seed=3)                  # 噪声率 0.5（每像素每窗）
+        a, b = T.eval_noise(seq, cfg, 4), T.eval_noise(seq, cfg, 4)
+        np.testing.assert_array_equal(a.t, b.t)                              # 同一序列、同一种子：逐事件相同
+        np.testing.assert_array_equal(a.x, b.x)
+        c = T.eval_noise(seq, cfg, 5)                                        # 不同序列：不同噪声
+        self.assertFalse(a.n_events == c.n_events and np.array_equal(a.x, c.x))
+        added = a.n_events - seq.n_events
+        expect = 0.5 * H * W * WINDOWS
+        self.assertLess(abs(added - expect), 5 * np.sqrt(expect))
+        self.assertTrue(np.all(a.label[seq.n_events:] == 0))
+
+
 class ConfigTests(unittest.TestCase):
     def test_e1_config_matches_v5(self):
         from utils.stream_common import load_flat_config
