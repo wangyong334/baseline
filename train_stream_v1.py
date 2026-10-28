@@ -33,6 +33,7 @@ import torch.nn.functional as F  # noqa: E402
 
 from dataset.ev_uav_stream import EvUAVStream, make_sequence_loader, window_to_device  # noqa: E402
 from dataset.stream_source import INPUT_DEVICES, make_window_source  # noqa: E402
+from dataset.noise_aug import NoiseAugment, noise_aug_settings  # noqa: E402
 from dataset.stream_windows import num_input_channels, refill_by_index  # noqa: E402
 from model.evspsegnet_stream import (LAYER_NAMES, EvSpSegNetStream, calibrate_gains,  # noqa: E402
                                      count_parameters, estimate_operations, tif_settings, window_sop_summary)
@@ -787,13 +788,16 @@ def stream_pieces(plan, chunk_start, chunk_end):
 class StreamSources(object):
     """多流训练按需读取录像并构造窗口数据来源；录像的最后一窗用完即释放。"""
 
-    def __init__(self, dataset, cfg, q99, device, dtype):
+    def __init__(self, dataset, cfg, q99, device, dtype, augment=None):
         self.dataset, self.cfg, self.q99, self.device, self.dtype = dataset, cfg, q99, device, dtype
+        self.augment = augment            # E1 噪声增强（dataset/noise_aug.NoiseAugment）或 None
         self.sources, self.bounds = {}, {}
 
     def get(self, index):
         if index not in self.sources:
             seq = self.dataset[index]
+            if self.augment is not None:
+                seq = self.augment(seq)
             self.sources[index] = make_window_source(seq, self.cfg, self.q99, self.device, self.dtype)
             self.bounds[index] = seq.bounds
         return self.sources[index]
@@ -871,7 +875,11 @@ def train_streams(net, dataset, lengths, optimizer, cfg, q99, pos_weight, device
     if max_chunks is not None:
         n_chunks = min(n_chunks, int(max_chunks))
     dtype = next(net.parameters()).dtype
-    sources = StreamSources(dataset, cfg, q99, device, dtype)
+    augment = None
+    if noise_aug_settings(cfg)[0] > 0.0:
+        # 独立的随机数流：只在开启时从 rng 取一次种子，关闭时 rng 的消耗与原来相同
+        augment = NoiseAugment(cfg, np.random.RandomState(int(rng.randint(2 ** 31 - 1))))
+    sources = StreamSources(dataset, cfg, q99, device, dtype, augment)
     weight = torch.tensor([pos_weight], dtype=dtype, device=device)
     clip = float(cfg["grad_clip"])
     loss_sum, events_total, updates, grad_acc, total_norms, missing = 0.0, 0, 0, {}, [], []
@@ -923,6 +931,8 @@ def train_streams(net, dataset, lengths, optimizer, cfg, q99, pos_weight, device
            "grad_total_norms": total_norms, "clipped_steps": sum(1 for v in total_norms if v > clip)}
     if comm is not None:
         out["comm"] = comm.summary()
+    if augment is not None:
+        out["noise_aug"] = augment.summary()
     return out
 
 
@@ -1307,6 +1317,8 @@ def mode_train(args, cfg):
             loss_sum, event_sum, grad_acc, n_seq = out["loss_sum"], out["events"], out["grad_norms"], 1
             total_norms, clipped_steps, updates = out["grad_total_norms"], out["clipped_steps"], out["steps"]
             comm_record = out.get("comm")
+            if out.get("noise_aug") is not None:
+                print("  noise_aug: %s" % json.dumps(out["noise_aug"]), flush=True)
         else:
             loader = make_sequence_loader(train_set, True, seed * 1000 + epoch, cfg["num_workers"])
             for seq in loader:
