@@ -25,6 +25,7 @@ from test_stream_tif import make_tif_net  # noqa: E402
 from tools import diagnose_tif as D  # noqa: E402
 from train_stream_v1 import build_net, run_sequence  # noqa: E402
 from utils.stream_common import load_flat_config  # noqa: E402
+from utils.stream_metrics import FastRoc  # noqa: E402
 
 
 def chebyshev_near(points, queries, radius):
@@ -248,18 +249,23 @@ class EntryTests(unittest.TestCase):
             for name in ("tifq", "tif"):
                 net, train_cfg, q99, _ = D.load_run(str(paths[name]), dict(base, threshold=0.5), torch.device("cpu"))
                 total = np.zeros(3, dtype=np.int64)
+                roc = FastRoc(base["pd_detT"], base["correct_thresh"], H, W)
                 for i, seed in enumerate((6, 7)):
                     seq = sw.load_npz_events(str(root / "val" / ("seq_%d.npz" % seed)), H, W, 50, WINDOWS, 5)
                     with torch.no_grad():
                         net.start_tif_stats()
-                        _, confusion = run_sequence(net, seq, train_cfg, q99, torch.device("cpu"), "carry")
+                        probs, confusion = run_sequence(net, seq, train_cfg, q99, torch.device("cpu"), "carry")
                         stats = net.stop_tif_stats()
                     total += confusion.sum(axis=0)[:3]
+                    roc.update(seq.t, probs, seq.target_id, seq.label, seq.x, seq.y, float(base["threshold"]))
                     rates = report["runs"][name]["sequences"][i]["message_abs_rate"]
                     for layer in LAYER_NAMES:
                         self.assertAlmostEqual(rates[layer], stats[layer]["message_abs_rate"], places=12)
                 t = report["runs"][name]["totals"]
                 self.assertEqual([t["tp"], t["fp"], t["fn"]], total.tolist(), name)
+                pd, fa = roc.result()                                             # 与正式评估同一份 FastRoc
+                self.assertEqual((t["pd"], t["fa"]), (pd, fa), name)
+                self.assertAlmostEqual(t["acc"], total[0] / max(total[0] + total[2], 1), places=12)
 
 
 if __name__ == "__main__":

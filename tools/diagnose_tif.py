@@ -58,7 +58,7 @@ from model.evspsegnet_stream import LAYER_NAMES  # noqa: E402
 from model.lif2d_stream import StreamingTIF2d  # noqa: E402
 from train_stream_v1 import build_net, seed_everything  # noqa: E402
 from utils.stream_common import load_flat_config  # noqa: E402
-from utils.stream_metrics import iou_from_counts, window_confusion  # noqa: E402
+from utils.stream_metrics import FastRoc, iou_from_counts, window_confusion  # noqa: E402
 
 STRIDE = dict(enc1=1, enc2=2, enc3=4, enc4=8, dec3=4, dec2=2, dec1=1)
 SPEED_EDGES = (0.0, 0.5, 1.0, 2.0, 4.0, 8.0, math.inf)
@@ -547,8 +547,9 @@ def fmt(value, spec="%.3f"):
 
 def print_run(name, run):
     t = run["totals"]
-    print("== %s（epoch %s）IoU %s  TP %d FP %d FN %d  （应与 eval json 的 carry IoU 相同）"
-          % (name, run["epoch"], fmt(t["iou"], "%.4f"), t["tp"], t["fp"], t["fn"]), flush=True)
+    print("== %s（epoch %s）IoU / ACC / Pd / Fa = %s / %s / %s / %s  TP %d FP %d FN %d  （应与 eval json 的 carry 相同）"
+          % (name, run["epoch"], fmt(t["iou"], "%.4f"), fmt(t.get("acc"), "%.4f"), fmt(t.get("pd"), "%.4f"),
+             fmt(t.get("fa"), "%.3g"), t["tp"], t["fp"], t["fn"]), flush=True)
     fp = max(t["fp"], 1)
     print("   FP 分类: " + "  ".join("%s %d (%.1f%%)" % (k, run["fp_kinds"][k], 100.0 * run["fp_kinds"][k] / fp)
                                   for k in FP_KINDS))
@@ -633,11 +634,13 @@ def main(argv=None):
     height, width = int(data_cfg["height"]), int(data_cfg["width_px"])
     dataset = EvUAVStream(cfg["root"], args.split, data_cfg)
     n_seq = len(dataset) if not args.max_sequences else min(len(dataset), args.max_sequences)
-    probes, collected = {}, {}
+    probes, collected, rocs = {}, {}, {}
     for name, (net, _, _, _) in loaded.items():
         regions = TargetRegions(args.trail_windows)
         probes[name] = (regions, LayerProbe(net, regions))
         collected[name] = {"sequences": [], "targets": []}
+        # Pd / Fa 与正式评估（evaluate_split full）同一份实现、同一口径
+        rocs[name] = FastRoc(cfg["pd_detT"], cfg["correct_thresh"], height, width)
     with torch.no_grad():
         for i in range(n_seq):
             seq = dataset[i]
@@ -646,6 +649,7 @@ def main(argv=None):
                 probes[name][1].start_sequence()
                 probs = run_sequence_probe(net, seq, train_cfg, q99, device, probes[name][0], plugins.get(name))
                 tif_stats = net.stop_tif_stats()
+                rocs[name].update(seq.t, probs, seq.target_id, seq.label, seq.x, seq.y, threshold)
                 record = analyze_sequence(seq, probs, threshold, height, width, args.near_px, args.trail_windows)
                 record["layers"] = probes[name][1].sequence_summary()
                 record["message_abs_rate"] = {layer: v["message_abs_rate"] for layer, v in tif_stats.items() if v}
@@ -661,11 +665,14 @@ def main(argv=None):
         net, train_cfg, _, epoch = loaded[name]
         seqs = collected[name]["sequences"]
         tp, fp, fn = (sum(s[key] for s in seqs) for key in ("tp", "fp", "fn"))
+        pd, fa = rocs[name].result()
+        acc = float(tp) / float(tp + fn) if tp + fn else float("nan")      # ACC = 正类召回（原 utils/eval.py 口径）
         report["runs"][name] = {
             "checkpoint": path, "epoch": epoch, "neuron": train_cfg["neuron"], "tif": net.tif_config,
             "plugin": ({"mode": plugin_specs[name][0], "background": plugin_specs[name][1], "dwell_ms": args.dwell_ms,
                         "ref_rate": args.ref_rate} if name in plugin_specs else None),
-            "totals": {"tp": tp, "fp": fp, "fn": fn, "iou": iou_from_counts(tp, fp, fn)},
+            "totals": {"tp": tp, "fp": fp, "fn": fn, "iou": iou_from_counts(tp, fp, fn),
+                       "acc": acc, "pd": pd, "fa": fa},
             "fp_kinds": {k: sum(s["fp_" + k] for s in seqs) for k in FP_KINDS},
             "speed": speed_table(collected[name]["targets"]),
             "density": density_rows(np.sum([s["density"] for s in seqs], axis=0)),
