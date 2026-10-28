@@ -35,6 +35,7 @@ from dataset.ev_uav_stream import EvUAVStream, make_sequence_loader, window_to_d
 from dataset.stream_source import INPUT_DEVICES, make_window_source  # noqa: E402
 from dataset.noise_aug import NoiseAugment, inject_background_noise, noise_aug_settings  # noqa: E402
 from dataset.stream_windows import num_input_channels, refill_by_index  # noqa: E402
+from model.comod import REF_RATE  # noqa: E402
 from model.evspsegnet_stream import (LAYER_NAMES, EvSpSegNetStream, calibrate_gains,  # noqa: E402
                                      count_parameters, estimate_operations, tif_settings, window_sop_summary)
 from model.lif2d_stream import (StreamingLIF2d, StreamingDualMemoryLIF2d, StreamingTIF2d,  # noqa: E402
@@ -222,7 +223,10 @@ def build_net(cfg, device):
         tau_max_ms=float(cfg["tau_max_ms"]), v_threshold=float(cfg["v_threshold"]),
         merged_decoder=cfg.get("merged_decoder", False), dual_memory=cfg.get("dual_memory"),
         subthreshold_residual=cfg.get("subthreshold_residual"),
-        tif=cfg.get("tif") if cfg["neuron"] == "tif" else None)
+        tif=cfg.get("tif") if cfg["neuron"] == "tif" else None,
+        invariant=(dict(time_bins=int(cfg["time_bins"]), clip=float(cfg["input_clip"]),
+                        ref_rate=tuple(cfg.get("invariant_ref_rate", REF_RATE)))
+                   if cfg.get("invariant_input") else None))
     return net.to(device)
 
 
@@ -278,8 +282,12 @@ def calibration_factory(cfg, q99, device):
 
     def windows_of(seq):
         """按时间顺序产出一个序列前 n_windows 个窗口的 (x, events)。"""
+        source = make_window_source(seq, cfg, q99, device) if cfg.get("invariant_input") else None
         for k in range(min(n_windows, seq.n_windows)):
-            x, events, _, _ = window_to_device(seq, k, q99, cfg, device)
+            if source is None:
+                x, events, _, _ = window_to_device(seq, k, q99, cfg, device)
+            else:                                    # 模块二：带上背景估计，校准时的前向与训练一致
+                x, events, _, _ = source.window(k)
             yield x, events
 
     def factory():
@@ -823,10 +831,16 @@ def assemble_streams(sources, pieces, steps, cfg, device, dtype):
                      int(cfg["pad_width"])), dtype=dtype, device=device)
     keep = torch.ones((steps, batch), dtype=dtype, device=device)
     parts, labels = {key: [] for key in ("t", "b", "y", "x", "p", "t_local")}, []
+    bg = None
     for b, stream in enumerate(pieces):
         for index, lo, hi, offset, new_start in stream:
             xs, events, lab, _ = sources.get(index).chunk(lo, hi)
             x[offset:offset + (hi - lo), b] = xs[:, 0]
+            if "bg" in events:                       # 模块二：背景估计 [T,1,2,H,W] -> [T,B,2,H,W]
+                if bg is None:
+                    bg = torch.zeros((steps, batch) + tuple(events["bg"].shape[2:]), dtype=torch.float32,
+                                     device=device)
+                bg[offset:offset + (hi - lo), b] = events["bg"][:, 0]
             if new_start:
                 keep[offset, b] = 0
             parts["t"].append(events["t"] + int(offset))
@@ -843,6 +857,8 @@ def assemble_streams(sources, pieces, steps, cfg, device, dtype):
         events = {"t": long_empty, "b": long_empty, "y": long_empty, "x": long_empty,
                   "p": float_empty, "t_local": float_empty}
         labels = float_empty
+    if bg is not None:
+        events["bg"] = bg                            # 空窗（流错开起点、流尾补齐）为 0：接口原样透传
     return x, events, labels, keep
 
 
@@ -1157,6 +1173,8 @@ def prepare_run(args, cfg, allow_existing=False):
     seed_everything(int(cfg["seed"]), bool(cfg["deterministic"]))
     stats, q99, pos_weight = load_stats(cfg)
     net = build_net(cfg, device)
+    if net.invariant is not None:
+        net.invariant.set_q99(q99)                   # 模块二：查表用的 q99（随 checkpoint 保存）
     root = Path(cfg["save_root"])
     root.mkdir(parents=True, exist_ok=allow_existing)
     write_json(root / ("run_config_%s.json" % args.mode), {

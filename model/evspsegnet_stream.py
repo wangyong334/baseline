@@ -33,6 +33,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from model.noise_invariant import InvariantInterface
 from model.lif2d_stream import (ChannelGain, ReLUNeuron, StreamingGraded2d,
                                 StreamingLIF2d, StreamingDualMemoryLIF2d, StreamingTIF2d,
                                 SurrogateSpike)
@@ -146,14 +147,17 @@ class SpikingConvBlock(nn.Module):
         pre_gain = self.norm(current)
         return self.gain(pre_gain), pre_gain
 
-    def forward(self, x, state, extra_current=None, return_driving_current=False):
+    def forward(self, x, state, extra_current=None, return_driving_current=False, bg=None):
         driving, pre_gain = self._currents(x, extra_current)
+        invariant = getattr(self, "invariant", None)
+        if invariant is not None:                    # 模块二：不变输入接口（只挂在 enc1，model/noise_invariant.py）
+            driving = invariant.normalize(driving, bg, self)
         spikes, new_state, u_pre = self.neuron(driving, state)
         result = (spikes, new_state, u_pre, pre_gain)
         return result + (driving,) if return_driving_current else result
 
     def forward_steps(self, x, state, carry, keep_u_pre, extra_current=None, collect_memory=False,
-                      return_driving_current=False, keep=None):
+                      return_driving_current=False, keep=None, bg=None):
         """一个片段的多窗口版本：卷积在 T*B 维上批量计算，神经元再按时间递推。
 
         输入: x [T,B,C_in,H,W]；extra_current 为已展平的 [T*B,C_out,H',W'] 或 None；
@@ -162,6 +166,9 @@ class SpikingConvBlock(nn.Module):
         """
         steps, batch = int(x.shape[0]), int(x.shape[1])
         current, _ = self._currents(x.reshape((steps * batch,) + tuple(x.shape[2:])), extra_current)
+        invariant = getattr(self, "invariant", None)
+        if invariant is not None and bg is not None:
+            current = invariant.normalize(current, bg.reshape((steps * batch,) + tuple(bg.shape[2:])), self)
         current = current.view((steps, batch) + tuple(current.shape[1:]))
         if collect_memory and isinstance(self.neuron, StreamingDualMemoryLIF2d):
             result = self.neuron.forward_steps(current, state, carry, keep_u_pre, collect_memory=True, keep=keep)
@@ -189,7 +196,7 @@ class EvSpSegNetStream(nn.Module):
     def __init__(self, in_channels=12, channels=(12, 24, 48, 48), neuron="lif", norm="none",
                  state_mode="carry", readout_hidden=32, dt_ms=50.0, tau_init_ms=200.0,
                  tau_min_ms=50.0, tau_max_ms=2000.0, v_threshold=1.0, merged_decoder=False,
-                 dual_memory=None, subthreshold_residual=None, tif=None):
+                 dual_memory=None, subthreshold_residual=None, tif=None, invariant=None):
         super(EvSpSegNetStream, self).__init__()
         if state_mode not in ("carry", "reset_each_window"):
             raise ValueError("state_mode 必须是 carry 或 reset_each_window")
@@ -215,6 +222,11 @@ class EvSpSegNetStream(nn.Module):
 
         block = lambda name, i, o, s: SpikingConvBlock(i, o, s, neuron, norm, lif, layer_tif(name))  # noqa: E731
         self.enc1 = block("enc1", in_channels, c1, 1)
+        if invariant is not None:
+            # 模块二：不变输入接口（time_bins / clip / ref_rate；q99 由训练脚本 set_q99 写入，随 checkpoint 保存）
+            if not isinstance(self.enc1.norm, nn.Identity):
+                raise ValueError("不变输入接口要求 enc1 没有归一化层（电流对输入是线性的）")
+            self.enc1.invariant = InvariantInterface(**invariant)
         self.enc2 = block("enc2", c1, c2, 2)
         self.enc3 = block("enc3", c2, c3, 2)
         self.enc4 = block("enc4", c3, c4, 2)
@@ -349,6 +361,11 @@ class EvSpSegNetStream(nn.Module):
     def message_layers(self):
         """发出消息的层名（见 MESSAGE_LAYERS）；通信预算与消息统计只通过这个接口得知网络连接。"""
         return MESSAGE_LAYERS
+
+    @property
+    def invariant(self):
+        """模块二的不变输入接口（挂在 enc1 上）；未开启时为 None。"""
+        return getattr(self.enc1, "invariant", None)
 
     def blocks(self):
         """按前向拓扑顺序返回 7 个脉冲卷积单元（校准必须按这个顺序逐层进行）。"""
@@ -519,7 +536,7 @@ class EvSpSegNetStream(nn.Module):
             s1, n1, u1, i1, drive1 = self.enc1(x, prev[0], return_driving_current=True)
             residual1 = self._observation_residual(drive1, s1)
         else:
-            s1, n1, u1, i1 = self.enc1(x, prev[0])
+            s1, n1, u1, i1 = self.enc1(x, prev[0], bg=events.get("bg") if self.invariant is not None else None)
             residual1 = None
         vertical1 = self._vertical_residual(residual1) if self.subthreshold_vertical_enabled else None
         enc2_input = s1 + vertical1 if vertical1 is not None else s1
@@ -592,12 +609,15 @@ class EvSpSegNetStream(nn.Module):
 
         memories = {}
 
+        bg = events.get("bg") if self.invariant is not None else None
+
         def run_layer(name, inputs, extra_current=None, keep_u_pre=None, return_driving_current=False):
             keep_flag = collect if keep_u_pre is None else keep_u_pre
             result = getattr(self, name).forward_steps(
                 inputs, prev[LAYER_NAMES.index(name)], carry, keep_flag,
                 extra_current=extra_current, collect_memory=collect,
-                return_driving_current=return_driving_current, keep=keep)
+                return_driving_current=return_driving_current, keep=keep,
+                bg=bg if name == "enc1" else None)
             if collect and name in self.dual_memory_layers:
                 memories[name] = result[3]
             return result[:3] + ((result[-1],) if return_driving_current else ())
