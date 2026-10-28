@@ -39,6 +39,7 @@ from model.evspsegnet_stream import (LAYER_NAMES, EvSpSegNetStream, calibrate_ga
                                      count_parameters, estimate_operations, tif_settings, window_sop_summary)
 from model.lif2d_stream import (StreamingLIF2d, StreamingDualMemoryLIF2d, StreamingTIF2d,  # noqa: E402
                                 detach_states)
+from utils.cfar_constraint import CfarConstraint  # noqa: E402
 from utils.comm_budget import CommBudget, mean_messages, window_message_summary  # noqa: E402
 from utils.stream_common import (health_warnings, linear_epoch_lr, load_flat_config,  # noqa: E402
                                  make_chunks, select_subset, subset_due, summarize_history)
@@ -852,7 +853,7 @@ def stream_valid(pieces, steps, device, dtype):
 
 
 def train_streams(net, dataset, lengths, optimizer, cfg, q99, pos_weight, device, rng, max_chunks=None, plan=None,
-                  comm=None):
+                  comm=None, cfar=None):
     """标准有状态 TBPTT（一轮）：B 条并行流一起前向 k 窗、反向 k 窗，每 n 个片段更新一次参数。
 
     状态跨片段延续，片段边界 detach（只切梯度、保留数值）；某条流开始新录像时只清零该流状态（keep 掩码）。
@@ -885,6 +886,8 @@ def train_streams(net, dataset, lengths, optimizer, cfg, q99, pos_weight, device
     loss_sum, events_total, updates, grad_acc, total_norms, missing = 0.0, 0, 0, {}, [], []
     if comm is not None:
         comm.start_epoch()
+    if cfar is not None:                 # E2 分环境恒虚警约束（utils/cfar_constraint.py）；None 时与原来逐位相同
+        cfar.start_epoch()
     states = None
     optimizer.zero_grad(set_to_none=True)
     for first in range(0, n_chunks, accumulate):
@@ -901,6 +904,10 @@ def train_streams(net, dataset, lengths, optimizer, cfg, q99, pos_weight, device
                 if comm is not None:
                     penalty = comm.chunk_loss(net, info["u_pre"], prev_states, keep, len(block),
                                               stream_valid(pieces, k, device, dtype))
+                    if penalty is not None:
+                        total = total + penalty
+                if cfar is not None:
+                    penalty = cfar.chunk_loss(logits, labels, events, k, len(pieces), block_events)
                     if penalty is not None:
                         total = total + penalty
                 total.backward()
@@ -924,6 +931,8 @@ def train_streams(net, dataset, lengths, optimizer, cfg, q99, pos_weight, device
             updates += 1
             if comm is not None:
                 comm.end_update()                                    # 对偶上升
+            if cfar is not None:
+                cfar.end_update()
         optimizer.zero_grad(set_to_none=True)
     out = {"loss_sum": loss_sum, "events": events_total,
            "grad_norms": {key: value / max(updates, 1) for key, value in grad_acc.items()},
@@ -933,6 +942,8 @@ def train_streams(net, dataset, lengths, optimizer, cfg, q99, pos_weight, device
         out["comm"] = comm.summary()
     if augment is not None:
         out["noise_aug"] = augment.summary()
+    if cfar is not None:
+        out["cfar"] = cfar.summary()
     return out
 
 
@@ -1168,9 +1179,12 @@ def mode_smoke(args, cfg):
         comm = CommBudget.from_config(cfg, net)
         if comm is not None:
             comm.mu = 1.0                       # 冒烟时让惩罚项真正参与反传
+        cfar = CfarConstraint.from_config(cfg)
+        if cfar is not None:
+            cfar.mu[1:] = 1.0                   # 冒烟时让 CFAR 惩罚项真正参与反传
         out = train_streams(net, smoke_set, lengths, optimizer, cfg, q99, pos_weight, device,
                             np.random.RandomState(int(cfg["seed"])), max_chunks=max(1, 32 // int(cfg["tbptt_k"])),
-                            comm=comm)
+                            comm=comm, cfar=cfar)
     else:
         out = train_sequence(net, seq, optimizer, cfg, q99, pos_weight, device,
                              np.random.RandomState(int(cfg["seed"])), max_windows=32)
@@ -1287,6 +1301,12 @@ def mode_train(args, cfg):
             comm.mu = float(history[-1]["comm"]["mu_end"])                  # 续训：乘子接着上一轮
         print("通信预算训练（每窗消息数的峰值约束）：每窗消息预算 %.4g，违约比例上限 %.0f%%，对偶步长 %g，"
               "发送层 %s" % (comm.budget, 100.0 * comm.alpha, comm.dual_lr, " ".join(net.message_layers())), flush=True)
+    cfar = CfarConstraint.from_config(cfg)           # E2 分环境恒虚警约束；未配置时为 None
+    if cfar is not None:
+        if history and history[-1].get("cfar"):
+            cfar.mu = np.asarray(history[-1]["cfar"]["mu_end"], dtype=np.float64)    # 续训：乘子接着上一轮
+        print("分环境恒虚警约束：负荷分层 %s，对偶步长 %g，温度 %g，阈值 %g" % (
+            list(cfar.edges), cfar.dual_lr, cfar.temperature, float(cfg["threshold"])), flush=True)
     subset = select_subset(train_file_names(cfg), int(cfg["train_subset_size"]), seed + 2000)
     train_set = EvUAVStream(cfg["root"], "train", cfg)
     execution, input_device = speed_options(cfg)
@@ -1312,13 +1332,21 @@ def mode_train(args, cfg):
         loss_sum, event_sum, grad_acc, n_seq = 0.0, 0, {}, 0
         total_norms, clipped_steps, updates = [], 0, 0
         comm_record = None
+        cfar_record = None
         if trainer == "streams":
-            out = train_streams(net, train_set, lengths, optimizer, cfg, q99, pos_weight, device, rng, comm=comm)
+            out = train_streams(net, train_set, lengths, optimizer, cfg, q99, pos_weight, device, rng, comm=comm,
+                                cfar=cfar)
             loss_sum, event_sum, grad_acc, n_seq = out["loss_sum"], out["events"], out["grad_norms"], 1
             total_norms, clipped_steps, updates = out["grad_total_norms"], out["clipped_steps"], out["steps"]
             comm_record = out.get("comm")
             if out.get("noise_aug") is not None:
                 print("  noise_aug: %s" % json.dumps(out["noise_aug"]), flush=True)
+            cfar_record = out.get("cfar")
+            if cfar_record is not None:
+                print("  [cfar] 各层负事件误报率 %s | mu %s | 负事件占比 %s" % (
+                    " ".join("-" if v is None else "%.3f%%" % (100 * v) for v in cfar_record["fpr_end"]),
+                    " ".join("%.3f" % v for v in cfar_record["mu_end"]),
+                    " ".join("%.2f" % v for v in cfar_record["neg_share"])), flush=True)
         else:
             loader = make_sequence_loader(train_set, True, seed * 1000 + epoch, cfg["num_workers"])
             for seq in loader:
@@ -1359,6 +1387,7 @@ def mode_train(args, cfg):
                   "subthreshold_diagnostics": val.get("subthreshold_diagnostics", {}),
                   "subthreshold_parameters": subthreshold_parameter_statistics(net),
                   "comm": comm_record,
+                  "cfar": cfar_record,
                   "warnings": health_warnings(health_layer_stats(val["layers"], val.get("tif")), taus, grad_mean)}
         with metrics_path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record) + "\n")
