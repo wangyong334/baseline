@@ -50,10 +50,13 @@ BLOB = 5            # 目标边长（像素）
 SPEED = 1.5         # 目标速度（像素/窗）
 TAU_S, TAU_C, TAU_BLIND = 20.0, 100.0, 36.0
 TRUNC_C, Z_LCB = 2, 2.0
+ISOLATION = True    # 13.44：中心分量只在孤立点源处接管
 LEVELS = (0.002, 0.01, 0.04, 0.11, 0.33)    # 每像素每窗背景率；感受野驱动 D = 9b
 MODES = ("fixed", "sub_blind", "sub", "gain", "time", "comod", "comod_oracle")
 # 第二轮（13.43）：按停留时间封顶的拉伸、两尺度（粗尺度门控细尺度）、沿运动方向积累的上限对照
 MODES2 = ("fixed", "sub", "comod", "comod_cap", "ms_fixed", "ms", "comod_lagr")
+# 第三轮（13.44）："先换时间、再换阈值"——时间拉伸到停留时间为止，超出部分用 CFAR 式增益保住虚警
+MODES3 = ("fixed", "sub", "comod", "comod_cap", "ntt", "ms", "ms_ntt", "comod_lagr")
 K_C, THR_C, CAP_C = 1.0, 1.0, 8.0     # 粗尺度（9x9 感受野）的补偿项、阈值、上界
 BLOCK, SUB = 16, 4                    # 突变检测：16x16 区块、4x4 子块中位数
 
@@ -128,6 +131,11 @@ class Estimator(object):
             return None
         b_ring = self.As / self.Ws
         lcb = (self.Ac - Z_LCB * np.sqrt(np.maximum(self.Ac, 0.0))) / self.Bc
+        if ISOLATION:
+            # 中心接管只给"孤立的点源"（热像素是单像素缺陷；目标有空间范围，邻居同样偏高）
+            rate = self.Ac / self.Bc
+            neigh = (box(rate, 1) - rate) / 8.0
+            lcb = np.where(rate > 3.0 * neigh, lcb, 0.0)
         return self.bias * np.maximum(b_ring, lcb)
 
     def update(self, n):
@@ -188,8 +196,8 @@ def simulate(scene, modes=MODES, bias=1.0, forget=False):
     lam0 = math.exp(-1.0 / TAU0)
     est = Estimator(bias, forget)
     M = {m: np.zeros((H, W)) for m in modes}
-    Mc = {m: np.zeros((H, W)) for m in ("ms_fixed", "ms") if m in modes}     # 粗尺度状态
-    Mf = {m: np.zeros((H, W)) for m in ("ms_fixed", "ms") if m in modes}     # 细尺度状态
+    Mc = {m: np.zeros((H, W)) for m in ("ms_fixed", "ms", "ms_ntt") if m in modes}     # 粗尺度状态
+    Mf = {m: np.zeros((H, W)) for m in ("ms_fixed", "ms", "ms_ntt") if m in modes}     # 细尺度状态
     vrow = scene.velocity_rows()
     gmin_f, gmin_c = TAU0 / dwell(3), TAU0 / dwell(9)    # 时间拉伸上限：1/g 不超过 停留时间/tau0
     blind_A, blind_W = np.zeros((H, W)), 0.0
@@ -205,6 +213,24 @@ def simulate(scene, modes=MODES, bias=1.0, forget=False):
         for m in modes:
             D = D_true if m == "comod_oracle" else D_hat
             g = K_COMP / (K_COMP + np.maximum(D, 0.0))
+            if m == "ntt":
+                gn = g
+                gg = np.maximum(gn, gmin_f)
+                gam = np.sqrt(gn / gg)                 # 被停留时间封顶时，按 CFAR 把剩余涨落压回上界
+                lam = lam0 ** gg
+                M[m] = np.clip(lam * M[m] + (1 - lam) * (gam * (I - D) - K_COMP), 0.0, CAP)
+                rec["M"][m].append(M[m].copy())
+                continue
+            if m == "ms_ntt":
+                Ic, Dc = box(n, 4), box(b_hat, 4) if b_hat is not None else np.zeros((H, W))
+                gn_f, gn_c = g, K_C / (K_C + np.maximum(Dc, 0.0))
+                gf, gc = np.maximum(gn_f, gmin_f), np.maximum(gn_c, gmin_c)
+                lf, lc = lam0 ** gf, lam0 ** gc
+                Mf[m] = np.clip(lf * Mf[m] + (1 - lf) * (np.sqrt(gn_f / gf) * (I - D) - K_COMP), 0.0, CAP)
+                Mc[m] = np.clip(lc * Mc[m] + (1 - lc) * (np.sqrt(gn_c / gc) * (Ic - Dc) - K_C), 0.0, CAP_C)
+                M[m] = np.where(Mc[m] > THR_C, Mf[m], 0.0)
+                rec["M"][m].append(M[m].copy())
+                continue
             if m in ("ms_fixed", "ms"):
                 Ic, Dc = box(n, 4), box(b_hat, 4) if b_hat is not None else np.zeros((H, W))
                 if m == "ms_fixed":
@@ -403,14 +429,14 @@ def run_misest(rng, trials):
     return rows
 
 
-def run_round2(trials, rng, forget=True):
-    """第二轮：MODES2 在均匀背景扫描下的 虚警 / 检出（目标强度与速度由命令行给定）。"""
+def run_round2(trials, rng, forget=True, modes=MODES2):
+    """第二 / 三轮：在均匀背景扫描下的 虚警 / 检出（目标强度与速度由命令行给定）。"""
     rows = []
     for b in LEVELS:
         acc = []
         for _ in range(trials):
             sc = Scene(uniform(b), moving_targets(), rng)
-            acc.append(metrics(sc, simulate(sc, modes=MODES2, forget=forget)))
+            acc.append(metrics(sc, simulate(sc, modes=modes, forget=forget)))
         rows.append({"b": b, "D": 9 * b, "res": average(acc)})
     return rows
 
@@ -434,14 +460,16 @@ def fmt(v, f="%.3f"):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--scenario", default="all", choices=("all", "sweep", "hover", "step", "hot", "gradient", "misest", "round2", "step2"))
+    ap.add_argument("--scenario", default="all", choices=("all", "sweep", "hover", "step", "hot", "gradient", "misest", "round2", "step2", "round3"))
     ap.add_argument("--trials", type=int, default=3)
     ap.add_argument("--seed", type=int, default=37)
     ap.add_argument("--out", default="log/comod_s0/s0.json")
     ap.add_argument("--target", type=float, default=S_TGT, help="目标强度（每像素每窗事件数）")
     ap.add_argument("--speed", type=float, default=SPEED, help="目标速度（像素/窗）；0 = 静止")
+    ap.add_argument("--no-isolation", action="store_true", help="关闭中心分量的孤立点源门控（对照）")
     args = ap.parse_args()
     globals()["S_TGT"], globals()["SPEED"] = float(args.target), float(args.speed)
+    globals()["ISOLATION"] = not args.no_isolation
     rng = np.random.default_rng(args.seed)
     report = {"config": {"k": K_COMP, "tau0": TAU0, "cap": CAP, "thr": THR, "s": S_TGT, "speed": SPEED,
                          "tau_s": TAU_S, "tau_c": TAU_C, "levels": LEVELS, "trials": args.trials}}
@@ -495,6 +523,14 @@ def main():
         for r in rows:
             print("%-6g " % r["b"] + " ".join("%-13s" % ("%s/%s" % (fmt(r["res"][m]["fa"]), fmt(r["res"][m]["pd"], "%.2f")))
                                              for m in MODES2))
+    if args.scenario == "round3":
+        rows = run_round2(args.trials, rng, modes=MODES3)
+        report["round3"] = rows
+        print("== round3（target=%g, speed=%g；停留上限 细 %.1f 窗 / 粗 %.1f 窗）：虚警 / 检出" % (S_TGT, SPEED, dwell(3), dwell(9)))
+        print("%-6s " % "b" + " ".join("%-13s" % m for m in MODES3))
+        for r in rows:
+            print("%-6g " % r["b"] + " ".join("%-13s" % ("%s/%s" % (fmt(r["res"][m]["fa"]), fmt(r["res"][m]["pd"], "%.2f")))
+                                             for m in MODES3))
     if args.scenario == "step2":
         report["step2"] = run_step2(rng)
         print("== step2（0.002 -> 0.11 @60 -> 0.002 @110）：comod 远处虚警，有 / 无突变遗忘")

@@ -33,7 +33,7 @@
      整个划分汇总，并且逐序列给出；逐窗给出背景区的饱和比例与平均电平（看失败是一开始就有还是随时间累积）。
   4. 逐窗计数：每窗负事件数、TP、FP、FN。
 五、协同调制插件（10-27 增加，model/comod.py，推理期、不改权重）：--plugin 名称=模式:背景 给某个 run 挂上插件，
-  同一个 checkpoint 可以用不同名称加载多次（例如 v5 与 v5_comod）做配对比较。模式 sub / comod / nocap，
+  同一个 checkpoint 可以用不同名称加载多次（例如 v5 与 v5_ntt）做配对比较。模式 sub / nocap / comod / ntt，
   背景 online（在线估计）/ oracle（整段背景事件统计，用到标签，只作上限）。不挂插件的 run 与原来逐位相同。
 """
 import os
@@ -53,7 +53,7 @@ import torch.nn.functional as F  # noqa: E402
 from dataset.ev_uav_stream import EvUAVStream  # noqa: E402
 from dataset.stream_source import make_window_source  # noqa: E402
 from dataset.stream_windows import refill_by_index  # noqa: E402
-from model.comod import CoModPlugin  # noqa: E402
+from model.comod import REF_RATE, CoModPlugin  # noqa: E402
 from model.evspsegnet_stream import LAYER_NAMES  # noqa: E402
 from model.lif2d_stream import StreamingTIF2d  # noqa: E402
 from train_stream_v1 import build_net, seed_everything  # noqa: E402
@@ -88,6 +88,8 @@ def parse_args(argv=None):
     parser.add_argument("--dwell-ms", type=float, default=175.0,
                         help="目标在 enc1 感受野上的停留时间（ms）= 窗长 *（目标尺寸 + 感受野）/ 速度；"
                              "默认按 EV-UAV 标签的中位速度 2.6 px/窗、目标约 6 px、感受野 3 px 得到")
+    parser.add_argument("--ref-rate", default="%g,%g" % REF_RATE,
+                        help="插件的参照背景率 ON,OFF（每像素每窗）；默认为训练集逐序列背景率的中位数（13.45）")
     parser.add_argument("--out", required=True, help="结果 JSON 路径")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args(argv)
@@ -618,8 +620,10 @@ def main(argv=None):
     plugins = {}
     for name, (mode, background) in plugin_specs.items():
         net, train_cfg, q99, _ = loaded[name]
+        ref_rate = tuple(float(v) for v in args.ref_rate.split(","))
         plugins[name] = CoModPlugin(net, mode, background, q99, int(train_cfg["time_bins"]),
-                                    float(train_cfg["input_clip"]), args.dwell_ms, float(train_cfg["window_ms"]))
+                                    float(train_cfg["input_clip"]), args.dwell_ms, float(train_cfg["window_ms"]),
+                                    ref_rate=ref_rate)
     data_cfg = loaded[runs[0][0]][1]
     for name, (_, train_cfg, _, _) in loaded.items():
         diff = [key for key in DATA_KEYS if train_cfg.get(key) != data_cfg.get(key)]
@@ -659,8 +663,8 @@ def main(argv=None):
         tp, fp, fn = (sum(s[key] for s in seqs) for key in ("tp", "fp", "fn"))
         report["runs"][name] = {
             "checkpoint": path, "epoch": epoch, "neuron": train_cfg["neuron"], "tif": net.tif_config,
-            "plugin": ({"mode": plugin_specs[name][0], "background": plugin_specs[name][1], "dwell_ms": args.dwell_ms}
-                       if name in plugin_specs else None),
+            "plugin": ({"mode": plugin_specs[name][0], "background": plugin_specs[name][1], "dwell_ms": args.dwell_ms,
+                        "ref_rate": args.ref_rate} if name in plugin_specs else None),
             "totals": {"tp": tp, "fp": fp, "fn": fn, "iou": iou_from_counts(tp, fp, fn)},
             "fp_kinds": {k: sum(s["fp_" + k] for s in seqs) for k in FP_KINDS},
             "speed": speed_table(collected[name]["targets"]),

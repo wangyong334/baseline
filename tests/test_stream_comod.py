@@ -1,9 +1,10 @@
-"""model/comod.py（协同调制推理期插件）与 tools/diagnose_tif.py --plugin 的单元测试（CPU，不需要数据集）。
+"""model/comod.py（噪声校准推理期插件）与 tools/diagnose_tif.py --plugin 的单元测试（CPU，不需要数据集）。
 
-    1. 背景期望输入与蒙特卡洛一致；由输入反推计数在未截断处精确
-    2. 背景估计：均匀泊松下收敛；环形挖空使中心的目标不进入参照；阶跃时突变遗忘生效
-    3. 插件：参照为 0 时三种模式与原网络逐位相同；detach 后恢复；参照非 0 时与手算公式一致
-    4. 入口：同一个 checkpoint 以两个名称加载，一个挂插件（online / oracle），JSON 合法，未挂插件的 run 不变
+    1. 输入矩：12 通道的均值、方差与"整窗 × 时间箱"协方差与蒙特卡洛一致；enc1 电流的背景均值、方差与蒙特卡洛一致；
+       由输入反推计数在未截断处精确
+    2. 背景估计：均匀泊松下收敛；环形挖空与孤立点源门控使静止目标不进入参照、热像素被中心分量接管；突变遗忘生效
+    3. 插件：背景不高于参照时与原网络逐位相同（ntt 在浮点误差内）；detach 后恢复；校正时与手算公式一致
+    4. 入口：同一个 checkpoint 以多个名称加载，部分挂插件（online / oracle），JSON 合法，未挂插件的 run 不变
 """
 import contextlib
 import io
@@ -16,6 +17,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -27,17 +29,53 @@ from train_stream_v1 import build_net  # noqa: E402
 from utils.stream_common import load_flat_config  # noqa: E402
 
 
-class InputTests(unittest.TestCase):
-    def test_expected_input_matches_monte_carlo(self):
+def encode(on_bins, off_bins, q99, clip=3.0):
+    """按 stream_windows 的通道布局，把每箱计数 [..., T] 编成 12 通道 clip(log1p(n)/q99)。"""
+    T = on_bins.shape[-1]
+    chans = [on_bins.sum(-1), off_bins.sum(-1)]
+    for t in range(T):
+        chans += [on_bins[..., t], off_bins[..., t]]
+    x = np.stack(chans, -1).astype(np.float64)
+    return np.clip(np.log1p(x) / q99, 0, clip)
+
+
+class MomentTests(unittest.TestCase):
+    def test_input_moments_match_monte_carlo(self):
         rng = np.random.RandomState(0)
         q99 = np.linspace(0.6, 1.4, 12)
-        for rate in (0.01, 0.3, 2.0):
-            b = torch.full((1, 2, 1, 1), rate, dtype=torch.float64)
-            ex = C.expected_input(b, q99, 5, 3.0)[0, :, 0, 0].numpy()
-            for c in (0, 1, 2, 7):
-                r = rate if c < 2 else rate / 5.0
-                samples = np.clip(np.log1p(rng.poisson(r, 200000)) / q99[c], 0, 3.0)
-                self.assertAlmostEqual(ex[c], samples.mean(), delta=4 * samples.std() / np.sqrt(2e5) + 1e-9)
+        n = 400000
+        for rate_on, rate_off in ((0.02, 0.3), (1.5, 0.004)):
+            b = torch.tensor([rate_on, rate_off], dtype=torch.float64).view(1, 2, 1, 1)
+            m, v, c = (t[0, :, 0, 0].numpy() for t in C.input_moments(b, q99, 5, 3.0))
+            x = encode(rng.poisson(rate_on / 5, (n, 5)), rng.poisson(rate_off / 5, (n, 5)), q99)
+            se = x.std(0) / np.sqrt(n)
+            np.testing.assert_allclose(m, x.mean(0), atol=float(5 * se.max() + 1e-9))
+            # 方差的蒙特卡洛相对误差约 1/sqrt(非零样本数)：按各通道的期望事件数给容差
+            rates = np.array([rate_on, rate_off] + [rate_on / 5, rate_off / 5] * 5)
+            rtol = 4.0 / np.sqrt(n * np.minimum(rates, 1.0)) + 0.01
+            self.assertTrue(np.all(np.abs(v - x.var(0)) <= rtol * x.var(0) + 1e-9), (v, x.var(0)))
+            for t in range(5):
+                for p in (0, 1):
+                    emp = np.cov(x[:, p], x[:, 2 + 2 * t + p])[0, 1]
+                    tol = rtol[2 + 2 * t + p] * abs(emp) + 1e-6
+                    self.assertAlmostEqual(c[2 * t + p], emp, delta=tol)
+
+    def test_current_moments_match_monte_carlo(self):
+        rng = np.random.RandomState(1)
+        net = make_tif_net(quantize=True).eval()
+        plugin = C.CoModPlugin(net, "comod", "online", Q99.astype(np.float64), 5, 3.0, dwell_ms=175.0)
+        rate = np.array([0.05, 0.02])
+        b = torch.tensor(rate, dtype=torch.float64).view(1, 2, 1, 1).expand(1, 2, 9, 9).contiguous()
+        mu, var = plugin.moments(b)
+        samples = []
+        for _ in range(20000):
+            x = encode(rng.poisson(rate[0] / 5, (9, 9, 5)), rng.poisson(rate[1] / 5, (9, 9, 5)), Q99.astype(np.float64))
+            xt = torch.from_numpy(x).permute(2, 0, 1).unsqueeze(0)
+            with torch.no_grad():
+                samples.append(net.enc1._currents(xt)[0][0, :, 4, 4].numpy())
+        s = np.array(samples)
+        np.testing.assert_allclose(mu[0, :, 4, 4].numpy(), s.mean(0), atol=float(5 * s.std(0).max() / np.sqrt(len(s))))
+        np.testing.assert_allclose(var[0, :, 4, 4].numpy(), s.var(0), rtol=0.06)
 
     def test_counts_from_input_inverts_transform(self):
         counts = torch.tensor([0., 1., 2., 5., 9.], dtype=torch.float64).view(1, 1, 1, 5).repeat(1, 2, 1, 1)
@@ -64,13 +102,24 @@ class EstimatorTests(unittest.TestCase):
         field = torch.full((1, 2, 64, 64), 0.1, dtype=torch.float64)
         out, est = self.run_stream(lambda t: field, 60, target=2.0)
         b = out[-1]
-        far = b[..., 0:16, 0:16].mean().item()
-        self.assertAlmostEqual(far, 0.1, delta=0.01)
+        self.assertAlmostEqual(b[..., 0:16, 0:16].mean().item(), 0.1, delta=0.01)
         ring = est.As / est.Ws
         self.assertLess(ring[..., 32, 32].mean().item(), 0.1 * 1.3)  # 环形参照挖空中心：静止源不进入自己的参照
-        # 持续 3 s、每窗 2 个事件的静止源由中心分量接管（热像素处理；也是悬停目标的可辨识性界）
-        self.assertGreater(b[..., 32, 32].mean().item(), 1.0)
-        self.assertLess(out[3][..., 32, 32].mean().item(), 0.5)       # 出现后最初几窗还没有接管
+        self.assertLess(b[..., 32, 32].mean().item(), 0.1 * 1.3)     # 5x5 的静止目标不是孤立点源，中心分量不接管
+
+    def test_isolated_point_source_gate(self):
+        """热像素（孤立单像素）由中心分量接管；同样强度、静止的 5x5 目标不会被当成热像素。"""
+        hot = torch.full((1, 2, 64, 64), 0.01, dtype=torch.float64)
+        hot[..., 10, 10] = 1.0
+        torch.manual_seed(2)
+        est = C.BackgroundEstimator(tau_s=10.0, forget=False)
+        for _ in range(80):
+            lam = hot.clone()
+            lam[..., 40:45, 40:45] += 1.0
+            est.update(torch.poisson(lam))
+        b = est.estimate()
+        self.assertGreater(b[..., 10, 10].mean().item(), 0.5)
+        self.assertLess(b[..., 42, 42].mean().item(), 0.05)
 
     def test_step_change_forgetting(self):
         lo = torch.full((1, 2, 44, 44), 0.005, dtype=torch.float64)
@@ -96,35 +145,50 @@ class PluginTests(unittest.TestCase):
             outs.append(memory)
         return torch.stack(outs)
 
-    def test_zero_reference_is_identity_and_detach_restores(self):
+    def set_rate(self, plugin, rate):
+        """让插件按给定的均匀背景率校正（绕过在线估计）。"""
+        plugin.background = "oracle"
+        plugin.oracle_b = torch.tensor(rate, dtype=torch.float64).view(1, 2, 1, 1).expand(1, 2, H, W).contiguous()
+        plugin.set_window(self.x)
+
+    def test_reference_level_is_identity_and_detach_restores(self):
         base = make_tif_net(quantize=True).eval()
         ref = self.forward_enc1(base)
         for mode in C.MODES:
             net = make_tif_net(quantize=True).eval()
             plugin = C.CoModPlugin(net, mode, "online", self.q99, 5, 3.0, dwell_ms=175.0)
-            plugin.reference = torch.zeros(1, SMALL[0], H, W, dtype=torch.float64)
-            self.assertTrue(torch.equal(self.forward_enc1(net), ref), mode)
+            self.set_rate(plugin, (0.001, 0.0))                       # 低于参照：不校正
+            out = self.forward_enc1(net)
+            if mode == "ntt":
+                self.assertTrue(torch.allclose(out, ref, atol=1e-12), mode)
+            else:
+                self.assertTrue(torch.equal(out, ref), mode)
             plugin.detach()
-            plugin.reference = torch.ones(1, SMALL[0], H, W, dtype=torch.float64)
+            self.set_rate(plugin, (0.3, 0.3))
             self.assertTrue(torch.equal(self.forward_enc1(net), ref), mode)
 
-    def test_nonzero_reference_matches_formula(self):
+    def test_correction_matches_formula(self):
         net = make_tif_net(quantize=False).eval()
         neuron = net.enc1.neuron
         current = net.enc1._currents(self.x)[0].detach()
-        Dref = torch.full_like(current, 0.03)
         lam = neuron.beta().view(1, -1, 1, 1).double()
         k = neuron.k().view(1, -1, 1, 1).double()
         cap = (neuron.theta() * neuron.levels).view(1, -1, 1, 1).double()
         tau = -50.0 / torch.log(lam)
-        for mode, dwell in (("sub", 175.0), ("nocap", 175.0), ("comod", 60.0)):
+        for mode, dwell in (("sub", 175.0), ("nocap", 175.0), ("comod", 60.0), ("ntt", 60.0), ("ntt", 1e6)):
             plugin = C.CoModPlugin(net, mode, "online", self.q99, 5, 3.0, dwell_ms=dwell)
-            plugin.reference = Dref
-            g = k / (k + Dref)
-            if mode == "comod":
-                g = torch.maximum(g, (tau / dwell).clamp(max=1.0))
-            lam_eff = lam.expand_as(Dref) if mode == "sub" else lam ** g
-            z = current - k - Dref
+            self.set_rate(plugin, (0.2, 0.1))
+            dmu, rho, mu_ref, mu_eff = plugin.state
+            self.assertTrue(bool((rho >= 1).all()))
+            if mode == "sub":
+                s = torch.ones_like(rho)
+            elif mode == "nocap":
+                s = rho
+            else:
+                s = torch.minimum(rho, (dwell / tau).clamp(min=1.0))
+            lam_eff = lam ** (1.0 / s)
+            I = mu_ref + torch.sqrt(s / rho) * (current - mu_eff) if mode == "ntt" else current - dmu
+            z = I - k
             m1 = torch.minimum(torch.relu((1 - lam_eff) * z), cap)
             m2 = torch.minimum(torch.relu(lam_eff * m1 + (1 - lam_eff) * z), cap)
             out = self.forward_enc1(net, steps=2)
@@ -159,7 +223,8 @@ class DiagnoseEntryTests(unittest.TestCase):
                 key: base[key] for key in D.EVAL_KEYS}}), encoding="utf-8")
             outs = {}
             for tag, extra in (("plain", []), ("plug", ["--run", "c=%s" % path, "--run", "o=%s" % path,
-                                                        "--plugin", "c=comod:online", "--plugin", "o=sub:oracle"])):
+                                                        "--plugin", "c=ntt:online", "--plugin", "o=sub:oracle",
+                                                        "--ref-rate", "0.002,0.0001"])):
                 out = root / ("diag_%s.json" % tag)
                 argv = ["--config", str(yaml_path), "--split", "val", "--device", "cpu", "--out", str(out),
                         "--run", "v5=%s" % path] + extra
@@ -169,7 +234,7 @@ class DiagnoseEntryTests(unittest.TestCase):
             plain, plug = outs["plain"]["runs"]["v5"], outs["plug"]["runs"]
             self.assertEqual(plain["totals"], plug["v5"]["totals"])                 # 未挂插件的 run 不受影响
             self.assertIsNone(plug["v5"]["plugin"])
-            self.assertEqual(plug["c"]["plugin"]["mode"], "comod")
+            self.assertEqual(plug["c"]["plugin"]["mode"], "ntt")
             self.assertEqual(plug["o"]["plugin"]["background"], "oracle")
             self.assertIn("comod", plug["c"]["sequences"][0])
             with self.assertRaises(ValueError):
