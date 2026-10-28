@@ -62,26 +62,30 @@ class CfarConstraint(object):
         self._mu_hist, self._fpr_hist, self._mu_start = [], [], self.mu.copy()
 
     def strata(self, events, steps, batch):
-        """每个事件所在窗的环境层号（long [N]）：按 (窗, 流) 统计事件数，换算成 5x5 巧合负荷后分层。"""
-        key = events["t"].long() * int(batch) + events["b"].long()
+        """每个事件所在窗的环境层号（CPU 上的 long [N]）：按 (窗, 流) 统计事件数，换算成 5x5 巧合负荷后分层。
+
+        计数在 CPU 上做：torch 1.9 开启确定性算法时，CUDA 上的 bincount 没有确定性实现，会直接报错。
+        """
+        key = (events["t"].long() * int(batch) + events["b"].long()).cpu()
         counts = torch.bincount(key, minlength=int(steps) * int(batch)).to(torch.float64)
         load = 25.0 * counts / self.pixels
-        edges = torch.tensor(self.edges, dtype=torch.float64, device=load.device)
+        edges = torch.tensor(self.edges, dtype=torch.float64)
         return torch.bucketize(load, edges, right=True)[key]
 
     def chunk_loss(self, logits, labels, events, steps, batch, block_events):
         """一个片段的惩罚项（全部 mu = 0 时返回 None）；同时累计本次更新的硬计数。"""
         if logits.numel() == 0:
             return None
-        stratum = self.strata(events, steps, batch)
+        stratum = self.strata(events, steps, batch)                       # CPU
         neg = labels < 0.5
         hard = (logits.detach() >= self.logit_thr) & neg
-        self._neg += torch.bincount(stratum[neg], minlength=self.n_strata).cpu().numpy()
-        self._fp += torch.bincount(stratum[hard], minlength=self.n_strata).cpu().numpy()
+        neg_cpu, hard_cpu = neg.cpu(), hard.cpu()
+        self._neg += torch.bincount(stratum[neg_cpu], minlength=self.n_strata).numpy()
+        self._fp += torch.bincount(stratum[hard_cpu], minlength=self.n_strata).numpy()
         if not np.any(self.mu > 0):
             return None
         soft = torch.sigmoid((logits - self.logit_thr) / self.temperature)
-        weight = torch.as_tensor(self.mu, dtype=logits.dtype, device=logits.device)[stratum]
+        weight = torch.as_tensor(self.mu, dtype=logits.dtype)[stratum].to(logits.device)   # CPU 上查表，再搬到设备
         return (weight * soft * neg.to(logits.dtype)).sum() / float(block_events)
 
     def end_update(self):
