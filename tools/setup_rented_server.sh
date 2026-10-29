@@ -46,6 +46,11 @@ mkdir -p "$LEGACY"
 if [ -e "$LEGACY/EV-UAV-dataset" ]; then ok "软链接已存在"; else
   ln -s "$ROOT/datasets/EV-UAV-dataset" "$LEGACY/EV-UAV-dataset" && ok "软链接已建立" || bad "软链接失败"; fi
 
+if [ -d "$ROOT/datasets/evflying_x4/train" ]; then                       # 可选：EV-Flying x4（单独上传到 $ROOT/datasets/）
+  if [ -e "$LEGACY/evflying_x4" ]; then ok "EV-Flying 软链接已存在"; else
+    ln -s "$ROOT/datasets/evflying_x4" "$LEGACY/evflying_x4" && ok "EV-Flying 软链接已建立" || bad "EV-Flying 软链接失败"; fi
+fi
+
 echo "== 4. 依赖（系统 Python；不用 conda）"
 python -m pip install -q pyyaml tqdm "numpy<1.25" pandas -i https://pypi.tuna.tsinghua.edu.cn/simple \
   && ok "pip 依赖" || bad "pip 安装失败"
@@ -69,6 +74,14 @@ n=$(ls "$ROOT"/datasets/EV-UAV-dataset/{train,val,test}/*.npz 2>/dev/null | wc -
 (cd "$CODE" && python -c "import torch;c=torch.load('log/stream_tif_commpeak_msg_seed37/best_val_iou_seed37.pt',map_location='cpu');print('V5 epoch',c['epoch'])") \
   && ok "V5 权重可读" || bad "V5 权重不可读"
 [ -f "$CODE/configs/stream_v1_train_stats.json" ] && ok "训练统计文件存在" || bad "缺 configs/stream_v1_train_stats.json"
+if [ -d "$ROOT/datasets/evflying_x4/train" ]; then
+  m=$(ls "$ROOT"/datasets/evflying_x4/{train,val,test}/*.npz 2>/dev/null | wc -l)
+  [ "$m" -eq 27 ] && ok "EV-Flying x4 27 段（17/4/6）" || bad "EV-Flying 段数 $m（应为 27）"
+  if [ ! -f "$CODE/configs/stream_v1_evflying_x4_stats.json" ]; then         # 只用训练集重新生成统计文件
+    (cd "$CODE" && python tools/stream_train_stats.py --config configs/evisseg_stream_tif_comm_peak_evflying.yaml >/dev/null 2>&1)
+  fi
+  [ -f "$CODE/configs/stream_v1_evflying_x4_stats.json" ] && ok "EV-Flying 训练统计文件存在"     || bad "EV-Flying 统计文件生成失败：手动运行 python tools/stream_train_stats.py --config configs/evisseg_stream_tif_comm_peak_evflying.yaml"
+fi
 
 echo "== 7. 单元测试"
 out=$(cd "$CODE" && python -m unittest discover -s tests -p "test_stream*.py" 2>&1 | tail -3)
