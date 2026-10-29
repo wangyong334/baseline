@@ -1432,6 +1432,21 @@ def mode_train(args, cfg):
     print("TRAINING FINISHED:", root, flush=True)
 
 
+def eval_train_config(ckpt_config, cfg):
+    """评估用配置：以 checkpoint 里的训练配置为准，数据根目录与评测口径取自当前 YAML。
+
+    invariant_sensor_mask：checkpoint 里有就用 checkpoint 的；没有（10-29 默认值改动前训练的权重）就取当前 YAML，
+    YAML 也没有则为 False（E3b 行为）。10-29 默认开掩码时训练的权重（EV-Flying 版 E3b）靠其 YAML 显式写 true 保持一致。
+    """
+    train_cfg = dict(ckpt_config)
+    train_cfg["root"] = cfg["root"]
+    for key in ("threshold", "pd_detT", "correct_thresh", "rolling_window", "segments",
+                "timing_warmup_windows"):
+        train_cfg[key] = cfg[key]
+    train_cfg.setdefault("invariant_sensor_mask", bool(cfg.get("invariant_sensor_mask", False)))
+    return train_cfg
+
+
 def mode_eval(args, cfg):
     """评估 checkpoint：同一权重分别用 carry 与 reset_each_window 跑完整 160 窗，结果写入 checkpoint 同目录。
 
@@ -1442,11 +1457,7 @@ def mode_eval(args, cfg):
         raise ValueError("eval 模式需要 --checkpoint")
     device = torch.device(args.device)
     ckpt = torch.load(args.checkpoint, map_location=device)
-    train_cfg = dict(ckpt["config"])
-    train_cfg["root"] = cfg["root"]
-    for key in ("threshold", "pd_detT", "correct_thresh", "rolling_window", "segments",
-                "timing_warmup_windows"):
-        train_cfg[key] = cfg[key]
+    train_cfg = eval_train_config(ckpt["config"], cfg)
     # 正式评估始终走原实现：论文指标与逐窗延迟都以它为准，与训练时用的加速选项无关
     if args.execution == "layer" or args.input_device == "gpu":
         print("注意：--mode eval 固定使用 execution=step、input_device=cpu，忽略命令行加速选项", flush=True)

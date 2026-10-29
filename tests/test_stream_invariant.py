@@ -156,15 +156,25 @@ class TrackerTests(unittest.TestCase):
         self.assertTrue(torch.allclose(c[:7], full[:7]))
         self.assertFalse(torch.allclose(c[7:], full[7:]))
 
-    def test_sensor_mask_default_and_off(self):
+    def test_sensor_mask_default_off_and_on(self):
         seq = synthetic_sequence(3)
         cfg = dict(self.cfg(), pad_height=H + 4, pad_width=W + 6)
-        mask = BackgroundTracker(seq, cfg, torch.device("cpu")).estimator.mask
+        self.assertIsNone(BackgroundTracker(seq, cfg, torch.device("cpu")).estimator.mask)   # 默认 = E3b 行为
+        on = BackgroundTracker(seq, dict(cfg, invariant_sensor_mask=True), torch.device("cpu"))
+        mask = on.estimator.mask
         self.assertEqual(tuple(mask.shape), (1, 1, H + 4, W + 6))
         self.assertEqual(float(mask.sum()), float(H * W))
         self.assertEqual(float(mask[..., H:, :].sum() + mask[..., :, W:].sum()), 0.0)
-        off = BackgroundTracker(seq, dict(cfg, invariant_sensor_mask=False), torch.device("cpu"))
-        self.assertIsNone(off.estimator.mask)
+
+    def test_eval_config_sensor_mask(self):
+        """评估时掩码开关：checkpoint 有就用 checkpoint 的，没有就取当前 YAML，都没有为 False。"""
+        import train_stream_v1 as T
+        base = dict(root="r", threshold=0.9, pd_detT=50, correct_thresh=1e-4, rolling_window=10,
+                    segments=[[0, 1]], timing_warmup_windows=1)
+        self.assertFalse(T.eval_train_config({}, base)["invariant_sensor_mask"])
+        self.assertTrue(T.eval_train_config({}, dict(base, invariant_sensor_mask=True))["invariant_sensor_mask"])
+        self.assertFalse(T.eval_train_config({"invariant_sensor_mask": False},
+                                             dict(base, invariant_sensor_mask=True))["invariant_sensor_mask"])
 
     def test_sources_add_bg(self):
         seq = synthetic_sequence(4)
@@ -320,7 +330,8 @@ class WideConfigTests(unittest.TestCase):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         ref = load_flat_config(os.path.join(root, "configs", "evisseg_stream_tif_comm_peak_evflying.yaml"))
         cfg = load_flat_config(os.path.join(root, "configs", "evisseg_stream_tif_comm_peak_invariant_noiseaug_evflying.yaml"))
-        extra = {"invariant_input", "invariant_ref_rate", "noise_aug_prob", "noise_aug_rate_min", "noise_aug_rate_max"}
+        extra = {"invariant_input", "invariant_ref_rate", "noise_aug_prob", "noise_aug_rate_min", "noise_aug_rate_max",
+                 "invariant_sensor_mask"}                                  # 掩码：与 10-29 已训练的权重一致
         self.assertEqual(set(cfg) - set(ref), extra)
         for key in ref:
             if key != "save_root":

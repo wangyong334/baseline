@@ -34,6 +34,7 @@ NET:
   readout_hidden: 32
   invariant_input: true        # 模块二：enc1 不变输入接口（model/noise_invariant.py，Inn 13.54）
   invariant_ref_rate: [0.00155, 0.01133]   # 参照背景率 ON / OFF（训练集逐序列中位数，见文件头）
+  invariant_sensor_mask: true  # 10-29 这次训练时掩码默认开；为与已训练的权重一致而显式写出。最终轮按 E3b（关）重训时删去本行
 
 CALIB:
   calib_sequences: 8

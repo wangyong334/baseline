@@ -149,8 +149,9 @@ class BackgroundTracker(object):
 
     窗口必须按顺序请求（流式训练与评估都是如此）；请求的起点早于已处理的位置时从头重算。
     计数按画布尺寸（pad_height x pad_width）统计：通道 0 = ON（p=1），1 = OFF（p=0），与 comod.counts_from_input 一致。
-    画布比传感器大（EV-UAV 264x352 对 260x346，只补下侧和右侧）。默认按传感器掩码只在有效像素上求平均；
-    cfg["invariant_sensor_mask"] = False 时把补零区当作"没有事件"（10-29 之前的行为，下边缘背景被低估约 20%～27%）。
+    画布比传感器大（EV-UAV 264x352 对 260x346，只补下侧和右侧）。默认把补零区当作"没有事件"（E3b 定型的行为，
+    下边缘背景被低估约 20%～27%）；cfg["invariant_sensor_mask"] = True 时按传感器掩码只在有效像素上求平均。
+    10-29 用户定：默认不开掩码，模块二以 E3b 为准；掩码修正记为细节问题（CLAUDE.md 第 1.5 节 D9），后期再完善。
     """
 
     def __init__(self, seq, cfg, device):
@@ -158,7 +159,7 @@ class BackgroundTracker(object):
         self.height, self.width = int(cfg["pad_height"]), int(cfg["pad_width"])
         eps_b = 0.5 * float(cfg.get("invariant_ref_rate", REF_RATE)[0])
         mask = None
-        if cfg.get("invariant_sensor_mask", True):     # 只在传感器像素上估计背景（10-29）；false = 10-29 之前的行为
+        if cfg.get("invariant_sensor_mask", False):    # true = 只在传感器像素上估计背景（细节问题 D9，默认关）
             mask = torch.zeros(1, 1, self.height, self.width, dtype=torch.float64, device=device)
             mask[..., :int(cfg["height"]), :int(cfg["width_px"])] = 1.0
         self.estimator = BackgroundEstimator(eps_b=eps_b, mask=mask)
