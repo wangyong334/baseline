@@ -246,5 +246,22 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(cfg["save_root"], out)
 
 
+class WideConfigTests(unittest.TestCase):
+    def test_wide_configs(self):
+        from utils.stream_common import load_flat_config
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        pairs = (("evisseg_stream_tif_comm_peak_noiseaug_wide", "evisseg_stream_tif_comm_peak_noiseaug",
+                  "log/stream_tif_commpeak_noiseaug_wide_seed37"),
+                 ("evisseg_stream_tif_comm_peak_invariant_noiseaug_wide", "evisseg_stream_tif_comm_peak_invariant_noiseaug",
+                  "log/stream_tif_commpeak_inv_noiseaug_wide_seed37"))
+        for wide, base, out in pairs:
+            w = load_flat_config(os.path.join(root, "configs", wide + ".yaml"))
+            b = load_flat_config(os.path.join(root, "configs", base + ".yaml"))
+            self.assertEqual(set(w), set(b), wide)
+            for key in b:
+                if key not in ("save_root", "noise_aug_rate_max"):
+                    self.assertEqual(w[key], b[key], (wide, key))
+            self.assertEqual((w["noise_aug_rate_max"], w["save_root"]), (0.12, out))
+
 if __name__ == "__main__":
     unittest.main()
