@@ -102,10 +102,17 @@ def input_moments(b_hat, q99, time_bins, clip):
 class BackgroundEstimator(object):
     """在线背景估计（见模块说明）。step(counts) 先返回本窗可用的 b_hat（只依赖之前的窗），再用本窗计数更新。"""
 
-    def __init__(self, tau_s=20.0, tau_c=100.0, trunc=2.0, z=2.0, forget=True, eps_b=0.0):
+    def __init__(self, tau_s=20.0, tau_c=100.0, trunc=2.0, z=2.0, forget=True, eps_b=0.0, mask=None):
+        """mask: 可选的传感器有效区掩码 [1,1,H,W]（1 = 传感器像素，0 = 画布补零区）。
+        给定时按归一化卷积（Knutsson & Westin 1993）只在有效像素上求平均：补零区是"没有观测"，不是"没有事件"，
+        否则靠近补零边的环形参照、邻域与子块速率都会被低估（10-29：下边缘误检）。None 时与原实现逐位相同。"""
         self.a_s, self.g_c = math.exp(-1.0 / float(tau_s)), math.exp(-1.0 / float(tau_c))
         self.trunc, self.z, self.forget, self.eps_b = float(trunc), float(z), bool(forget), float(eps_b)
+        self.mask = mask
         self.reset()
+
+    def _valid(self, like):
+        return torch.ones_like(like[:, :1]) if self.mask is None else self.mask.to(like)
 
     def reset(self):
         self.As = self.Ws = self.Ac = self.Bc = self.fast = self.alarm = None
@@ -117,13 +124,14 @@ class BackgroundEstimator(object):
         ring = self.As / self.Ws
         lcb = (self.Ac - self.z * torch.sqrt(self.Ac.clamp(min=0.0))) / self.Bc
         rate = self.Ac / self.Bc
-        ones = torch.ones_like(rate[:, :1])
-        neigh = (box_sum(rate, 1) - rate) / (box_sum(ones, 1) - 1.0).clamp(min=1.0)
+        ones = self._valid(rate)
+        neigh = (box_sum(rate, 1) - rate) / (box_sum(ones, 1) - ones).clamp(min=1.0)
         lcb = torch.where(rate > 3.0 * neigh, lcb, torch.zeros_like(lcb))
         return torch.maximum(ring, lcb)
 
     def update(self, counts):
-        valid = box_sum(torch.ones_like(counts[:, :1]), R_OUT) - box_sum(torch.ones_like(counts[:, :1]), R_IN)
+        ones = self._valid(counts)
+        valid = box_sum(ones, R_OUT) - box_sum(ones, R_IN)
         ring = (box_sum(counts, R_OUT) - box_sum(counts, R_IN)) / valid.clamp(min=1.0)
         truncated = counts.clamp(max=self.trunc)
         if self.As is None:
@@ -139,18 +147,33 @@ class BackgroundEstimator(object):
 
     def _forget(self, counts):
         H, W = counts.shape[-2:]
-        sub = F.avg_pool2d(counts, SUB, stride=SUB, ceil_mode=True)                 # 子块速率 [B,2,h,w]
+        pool = lambda v: F.avg_pool2d(v, SUB, stride=SUB, ceil_mode=True)             # noqa: E731
+        if self.mask is None:
+            sub, slow = pool(counts), pool(self.As / self.Ws)                        # 子块速率 [B,2,h,w]
+        else:                                                                        # 只在传感器像素上平均
+            cover = pool(self._valid(counts)).clamp(min=1e-6)
+            sub, slow = pool(counts) / cover, pool(self.As / self.Ws * self._valid(counts)) / cover
         h, w = sub.shape[-2:]
         patches = F.unfold(F.pad(sub, (2, 2, 2, 2), mode="replicate"), 5)           # [B,2*25,h*w]
         # 用排序取中位数（25 个取第 13 个）：确定性模式下 CUDA 的 median/kthvalue 会报错，sort 不会
-        med = patches.view(sub.shape[0], 2, 25, h, w).sort(dim=2).values[:, :, 12]
+        if self.mask is None:
+            med = patches.view(sub.shape[0], 2, 25, h, w).sort(dim=2).values[:, :, 12]
+        else:                                                                        # 完全在补零区的子块不参与中位数
+            seen = F.unfold(F.pad((cover > 1e-3).to(sub).expand_as(sub), (2, 2, 2, 2), mode="replicate"), 5)
+            seen = seen.view(sub.shape[0], 2, 25, h, w) > 0.5
+            raw = patches.view(sub.shape[0], 2, 25, h, w)
+            vals = torch.where(seen, raw, torch.full_like(raw, float("inf")))
+            k = ((seen.sum(2, keepdim=True) - 1).clamp(min=0) // 2)
+            med = vals.sort(dim=2).values.gather(2, k)[:, :, 0]
+            med = torch.where(torch.isinf(med), torch.zeros_like(med), med)
         a_f = math.exp(-1.0 / 2.0)
         self.fast = med if self.fast is None else a_f * self.fast + (1 - a_f) * med
-        slow = F.avg_pool2d(self.As / self.Ws, SUB, stride=SUB, ceil_mode=True)
         off = (self.fast - slow).abs() > torch.maximum(0.5 * slow, torch.full_like(slow, self.eps_b))
         self.alarm = torch.where(off, (self.alarm if self.alarm is not None else torch.zeros_like(slow)) + 1,
                                  torch.zeros_like(slow))
         trig = self.alarm >= 2
+        if self.mask is not None:                                                    # 补零区子块没有观测，不重启
+            trig = trig & (cover > 1e-3)
         if bool(trig.any()):
             up = lambda t: t.repeat_interleave(SUB, -2).repeat_interleave(SUB, -1)[..., :H, :W]  # noqa: E731
             full, restart = up(trig), up(self.fast)

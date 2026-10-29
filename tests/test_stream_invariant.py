@@ -95,6 +95,44 @@ class InterfaceTests(unittest.TestCase):
             self.assertTrue(bool(((v / ref_var - 1.0).abs() < 0.2).all()), (v, ref_var))
 
 
+class SensorMaskTests(unittest.TestCase):
+    """10-29：画布比传感器大时（只补下侧、右侧），背景估计在补零边附近不能偏低（归一化卷积）。"""
+    SH, SW, PH, PW, RATE = 40, 50, 48, 56, 0.5
+
+    def run_estimator(self, mask, windows=60, seed=0):
+        from model.comod import BackgroundEstimator
+        torch.manual_seed(seed)
+        est = BackgroundEstimator(eps_b=1e-3, mask=mask)
+        for _ in range(windows):
+            counts = torch.zeros(1, 2, self.PH, self.PW, dtype=torch.float64)
+            counts[..., :self.SH, :self.SW] = torch.poisson(torch.full((1, 2, self.SH, self.SW), self.RATE,
+                                                                       dtype=torch.float64))
+            est.update(counts)
+        return est.estimate()[0, :, :self.SH, :self.SW]                  # 只看传感器像素
+
+    def sensor_mask(self):
+        m = torch.zeros(1, 1, self.PH, self.PW, dtype=torch.float64)
+        m[..., :self.SH, :self.SW] = 1.0
+        return m
+
+    def test_unbiased_near_padded_edges(self):
+        for mask, ok in ((self.sensor_mask(), True), (None, False)):
+            b = self.run_estimator(mask)
+            interior = float(b[:, 10:-10, 10:-10].mean())
+            bottom, right = float(b[:, -3:, 10:-10].mean()), float(b[:, 10:-10, -3:].mean())
+            self.assertLess(abs(interior / self.RATE - 1.0), 0.05)
+            if ok:                                                        # 带掩码：边缘与内部一致
+                self.assertLess(abs(bottom / interior - 1.0), 0.05, bottom)
+                self.assertLess(abs(right / interior - 1.0), 0.05, right)
+            else:                                                         # 旧行为：补零边附近被低估
+                self.assertLess(bottom / interior, 0.9, bottom)
+                self.assertLess(right / interior, 0.9, right)
+
+    def test_all_ones_mask_matches_none(self):
+        ones = torch.ones(1, 1, self.PH, self.PW, dtype=torch.float64)
+        self.assertTrue(torch.equal(self.run_estimator(ones, 12), self.run_estimator(None, 12)))
+
+
 class TrackerTests(unittest.TestCase):
     def cfg(self):
         return dict(CFG, pad_height=H, pad_width=W, invariant_input=True, height=H, width_px=W, window_ms=50)
@@ -117,6 +155,16 @@ class TrackerTests(unittest.TestCase):
         c = BackgroundTracker(seq2, self.cfg(), torch.device("cpu")).background(0, WINDOWS)
         self.assertTrue(torch.allclose(c[:7], full[:7]))
         self.assertFalse(torch.allclose(c[7:], full[7:]))
+
+    def test_sensor_mask_default_and_off(self):
+        seq = synthetic_sequence(3)
+        cfg = dict(self.cfg(), pad_height=H + 4, pad_width=W + 6)
+        mask = BackgroundTracker(seq, cfg, torch.device("cpu")).estimator.mask
+        self.assertEqual(tuple(mask.shape), (1, 1, H + 4, W + 6))
+        self.assertEqual(float(mask.sum()), float(H * W))
+        self.assertEqual(float(mask[..., H:, :].sum() + mask[..., :, W:].sum()), 0.0)
+        off = BackgroundTracker(seq, dict(cfg, invariant_sensor_mask=False), torch.device("cpu"))
+        self.assertIsNone(off.estimator.mask)
 
     def test_sources_add_bg(self):
         seq = synthetic_sequence(4)
@@ -202,7 +250,8 @@ class EndToEndTests(unittest.TestCase):
                         neg += seq.n_events - int(seq.label.sum())
             stats = dict(q99=Q99.tolist(), train_pos=pos, train_neg=neg, pos_weight=min(neg / pos, 30.0))
             (root / "stats.json").write_text(json.dumps(stats), encoding="utf-8")
-            for config in ("evisseg_stream_tif_comm_peak_invariant", "evisseg_stream_tif_comm_peak_invariant_noiseaug"):
+            for config in ("evisseg_stream_tif_comm_peak_invariant", "evisseg_stream_tif_comm_peak_invariant_noiseaug",
+                           "evisseg_stream_tif_comm_peak_invariant_noiseaug_evflying"):
                 run = root / config
                 cfg = load_flat_config("configs/%s.yaml" % config)
                 cfg.update(root=str(root), stats_path=str(root / "stats.json"), save_root=str(run),
@@ -215,6 +264,8 @@ class EndToEndTests(unittest.TestCase):
                 checkpoint = run / "best_val_iou_seed37.pt"
                 ckpt = torch.load(str(checkpoint), map_location="cpu")
                 np.testing.assert_allclose(ckpt["model"]["enc1.invariant.q99"].numpy(), Q99, rtol=1e-6)
+                net = T.build_net(ckpt["config"], torch.device("cpu"))         # 参照率随配置进入接口
+                self.assertEqual(net.invariant.ref_rate, tuple(cfg.get("invariant_ref_rate", REF_RATE)))
                 for load in (0.0, 2.0):
                     args = SimpleNamespace(checkpoint=str(checkpoint), device="cpu", mode="eval", split="val",
                                            overwrite=True, execution=None, input_device=None, readout_ablation="none",
@@ -262,6 +313,47 @@ class WideConfigTests(unittest.TestCase):
                 if key not in ("save_root", "noise_aug_rate_max"):
                     self.assertEqual(w[key], b[key], (wide, key))
             self.assertEqual((w["noise_aug_rate_max"], w["save_root"]), (0.12, out))
+
+    def test_evflying_config(self):
+        """EV-Flying 版 E3b：与 EV-Flying 版 V5 只差接口、参照率、增强三项与输出目录。"""
+        from utils.stream_common import load_flat_config
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        ref = load_flat_config(os.path.join(root, "configs", "evisseg_stream_tif_comm_peak_evflying.yaml"))
+        cfg = load_flat_config(os.path.join(root, "configs", "evisseg_stream_tif_comm_peak_invariant_noiseaug_evflying.yaml"))
+        extra = {"invariant_input", "invariant_ref_rate", "noise_aug_prob", "noise_aug_rate_min", "noise_aug_rate_max"}
+        self.assertEqual(set(cfg) - set(ref), extra)
+        for key in ref:
+            if key != "save_root":
+                self.assertEqual(cfg[key], ref[key], key)
+        self.assertEqual(cfg["save_root"], "log/stream_tif_commpeak_inv_noiseaug_evflying_x4_seed37")
+        aug = load_flat_config(os.path.join(root, "configs", "evisseg_stream_tif_comm_peak_noiseaug.yaml"))
+        self.assertEqual((cfg["noise_aug_prob"], cfg["noise_aug_rate_max"]), (aug["noise_aug_prob"], aug["noise_aug_rate_max"]))
+
+    def test_evflying_reference_rates_from_train_split(self):
+        """参照率与增强下限 = EV-Flying 训练集逐序列背景率的中位数（只在有数据的机器上核对）。"""
+        import glob
+        from utils.stream_common import load_flat_config
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        cfg = load_flat_config(os.path.join(root, "configs", "evisseg_stream_tif_comm_peak_invariant_noiseaug_evflying.yaml"))
+        candidates = [cfg["root"], os.path.join(root, "..", "dataset", "evflying_x4")]
+        files = next((sorted(glob.glob(os.path.join(c, "train", "*.npz"))) for c in candidates
+                      if glob.glob(os.path.join(c, "train", "*.npz"))), None)
+        if not files:
+            self.skipTest("没有 EV-Flying 训练数据")
+        H, Wd = int(cfg["height"]), int(cfg["width_px"])
+        on, off = [], []
+        for f in files:
+            s = sw.load_npz_events(f, H, Wd, int(cfg["window_ms"]), 0, int(cfg["time_bins"]))
+            area = H * Wd * (s.bounds.shape[0] - 1)
+            neg = s.label < 0.5
+            on.append((neg & (s.p == 1)).sum() / area)
+            off.append((neg & (s.p == 0)).sum() / area)
+        self.assertEqual(len(files), 17)
+        got = (np.median(on), np.median(off), np.median(np.add(on, off)))
+        want = tuple(cfg["invariant_ref_rate"]) + (cfg["noise_aug_rate_min"],)
+        for g, w in zip(got, want):
+            self.assertLess(abs(g / w - 1.0), 0.01, (got, want))
+
 
 if __name__ == "__main__":
     unittest.main()
