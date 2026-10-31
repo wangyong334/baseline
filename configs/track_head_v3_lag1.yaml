@@ -1,0 +1,76 @@
+# 模块三：目标级航迹头 v3 = v2 + IPDA 存在与关联（Stream-SNN-Innovations.md 13.62；train_track_head.py）。
+# 改动的依据（v1 诊断，CLAUDE.md 1.2 的 10-31 条）：v1 补不上断续漏检，是因为目标一不可见，航迹的存在概率就塌了。
+# v3 的存在概率按伯努利递推（IPDA，Musicki 1994）：
+#   有量测乘 (1 - P_D + P_D l)，漏检乘 (1 - P_D)；
+#   卡尔曼更新按关联概率 beta = P_D l / (1 - P_D + P_D l) 加权（PDAF），量测像杂波时航迹不会被拉走；
+#   P_D、似然比 l、存活概率（<= 0.999）都是学出来的；杂波量 = 3x3 格内的 sum(1 - p)（骨干判为背景的事件数），不用数据集常数；
+#   P_D、量测来源概率各有校准监督（分离原理：估计器输出校准的信念，判决只看信念）；
+#   事件关联用 PDA 形式（航迹的高斯密度对比事件所在处的杂波密度），航迹记忆记软检测 beta。
+# 变体：track_head_v3_lag1.yaml（decision_lag 1）。对照组沿用 track_head_v2_notrack（修正项看不到航迹，与存在模型无关）。
+# 常数的来历（13.60）：
+#   cell 4 像素            目标中位 5～6 像素 ≈ 1.5 格；3x3 格 = 12 像素，盖住一个目标
+#   slots 10               训练集同一窗内同时出现的目标最多 5 个，x 2
+#   history 21             当前窗 + 前 20 窗（1 s）：与误差分类里"拖尾 = 0.1～1 s 前目标在这里"同一口径
+#   gate_sigma 3           3 倍标准差的验证门（标准做法）
+#   gate_max_px 24         每窗位移的 99% 分位约 8 像素，x 3
+#   gate_floor 0.5         局部峰至少有"半个确信事件"的证据（概率和，3x3 格）才算量测
+#   birth_floor 1.0        至少"一个确信事件"的证据才出生
+#   death_exist 0.02       存在概率低于 2% 删除；max_coast 20 窗（1 s）没有量测删除
+#   recycle_exist 0.5      没有空槽时，只回收存在概率低于 50% 的航迹（比"不存在"更可能）
+#   match_min_px 8         监督时航迹与标注目标匹配的最小半径（约 1.5 个目标尺寸）
+# 用法（实验室服务器，3 号卡；完整流程见 tools/run_track_head.sh 与 tools/queue_track_head_v2.sh）：
+#   python -u train_track_head.py --config configs/track_head_v3_lag1.yaml --mode train --device cuda:0
+#   python -u train_track_head.py --config configs/track_head_v3_lag1.yaml --mode eval --device cuda:0 --split test \
+#       --checkpoint log/track_head_v3_lag1_seed37/best_val_iou_seed37.pt
+DATA:
+  root: /media/stephen/nvme0n1/wy_data/datasets/EV-UAV-dataset
+  input_device: gpu
+BASE:
+  base_checkpoint: log/stream_tif_commpeak_inv_seed37/best_val_iou_seed37.pt   # E3a（val 最好一轮，第 42 轮）
+HEAD:
+  cell: 4
+  slots: 10
+  hidden: 32
+  history: 21
+  gate_sigma: 3.0
+  gate_max_px: 24.0
+  gate_floor: 0.5
+  birth_floor: 1.0
+  max_births: 4
+  death_exist: 0.02
+  max_coast: 20
+  recycle_exist: 0.5
+  match_min_px: 8.0
+  corr_hidden: 32
+  r_min: 0.25
+  decision_lag: 1
+  context: track
+  existence: ipda
+TRAIN:
+  seed: 37
+  epochs: 20
+  lr: 0.001
+  lr_end: 0.0001
+  streams: 4
+  tbptt_k: 16
+  stream_layout: greedy
+  grad_clip: 1.0
+  lambda_exist: 1.0
+  lambda_pos: 0.5
+  lambda_pd: 1.0             # v3：检测概率 P_D 的校准监督（目标本窗有没有产生量测）
+  lambda_origin: 1.0         # v3：量测来源概率的校准监督（量测是否落在标注目标上）
+  now_loss_weight: 1.0        # 只在 decision_lag 1 时用：零等待输出的损失权重
+  lag_loss_weight: 1.0        # 只在 decision_lag 1 时用：滞后输出的损失权重
+  deterministic: true
+  eval_chunk: 32
+  save_root: log/track_head_v3_lag1_seed37
+EVAL:
+  threshold: 0.9
+  pd_detT: 50
+  correct_thresh: 0.0001
+  rolling_window: 10
+  segments: [[0, 15], [64, 79], [144, 159]]
+  timing_warmup_windows: 20
+  gate_tail_drop: 0.30        # 关口：拖尾误报至少降 30%
+  gate_gap_drop: 0.30         # 关口：断续漏检至少降 30%
+  gate_near_rise: 0.10        # 关口：目标附近的误报最多增加 10%（IoU 还要不低于 base）

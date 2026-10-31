@@ -37,9 +37,11 @@ import torch.nn.functional as F
 
 MEAS_SUMS = 8          # 每格累加量：p, p^2, 1, p*pol, p*x, p*y, p*x^2, p*y^2（其后为 p*feat）
 BIG = 1e6
-TRACK_KEYS = ("active", "pos", "vel", "P", "h", "ex", "age", "miss", "has", "hist", "hist_ok")
+TRACK_KEYS = ("active", "pos", "vel", "P", "h", "ex", "pd", "beta", "age", "miss", "has", "hist", "hist_ok")
+SURV_MAX_LOGIT = math.log(0.999 / 0.001)   # survival p_S <= 0.999: existence log-odds stay bounded
 PEND_KEYS = ("b", "x", "y", "p", "t_local", "z0", "feat", "ctx", "key")
 CONTEXTS = ("track", "none")
+EXISTENCE = ("gru", "ipda")
 CTX_DIM, LAG_DIM = 11, 7
 
 
@@ -63,10 +65,12 @@ class TrackHead(nn.Module):
     def __init__(self, feat_dim, height, width, cell=4, slots=10, hidden=32, history=21, gate_sigma=3.0,
                  gate_max_px=24.0, gate_floor=0.5, birth_floor=1.0, max_births=4, death_exist=0.02,
                  max_coast=20, match_min_px=8.0, corr_hidden=32, r_min=0.25, recycle_exist=0.5,
-                 decision_lag=0, context="track"):
+                 decision_lag=0, context="track", existence="gru"):
         super(TrackHead, self).__init__()
         if context not in CONTEXTS:
             raise ValueError("context 必须是 %s 之一" % (CONTEXTS,))
+        if existence not in EXISTENCE:
+            raise ValueError("existence 必须是 %s 之一" % (EXISTENCE,))
         if int(decision_lag) not in (0, 1):
             raise ValueError("decision_lag 只支持 0（零等待）或 1（一窗固定滞后）")
         self.feat_dim = int(feat_dim)
@@ -77,7 +81,7 @@ class TrackHead(nn.Module):
         self.gate_floor, self.birth_floor = float(gate_floor), float(birth_floor)
         self.max_births, self.death_exist, self.max_coast = int(max_births), float(death_exist), float(max_coast)
         self.match_min_px, self.r_min, self.recycle_exist = float(match_min_px), float(r_min), float(recycle_exist)
-        self.decision_lag, self.context = int(decision_lag), str(context)
+        self.decision_lag, self.context, self.existence = int(decision_lag), str(context), str(existence)
         self.meas_dim = 5 + self.feat_dim
         self.u_dim = self.meas_dim + 11
         self.log_q = nn.Parameter(torch.tensor(math.log(0.25)))       # 过程噪声（像素/窗^2 的加速度方差）
@@ -87,7 +91,20 @@ class TrackHead(nn.Module):
         nn.init.constant_(self.r_net[2].bias, math.log(math.expm1(4.0)))   # 初始 R = 4 + r_min
         self.gru = nn.GRUCell(self.u_dim, self.hidden)
         self.exist = nn.Linear(self.hidden, 1)
-        self.none_logit = nn.Parameter(torch.zeros(()))
+        if self.existence == "ipda":
+            # IPDA (Musicki 1994): existence and association updated together. Learned parts: detection probability
+            # P_D from track memory + clutter at the predicted position; measurement likelihood ratio (target vs
+            # clutter) from measurement features, normalized innovation and clutter at the measurement; survival.
+            self.pd_head = nn.Linear(self.hidden + 1, 1)
+            nn.init.zeros_(self.pd_head.weight)
+            nn.init.constant_(self.pd_head.bias, math.log(4.0))                 # P_D = 0.8
+            self.lr_net = _mlp(self.meas_dim + 2, 16, 1)
+            nn.init.zeros_(self.lr_net[2].weight)
+            nn.init.constant_(self.lr_net[2].bias, 2.0)                         # likelihood ratio e^2
+            self.surv_logit = nn.Parameter(torch.tensor(math.log(0.995 / 0.005)))
+        # ipda: the clutter term is a density (clutter count over the 3x3-cell area), so it starts at -log(area)
+        none0 = -math.log(9.0 * self.cell * self.cell) if self.existence == "ipda" else 0.0
+        self.none_logit = nn.Parameter(torch.tensor(none0))
         base_in = 1 + self.feat_dim + 2 + CTX_DIM
         self.corr = _zero_last(_mlp(base_in, int(corr_hidden), 1))
         if self.decision_lag:
@@ -104,7 +121,8 @@ class TrackHead(nn.Module):
         zeros = lambda *shape: torch.zeros(*shape, device=device)  # noqa: E731
         flag = lambda *shape: torch.zeros(*shape, dtype=torch.bool, device=device)  # noqa: E731
         return {"active": flag(B, N), "pos": zeros(B, N, 2), "vel": zeros(B, N, 2), "P": zeros(B, N, 2, 2),
-                "h": zeros(B, N, D), "ex": zeros(B, N), "age": zeros(B, N), "miss": zeros(B, N), "has": flag(B, N),
+                "h": zeros(B, N, D), "ex": zeros(B, N), "pd": zeros(B, N), "beta": zeros(B, N), "age": zeros(B, N),
+                "miss": zeros(B, N), "has": flag(B, N),
                 "hist": zeros(B, N, H, 2), "hist_ok": flag(B, N, H), "pending": None}
 
     @staticmethod
@@ -231,13 +249,36 @@ class TrackHead(nn.Module):
         S = Ppred[..., 0, 0] + R
         K = Ppred[..., :, 0] / S[..., None]                                              # [B, N, 2]：位置、速度增益
         innov = zpos - pos_pred
-        hv = has[..., None]
-        pos = torch.where(hv, pos_pred + K[..., 0:1] * innov, pos_pred)
-        vel = torch.where(hv, vel_pred + K[..., 1:2] * innov, vel_pred)
-        P_upd = Ppred - K[..., :, None] * Ppred[..., 0, :][..., None, :]
-        P = torch.where(has[..., None, None], P_upd, Ppred)
         d2n = (innov ** 2).sum(-1) / S
-        hf = has.to(dtype)
+        P_upd = Ppred - K[..., :, None] * Ppred[..., 0, :][..., None, :]
+        clutter = None
+        if self.existence == "ipda":
+            # 杂波量 = 3x3 格内骨干判为背景的事件数之和 sum(1 - p)；不用任何数据集常数
+            clutter = (sums[:, 2] - sums[:, 0]).clamp(min=0.0)                            # [B, G]
+            px = pos_pred[..., 0].detach().round().clamp(0, self.width - 1).long()
+            py = pos_pred[..., 1].detach().round().clamp(0, self.height - 1).long()
+            c_pred = clutter[bidx, self._cells(px, py)]
+            c_meas = clutter[bidx, cidx]
+            pd_logit = self.pd_head(torch.cat([state["h"], torch.log1p(c_pred)[..., None]], -1)).squeeze(-1)
+            log_lr = self.lr_net(torch.cat([f, torch.log1p(d2n)[..., None], torch.log1p(c_meas)[..., None]],
+                                           -1)).squeeze(-1)
+            log_pd, log_miss = F.logsigmoid(pd_logit), F.logsigmoid(-pd_logit)
+            log_det = torch.logaddexp(log_miss, log_pd + log_lr)                          # log(1 - P_D + P_D l)
+            beta = torch.where(has, torch.exp(log_pd + log_lr - log_det), torch.zeros_like(log_det))
+            bv, bm = beta[..., None], beta[..., None, None]
+            pos = pos_pred + bv * K[..., 0:1] * innov                                     # PDAF：按关联概率更新
+            vel = vel_pred + bv * K[..., 1:2] * innov
+            spread = (beta * (1.0 - beta) * (innov ** 2).mean(-1))[..., None, None] * (K[..., :, None] * K[..., None, :])
+            P = bm * P_upd + (1.0 - bm) * Ppred + spread
+            pd_now = torch.sigmoid(pd_logit)
+        else:
+            hv = has[..., None]
+            pos = torch.where(hv, pos_pred + K[..., 0:1] * innov, pos_pred)
+            vel = torch.where(hv, vel_pred + K[..., 1:2] * innov, vel_pred)
+            P = torch.where(has[..., None, None], P_upd, Ppred)
+            pd_now = torch.zeros_like(state["ex"])
+            beta = has.to(dtype)
+        hf = beta if self.existence == "ipda" else has.to(dtype)       # ipda：航迹记忆记的是软检测（关联概率）
         zero = torch.zeros_like(hf)
         miss = torch.where(act, torch.where(has, zero, state["miss"] + 1.0), zero)
         age = torch.where(act, state["age"] + 1.0, zero)
@@ -317,7 +358,20 @@ class TrackHead(nn.Module):
         live = act | born
 
         # 6. 存在概率；7. 消亡
-        ex_logit = self.exist(h).squeeze(-1)
+        extra = {}
+        if self.existence == "ipda":
+            # 伯努利递推（对数几率）：预测 r -> p_S r；有量测乘 (1 - P_D + P_D l)，漏检乘 (1 - P_D)；新生航迹由出生编码给出
+            r = ex_prev.clamp(1e-6, 1.0 - 1e-6)
+            rp = (torch.sigmoid(self.surv_logit.clamp(0.0, SURV_MAX_LOGIT)) * r).clamp(max=1.0 - 1e-6)
+            L_pred = torch.log(rp) - torch.log1p(-rp)
+            L_post = L_pred + torch.where(has, log_det, log_miss)
+            ex_logit = torch.where(born, self.exist(h).squeeze(-1), L_post)
+            # 量测来源的后验对数几率（目标存在且量测来自它）：log(r P_D l) - log(1 - r P_D)，供校准监督
+            rpd = (rp * torch.exp(log_pd)).clamp(max=1.0 - 1e-6)
+            extra = {"pd_logit": pd_logit, "org_logit": torch.log(rpd) + log_lr - torch.log1p(-rpd), "zpos": zpos,
+                     "prior": act & ~born}
+        else:
+            ex_logit = self.exist(h).squeeze(-1)
         ex = torch.sigmoid(ex_logit)
         m = self.gate_max_px
         outside = (pos[..., 0] < -m) | (pos[..., 0] > self.width + m) | (pos[..., 1] < -m) | (pos[..., 1] > self.height + m)
@@ -325,6 +379,7 @@ class TrackHead(nn.Module):
         alive = live & ~die
         info = {"ex_logit": ex_logit, "live": live, "pos": pos, "born": born, "has": has,
                 "births": len(bb), "recycled": recycled, "delayed": None}
+        info.update(extra)
 
         # 8. 滞后判决：用第 k 窗的信息重判第 k-1 窗的事件（在清零消亡航迹之前，用到它们本窗的后验）
         pend = state.get("pending")
@@ -336,13 +391,17 @@ class TrackHead(nn.Module):
         pos, vel = torch.where(av, pos, torch.zeros_like(pos)), torch.where(av, vel, torch.zeros_like(vel))
         P, h = torch.where(am, P, torch.zeros_like(P)), torch.where(av, h, torch.zeros_like(h))
         ex = torch.where(alive, ex, torch.zeros_like(ex))
+        pd_now = torch.where(alive & ~born, pd_now, torch.zeros_like(pd_now))
+        beta = torch.where(alive & has, beta, torch.zeros_like(beta))
         age, miss = torch.where(alive, age, zero), torch.where(alive, miss, zero)
         hist = torch.cat([pos[:, :, None], hist[:, :, :-1]], 2)
         hist_ok = torch.cat([alive[:, :, None], hist_ok[:, :, :-1]], 2) & alive[..., None]
-        new_state = {"active": alive, "pos": pos, "vel": vel, "P": P, "h": h, "ex": ex, "age": age, "miss": miss,
-                     "has": has & alive, "hist": hist, "hist_ok": hist_ok, "pending": None}
+        new_state = {"active": alive, "pos": pos, "vel": vel, "P": P, "h": h, "ex": ex, "pd": pd_now, "beta": beta,
+                     "age": age, "miss": miss, "has": has & alive, "hist": hist, "hist_ok": hist_ok, "pending": None}
 
         # 9. 本窗事件的零等待修正
+        if clutter is not None:
+            ev = dict(ev, clutter=clutter[ev["b"], self._cells(ev["x"], ev["y"])])        # 事件所在处的杂波量
         if int(z0.shape[0]):
             ctx = self._context(ev, new_state)
             z = self._fuse(self.corr, z0, feat, ev, ctx)
@@ -390,8 +449,16 @@ class TrackHead(nn.Module):
         d = _dist(exy[:, None], pos_e)                                                   # [Ne, N]
         delta2 = d * d / (st["P"][eb][..., 0, 0] + cell * cell)
         speed = torch.sqrt((vel_e ** 2).sum(-1) + 1e-6) / cell
-        logit_w = torch.where(act_e, -0.5 * delta2 + torch.log(ex_e.clamp(min=1e-6)), torch.full_like(d, -1e4))
-        w = torch.softmax(torch.cat([logit_w, self.none_logit.expand(int(d.shape[0]), 1)], 1), 1)
+        if self.existence == "ipda":
+            # PDA 形式的事件关联：航迹 r N(e; x, S)（含 1/S 归一化）对比事件所在处的杂波密度
+            spred_e = st["P"][eb][..., 0, 0] + cell * cell
+            logit_w = torch.where(act_e, -0.5 * delta2 - torch.log(spred_e) + torch.log(ex_e.clamp(min=1e-6)),
+                                  torch.full_like(d, -1e4))
+            none = (self.none_logit + torch.log1p(ev["clutter"].to(dtype)))[:, None]
+        else:
+            logit_w = torch.where(act_e, -0.5 * delta2 + torch.log(ex_e.clamp(min=1e-6)), torch.full_like(d, -1e4))
+            none = self.none_logit.expand(int(d.shape[0]), 1)
+        w = torch.softmax(torch.cat([logit_w, none], 1), 1)
         wt, wn = w[:, :N], w[:, N]
         scale = 8.0 * cell
         dcur = torch.where(act_e, d, torch.full_like(d, BIG)).amin(1)
@@ -400,7 +467,8 @@ class TrackHead(nn.Module):
         dh = _dist(exy[:, None, None], hist)
         tail = torch.where(hok, dh, torch.full_like(dh, BIG)).amin(2).amin(1)
         j, rows, none, along, cross = self._nearest(exy, pos_e, vel_e, act_e, delta2)
-        has_j = torch.where(none, torch.zeros_like(along), st["has"][eb][rows, j].to(dtype))
+        det = st["beta"] if self.existence == "ipda" else st["has"].to(dtype)            # ipda：软检测
+        has_j = torch.where(none, torch.zeros_like(along), det[eb][rows, j])
         age_j = torch.where(none, torch.zeros_like(along), (torch.log1p(st["age"][eb][rows, j]) / 3.0).clamp(max=1.0))
         ctx = torch.stack([wn, (wt * ex_e).sum(1), (wt * delta2.clamp(max=25.0) / 25.0).sum(1),
                            (wt * speed.clamp(max=4.0) / 4.0).sum(1), (dcur / scale).clamp(max=1.0),
@@ -446,6 +514,7 @@ class TrackHead(nn.Module):
             batch = int(keep.shape[1]) if keep is not None else int(events["b"].max()) + 1 if events["b"].numel() else 1
             state = self.init_state(batch, z0.device)
         aux = {"exist_sum": z0.new_zeros(()), "exist_n": 0, "pos_sum": z0.new_zeros(()), "pos_n": 0,
+               "pd_sum": z0.new_zeros(()), "pd_n": 0, "org_sum": z0.new_zeros(()), "org_n": 0,
                "births": 0, "recycled": 0, "live": 0, "slot_windows": 0}
         idx_parts, z_parts, dz, dk = [], [], [], []
         for t in range(int(steps)):
@@ -468,7 +537,8 @@ class TrackHead(nn.Module):
             if labels is not None:
                 self._supervise(info, ev, labels[idx], tid[idx], aux)
             if log is not None:
-                log.append({key: state[key].detach().cpu().numpy() for key in ("active", "pos", "vel", "ex")})
+                log.append({key: state[key].detach().cpu().numpy() for key in ("active", "pos", "vel", "ex", "pd",
+                                                                                "beta")})
         if idx_parts and sum(int(i.shape[0]) for i in idx_parts):
             z = z0.index_put((torch.cat(idx_parts),), torch.cat(z_parts))
         else:
@@ -484,6 +554,8 @@ class TrackHead(nn.Module):
         pos_t = torch.zeros_like(pos)
         pmask = torch.zeros_like(live)
         gb, gc, gr = window_targets(ev["b"], ev["x"], ev["y"], label, tid, self.match_min_px)
+        ipda = self.existence == "ipda"
+        det_t, det_m = torch.zeros_like(ex_logit), torch.zeros_like(live)
         if gb.numel() and bool(live.any()):
             dist = _dist(gc[:, None], pos[gb])                                            # [Gt, N]
             ok = live[gb] & (dist <= gr[:, None])
@@ -496,6 +568,31 @@ class TrackHead(nn.Module):
                 target = target.index_put((bsel, cols), torch.ones_like(cols, dtype=target.dtype))
                 pos_t = pos_t.index_put((bsel, cols), gc[rows])
                 pmask = pmask.index_put((bsel, cols), torch.ones_like(cols, dtype=torch.bool))
+                if ipda:
+                    # 检测概率的标签：匹配上的目标本窗有没有产生量测（它的事件在骨干上的证据和 >= gate_floor）
+                    mass = target_mass(ev["b"], label, tid, torch.sigmoid(ev["z0"]).detach())
+                    det_t = det_t.index_put((bsel, cols), (mass[rows] >= self.gate_floor).to(det_t.dtype))
+                    det_m = det_m.index_put((bsel, cols), torch.ones_like(cols, dtype=torch.bool))
+        if ipda:
+            # 校准监督（分离原理：估计器输出校准的信念）：P_D 对"目标有没有产生量测"，量测来源概率对"量测是否落在目标上"
+            prior = info["prior"]
+            m = det_m & prior
+            if bool(m.any()):
+                aux["pd_sum"] = aux["pd_sum"] + F.binary_cross_entropy_with_logits(
+                    info["pd_logit"][m], det_t[m], reduction="sum")
+                aux["pd_n"] += int(m.sum())
+            hm = info["has"] & prior
+            if bool(hm.any()):
+                B, N = hm.shape
+                org = torch.zeros(B * N, device=pos.device)
+                if gb.numel():
+                    near = (_dist(gc[:, None], info["zpos"][gb]) <= gr[:, None]).to(org.dtype)   # [Gt, N]
+                    flat = (gb[:, None] * N + torch.arange(N, device=pos.device)[None, :]).reshape(-1)
+                    org = org.index_put((flat,), near.reshape(-1).detach(), accumulate=True)
+                org = (org.view(B, N) > 0).to(ex_logit.dtype)
+                aux["org_sum"] = aux["org_sum"] + F.binary_cross_entropy_with_logits(
+                    info["org_logit"][hm], org[hm], reduction="sum")
+                aux["org_n"] += int(hm.sum())
         if bool(live.any()):
             aux["exist_sum"] = aux["exist_sum"] + F.binary_cross_entropy_with_logits(
                 ex_logit[live], target[live], reduction="sum")
@@ -541,6 +638,17 @@ def window_targets(eb, ex, ey, label, tid, match_min_px):
     var = (acc[:, 3] / n - cx * cx) + (acc[:, 4] / n - cy * cy)
     radius = (2.5 * torch.sqrt(var.clamp(min=0.0))).clamp(min=float(match_min_px))
     return torch.div(uniq, 1000003, rounding_mode="floor"), torch.stack([cx, cy], 1), radius
+
+
+def target_mass(eb, label, tid, prob):
+    """本窗每个标注目标在骨干上的证据和 sum(p)，顺序与 window_targets 相同（按 流号 x 1000003 + target_id 排序）。"""
+    sel = (label > 0.5) & (tid > 0)
+    if not bool(sel.any()):
+        return torch.zeros(0, device=eb.device, dtype=prob.dtype)
+    key = eb[sel] * 1000003 + tid[sel].to(torch.long)
+    uniq, inv = torch.unique(key, return_inverse=True)
+    acc = torch.zeros(int(uniq.shape[0]), device=eb.device, dtype=prob.dtype)
+    return acc.index_put((inv,), prob[sel], accumulate=True)
 
 
 def greedy_match(dist, stream):

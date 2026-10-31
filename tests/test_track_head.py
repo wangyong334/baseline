@@ -9,9 +9,12 @@
     7. 近期轨迹距离、沿迹坐标；对照组（context = none）看不到航迹
     8. 一窗滞后：除最后一窗外每个事件都恰好重判一次，初始化时滞后输出与 z0 相同；RTS 平滑与矩阵公式一致
     9. 监督：标注目标与航迹的匹配、存在 / 位置损失可反传，梯度只到航迹头；确定性模式下前向、反向不报错
-   10. 配置：三个 v2 配置只差 decision_lag / context 与输出目录
-   11. 端到端：训练一个小骨干 -> 航迹头训练 -> 评估（零等待与一窗滞后）
+   10. 配置：三个 v2 配置只差 decision_lag / context 与输出目录；v3 配置只比 v2 多 existence = ipda（及 decision_lag）
+   11. 端到端：训练一个小骨干 -> 航迹头训练 -> 评估（零等待、一窗滞后、v3）
+   12. v3（existence = ipda）：初始化恒等、片段切分不变；存在概率的伯努利递推与公式一致；检测概率低时航迹撑过缺口；
+       卡尔曼更新按关联概率加权（像杂波的量测不拉动航迹）；梯度到达 P_D、似然比、存活概率
 """
+import math
 import os
 import sys
 import unittest
@@ -308,12 +311,149 @@ class SupervisionTests(unittest.TestCase):
     def test_deterministic_mode(self):
         torch.use_deterministic_algorithms(True)
         try:
-            head = make_head(decision_lag=1)
-            events, z0, feat, lab, tid = blob_windows(6, batch=2, noise=10)
-            z, _, aux = head.forward_chunk(events, z0, feat, None, 6, labels=lab, tid=tid, keys=lab)
-            (z.sum() + aux["delayed_z"].sum() + aux["exist_sum"]).backward()
+            for existence in ("gru", "ipda"):
+                head = make_head(decision_lag=1, existence=existence)
+                events, z0, feat, lab, tid = blob_windows(6, batch=2, noise=10)
+                z, _, aux = head.forward_chunk(events, z0, feat, None, 6, labels=lab, tid=tid, keys=lab)
+                (z.sum() + aux["delayed_z"].sum() + aux["exist_sum"]).backward()
         finally:
             torch.use_deterministic_algorithms(False)
+
+
+def single_track_state(head, pos, vel, ex=0.9, slots=(0,)):
+    st = head.init_state(1, torch.device("cpu"))
+    for n, p, v in zip(slots, pos, vel):
+        st["active"][0, n] = True
+        st["ex"][0, n] = ex
+        st["pos"][0, n] = torch.tensor(p)
+        st["vel"][0, n] = torch.tensor(v)
+        st["P"][0, n] = torch.eye(2)
+    return st
+
+
+class IpdaTests(unittest.TestCase):
+    def test_identity_and_chunk_invariance(self):
+        for lag in (0, 1):
+            head = make_head(existence="ipda", decision_lag=lag)
+            events, z0, feat, _, _ = blob_windows(12, batch=2, noise=20, gaps=(5, 6))
+            keys = torch.arange(z0.shape[0]).float()
+            with torch.no_grad():
+                z, _, _ = head.forward_chunk(events, z0, feat, None, 12, keys=keys)
+            self.assertTrue(torch.equal(z, z0), lag)
+            randomize(head)
+            with torch.no_grad():
+                for p in list(head.pd_head.parameters()) + list(head.lr_net.parameters()):
+                    p.add_(0.2 * torch.randn_like(p))
+                z_full, s_full, d_full = run_split_chunks(head, events, z0, feat, 2, [(0, 12)], keys)
+                z_split, s_split, d_split = run_split_chunks(head, events, z0, feat, 2, [(0, 3), (3, 8), (8, 12)], keys)
+            self.assertTrue(torch.equal(z_full, z_split), lag)
+            for key in s_full:
+                if key != "pending":
+                    self.assertTrue(torch.equal(s_full[key], s_split[key]), (lag, key))
+            self.assertEqual(d_full, d_split)
+
+    def test_existence_recursion_matches_formula(self):
+        head = make_head(existence="ipda")
+        st = single_track_state(head, [(20.0, 16.0), (40.0, 8.0)], [(0.0, 0.0), (0.0, 0.0)], ex=0.9, slots=(0, 1))
+        ev = window_events([(20, 16)] * 7)                             # 只有槽 0 的预测位置有证据
+        with torch.no_grad():
+            _, new, info = head.forward_window(st, ev)
+        self.assertTrue(bool(info["has"][0, 0]))
+        self.assertFalse(bool(info["has"][0, 1]))
+        rp = 0.9 / (1.0 + math.exp(-math.log(0.995 / 0.005)))
+        L_pred = math.log(rp / (1.0 - rp))
+        pd, lr = 0.8, math.exp(2.0)                                    # 初始化：P_D = 0.8，似然比 e^2
+        self.assertAlmostEqual(float(info["ex_logit"][0, 0]), L_pred + math.log(1.0 - pd + pd * lr), places=4)
+        self.assertAlmostEqual(float(info["ex_logit"][0, 1]), L_pred + math.log(1.0 - pd), places=4)
+        self.assertAlmostEqual(float(new["pd"][0, 1]), pd, places=5)
+
+    def test_low_detection_probability_keeps_track_through_gap(self):
+        ex_end = {}
+        for pd in (0.3, 0.9):
+            head = make_head(existence="ipda")
+            with torch.no_grad():
+                head.pd_head.bias.fill_(math.log(pd / (1.0 - pd)))
+            events, z0, feat, _, _ = blob_windows(12, noise=10, gaps=(6, 7, 8, 9))
+            log = []
+            with torch.no_grad():
+                head.forward_chunk(events, z0, feat, None, 12, log=log)
+            slot = int(np.flatnonzero(log[5]["active"][0])[0])
+            ex_end[pd] = float(log[9]["ex"][0, slot])
+        self.assertGreater(ex_end[0.3], 0.9)                           # 检测不可靠：漏 4 窗仍相信目标在
+        self.assertLess(ex_end[0.9], 0.5)                              # 检测可靠：漏 4 窗就不再相信
+
+    def test_update_weighted_by_association_probability(self):
+        moved = {}
+        for bias in (-12.0, 12.0):
+            head = make_head(existence="ipda")
+            with torch.no_grad():
+                head.lr_net[2].bias.fill_(bias)
+            st = single_track_state(head, [(20.0, 16.0)], [(0.0, 0.0)])
+            ev = window_events([(24, 16)] * 5)                         # 预测位置 4 像素外的一个量测（在验证门内）
+            with torch.no_grad():
+                _, new, info = head.forward_window(st, ev)
+            self.assertTrue(bool(info["has"][0, 0]))
+            moved[bias] = float(new["pos"][0, 0, 0]) - 20.0
+        self.assertLess(abs(moved[-12.0]), 0.01)                       # 像杂波：航迹保持预测
+        self.assertGreater(moved[12.0], 1.0)                           # 像目标：普通卡尔曼更新
+
+    def test_survival_bound_keeps_log_odds_finite(self):
+        head = make_head(existence="ipda")
+        with torch.no_grad():
+            head.surv_logit.fill_(20.0)                                # 想让 p_S -> 1：被限制在 0.999
+        st = single_track_state(head, [(40.0, 8.0)], [(0.0, 0.0)], ex=1.0 - 1e-6)
+        with torch.no_grad():
+            _, _, info = head.forward_window(st, window_events([(2, 30)] * 3, z=-6.0))
+        self.assertLess(float(info["ex_logit"][0, 0]), math.log(0.999 / 0.001) + math.log(0.2) + 1e-3)
+
+    def test_pda_association_uses_local_clutter(self):
+        head = make_head(existence="ipda")
+        st = single_track_state(head, [(20.0, 16.0)], [(2.0, 0.0)])
+        ev = window_events([(21, 16)], z=0.0)
+        weights = []
+        for c in (0.0, 30.0):
+            ev["clutter"] = torch.tensor([c])
+            weights.append(float(head._context(ev, st)[0, 0]))       # 第 0 维：事件归为杂波（无航迹）的权重
+        self.assertGreater(weights[1], weights[0] + 0.1)               # 杂波越密，同一位置的事件越不归航迹
+
+    def test_calibration_targets_and_gradients(self):
+        eb = torch.tensor([0, 0, 0, 1, 1])
+        label = torch.tensor([1.0, 1.0, 0.0, 1.0, 1.0])
+        tid = torch.tensor([2.0, 2.0, 0.0, 1.0, 1.0])
+        prob = torch.tensor([0.4, 0.3, 0.9, 0.1, 0.2])
+        from model.track_head import target_mass
+        self.assertTrue(torch.allclose(target_mass(eb, label, tid, prob), torch.tensor([0.7, 0.3])))   # 与 window_targets 同序
+        head = make_head(existence="ipda")
+        events, z0, feat, lab, tid = blob_windows(10, noise=20)
+        weak = (lab > 0.5) & ((events["t"] == 5) | (events["t"] == 6))
+        z0 = torch.where(weak, torch.full_like(z0, -4.0), z0)          # 第 5、6 窗目标在、但骨干几乎没看见（未检出）
+        sums = {}
+        for name, labels in (("all", lab), ("detected", torch.where(weak, torch.zeros_like(lab), lab))):
+            _, _, aux = head.forward_chunk(events, z0, feat, None, 10, labels=labels, tid=tid)
+            sums[name] = (float(aux["pd_sum"]), aux["pd_n"])
+        self.assertGreater(sums["all"][1], sums["detected"][1])        # 未检出的两窗也给了 P_D 标签（标签为 0）
+        _, _, aux = head.forward_chunk(events, z0, feat, None, 10, labels=lab, tid=tid)
+        self.assertGreater(aux["org_n"], 0)
+        (aux["pd_sum"] / aux["pd_n"]).backward(retain_graph=True)
+        self.assertGreater(float(head.pd_head.bias.grad.abs()), 0.0)
+        head.zero_grad()
+        (aux["org_sum"] / aux["org_n"]).backward()
+        self.assertGreater(float(head.lr_net[2].bias.grad.abs()), 0.0)
+
+    def test_gradients_reach_ipda_parameters(self):
+        head = make_head(existence="ipda", decision_lag=1)
+        events, z0, feat, lab, tid = blob_windows(10, noise=20, gaps=(5,))
+        z, _, aux = head.forward_chunk(events, z0, feat, None, 10, labels=lab, tid=tid, keys=lab)
+        bce = torch.nn.functional.binary_cross_entropy_with_logits
+        loss = bce(z, lab) + bce(aux["delayed_z"], aux["delayed_key"]) + aux["exist_sum"] / aux["exist_n"] \
+            + aux["pos_sum"] / aux["pos_n"]
+        loss.backward()
+        grads = {name: p.grad for name, p in head.named_parameters()}
+        for name in ("pd_head.weight", "pd_head.bias", "lr_net.2.weight", "lr_net.2.bias", "surv_logit",
+                     "exist.weight", "corr.2.weight"):
+            self.assertIsNotNone(grads[name], name)
+            self.assertTrue(torch.isfinite(grads[name]).all(), name)
+            self.assertGreater(float(grads[name].abs().sum()), 0.0, name)
 
 
 class ConfigTests(unittest.TestCase):
@@ -328,6 +468,19 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(cfg[key], value)
             self.assertEqual(cfg["save_root"], "log/%s_seed37" % name)
         self.assertEqual((base["decision_lag"], base["context"]), (0, "track"))
+
+    def test_v3_variants(self):
+        from utils.stream_common import load_flat_config
+        base = load_flat_config(os.path.join(ROOT, "configs", "track_head_v2.yaml"))
+        for name, extra in (("track_head_v3", {}), ("track_head_v3_lag1", {"decision_lag": 1})):
+            cfg = load_flat_config(os.path.join(ROOT, "configs", name + ".yaml"))
+            self.assertEqual(set(cfg), set(base) | {"existence", "lambda_pd", "lambda_origin"})
+            self.assertEqual((cfg["lambda_pd"], cfg["lambda_origin"]), (1.0, 1.0))
+            self.assertEqual(cfg["existence"], "ipda")
+            self.assertEqual({k for k in base if cfg[k] != base[k]}, set(extra) | {"save_root"}, name)
+            for k, v in extra.items():
+                self.assertEqual(cfg[k], v)
+            self.assertEqual(cfg["save_root"], "log/%s_seed37" % name)
 
 
 class EndToEndTests(unittest.TestCase):
@@ -373,7 +526,7 @@ class EndToEndTests(unittest.TestCase):
                        segments=[[0, 3], [4, 7], [8, 11]], timing_warmup_windows=1, eval_chunk=4,
                        execution="layer", input_device="gpu", streams=2)
             T.mode_train(SimpleNamespace(device="cpu", mode="train", resume=False), cfg)
-            for name in ("track_head_v2", "track_head_v2_lag1"):
+            for name in ("track_head_v2", "track_head_v2_lag1", "track_head_v3"):
                 head_cfg = load_flat_config(os.path.join(ROOT, "configs", name + ".yaml"))
                 head_cfg.update(root=str(root), base_checkpoint=str(base_dir / "best_val_iou_seed37.pt"),
                                 save_root=str(root / name), epochs=2, streams=2, tbptt_k=4, eval_chunk=4,
@@ -396,6 +549,8 @@ class EndToEndTests(unittest.TestCase):
                     self.assertEqual(dump["probabilities"].shape, dump["base_probabilities"].shape)
                 with np.load(str(root / ("tracks_" + name) / "seq_7.npz")) as tracks:
                     self.assertEqual(tracks["pos"].shape[1:], (4, 2))
+                    self.assertEqual(tracks["pd"].shape[1:], (4,))
+                    self.assertEqual(tracks["beta"].shape[1:], (4,))
             # base 一列是骨干的原输出：与正式评估（逐窗执行）的 IoU 一致
             args = SimpleNamespace(checkpoint=str(base_dir / "best_val_iou_seed37.pt"), device="cpu", mode="eval",
                                    split="test", overwrite=True, execution=None, input_device=None,
