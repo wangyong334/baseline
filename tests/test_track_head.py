@@ -569,6 +569,37 @@ class DeferTests(unittest.TestCase):
         torch.nn.functional.binary_cross_entropy_with_logits(aux["delayed_z"], aux["delayed_key"]).backward()
         self.assertGreater(float(head.corr_final[2].weight.grad.abs().sum()), 0.0)
 
+    def test_gated_revision_identity_invariance_and_gate(self):
+        head = neutral_birth(defer_head(defer_revision="gated"))
+        events, z0, feat, lab, tid = blob_windows(10, batch=2, noise=20)
+        keys = torch.arange(z0.shape[0]).float()
+        z, _, aux = self.run_defer(head, events, z0, feat, 10)
+        k = aux["delayed_key"].long()
+        self.assertTrue(torch.equal(aux["delayed_z"], z[k]))            # 初始化时终判 = 暂定
+        with torch.no_grad():
+            head.corr_rev[2].bias.fill_(5.0)                           # 目标层的修正固定为 +5
+        z, _, aux = self.run_defer(head, events, z0, feat, 10)
+        k = aux["delayed_key"].long()
+        delta = aux["delayed_z"] - z[k]
+        self.assertTrue(bool(((delta >= 0.0) & (delta <= 5.0 + 1e-5)).all()))   # 修正 = 归属概率 x 5
+        tgt, bg = lab[k] > 0.5, lab[k] < 0.5
+        self.assertTrue(bool(tgt.any()) and bool(bg.any()))
+        self.assertGreater(float(delta[tgt].mean()), float(delta[bg].mean()))      # 目标中心的事件归属高、修正大
+        with torch.no_grad():
+            z_full, _, d_full = run_split_chunks(head, events, z0, feat, 2, [(0, 10)], keys)
+            z_split, _, d_split = run_split_chunks(head, events, z0, feat, 2, [(0, 4), (4, 10)], keys)
+        self.assertTrue(torch.equal(z_full, z_split))
+        self.assertEqual(d_full, d_split)
+
+    def test_membership_calibration_loss(self):
+        head = defer_head(defer_revision="gated")
+        events, z0, feat, lab, tid = blob_windows(8, noise=30)
+        _, _, aux = head.forward_chunk(events, z0, feat, None, 8, labels=lab, tid=tid, keys=lab)
+        self.assertGreater(aux["mem_n"], 0)
+        (aux["mem_sum"] / aux["mem_n"]).backward()
+        self.assertGreater(float(head.mem_theta.grad.abs().sum()), 0.0)
+        self.assertGreater(float(head.mem_bias.grad.abs()), 0.0)
+
     def test_requires_ipda_and_excludes_lag(self):
         with self.assertRaises(ValueError):
             make_head(defer_max=4)
@@ -586,6 +617,15 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual({k for k in base if cfg[k] != base[k]}, {"save_root"}, name)
             self.assertEqual((cfg["defer_max"], cfg["defer_alpha"]), (10, alpha))
             self.assertEqual(cfg["save_root"], "log/%s_seed37" % name)
+
+    def test_v4b_variant(self):
+        from utils.stream_common import load_flat_config
+        base = load_flat_config(os.path.join(ROOT, "configs", "track_head_v4.yaml"))
+        cfg = load_flat_config(os.path.join(ROOT, "configs", "track_head_v4b.yaml"))
+        self.assertEqual(set(cfg), set(base) | {"defer_revision", "lambda_membership"})
+        self.assertEqual({k for k in base if cfg[k] != base[k]}, {"save_root"})
+        self.assertEqual((cfg["defer_revision"], cfg["lambda_membership"]), ("gated", 1.0))
+        self.assertEqual(cfg["save_root"], "log/track_head_v4b_seed37")
 
     def test_v2_variants(self):
         from utils.stream_common import load_flat_config
@@ -656,7 +696,7 @@ class EndToEndTests(unittest.TestCase):
                        segments=[[0, 3], [4, 7], [8, 11]], timing_warmup_windows=1, eval_chunk=4,
                        execution="layer", input_device="gpu", streams=2)
             T.mode_train(SimpleNamespace(device="cpu", mode="train", resume=False), cfg)
-            for name in ("track_head_v2", "track_head_v2_lag1", "track_head_v3", "track_head_v4"):
+            for name in ("track_head_v2", "track_head_v2_lag1", "track_head_v3", "track_head_v4", "track_head_v4b"):
                 head_cfg = load_flat_config(os.path.join(ROOT, "configs", name + ".yaml"))
                 head_cfg.update(root=str(root), base_checkpoint=str(base_dir / "best_val_iou_seed37.pt"),
                                 save_root=str(root / name), epochs=2, streams=2, tbptt_k=4, eval_chunk=4,
@@ -670,18 +710,23 @@ class EndToEndTests(unittest.TestCase):
                          "--checkpoint", str(ckpt), "--dump-dir", str(root / ("dump_" + name)),
                          "--tracks-dir", str(root / ("tracks_" + name))])
                 result = json.loads((root / name / "eval_test_best_val_iou_seed37.json").read_text(encoding="utf-8"))
-                delayed = name.endswith("lag1") or name == "track_head_v4"
+                delayed = name.endswith("lag1") or name.startswith("track_head_v4")
                 kinds = ("base", "track", "track_now") if delayed else ("base", "track")
                 for kind in kinds:
                     for key in ("iou", "acc", "pd", "fa"):
                         self.assertTrue(np.isfinite(result[kind][key]), (name, kind, key))
-                if name == "track_head_v4":                            # 延迟决策的统计：比例、平均等待、终判状态
+                if name.startswith("track_head_v4"):                   # 延迟决策的统计：比例、平均等待、终判状态
                     hs = result["head_stats"]
                     self.assertTrue(0.0 <= hs["deferred_frac"] <= 1.0)
                     self.assertEqual(set(hs["status"]), {"confirmed", "rejected", "reacquired", "lost", "forced"})
                 self.assertIn("pass", result["gate"])
                 with np.load(str(root / ("dump_" + name) / "seq_7.npz")) as dump:
                     self.assertEqual(dump["probabilities"].shape, dump["base_probabilities"].shape)
+                    if name.startswith("track_head_v4"):                   # 逐事件的判决延迟与终判状态（作图用）
+                        w, st = dump["decision_wait"], dump["decision_status"]
+                        self.assertEqual(w.shape, dump["probabilities"].shape)
+                        self.assertTrue(bool(((w == -1) == (st == -1)).all()))
+                        self.assertTrue(bool((w <= 10).all()))
                 with np.load(str(root / ("tracks_" + name) / "seq_7.npz")) as tracks:
                     self.assertEqual(tracks["pos"].shape[1:], (4, 2))
                     self.assertEqual(tracks["pd"].shape[1:], (4,))

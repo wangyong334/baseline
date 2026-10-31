@@ -39,7 +39,8 @@ import error_budget  # noqa: E402
 
 HEAD_KEYS = ("cell", "slots", "hidden", "history", "gate_sigma", "gate_max_px", "gate_floor", "birth_floor",
              "max_births", "death_exist", "max_coast", "match_min_px", "corr_hidden", "r_min", "recycle_exist",
-             "decision_lag", "context", "existence", "defer_max", "defer_alpha")
+             "decision_lag", "context", "existence", "defer_max", "defer_alpha",
+             "defer_revision")
 
 
 # ---------------------------------------------------------------------------
@@ -186,10 +187,11 @@ def train_epoch(outputs, head, lengths, optimizer, cfg, pos_weight, device, rng,
     weight = torch.tensor([pos_weight], dtype=torch.float32, device=device)
     lam_e, lam_p, clip = float(cfg["lambda_exist"]), float(cfg["lambda_pos"]), float(cfg["grad_clip"])
     lam_d, lam_o = float(cfg.get("lambda_pd", 1.0)), float(cfg.get("lambda_origin", 1.0))   # 只在 existence = ipda 时有项
+    lam_m = float(cfg.get("lambda_membership", 1.0))                    # 只在门控修正（defer_revision = gated）时有项
     w_now, w_lag = float(cfg.get("now_loss_weight", 1.0)), float(cfg.get("lag_loss_weight", 1.0))
     lag = head.has_delayed                                              # 一窗滞后或目标级延迟决策：都有终判输出
     sums = {"event": 0.0, "events": 0, "lag": 0.0, "lag_n": 0, "exist": 0.0, "exist_n": 0, "pos": 0.0, "pos_n": 0,
-            "pd": 0.0, "pd_n": 0, "org": 0.0, "org_n": 0,
+            "pd": 0.0, "pd_n": 0, "org": 0.0, "org_n": 0, "mem": 0.0, "mem_n": 0,
             "updates": 0, "births": 0, "recycled": 0, "live": 0, "slot_windows": 0}
     norms = []
     hstate = None
@@ -220,6 +222,8 @@ def train_epoch(outputs, head, lengths, optimizer, cfg, pos_weight, device, rng,
                 loss = loss + lam_d * aux["pd_sum"] / aux["pd_n"]
             if aux["org_n"]:
                 loss = loss + lam_o * aux["org_sum"] / aux["org_n"]
+            if aux["mem_n"]:
+                loss = loss + lam_m * aux["mem_sum"] / aux["mem_n"]
             if not math.isfinite(float(loss.detach())):
                 raise RuntimeError("损失出现非有限值：片段 %d" % c)
             optimizer.zero_grad(set_to_none=True)
@@ -232,7 +236,7 @@ def train_epoch(outputs, head, lengths, optimizer, cfg, pos_weight, device, rng,
             sums["exist_n"] += aux["exist_n"]
             sums["pos"] += float(aux["pos_sum"].detach())
             sums["pos_n"] += aux["pos_n"]
-            for key in ("pd", "org"):
+            for key in ("pd", "org", "mem"):
                 sums[key] += float(aux[key + "_sum"].detach())
                 sums[key + "_n"] += aux[key + "_n"]
             sums["updates"] += 1
@@ -244,6 +248,7 @@ def train_epoch(outputs, head, lengths, optimizer, cfg, pos_weight, device, rng,
             "pos_loss": sums["pos"] / max(sums["pos_n"], 1),
             "pd_loss": sums["pd"] / sums["pd_n"] if sums["pd_n"] else None,
             "origin_loss": sums["org"] / sums["org_n"] if sums["org_n"] else None,
+            "membership_loss": sums["mem"] / sums["mem_n"] if sums["mem_n"] else None,
             "updates": sums["updates"], "chunks": n_chunks,
             "grad_norm_median": float(np.median(norms)) if norms else 0.0,
             "births_per_window": sums["births"] / windows, "recycled_per_window": sums["recycled"] / windows,
@@ -279,6 +284,7 @@ def run_split(outputs, head, base, device, split, full=False, dump_dir=None, tra
             seq, z0_all, feat_all = outputs.get(i)
             hstate = head.init_state(1, device)
             idx_parts, p0_parts, p1_parts, lag_key, lag_prob = [], [], [], [], []
+            seq_wait, seq_status = [], []                          # 延迟决策：每个终判事件等了几窗、终判状态
             log = [] if tracks_dir else None
             for start in range(0, seq.n_windows, chunk):
                 end = min(start + chunk, seq.n_windows)
@@ -299,9 +305,12 @@ def run_split(outputs, head, base, device, split, full=False, dump_dir=None, tra
                     if aux.get("delayed_lag") is not None:
                         lk = lag_key[-1]
                         lw = aux["delayed_lag"].cpu().numpy().astype(np.int64)
+                        ls = aux["delayed_status"].cpu().numpy().astype(np.int64)
                         delays.append(lw)
                         t_delays.append(lw[seq.label[lk] > 0.5])
-                        dstat += np.bincount(aux["delayed_status"].cpu().numpy().astype(np.int64), minlength=5)
+                        dstat += np.bincount(ls, minlength=5)
+                        seq_wait.append(lw)
+                        seq_status.append(ls)
             probs = {"base": refill_by_index(seq.n_events, idx_parts, p0_parts),
                      "track": refill_by_index(seq.n_events, idx_parts, p1_parts)}
             if lag:
@@ -333,6 +342,15 @@ def run_split(outputs, head, base, device, split, full=False, dump_dir=None, tra
                     rows[kind].append(row)
             if dump_dir:
                 extra = {"now_probabilities": probs["track_now"].astype(np.float32)} if lag else {}
+                if head.defer_max:
+                    # 每个事件的判决延迟（窗，-1 = 当窗终判）与终判状态（0 确认 1 否定 2 重新捕获 3 丢失 4 强制，-1 = 未延后）
+                    wait = np.full(seq.n_events, -1, dtype=np.int8)
+                    status = np.full(seq.n_events, -1, dtype=np.int8)
+                    if seq_wait:
+                        keys_all = np.concatenate(lag_key)
+                        wait[keys_all] = np.concatenate(seq_wait)
+                        status[keys_all] = np.concatenate(seq_status)
+                    extra.update(decision_wait=wait, decision_status=status)
                 np.savez(os.path.join(dump_dir, seq.name),
                          locs=np.stack([np.zeros(seq.n_events, dtype=np.int64), seq.x, seq.y, seq.t], 1),
                          labels=seq.label.astype(np.float32), probabilities=probs["track"].astype(np.float32),
@@ -445,6 +463,8 @@ def mode_train(args, cfg):
             now += " | 延后终判 %.2f%%（目标事件 %.1f%%，平均 %.3f 窗）" % (
                 100.0 * hs["deferred_frac"], 100.0 * hs["target_deferred_frac"], hs["target_mean_delay_windows"])
         calib = "" if out["pd_loss"] is None else " 检测 %.4f 来源 %.4f" % (out["pd_loss"], out["origin_loss"] or 0.0)
+        if out["membership_loss"] is not None:
+            calib += " 归属 %.4f" % out["membership_loss"]
         print("epoch %d lr %.2e | 损失 事件 %.4f%s 存在 %.4f 位置 %.4f%s | val IoU base %.4f -> track %.4f%s | "
               "拖尾误报 %d -> %d 断续漏检 %d -> %d 目标附近误报 %d -> %d | 每窗 航迹 %.2f 出生 %.3f 回收 %.4f | "
               "%.0fs（训练 %.0fs）| 显存峰值 %.2f GiB" % (

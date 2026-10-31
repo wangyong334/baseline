@@ -50,6 +50,8 @@ DEFER_KEYS = ("b", "x", "y", "p", "t_local", "z0", "feat", "ctx", "key", "znow",
               "reason", "L_then", "m_then", "beta_then", "fx", "fy", "miss_then")
 DEFER_LONG = ("b", "x", "y", "lag", "slot", "age_off", "reason")
 FIN_DIM = 15
+REV_DIM = 13          # gated revision: status 5 + reason 3 + L_now + L_then + lag + beta_then + z_now
+REVISIONS = ("free", "gated")
 STATUS_NAMES = ("confirmed", "rejected", "reacquired", "lost", "forced")
 
 
@@ -90,7 +92,8 @@ class TrackHead(nn.Module):
     def __init__(self, feat_dim, height, width, cell=4, slots=10, hidden=32, history=21, gate_sigma=3.0,
                  gate_max_px=24.0, gate_floor=0.5, birth_floor=1.0, max_births=4, death_exist=0.02,
                  max_coast=20, match_min_px=8.0, corr_hidden=32, r_min=0.25, recycle_exist=0.5,
-                 decision_lag=0, context="track", existence="gru", defer_max=0, defer_alpha=0.05):
+                 decision_lag=0, context="track", existence="gru", defer_max=0, defer_alpha=0.05,
+                 defer_revision="free"):
         super(TrackHead, self).__init__()
         if context not in CONTEXTS:
             raise ValueError("context 必须是 %s 之一" % (CONTEXTS,))
@@ -136,7 +139,7 @@ class TrackHead(nn.Module):
             self.corr_lag = _zero_last(_mlp(base_in + LAG_DIM, int(corr_hidden), 1))
         # 目标级延迟决策：等待单位是目标；判决依据是校准的存在后验越过 +-A（A = log((1 - alpha) / alpha)，
         # alpha = 0 表示 A = 无穷，即所有挂起事件都等满 defer_max 窗，作固定等待的对照）
-        self.defer_max = int(defer_max)
+        self.defer_max, self.defer_revision = int(defer_max), str(defer_revision)
         if self.defer_max:
             if self.existence != "ipda":
                 raise ValueError("延迟决策需要 existence = ipda（判决依据是校准的存在后验）")
@@ -146,8 +149,19 @@ class TrackHead(nn.Module):
             if not 0.0 <= alpha < 0.5:
                 raise ValueError("defer_alpha 必须在 [0, 0.5) 内")
             self.defer_A = math.log((1.0 - alpha) / alpha) if alpha > 0 else float("inf")
-            self.corr_final = _zero_last(_mlp(base_in + FIN_DIM, int(corr_hidden), 1))
+            if defer_revision not in REVISIONS:
+                raise ValueError("defer_revision 必须是 %s 之一" % (REVISIONS,))
+            self.defer_revision = str(defer_revision)
+            if self.defer_revision == "gated":
+                # 门控修正（v4b）：修正量 = 事件的归属概率 x 目标层的修正。归属概率是校准过的几何模型
+                # （到目标的归一化距离、目标位置不确定度、本地杂波），单调性由 softplus 保证，只由归属标签监督
+                self.mem_theta = nn.Parameter(torch.full((3,), math.log(math.e - 1.0)))      # 三个权重初始 1
+                self.mem_bias = nn.Parameter(torch.tensor(math.log(9.0 * self.cell * self.cell)))
+                self.corr_rev = _zero_last(_mlp(REV_DIM, int(corr_hidden), 1))
+            else:
+                self.corr_final = _zero_last(_mlp(base_in + FIN_DIM, int(corr_hidden), 1))
         self.has_delayed = bool(self.decision_lag or self.defer_max)
+        self.gated = bool(self.defer_max) and self.defer_revision == "gated"
         gy = torch.arange(self.gh, dtype=torch.float32).repeat_interleave(self.gw)
         gx = torch.arange(self.gw, dtype=torch.float32).repeat(self.gh)
         half = (self.cell - 1) / 2.0
@@ -458,6 +472,8 @@ class TrackHead(nn.Module):
         else:
             ctx = z0.new_zeros((0, CTX_DIM))
             z = z0
+        if self.gated:
+            info["assoc"] = assoc                                      # 归属概率的校准监督用
         if self.defer_max:                                             # 10. 目标级延迟决策
             out = self._defer_step(defer_q, orphan_q, pre, new_state, born & alive, ev, z, ctx, assoc)
             new_state["defer"], new_state["orphan"] = out[0], out[1]
@@ -539,6 +555,11 @@ class TrackHead(nn.Module):
         return ctx, {"j": j, "none": none, "d2": delta2[rows, j], "spred": spred_j, "lc": lc}
 
     # ------------------------------------------------------------------ 目标级延迟决策
+    def _membership_logit(self, d2, S, lc):
+        """假如目标存在、事件属于它的对数几率：随归一化距离 d2、目标位置方差 S、本地杂波 lc = log1p(杂波量) 单调下降。"""
+        w = F.softplus(self.mem_theta)
+        return -0.5 * w[0] * d2 - w[1] * torch.log(S) - w[2] * lc + self.mem_bias
+
     def _defer_step(self, dq, oq, pre, st, newborn, ev, znow, ctx, assoc):
         """一窗的延迟决策。返回 (挂起队列, 孤儿队列, 终判 logit, key, 等待窗数, 状态码)；没有终判时后四项为 None。
 
@@ -593,7 +614,10 @@ class TrackHead(nn.Module):
             gated = ~assoc["none"] & (assoc["d2"] <= self.gate_sigma ** 2)
             pend = gated & ((L.abs() < A) | ((meas < 0.5) & (L > -A)))
             none_e = self.none_logit.detach() + assoc["lc"]
-            m_then = torch.sigmoid(-0.5 * assoc["d2"] - torch.log(assoc["spred"]) - none_e)   # 假如目标存在、事件属于它
+            if self.gated:
+                m_then = torch.sigmoid(self._membership_logit(assoc["d2"], assoc["spred"], assoc["lc"])).detach()
+            else:
+                m_then = torch.sigmoid(-0.5 * assoc["d2"] - torch.log(assoc["spred"]) - none_e)   # 假如目标存在、事件属于它
             base = {"b": b, "x": ev["x"], "y": ev["y"], "p": ev["p"].to(dtype), "t_local": ev["t_local"].to(dtype),
                     "z0": ev["z0"], "feat": ev["feat"], "ctx": ctx, "key": ev["key"].to(dtype), "znow": znow,
                     "lc": assoc["lc"], "lag": torch.zeros_like(b)}
@@ -627,6 +651,19 @@ class TrackHead(nn.Module):
         m_s = torch.sigmoid(-0.5 * d2s - torch.log(spred) - (self.none_logit + r["lc"]))
         m_s = torch.where(lost & orphan[:, 0], torch.zeros_like(m_s), m_s)
         L_now = torch.where(lost, torch.zeros_like(lagf), exl[b, j])
+        if self.gated:
+            # 门控修正：修正量 = 归属概率（平滑后的位置；回推 / 插值的不确定度随等待窗数增大）x 目标层的修正。
+            # 修正项只看目标层的量和事件此刻的 logit，不看外观特征，所以不能把目标的存在证据分给不属于它的事件
+            grow = torch.where(r["reason"] >= 1, lagf ** 2 * st["P"][b, j][:, 1, 1], torch.zeros_like(lagf))
+            S_s = spred + grow
+            d2g = ((exy - xs) ** 2).sum(1) / S_s
+            m = torch.sigmoid(self._membership_logit(d2g, S_s, r["lc"])).detach()
+            m = torch.where(lost & orphan[:, 0], torch.zeros_like(m), m)
+            rev = torch.cat([F.one_hot(status, 5).to(dtype), F.one_hot(r["reason"], 3).to(dtype),
+                             (L_now / 3.0).clamp(-2.0, 2.0)[:, None], (r["L_then"] / 3.0).clamp(-2.0, 2.0)[:, None],
+                             (lagf / float(self.defer_max))[:, None], r["beta_then"][:, None],
+                             (r["znow"] / 5.0).clamp(-3.0, 3.0)[:, None]], 1)
+            return r["znow"] + m * self.corr_rev(rev).squeeze(-1)
         fin = torch.cat([F.one_hot(status, 5).to(dtype), F.one_hot(r["reason"], 3).to(dtype),
                          (L_now / 3.0).clamp(-2.0, 2.0)[:, None], (r["L_then"] / 3.0).clamp(-2.0, 2.0)[:, None],
                          (lagf / float(self.defer_max))[:, None], r["m_then"][:, None], m_s[:, None],
@@ -674,6 +711,7 @@ class TrackHead(nn.Module):
             state = self.init_state(batch, z0.device)
         aux = {"exist_sum": z0.new_zeros(()), "exist_n": 0, "pos_sum": z0.new_zeros(()), "pos_n": 0,
                "pd_sum": z0.new_zeros(()), "pd_n": 0, "org_sum": z0.new_zeros(()), "org_n": 0,
+               "mem_sum": z0.new_zeros(()), "mem_n": 0,
                "births": 0, "recycled": 0, "live": 0, "slot_windows": 0}
         idx_parts, z_parts, dz, dk, dl, ds = [], [], [], [], [], []
         for t in range(int(steps)):
@@ -757,6 +795,15 @@ class TrackHead(nn.Module):
                 aux["org_sum"] = aux["org_sum"] + F.binary_cross_entropy_with_logits(
                     info["org_logit"][hm], org[hm], reduction="sum")
                 aux["org_n"] += int(hm.sum())
+        if self.gated and info.get("assoc") is not None and int(label.shape[0]):
+            # 归属概率的校准监督：匹配上标注目标的航迹，其验证门内的事件是不是目标事件
+            a = info["assoc"]
+            near = ~a["none"] & (a["d2"] <= self.gate_sigma ** 2) & (target[ev["b"], a["j"]] > 0.5)
+            if bool(near.any()):
+                logit = self._membership_logit(a["d2"][near].detach(), a["spred"][near].detach(), a["lc"][near].detach())
+                aux["mem_sum"] = aux["mem_sum"] + F.binary_cross_entropy_with_logits(
+                    logit, (label[near] > 0.5).to(logit.dtype), reduction="sum")
+                aux["mem_n"] += int(near.sum())
         if bool(live.any()):
             aux["exist_sum"] = aux["exist_sum"] + F.binary_cross_entropy_with_logits(
                 ex_logit[live], target[live], reduction="sum")
