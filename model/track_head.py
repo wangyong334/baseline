@@ -22,6 +22,11 @@
               航迹的存在概率、速度、本窗有无量测、年龄
     8. 滞后判决（decision_lag = 1 时）：第 k 窗结束后，用 RTS 平滑得到的第 k-1 窗航迹位置、第 k 窗的存在概率与量测、
               事件所在处第 k 窗的证据（持续性）重判第 k-1 窗的事件；零等待的输出照常给出
+    9. 目标停时判决（defer_max > 0，v4 系列；existence = ipda）：每个事件即时给暂定输出；所属目标的状态还没被证据确定
+              （存在未定 / 那一窗缺量测 / 事件发生时目标还没出生、之后被新生目标回溯认领）的事件挂起，
+              目标的存在对数几率 L 越过 +-A（A = log((1 - alpha) / alpha)）、缺口后重新捕获、丢失或等满 defer_max 窗时终判。
+              证据修正（defer_revision = evidence，v4e）：z_final = z_now + m x kappa[原因] x (L(终判) - L(事件那一窗))，
+              m 为校准的归属概率：目标在等待期间新增的存在证据按归属分给事件，证据不变则不修正，不属于目标的事件不被修正
 context = "none" 是对照组：航迹照常运行，但修正项看不到航迹（检验增益来自航迹，而不是"再训一个读出头"）。
 训练监督（标签里的 target_id）：逐窗把航迹与标注目标一一匹配（距离 <= max(match_min_px, 2.5 x 目标扩散)），
     匹配上的航迹存在 = 1、位置回归到目标质心；其余存在 = 0。
@@ -51,7 +56,7 @@ DEFER_KEYS = ("b", "x", "y", "p", "t_local", "z0", "feat", "ctx", "key", "znow",
 DEFER_LONG = ("b", "x", "y", "lag", "slot", "age_off", "reason")
 FIN_DIM = 15
 REV_DIM = 13          # gated revision: status 5 + reason 3 + L_now + L_then + lag + beta_then + z_now
-REVISIONS = ("free", "gated")
+REVISIONS = ("free", "gated", "evidence")
 STATUS_NAMES = ("confirmed", "rejected", "reacquired", "lost", "forced")
 
 
@@ -157,21 +162,26 @@ class TrackHead(nn.Module):
             if defer_revision not in REVISIONS:
                 raise ValueError("defer_revision 必须是 %s 之一" % (REVISIONS,))
             self.defer_revision = str(defer_revision)
-            if self.defer_revision == "gated":
+            if self.defer_revision in ("gated", "evidence"):
                 # 门控修正（v4b）：修正量 = 事件的归属概率 x 目标层的修正。归属概率是校准过的几何模型
                 # （到目标的归一化距离、目标位置不确定度、本地杂波），单调性由 softplus 保证，只由归属标签监督
                 self.mem_theta = nn.Parameter(torch.full((3,), math.log(math.e - 1.0)))      # 三个权重初始 1
                 self.mem_bias = nn.Parameter(torch.tensor(math.log(9.0 * self.cell * self.cell)))
-                self.corr_rev = _zero_last(_mlp(REV_DIM, int(corr_hidden), 1))
+                if self.defer_revision == "gated":
+                    self.corr_rev = _zero_last(_mlp(REV_DIM, int(corr_hidden), 1))
+                else:
+                    # 证据修正（v4e）：修正量 = 归属概率 x kappa[等待原因] x 等待期间目标存在对数几率的增量。
+                    # 只学 3 个非负系数（softplus，初始 1）：证据不变就不修正，不属于目标的事件不被修正
+                    self.kappa_raw = nn.Parameter(torch.full((3,), math.log(math.e - 1.0)))
             else:
                 self.corr_final = _zero_last(_mlp(base_in + FIN_DIM, int(corr_hidden), 1))
         self.has_delayed = bool(self.decision_lag or self.defer_max)
-        self.gated = bool(self.defer_max) and self.defer_revision == "gated"
+        self.gated = bool(self.defer_max) and self.defer_revision in ("gated", "evidence")
         # 暂定修正也按"存在 x 归属"分解（v4d）：零等待的修正量 = 事件对最近目标的归属概率 x 修正项；
         # 没有目标的事件不被修正（判决层只有一条规则：修正来自目标层的证据，按归属分给事件）
         self.provisional_gate = bool(provisional_gate)
         if self.provisional_gate and not self.gated:
-            raise ValueError("provisional_gate 需要门控修正（defer_revision = gated）的归属模型")
+            raise ValueError("provisional_gate 需要归属模型（defer_revision = gated 或 evidence）")
         self.collect_calibration = False                              # 评估时收集存在概率的校准样本
         gy = torch.arange(self.gh, dtype=torch.float32).repeat_interleave(self.gw)
         gx = torch.arange(self.gw, dtype=torch.float32).repeat(self.gh)
@@ -683,6 +693,15 @@ class TrackHead(nn.Module):
             d2g = ((exy - xs) ** 2).sum(1) / S_s
             m = torch.sigmoid(self._membership_logit(d2g, S_s, r["lc"])).detach()
             m = torch.where(lost & orphan[:, 0], torch.zeros_like(m), m)
+            if self.defer_revision == "evidence":
+                # 证据修正（v4e）：z_final = z_now + m x kappa[原因] x (L(终判) - L_ref)。
+                # L_ref：原因 0 / 1 取事件那一窗的存在对数几率（暂定输出已经用过这份证据）；孤儿（原因 2）当时还没有目标，取 0。
+                # 归属：原因 0 用事件那一窗的值（与暂定门控是同一个）；缺口 / 孤儿用插值 / 回推后的位置重算（上面的 m）。
+                # 丢失（槽位已换成别的目标）不知道原目标的结局：增量记 0。存在与归属只由各自的校准监督训练（detach）
+                m_ev = torch.where(r["reason"] == 0, r["m_then"], m)
+                ref = torch.where(r["reason"] == 2, torch.zeros_like(lagf), r["L_then"].to(dtype))
+                gain = torch.where(lost, torch.zeros_like(lagf), (L_now - ref).detach())
+                return r["znow"] + m_ev * F.softplus(self.kappa_raw)[r["reason"]] * gain
             rev = torch.cat([F.one_hot(status, 5).to(dtype), F.one_hot(r["reason"], 3).to(dtype),
                              (L_now / 3.0).clamp(-2.0, 2.0)[:, None], (r["L_then"] / 3.0).clamp(-2.0, 2.0)[:, None],
                              (lagf / float(self.defer_max))[:, None], r["beta_then"][:, None],

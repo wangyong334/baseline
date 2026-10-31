@@ -414,6 +414,13 @@ def gate_check(result, cfg):
 # ---------------------------------------------------------------------------
 
 
+def head_kappa(head):
+    """证据修正（v4e）的三个系数 [存在未定, 缺口, 孤儿]；其他修正方式返回 None。"""
+    if getattr(head, "kappa_raw", None) is None:
+        return None
+    return [float(k) for k in F.softplus(head.kappa_raw.detach()).cpu()]
+
+
 def mode_train(args, cfg):
     device = torch.device(args.device)
     T.seed_everything(int(cfg["seed"]), bool(cfg["deterministic"]))
@@ -448,7 +455,8 @@ def mode_train(args, cfg):
         train_s = time.perf_counter() - t0
         val = run_split(val_out, head, base, device, "val", cache=val_cache)
         record = dict(epoch=epoch, lr=lr, train=out, val=val, gate=gate_check(val, cfg), train_seconds=train_s,
-                      epoch_seconds=time.perf_counter() - t0, peak_memory_gib=T.peak_memory_gib(device))
+                      epoch_seconds=time.perf_counter() - t0, peak_memory_gib=T.peak_memory_gib(device),
+                      kappa=head_kappa(head))
         with metrics_path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record) + "\n")
         state = {"head": head.state_dict(), "epoch": epoch, "val": val, "config": cfg}
@@ -465,6 +473,8 @@ def mode_train(args, cfg):
         calib = "" if out["pd_loss"] is None else " 检测 %.4f 来源 %.4f" % (out["pd_loss"], out["origin_loss"] or 0.0)
         if out["membership_loss"] is not None:
             calib += " 归属 %.4f" % out["membership_loss"]
+        if record["kappa"] is not None:                               # 证据修正（v4e）：三种等待原因的证据传递系数
+            calib += " kappa %s" % "/".join("%.2f" % k for k in record["kappa"])
         print("epoch %d lr %.2e | 损失 事件 %.4f%s 存在 %.4f 位置 %.4f%s | val IoU base %.4f -> track %.4f%s | "
               "拖尾误报 %d -> %d 断续漏检 %d -> %d 目标附近误报 %d -> %d | 每窗 航迹 %.2f 出生 %.3f 回收 %.4f | "
               "%.0fs（训练 %.0fs）| 显存峰值 %.2f GiB" % (
@@ -542,7 +552,8 @@ def mode_eval(args, cfg):
                        tracks_dir=args.tracks_dir)
     result.update(checkpoint=args.checkpoint, epoch=ckpt.get("epoch"), base_checkpoint=cfg["base_checkpoint"],
                   gate=gate_check(result, cfg), context=head.context, decision_lag=head.decision_lag,
-                  defer_max=head.defer_max, defer_alpha=cfg.get("defer_alpha"), existence_calibration=calib)
+                  defer_max=head.defer_max, defer_alpha=cfg.get("defer_alpha"), existence_calibration=calib,
+                  defer_revision=head.defer_revision if head.defer_max else None, kappa=head_kappa(head))
     name = Path(args.checkpoint).stem
     path = Path(args.checkpoint).parent / ("eval_%s_%s.json" % (args.split, name))
     T.write_json(path, result)
@@ -567,6 +578,8 @@ def parse_args(argv=None):
     parser.add_argument("--dump-dir", default=None, help="eval：保存逐事件预测（含 base_probabilities）")
     parser.add_argument("--tracks-dir", default=None, help="eval：保存逐窗航迹（active / pos / vel / ex）")
     parser.add_argument("--save-root", default=None)
+    parser.add_argument("--seed", type=int, default=None, help="覆盖配置中的 seed（整体模型多种子）")
+    parser.add_argument("--base-checkpoint", default=None, help="覆盖配置中的骨干 checkpoint（接新训练的估计器）")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--max-chunks", type=int, default=None, help="train：每轮最多几个片段（冒烟用）")
     return parser.parse_args(argv)
@@ -579,6 +592,10 @@ def main(argv=None):
         cfg["save_root"] = args.save_root
     if args.epochs is not None:
         cfg["epochs"] = int(args.epochs)
+    if args.seed is not None:
+        cfg["seed"] = int(args.seed)
+    if args.base_checkpoint:
+        cfg["base_checkpoint"] = args.base_checkpoint
     if args.mode == "train":
         mode_train(args, cfg)
     else:

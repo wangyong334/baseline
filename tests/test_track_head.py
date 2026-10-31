@@ -641,6 +641,58 @@ class DeferTests(unittest.TestCase):
         d_gate, d_free = (z_gate - z0)[far].abs(), (z_free - z0)[far].abs()
         self.assertLess(float(d_gate.mean()), float(d_free.mean()))    # 远离目标的背景事件修正被压住
 
+    def test_evidence_revision_formula(self):
+        from model.track_head import _logit
+        head = defer_head(defer_revision="evidence")
+        with torch.no_grad():
+            head.kappa_raw.copy_(torch.log(torch.expm1(torch.tensor([0.5, 1.0, 2.0]))))   # kappa = 0.5 / 1 / 2
+        st = single_track_state(head, [(20.0, 16.0)], [(0.0, 0.0)], ex=0.9)
+        L_now = float(_logit(st["ex"])[0, 0])
+        n = 6
+        f = lambda *v: torch.tensor(v, dtype=torch.float32)  # noqa: E731
+        r = {"b": torch.zeros(n, dtype=torch.long), "slot": torch.zeros(n, dtype=torch.long),
+             "lag": torch.full((n,), 2, dtype=torch.long), "reason": torch.tensor([0, 0, 0, 0, 2, 0]),
+             "x": torch.full((n,), 20, dtype=torch.long), "y": torch.full((n,), 16, dtype=torch.long),
+             "fx": f(20, 20, 20, 20, 0, 20), "fy": f(16, 16, 16, 16, 0, 16), "miss_then": torch.zeros(n),
+             "lc": torch.zeros(n), "znow": f(1.0, -0.5, 2.0, 0.3, -1.0, 0.7), "beta_then": torch.ones(n),
+             "L_then": f(L_now, L_now - 2.0, L_now - 4.0, -1.0, 7.0, L_now + 3.0),
+             "m_then": f(0.9, 0.8, 0.0, 0.9, 0.0, 0.6)}
+        status = torch.tensor([0, 0, 0, 3, 0, 1])
+        exl = _logit(st["ex"]).clone().requires_grad_(True)
+        out = head._final(r, status, st, exl)
+        d = (out - r["znow"]).detach()
+        self.assertEqual(float(d[0]), 0.0)                                  # 等待期间证据没变：不修正
+        self.assertAlmostEqual(float(d[1]), 0.8 * 0.5 * 2.0, places=5)      # 归属 x kappa[存在未定] x 证据增量
+        self.assertEqual(float(d[2]), 0.0)                                  # 不属于目标（m = 0）：不修正
+        self.assertEqual(float(d[3]), 0.0)                                  # 丢失：不知道原目标的结局，不修正
+        self.assertAlmostEqual(float(d[5]), 0.6 * 0.5 * -3.0, places=5)     # 证据变少：往下修
+        # 孤儿：参照取 0（事件发生时还没有目标），归属在回推的位置上重算（S = P00 + cell^2 + lag^2 P11），与存的 L_then 无关
+        m = torch.sigmoid(head._membership_logit(torch.zeros(1), torch.tensor([1.0 + 16.0 + 4.0]), torch.zeros(1)))
+        self.assertAlmostEqual(float(d[4]), float(m) * 2.0 * L_now, places=4)
+        out.sum().backward()
+        self.assertIsNone(exl.grad)                                         # 存在只由自己的校准监督训练
+        self.assertGreater(float(head.kappa_raw.grad.abs().sum()), 0.0)
+
+    def test_evidence_revision_in_stream(self):
+        head = neutral_birth(defer_head(defer_revision="evidence", provisional_gate=True))
+        events, z0, feat, lab, tid = blob_windows(12, batch=2, noise=20, gaps=(5, 6))
+        keys = torch.arange(z0.shape[0]).float()
+        z, _, aux = self.run_defer(head, events, z0, feat, 12)
+        k = aux["delayed_key"].long()
+        self.assertGreater(int(k.numel()), 0)
+        self.assertEqual(len(set(k.tolist())), int(k.numel()))            # 每个事件最多终判一次
+        self.assertTrue(bool(torch.isfinite(aux["delayed_z"]).all()))
+        self.assertTrue(bool(((aux["delayed_lag"] >= 1) & (aux["delayed_lag"] <= 4)).all()))
+        delta = aux["delayed_z"] - z[k]
+        tgt, bg = lab[k] > 0.5, lab[k] < 0.5
+        self.assertTrue(bool(tgt.any()) and bool(bg.any()))
+        self.assertGreater(float(delta[tgt].mean()), float(delta[bg].mean()))      # 目标被确认：目标事件往上修得多
+        with torch.no_grad():
+            z_full, _, d_full = run_split_chunks(head, events, z0, feat, 2, [(0, 12)], keys)
+            z_split, _, d_split = run_split_chunks(head, events, z0, feat, 2, [(0, 4), (4, 9), (9, 12)], keys)
+        self.assertTrue(torch.equal(z_full, z_split))
+        self.assertEqual(d_full, d_split)
+
     def test_provisional_gate_requires_membership_model(self):
         with self.assertRaises(ValueError):
             make_head(existence="ipda", defer_max=4, provisional_gate=True)
@@ -682,6 +734,30 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual({k for k in base if cfg[k] != base[k]}, expect, name)
             self.assertEqual((cfg["provisional_gate"], cfg["calibrate_existence"], cfg["defer_alpha"]), (True, True, alpha))
             self.assertEqual(cfg["save_root"], "log/%s_seed37" % name)
+
+    def test_v4e_variant(self):
+        from utils.stream_common import load_flat_config
+        base = load_flat_config(os.path.join(ROOT, "configs", "track_head_v4d.yaml"))
+        cfg = load_flat_config(os.path.join(ROOT, "configs", "track_head_v4e.yaml"))
+        self.assertEqual(set(cfg), set(base))
+        self.assertEqual({k for k in base if cfg[k] != base[k]}, {"defer_revision", "save_root"})
+        self.assertEqual((cfg["defer_revision"], cfg["save_root"]), ("evidence", "log/track_head_v4e_seed37"))
+
+    def test_full_model_pipeline_script(self):
+        import re
+        path = os.path.join(ROOT, "tools", "run_full_model.sh")
+        with open(path, encoding="utf-8") as stream:
+            text = stream.read()
+        self.assertIn("set -e", text)
+        heads = re.search(r'HEADS=\$\{HEADS:-"([^"]+)"\}', text).group(1).split()
+        self.assertEqual(heads, ["track_head_v4d", "track_head_v4e"])
+        bb = re.search(r"BB_CFG=\$\{BB_CFG:-([^}]+)\}", text).group(1)
+        for cfg in [bb] + ["configs/%s.yaml" % h for h in heads]:
+            self.assertTrue(os.path.exists(os.path.join(ROOT, cfg)), cfg)
+        for flag in ("--base-checkpoint", "--seed", "--resume", "--mode smoke"):
+            self.assertIn(flag, text)
+        for n in re.findall(r"--epochs (\d+)", text):                   # 线性学习率至少要 2 轮
+            self.assertGreaterEqual(int(n), 2)
 
     def test_v4c_variant(self):
         from utils.stream_common import load_flat_config
@@ -760,30 +836,40 @@ class EndToEndTests(unittest.TestCase):
                        segments=[[0, 3], [4, 7], [8, 11]], timing_warmup_windows=1, eval_chunk=4,
                        execution="layer", input_device="gpu", streams=2)
             T.mode_train(SimpleNamespace(device="cpu", mode="train", resume=False), cfg)
+            base_ckpt = str(base_dir / "best_val_iou_seed37.pt")
             for name in ("track_head_v2", "track_head_v2_lag1", "track_head_v3", "track_head_v4", "track_head_v4b",
-                         "track_head_v4c", "track_head_v4d"):
+                         "track_head_v4c", "track_head_v4d", "track_head_v4e"):
                 head_cfg = load_flat_config(os.path.join(ROOT, "configs", name + ".yaml"))
-                head_cfg.update(root=str(root), base_checkpoint=str(base_dir / "best_val_iou_seed37.pt"),
+                # v4e：种子与骨干 checkpoint 走命令行覆盖（整体模型流水线 tools/run_full_model.sh 的用法）
+                cli = name == "track_head_v4e"
+                seed, extra = (41, ["--seed", "41", "--base-checkpoint", base_ckpt]) if cli else (37, [])
+                head_cfg.update(root=str(root), base_checkpoint=str(root / "missing.pt") if cli else base_ckpt,
                                 save_root=str(root / name), epochs=2, streams=2, tbptt_k=4, eval_chunk=4,
                                 slots=4, segments=[[0, 3], [4, 7], [8, 11]], timing_warmup_windows=1)
                 cfg_path = root / (name + ".yaml")
                 cfg_path.write_text(yaml.safe_dump({"ALL": head_cfg}), encoding="utf-8")
-                TH.main(["--config", str(cfg_path), "--mode", "train", "--device", "cpu"])
-                ckpt = root / name / "best_val_iou_seed37.pt"
+                TH.main(["--config", str(cfg_path), "--mode", "train", "--device", "cpu"] + extra)
+                ckpt = root / name / ("best_val_iou_seed%d.pt" % seed)
                 self.assertTrue(ckpt.exists())
                 TH.main(["--config", str(cfg_path), "--mode", "eval", "--device", "cpu", "--split", "test",
                          "--checkpoint", str(ckpt), "--dump-dir", str(root / ("dump_" + name)),
-                         "--tracks-dir", str(root / ("tracks_" + name))])
-                result = json.loads((root / name / "eval_test_best_val_iou_seed37.json").read_text(encoding="utf-8"))
+                         "--tracks-dir", str(root / ("tracks_" + name))] + extra)
+                result = json.loads((root / name / ("eval_test_best_val_iou_seed%d.json" % seed)).read_text(
+                    encoding="utf-8"))
+                self.assertEqual(result["base_checkpoint"], base_ckpt)
                 delayed = name.endswith("lag1") or name.startswith("track_head_v4")
                 kinds = ("base", "track", "track_now") if delayed else ("base", "track")
                 for kind in kinds:
                     for key in ("iou", "acc", "pd", "fa"):
                         self.assertTrue(np.isfinite(result[kind][key]), (name, kind, key))
-                if name == "track_head_v4d":                           # 停止规则的温度校准：在 val 上拟合并存盘
+                if name in ("track_head_v4d", "track_head_v4e"):        # 停止规则的温度校准：在 val 上拟合并存盘
                     calib = result["existence_calibration"]
                     self.assertTrue(0.5 <= calib["temperature"] <= 5.0)
-                    self.assertTrue((root / name / "existence_temperature_best_val_iou_seed37.json").exists())
+                    self.assertTrue((root / name / ("existence_temperature_best_val_iou_seed%d.json" % seed)).exists())
+                if name == "track_head_v4e":                           # 证据修正：三个系数随结果存盘（论文里报）
+                    self.assertEqual(result["defer_revision"], "evidence")
+                    self.assertEqual(len(result["kappa"]), 3)
+                    self.assertTrue(all(k > 0.0 for k in result["kappa"]))
                 if name.startswith("track_head_v4"):                   # 延迟决策的统计：比例、平均等待、终判状态
                     hs = result["head_stats"]
                     self.assertTrue(0.0 <= hs["deferred_frac"] <= 1.0)
