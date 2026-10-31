@@ -1,20 +1,28 @@
-"""模块三：目标级航迹头（Track Head；Stream-SNN-Innovations.md 13.60）。
+"""模块三：目标级航迹头 v2（Track Head；Stream-SNN-Innovations.md 13.60～13.61）。
 
 问题：流式逐像素记忆没有"目标"这个单位。证据钉在像素上、起落同速，目标离开后旧位置继续报目标（残影 / 拖尾误报），
       目标弱的几窗断掉（断裂 / 断续与第一拍漏检）。
-原理：贝叶斯多目标滤波 = 卡尔曼形状态 + 伯努利存在概率（对标 CNSF 2026、Residual Kalman 2026、MOTIP 2025）。
+原理：贝叶斯多目标滤波 = 卡尔曼形状态 + 伯努利存在概率（对标 CNSF 2026、Residual Kalman 2026、MOTIP 2025）；
+      可选的一窗固定滞后判决 = RTS 平滑（暂定输出 + 修正）。
 接口：只读骨干（E3a）的逐事件 logit z0 与 dec1 特征，不回写骨干（避免输出回写造成的自激；骨干照常逐层并行）。
 每窗一次（B 条流并行，每条流 N 个航迹槽）：
     1. 预测   匀速模型：每个坐标轴的状态为 [位置, 速度]，两轴共用 2x2 协方差 P；过程噪声 q 学出来
-    2. 量测   证据图 = 每格（cell x cell 像素）事件概率之和，再取 3x3 格之和；先在每条航迹的验证门（gate_sigma 倍标准差）
-              内取证据最强的格，几条航迹抢同一格时存在概率高的优先；量测位置 = 概率加权质心，
+    2. 量测   证据图 = 每格（cell x cell 像素）事件概率之和，再取 3x3 格之和；候选 = 证据图的局部峰。
+              每条航迹在验证门（gate_sigma 倍标准差）内按"证据加权的似然" log(质量) - d^2 / (2S) 选一个峰
+              （带幅度信息的最近邻），几条航迹抢同一峰时存在概率高的优先；量测位置 = 概率加权质心，
               量测特征 = 质量、平均概率、事件数、极性、空间扩散、概率加权的平均 dec1 特征
     3. 更新   卡尔曼增益 K = P H^T / (H P H^T + R)；量测噪声 R 由量测特征预测（网络给出"这个量测多可靠"）
     4. 存在   GRU 累积航迹级证据（有无量测、量测特征、归一化新息、不确定度、速度、年龄、连续漏检）-> 存在概率
-    5. 出生   所有验证门之外的局部峰（质量 >= birth_floor）；附带"到现有航迹当前位置、近期轨迹的距离"，
-              由存在监督学会不让拖尾（落在近期轨迹上的峰）长成新目标
+    5. 出生   所有验证门之外的局部峰（质量 >= birth_floor），附带"到现有航迹当前位置、近期轨迹的距离"，
+              由存在监督学会不让拖尾（落在近期轨迹上的峰）长成新目标；同一窗内两次出生至少隔开一个量测邻域
+              （3x3 格之外）；没有空槽时替换存在概率最低（< recycle_exist）的航迹
     6. 消亡   存在概率 < death_exist，或连续漏检 > max_coast 窗，或位置离开画布
-    7. 修正   最终 logit = z0 + Δ(z0, 事件特征, 极性, 窗内时间, 事件与航迹的关系)；Δ 的末层零初始化，起步与 z0 逐位相同
+    7. 修正   最终 logit = z0 + Δ(z0, 事件特征, 极性, 窗内时间, 事件与航迹的关系)；Δ 的末层零初始化，起步与 z0 逐位相同。
+              事件与航迹的关系：到最近航迹的归一化距离、沿迹 / 横迹坐标（残影在目标身后）、到近期轨迹的距离、
+              航迹的存在概率、速度、本窗有无量测、年龄
+    8. 滞后判决（decision_lag = 1 时）：第 k 窗结束后，用 RTS 平滑得到的第 k-1 窗航迹位置、第 k 窗的存在概率与量测、
+              事件所在处第 k 窗的证据（持续性）重判第 k-1 窗的事件；零等待的输出照常给出
+context = "none" 是对照组：航迹照常运行，但修正项看不到航迹（检验增益来自航迹，而不是"再训一个读出头"）。
 训练监督（标签里的 target_id）：逐窗把航迹与标注目标一一匹配（距离 <= max(match_min_px, 2.5 x 目标扩散)），
     匹配上的航迹存在 = 1、位置回归到目标质心；其余存在 = 0。
 实现注意：只用 torch 1.9 可用、确定性模式下允许的算子（累加用 index_put_(accumulate=True)，取值用高级索引，不用 gather /
@@ -29,10 +37,20 @@ import torch.nn.functional as F
 
 MEAS_SUMS = 8          # 每格累加量：p, p^2, 1, p*pol, p*x, p*y, p*x^2, p*y^2（其后为 p*feat）
 BIG = 1e6
+TRACK_KEYS = ("active", "pos", "vel", "P", "h", "ex", "age", "miss", "has", "hist", "hist_ok")
+PEND_KEYS = ("b", "x", "y", "p", "t_local", "z0", "feat", "ctx", "key")
+CONTEXTS = ("track", "none")
+CTX_DIM, LAG_DIM = 11, 7
 
 
 def _mlp(inp, hidden, out):
     return nn.Sequential(nn.Linear(inp, hidden), nn.ReLU(), nn.Linear(hidden, out))
+
+
+def _zero_last(mlp):
+    nn.init.zeros_(mlp[2].weight)
+    nn.init.zeros_(mlp[2].bias)
+    return mlp
 
 
 def _dist(a, b):
@@ -44,8 +62,13 @@ class TrackHead(nn.Module):
 
     def __init__(self, feat_dim, height, width, cell=4, slots=10, hidden=32, history=21, gate_sigma=3.0,
                  gate_max_px=24.0, gate_floor=0.5, birth_floor=1.0, max_births=4, death_exist=0.02,
-                 max_coast=20, match_min_px=8.0, corr_hidden=32, r_min=0.25):
+                 max_coast=20, match_min_px=8.0, corr_hidden=32, r_min=0.25, recycle_exist=0.5,
+                 decision_lag=0, context="track"):
         super(TrackHead, self).__init__()
+        if context not in CONTEXTS:
+            raise ValueError("context 必须是 %s 之一" % (CONTEXTS,))
+        if int(decision_lag) not in (0, 1):
+            raise ValueError("decision_lag 只支持 0（零等待）或 1（一窗固定滞后）")
         self.feat_dim = int(feat_dim)
         self.height, self.width, self.cell = int(height), int(width), int(cell)
         self.gh, self.gw = -(-self.height // self.cell), -(-self.width // self.cell)
@@ -53,10 +76,10 @@ class TrackHead(nn.Module):
         self.gate_sigma, self.gate_max_px = float(gate_sigma), float(gate_max_px)
         self.gate_floor, self.birth_floor = float(gate_floor), float(birth_floor)
         self.max_births, self.death_exist, self.max_coast = int(max_births), float(death_exist), float(max_coast)
-        self.match_min_px, self.r_min = float(match_min_px), float(r_min)
+        self.match_min_px, self.r_min, self.recycle_exist = float(match_min_px), float(r_min), float(recycle_exist)
+        self.decision_lag, self.context = int(decision_lag), str(context)
         self.meas_dim = 5 + self.feat_dim
         self.u_dim = self.meas_dim + 11
-        self.ctx_dim = 7
         self.log_q = nn.Parameter(torch.tensor(math.log(0.25)))       # 过程噪声（像素/窗^2 的加速度方差）
         self.log_v0 = nn.Parameter(torch.tensor(math.log(4.0)))       # 出生时的速度方差（(像素/窗)^2）
         self.r_net = _mlp(self.meas_dim, 16, 1)                        # 量测特征 -> 量测噪声 R（像素^2）
@@ -65,9 +88,10 @@ class TrackHead(nn.Module):
         self.gru = nn.GRUCell(self.u_dim, self.hidden)
         self.exist = nn.Linear(self.hidden, 1)
         self.none_logit = nn.Parameter(torch.zeros(()))
-        self.corr = _mlp(1 + self.feat_dim + 2 + self.ctx_dim, int(corr_hidden), 1)
-        nn.init.zeros_(self.corr[2].weight)
-        nn.init.zeros_(self.corr[2].bias)
+        base_in = 1 + self.feat_dim + 2 + CTX_DIM
+        self.corr = _zero_last(_mlp(base_in, int(corr_hidden), 1))
+        if self.decision_lag:
+            self.corr_lag = _zero_last(_mlp(base_in + LAG_DIM, int(corr_hidden), 1))
         gy = torch.arange(self.gh, dtype=torch.float32).repeat_interleave(self.gw)
         gx = torch.arange(self.gw, dtype=torch.float32).repeat(self.gh)
         half = (self.cell - 1) / 2.0
@@ -78,30 +102,47 @@ class TrackHead(nn.Module):
     def init_state(self, batch, device):
         B, N, H, D = int(batch), self.slots, self.history, self.hidden
         zeros = lambda *shape: torch.zeros(*shape, device=device)  # noqa: E731
-        return {"active": torch.zeros(B, N, dtype=torch.bool, device=device),
-                "pos": zeros(B, N, 2), "vel": zeros(B, N, 2), "P": zeros(B, N, 2, 2), "h": zeros(B, N, D),
-                "ex": zeros(B, N), "age": zeros(B, N), "miss": zeros(B, N),
-                "hist": zeros(B, N, H, 2), "hist_ok": torch.zeros(B, N, H, dtype=torch.bool, device=device)}
+        flag = lambda *shape: torch.zeros(*shape, dtype=torch.bool, device=device)  # noqa: E731
+        return {"active": flag(B, N), "pos": zeros(B, N, 2), "vel": zeros(B, N, 2), "P": zeros(B, N, 2, 2),
+                "h": zeros(B, N, D), "ex": zeros(B, N), "age": zeros(B, N), "miss": zeros(B, N), "has": flag(B, N),
+                "hist": zeros(B, N, H, 2), "hist_ok": flag(B, N, H), "pending": None}
 
     @staticmethod
     def detach_state(state):
-        return None if state is None else {k: v.detach() for k, v in state.items()}
+        if state is None:
+            return None
+        out = {}
+        for key, value in state.items():
+            if key == "pending":
+                out[key] = None if value is None else {k: v.detach() for k, v in value.items()}
+            else:
+                out[key] = value.detach()
+        return out
 
     @staticmethod
     def _reset(state, mask):
-        """mask [B] bool：这些流开始新录像，航迹全部清空。"""
+        """mask [B] bool：这些流开始新录像，航迹全部清空，上一窗待判的事件不再重判（保留零等待输出）。"""
         out = {}
-        for key, value in state.items():
+        for key in TRACK_KEYS:
+            value = state[key]
             view = mask.view((-1,) + (1,) * (value.dim() - 1))
             out[key] = torch.where(view, torch.zeros_like(value), value)
+        pend = state.get("pending")
+        if pend is not None:
+            keep = ~mask[pend["b"]]
+            pend = {k: v[keep] for k, v in pend.items()}
+        out["pending"] = pend
         return out
 
     # ------------------------------------------------------------------ 量测
-    def _maps(self, eb, ex, ey, prob, pol, feat, batch):
-        """每格累加量 -> 3x3 格之和 [B, C, G]。"""
-        C, G = MEAS_SUMS + self.feat_dim, self.gh * self.gw
-        cell = (torch.div(ey, self.cell, rounding_mode="floor") * self.gw
+    def _cells(self, ex, ey):
+        return (torch.div(ey, self.cell, rounding_mode="floor") * self.gw
                 + torch.div(ex, self.cell, rounding_mode="floor"))
+
+    def _maps(self, eb, ex, ey, prob, pol, feat, batch):
+        """每格累加量 -> (3x3 格之和 [B, C, G], 每格自身的质量 [B, G])。"""
+        C, G = MEAS_SUMS + self.feat_dim, self.gh * self.gw
+        cell = self._cells(ex, ey)
         xf, yf = ex.to(prob.dtype), ey.to(prob.dtype)
         cols = [prob, prob * prob, torch.ones_like(prob), prob * pol, prob * xf, prob * yf, prob * xf * xf,
                 prob * yf * yf]
@@ -110,9 +151,9 @@ class TrackHead(nn.Module):
         flat = (eb[:, None] * C + chans[None, :]) * G + cell[:, None]
         buf = torch.zeros(batch * C * G, dtype=prob.dtype, device=prob.device)
         buf = buf.index_put((flat.reshape(-1),), vals.reshape(-1), accumulate=True)
-        sums = buf.view(batch, C, self.gh, self.gw)
-        sums = F.avg_pool2d(sums, 3, stride=1, padding=1, count_include_pad=True) * 9.0
-        return sums.view(batch, C, G)
+        raw = buf.view(batch, C, self.gh, self.gw)
+        sums = F.avg_pool2d(raw, 3, stride=1, padding=1, count_include_pad=True) * 9.0
+        return sums.view(batch, C, G), raw[:, 0].reshape(batch, G)
 
     def _measure(self, s):
         """累加量 [..., C] -> (量测特征 [..., meas_dim], 质心 [..., 2])。"""
@@ -132,58 +173,71 @@ class TrackHead(nn.Module):
 
     # ------------------------------------------------------------------ 一窗
     def forward_window(self, state, ev, reset_mask=None):
-        """state：init_state 的字典；ev：本窗事件 b/x/y/p/t_local/z0/feat。返回 (z [Ne], 新状态, info)。"""
+        """state：init_state 的字典；ev：本窗事件 b/x/y/p/t_local/z0/feat（滞后判决时另有 key）。
+
+        返回 (z [Ne] 零等待输出, 新状态, info)；info["delayed"] 为 None 或 (上一窗事件的滞后输出, 它们的 key)。
+        """
         if reset_mask is not None:
             state = self._reset(state, reset_mask)
         act = state["active"]
         B, N = act.shape
         dev, cell = act.device, float(self.cell)
         z0, feat = ev["z0"], ev["feat"]
+        dtype = z0.dtype
         prob = torch.sigmoid(z0)
         idx_n = torch.arange(N, device=dev)
+        pos_prev, vel_prev, P_prev = state["pos"], state["vel"], state["P"]
 
         # 1. 预测（匀速，离散白噪声加速度模型，dt = 1 窗）
         q = torch.exp(self.log_q)
-        P = state["P"]
-        P00 = P[..., 0, 0] + 2.0 * P[..., 0, 1] + P[..., 1, 1] + 0.25 * q
-        P01 = P[..., 0, 1] + P[..., 1, 1] + 0.5 * q
-        P11 = P[..., 1, 1] + q
+        P00 = P_prev[..., 0, 0] + 2.0 * P_prev[..., 0, 1] + P_prev[..., 1, 1] + 0.25 * q
+        P01 = P_prev[..., 0, 1] + P_prev[..., 1, 1] + 0.5 * q
+        P11 = P_prev[..., 1, 1] + q
         Ppred = torch.stack([torch.stack([P00, P01], -1), torch.stack([P01, P11], -1)], -2)
         actv, actm = act[..., None], act[..., None, None]
-        pos = torch.where(actv, state["pos"] + state["vel"], state["pos"])
-        vel = state["vel"]
-        Ppred = torch.where(actm, Ppred, P)
+        pos_pred = torch.where(actv, pos_prev + vel_prev, pos_prev)
+        vel_pred = vel_prev
+        Ppred = torch.where(actm, Ppred, P_prev)
 
-        # 2. 量测：验证门内证据最强的格
-        sums = self._maps(ev["b"], ev["x"], ev["y"], prob, ev["p"].to(prob.dtype), feat, B)   # [B, C, G]
+        # 2. 量测：验证门内的局部峰，按证据加权的似然选
+        sums, own = self._maps(ev["b"], ev["x"], ev["y"], prob, ev["p"].to(dtype), feat, B)   # [B, C, G]
         mass = sums[:, 0]
-        d2 = ((self.centers[None, None] - pos[:, :, None]) ** 2).sum(-1)                  # [B, N, G]
-        gate_r2 = (self.gate_sigma ** 2 * (Ppred[..., 0, 0] + cell * cell)).clamp(max=self.gate_max_px ** 2)
+        # 局部峰：3x3 格内的最大值。一个目标落在 2x2 格内时四个格的 3x3 和相等：按格自身的质量取事件真正所在的格，
+        # 仍相同时按格号取一个
+        G = mass.shape[1]
+        rank = 1e-6 * (1.0 - torch.arange(G, device=dev, dtype=dtype) / float(G))
+        mass_tb = mass + 1e-3 * own + rank * (1.0 + mass)
+        peak_map = F.max_pool2d(mass_tb.view(B, 1, self.gh, self.gw), 3, stride=1, padding=1).view(B, -1)
+        is_peak = (mass_tb >= peak_map) & (mass >= self.gate_floor)
+        d2 = ((self.centers[None, None] - pos_pred[:, :, None]) ** 2).sum(-1)             # [B, N, G]
+        spred = Ppred[..., 0, 0] + cell * cell
+        gate_r2 = (self.gate_sigma ** 2 * spred).clamp(max=self.gate_max_px ** 2)
         in_gate = (d2 <= gate_r2[..., None]) & actv
-        score = torch.where(in_gate, mass[:, None].expand_as(d2), torch.full_like(d2, -1.0))
+        logm = torch.log(mass.clamp(min=1e-6))
+        score = torch.where(in_gate & is_peak[:, None], logm[:, None] - 0.5 * d2 / spred[..., None],
+                            torch.full_like(d2, -1e9))
         best, cidx = score.max(-1)
-        has = act & (best >= self.gate_floor)
+        has = act & (best > -1e8)
         ex_prev = state["ex"]
         same = (cidx[:, :, None] == cidx[:, None, :]) & has[:, :, None] & has[:, None, :]
         better = (ex_prev[:, None, :] > ex_prev[:, :, None]) | (
             (ex_prev[:, None, :] == ex_prev[:, :, None]) & (idx_n[None, None, :] < idx_n[None, :, None]))
         has = has & ~(same & better).any(-1)
         bidx = torch.arange(B, device=dev)[:, None].expand(B, N)
-        s_gate = sums.permute(0, 2, 1)[bidx, cidx]                                       # [B, N, C]
-        f, zpos = self._measure(s_gate)
+        f, zpos = self._measure(sums.permute(0, 2, 1)[bidx, cidx])
 
         # 3. 卡尔曼更新
         R = self._noise(f)
         S = Ppred[..., 0, 0] + R
         K = Ppred[..., :, 0] / S[..., None]                                              # [B, N, 2]：位置、速度增益
-        innov = zpos - pos
+        innov = zpos - pos_pred
         hv = has[..., None]
-        pos = torch.where(hv, pos + K[..., 0:1] * innov, pos)
-        vel = torch.where(hv, vel + K[..., 1:2] * innov, vel)
+        pos = torch.where(hv, pos_pred + K[..., 0:1] * innov, pos_pred)
+        vel = torch.where(hv, vel_pred + K[..., 1:2] * innov, vel_pred)
         P_upd = Ppred - K[..., :, None] * Ppred[..., 0, :][..., None, :]
         P = torch.where(has[..., None, None], P_upd, Ppred)
         d2n = (innov ** 2).sum(-1) / S
-        hf = has.to(prob.dtype)
+        hf = has.to(dtype)
         zero = torch.zeros_like(hf)
         miss = torch.where(act, torch.where(has, zero, state["miss"] + 1.0), zero)
         age = torch.where(act, state["age"] + 1.0, zero)
@@ -193,26 +247,39 @@ class TrackHead(nn.Module):
         u = torch.cat([hf[..., None], f * hf[..., None], (torch.log1p(d2n) * hf)[..., None],
                        (torch.log(S) * hf)[..., None], torch.log(Ppred[..., 0, 0].clamp(min=1e-6))[..., None],
                        (speed.clamp(max=4.0) / 4.0)[..., None], (torch.log1p(age) / 3.0)[..., None],
-                       (miss / self.max_coast)[..., None], torch.zeros(B, N, 4, device=dev, dtype=prob.dtype)], -1)
+                       (miss / self.max_coast)[..., None], torch.zeros(B, N, 4, device=dev, dtype=dtype)], -1)
         h_new = self.gru(u.reshape(B * N, self.u_dim), state["h"].reshape(B * N, self.hidden)).view(B, N, self.hidden)
         h = torch.where(actv, h_new, state["h"])
         hist, hist_ok = state["hist"], state["hist_ok"]
 
-        # 5. 出生：所有验证门之外的局部峰
-        in_any = in_gate.any(1)
-        peak = F.max_pool2d(mass.view(B, 1, self.gh, self.gw), 3, stride=1, padding=1).view(B, -1)
-        cand = (mass >= self.birth_floor) & (mass >= peak) & ~in_any
+        # 5. 出生：所有验证门之外的局部峰；没有空槽时回收存在概率最低的航迹
+        cand = is_peak & (mass >= self.birth_floor) & ~in_gate.any(1)
         k = min(self.max_births, mass.shape[1])
         cv, ci = torch.where(cand, mass, torch.full_like(mass, -1.0)).topk(k, dim=1)
-        cv_l, ci_l, free_l = cv.cpu().tolist(), ci.cpu().tolist(), (~act).cpu().tolist()
-        bb, ss, cc = [], [], []
+        cv_l, ci_l = cv.cpu().tolist(), ci.cpu().tolist()
+        act_l, ex_l = act.cpu().tolist(), ex_prev.cpu().tolist()
+        bb, ss, cc, recycled = [], [], [], 0
         for b in range(B):
-            free = [n for n in range(N) if free_l[b][n]]
+            free = [n for n in range(N) if not act_l[b][n]]
+            weak = sorted((n for n in range(N) if act_l[b][n] and ex_l[b][n] < self.recycle_exist),
+                          key=lambda n: ex_l[b][n])
+            taken = []                                            # 本窗已出生的格：3x3 量测邻域内不再出生第二条
             for value, c in zip(cv_l[b], ci_l[b]):
-                if value < self.birth_floor or not free:
+                if value < self.birth_floor:
                     break
+                gy, gx = divmod(int(c), self.gw)
+                if any(abs(gy - ty) <= 2 and abs(gx - tx) <= 2 for ty, tx in taken):
+                    continue
+                if free:
+                    slot = free.pop(0)
+                elif weak:
+                    slot = weak.pop(0)
+                    recycled += 1
+                else:
+                    break
+                taken.append((gy, gx))
                 bb.append(b)
-                ss.append(free.pop(0))
+                ss.append(slot)
                 cc.append(c)
         born = torch.zeros(B, N, dtype=torch.bool, device=dev)
         if bb:
@@ -222,29 +289,30 @@ class TrackHead(nn.Module):
             f_b, z_b = self._measure(sums.permute(0, 2, 1)[bt, ct])
             scale = 8.0 * cell
             act_s = act[bt]
-            dcur = torch.where(act_s, _dist(z_b[:, None], pos[bt]), torch.full_like(act_s, BIG, dtype=prob.dtype))
+            dcur = torch.where(act_s, _dist(z_b[:, None], pos[bt]), torch.full_like(act_s, BIG, dtype=dtype))
             dcur = dcur.amin(1)
             hok = hist_ok[bt] & act_s[..., None]
-            dh = torch.where(hok, _dist(z_b[:, None, None], hist[bt]), torch.full_like(hok, BIG, dtype=prob.dtype))
+            dh = torch.where(hok, _dist(z_b[:, None, None], hist[bt]), torch.full_like(hok, BIG, dtype=dtype))
             dh = dh.amin(2).amin(1)
             R_b = self._noise(f_b)
             M = int(bt.shape[0])
-            ones, zeros1 = torch.ones(M, 1, device=dev, dtype=prob.dtype), torch.zeros(M, 1, device=dev, dtype=prob.dtype)
+            ones, zeros1 = torch.ones(M, 1, device=dev, dtype=dtype), torch.zeros(M, 1, device=dev, dtype=dtype)
             logR = torch.log(R_b)[:, None]
             u_b = torch.cat([ones, f_b, zeros1, logR, logR, zeros1, zeros1, zeros1, ones,
                              (dcur / scale).clamp(max=1.0)[:, None], (dh / scale).clamp(max=1.0)[:, None],
-                             (dh < 2.0 * cell).to(prob.dtype)[:, None]], -1)
-            h_b = self.gru(u_b, torch.zeros(M, self.hidden, device=dev, dtype=prob.dtype))
+                             (dh < 2.0 * cell).to(dtype)[:, None]], -1)
+            h_b = self.gru(u_b, torch.zeros(M, self.hidden, device=dev, dtype=dtype))
             v0 = torch.exp(self.log_v0).expand(M)
             P_b = torch.stack([torch.stack([R_b, torch.zeros_like(R_b)], -1),
                                torch.stack([torch.zeros_like(R_b), v0], -1)], -2)
             pos = pos.index_put((bt, st), z_b)
-            vel = vel.index_put((bt, st), torch.zeros(M, 2, device=dev, dtype=prob.dtype))
+            vel = vel.index_put((bt, st), torch.zeros(M, 2, device=dev, dtype=dtype))
             P = P.index_put((bt, st), P_b)
             h = h.index_put((bt, st), h_b)
             born = born.index_put((bt, st), torch.ones(M, dtype=torch.bool, device=dev))
-            age = age.index_put((bt, st), torch.zeros(M, device=dev, dtype=prob.dtype))
-            miss = miss.index_put((bt, st), torch.zeros(M, device=dev, dtype=prob.dtype))
+            age = age.index_put((bt, st), torch.zeros(M, device=dev, dtype=dtype))
+            miss = miss.index_put((bt, st), torch.zeros(M, device=dev, dtype=dtype))
+            has = has & ~born
             hist_ok = hist_ok & ~born[..., None]
         live = act | born
 
@@ -255,7 +323,15 @@ class TrackHead(nn.Module):
         outside = (pos[..., 0] < -m) | (pos[..., 0] > self.width + m) | (pos[..., 1] < -m) | (pos[..., 1] > self.height + m)
         die = live & ((ex < self.death_exist) | (miss > self.max_coast) | outside)
         alive = live & ~die
-        info = {"ex_logit": ex_logit, "live": live, "pos": pos, "born": born, "has": has}
+        info = {"ex_logit": ex_logit, "live": live, "pos": pos, "born": born, "has": has,
+                "births": len(bb), "recycled": recycled, "delayed": None}
+
+        # 8. 滞后判决：用第 k 窗的信息重判第 k-1 窗的事件（在清零消亡航迹之前，用到它们本窗的后验）
+        pend = state.get("pending")
+        if self.decision_lag and pend is not None and int(pend["z0"].shape[0]):
+            info["delayed"] = self._delayed(pend, act & ~born, pos_prev, P_prev, pos_pred, vel_pred, Ppred,
+                                            pos, vel, ex, has, sums)
+
         av, am = alive[..., None], alive[..., None, None]
         pos, vel = torch.where(av, pos, torch.zeros_like(pos)), torch.where(av, vel, torch.zeros_like(vel))
         P, h = torch.where(am, P, torch.zeros_like(P)), torch.where(av, h, torch.zeros_like(h))
@@ -264,23 +340,56 @@ class TrackHead(nn.Module):
         hist = torch.cat([pos[:, :, None], hist[:, :, :-1]], 2)
         hist_ok = torch.cat([alive[:, :, None], hist_ok[:, :, :-1]], 2) & alive[..., None]
         new_state = {"active": alive, "pos": pos, "vel": vel, "P": P, "h": h, "ex": ex, "age": age, "miss": miss,
-                     "hist": hist, "hist_ok": hist_ok}
+                     "has": has & alive, "hist": hist, "hist_ok": hist_ok, "pending": None}
 
-        # 8. 逐事件修正
-        z = self._correct(ev, z0, feat, new_state)
+        # 9. 本窗事件的零等待修正
+        if int(z0.shape[0]):
+            ctx = self._context(ev, new_state)
+            z = self._fuse(self.corr, z0, feat, ev, ctx)
+        else:
+            ctx = z0.new_zeros((0, CTX_DIM))
+            z = z0
+        if self.decision_lag:
+            key = ev["key"] if "key" in ev else torch.zeros_like(z0)
+            new_state["pending"] = {"b": ev["b"], "x": ev["x"], "y": ev["y"], "p": ev["p"], "t_local": ev["t_local"],
+                                    "z0": z0, "feat": feat, "ctx": ctx, "key": key}
         return z, new_state, info
 
+    def _fuse(self, mlp, z0, feat, ev, ctx, extra=None):
+        parts = [z0.clamp(-15.0, 15.0)[:, None] / 5.0, feat, ev["p"].to(z0.dtype)[:, None],
+                 ev["t_local"].to(z0.dtype)[:, None], ctx]
+        if extra is not None:
+            parts.append(extra)
+        return z0 + mlp(torch.cat(parts, 1)).squeeze(-1)
+
+    def _nearest(self, exy, pos_e, vel_e, act_e, delta2):
+        """最近航迹（按归一化距离）的沿迹 / 横迹坐标与下标；没有航迹的事件沿迹 0、横迹 1。"""
+        scale = 8.0 * float(self.cell)
+        j = torch.where(act_e, delta2, torch.full_like(delta2, BIG)).argmin(1)
+        none = ~act_e.any(1)
+        rows = torch.arange(int(exy.shape[0]), device=exy.device)
+        rel = exy - pos_e[rows, j]
+        v = vel_e[rows, j]
+        vn = torch.sqrt((v ** 2).sum(1) + 1e-6) + 0.5
+        along = ((rel * v).sum(1) / vn / scale).clamp(-1.0, 1.0)
+        cross = ((rel[:, 0] * v[:, 1] - rel[:, 1] * v[:, 0]).abs() / vn / scale).clamp(max=1.0)
+        along = torch.where(none, torch.zeros_like(along), along)
+        cross = torch.where(none, torch.ones_like(cross), cross)
+        return j, rows, none, along, cross
+
     def _context(self, ev, st):
-        """事件与航迹的关系 [Ne, ctx_dim]：无航迹权重、加权存在、加权归一化距离、加权速度、到最近航迹当前位置的距离、
-        到航迹 2～20 窗之前位置（近期轨迹）的最近距离、本流活航迹数占比。距离按 8 格归一并截到 1。"""
+        """本窗事件与航迹的关系 [Ne, CTX_DIM]（距离按 8 格归一并截到 1）：
+        0 无航迹权重 1 加权存在 2 加权归一化距离 3 加权速度 4 到最近航迹当前位置的距离 5 到近期轨迹（2～20 窗前）的距离
+        6 本流活航迹数占比 7 沿迹坐标（负 = 在航迹身后） 8 横迹距离 9 最近航迹本窗有无量测 10 最近航迹年龄。"""
         N, cell = self.slots, float(self.cell)
         eb = ev["b"]
         dtype = ev["z0"].dtype
         exy = torch.stack([ev["x"], ev["y"]], 1).to(dtype)
         act_e, ex_e = st["active"][eb], st["ex"][eb]
-        d = _dist(exy[:, None], st["pos"][eb])                                           # [Ne, N]
+        pos_e, vel_e = st["pos"][eb], st["vel"][eb]
+        d = _dist(exy[:, None], pos_e)                                                   # [Ne, N]
         delta2 = d * d / (st["P"][eb][..., 0, 0] + cell * cell)
-        speed = torch.sqrt((st["vel"][eb] ** 2).sum(-1) + 1e-6) / cell
+        speed = torch.sqrt((vel_e ** 2).sum(-1) + 1e-6) / cell
         logit_w = torch.where(act_e, -0.5 * delta2 + torch.log(ex_e.clamp(min=1e-6)), torch.full_like(d, -1e4))
         w = torch.softmax(torch.cat([logit_w, self.none_logit.expand(int(d.shape[0]), 1)], 1), 1)
         wt, wn = w[:, :N], w[:, N]
@@ -290,39 +399,72 @@ class TrackHead(nn.Module):
         hok = st["hist_ok"][eb][:, :, 2:]
         dh = _dist(exy[:, None, None], hist)
         tail = torch.where(hok, dh, torch.full_like(dh, BIG)).amin(2).amin(1)
-        return torch.stack([wn, (wt * ex_e).sum(1), (wt * delta2.clamp(max=25.0) / 25.0).sum(1),
-                            (wt * speed.clamp(max=4.0) / 4.0).sum(1), (dcur / scale).clamp(max=1.0),
-                            (tail / scale).clamp(max=1.0), act_e.to(dtype).sum(1) / float(N)], 1)
+        j, rows, none, along, cross = self._nearest(exy, pos_e, vel_e, act_e, delta2)
+        has_j = torch.where(none, torch.zeros_like(along), st["has"][eb][rows, j].to(dtype))
+        age_j = torch.where(none, torch.zeros_like(along), (torch.log1p(st["age"][eb][rows, j]) / 3.0).clamp(max=1.0))
+        ctx = torch.stack([wn, (wt * ex_e).sum(1), (wt * delta2.clamp(max=25.0) / 25.0).sum(1),
+                           (wt * speed.clamp(max=4.0) / 4.0).sum(1), (dcur / scale).clamp(max=1.0),
+                           (tail / scale).clamp(max=1.0), act_e.to(dtype).sum(1) / float(N), along, cross,
+                           has_j, age_j], 1)
+        return torch.zeros_like(ctx) if self.context == "none" else ctx
 
-    def _correct(self, ev, z0, feat, st):
-        if int(z0.shape[0]) == 0:
-            return z0
-        ctx = self._context(ev, st)
-        inp = torch.cat([z0.clamp(-15.0, 15.0)[:, None] / 5.0, feat, ev["p"].to(z0.dtype)[:, None],
-                         ev["t_local"].to(z0.dtype)[:, None], ctx], 1)
-        return z0 + self.corr(inp).squeeze(-1)
+    def _delayed(self, pend, valid, pos_prev, P_prev, pos_pred, vel_pred, Ppred, pos_post, vel_post, ex, has, sums):
+        """一窗固定滞后：RTS 平滑出第 k-1 窗的航迹位置，再重判第 k-1 窗的事件。valid [B, N]：第 k-1 窗就在、本窗没有重生的槽。"""
+        cell = float(self.cell)
+        pos_s = rts_position(pos_prev, P_prev, pos_pred, vel_pred, Ppred, pos_post, vel_post)
+        eb = pend["b"]
+        dtype = pend["z0"].dtype
+        exy = torch.stack([pend["x"], pend["y"]], 1).to(dtype)
+        v_e = valid[eb]
+        ps = pos_s[eb]
+        d = _dist(exy[:, None], ps)
+        delta2 = d * d / (P_prev[eb][..., 0, 0] + cell * cell)
+        j, rows, none, along, cross = self._nearest(exy, ps, vel_post[eb], v_e, delta2)
+        zero = torch.zeros(int(exy.shape[0]), device=exy.device, dtype=dtype)
+        ex_j = torch.where(none, zero, ex[eb][rows, j])
+        has_j = torch.where(none, zero, has[eb][rows, j].to(dtype))
+        dl_j = torch.where(none, torch.ones_like(zero), delta2[rows, j].clamp(max=25.0) / 25.0)
+        mk = sums[eb, 0, self._cells(pend["x"], pend["y"])]                              # 事件所在处第 k 窗的证据
+        lag = torch.stack([ex_j, dl_j, along, cross, has_j, (torch.log1p(mk) / 3.0).clamp(max=1.0),
+                           v_e.to(dtype).sum(1) / float(self.slots)], 1)
+        if self.context == "none":
+            lag = torch.zeros_like(lag)
+        z_d = self._fuse(self.corr_lag, pend["z0"], pend["feat"], pend, pend["ctx"], lag)
+        return z_d, pend["key"]
 
     # ------------------------------------------------------------------ 片段
-    def forward_chunk(self, events, z0, feat, state, steps, keep=None, labels=None, tid=None, log=None):
+    def forward_chunk(self, events, z0, feat, state, steps, keep=None, labels=None, tid=None, log=None, keys=None):
         """events：片段事件（t 为片段内窗号、b 为流号）；z0 [Ne]、feat [Ne, F] 来自骨干。
 
         keep [T, B]（或 None）：keep[t, b] = 0 表示第 b 条流在第 t 窗开始一段新录像，先清空该流航迹。
         labels / tid 给出时计算航迹监督（存在 BCE 之和、质心 L1 之和及其个数）。log 为列表时逐窗记录航迹（可视化）。
-        返回 (z [Ne]，顺序与 events 相同, 片段结束时的状态, aux)。
+        keys（滞后判决时用）：与事件一一对应的标识（训练传标签、评估传事件在文件中的下标），随滞后输出一起返回。
+        返回 (z [Ne] 零等待输出，顺序与 events 相同, 片段结束时的状态, aux)；
+        aux["delayed_z"] / aux["delayed_key"]：本片段内完成重判的事件（含上一片段末窗的事件），没有时为 None。
         """
         if state is None:
             batch = int(keep.shape[1]) if keep is not None else int(events["b"].max()) + 1 if events["b"].numel() else 1
             state = self.init_state(batch, z0.device)
-        aux = {"exist_sum": z0.new_zeros(()), "exist_n": 0, "pos_sum": z0.new_zeros(()), "pos_n": 0}
-        idx_parts, z_parts = [], []
+        aux = {"exist_sum": z0.new_zeros(()), "exist_n": 0, "pos_sum": z0.new_zeros(()), "pos_n": 0,
+               "births": 0, "recycled": 0, "live": 0, "slot_windows": 0}
+        idx_parts, z_parts, dz, dk = [], [], [], []
         for t in range(int(steps)):
             idx = torch.nonzero(events["t"] == t, as_tuple=False).flatten()
             ev = {key: events[key][idx] for key in ("b", "x", "y", "p", "t_local")}
             ev["z0"], ev["feat"] = z0[idx], feat[idx]
+            if self.decision_lag:
+                ev["key"] = keys[idx] if keys is not None else idx.to(z0.dtype)
             reset = (keep[t] == 0) if keep is not None else None
             z_t, state, info = self.forward_window(state, ev, reset)
             idx_parts.append(idx)
             z_parts.append(z_t)
+            if info["delayed"] is not None:
+                dz.append(info["delayed"][0])
+                dk.append(info["delayed"][1])
+            aux["births"] += info["births"]
+            aux["recycled"] += info["recycled"]
+            aux["live"] += int(state["active"].sum())
+            aux["slot_windows"] += int(state["active"].shape[0])
             if labels is not None:
                 self._supervise(info, ev, labels[idx], tid[idx], aux)
             if log is not None:
@@ -331,12 +473,13 @@ class TrackHead(nn.Module):
             z = z0.index_put((torch.cat(idx_parts),), torch.cat(z_parts))
         else:
             z = z0
+        aux["delayed_z"] = torch.cat(dz) if dz else None
+        aux["delayed_key"] = torch.cat(dk) if dk else None
         return z, state, aux
 
     # ------------------------------------------------------------------ 监督
     def _supervise(self, info, ev, label, tid, aux):
         live, pos, ex_logit = info["live"], info["pos"], info["ex_logit"]
-        B, N = live.shape
         target = torch.zeros_like(ex_logit)
         pos_t = torch.zeros_like(pos)
         pmask = torch.zeros_like(live)
@@ -345,8 +488,7 @@ class TrackHead(nn.Module):
             dist = _dist(gc[:, None], pos[gb])                                            # [Gt, N]
             ok = live[gb] & (dist <= gr[:, None])
             dist_np = torch.where(ok, dist, torch.full_like(dist, np.inf)).detach().cpu().numpy()
-            gb_np = gb.cpu().numpy()
-            pairs = greedy_match(dist_np, gb_np)
+            pairs = greedy_match(dist_np, gb.cpu().numpy())
             if pairs:
                 rows = torch.tensor([r for r, _ in pairs], dtype=torch.long, device=pos.device)
                 cols = torch.tensor([c for _, c in pairs], dtype=torch.long, device=pos.device)
@@ -362,6 +504,20 @@ class TrackHead(nn.Module):
             aux["pos_sum"] = aux["pos_sum"] + F.smooth_l1_loss((pos[pmask] - pos_t[pmask]) / 4.0,
                                                                torch.zeros_like(pos[pmask]), reduction="sum")
             aux["pos_n"] += int(pmask.sum())
+
+
+def rts_position(pos_prev, P_prev, pos_pred, vel_pred, Ppred, pos_post, vel_post):
+    """一步 RTS 平滑的位置：x(k-1|k) = x(k-1|k-1) + C (x(k|k) - x(k|k-1))，C = P(k-1|k-1) F^T P(k|k-1)^-1，取位置行。
+
+    每个坐标轴的状态为 [位置, 速度]，两轴共用 2x2 协方差；F = [[1, 1], [0, 1]]。没有量测时 x(k|k) = x(k|k-1)，位置不变。
+    """
+    a, b_ = P_prev[..., 0, 0], P_prev[..., 0, 1]
+    p, q_, r = Ppred[..., 0, 0], Ppred[..., 0, 1], Ppred[..., 1, 1]
+    det = (p * r - q_ * q_).clamp(min=1e-9)
+    A00, A01 = a + b_, b_                                                                 # P(k-1|k-1) F^T 的位置行
+    C00 = (A00 * r - A01 * q_) / det
+    C01 = (-A00 * q_ + A01 * p) / det
+    return pos_prev + C00[..., None] * (pos_post - pos_pred) + C01[..., None] * (vel_post - vel_pred)
 
 
 def window_targets(eb, ex, ey, label, tid, match_min_px):

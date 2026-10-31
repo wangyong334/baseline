@@ -1,19 +1,24 @@
-# 模块三：目标级航迹头，接在冻结的 E3a 骨干上（Stream-SNN-Innovations.md 13.60；train_track_head.py）。
+# 对照组：目标级航迹头 v2 但修正项看不到航迹（context none），接在冻结的 E3a 骨干上（Stream-SNN-Innovations.md 13.60～13.61；train_track_head.py）。
 # 骨干的结构、q99、pos_weight 取自 base_checkpoint；这里只定义数据位置、航迹头、训练与评测口径。
+# v2 相对 v1（13.61）：门内按"证据加权的似然"在局部峰中选量测；没有空槽时回收最弱航迹；事件特征加入沿迹 / 横迹坐标等。
+# 同一套设置的两个变体（与本文件只差下列键与输出目录，tests/test_track_head.py 核对）：
+#   track_head_v2_lag1.yaml     decision_lag 1（一窗固定滞后判决，RTS 平滑）
+#   track_head_v2_notrack.yaml  context none（对照组：修正项看不到航迹）
 # 常数的来历（13.60）：
 #   cell 4 像素            目标中位 5～6 像素 ≈ 1.5 格；3x3 格 = 12 像素，盖住一个目标
 #   slots 10               训练集同一窗内同时出现的目标最多 5 个，x 2
 #   history 21             当前窗 + 前 20 窗（1 s）：与误差分类里"拖尾 = 0.1～1 s 前目标在这里"同一口径
 #   gate_sigma 3           3 倍标准差的验证门（标准做法）
 #   gate_max_px 24         每窗位移的 99% 分位约 8 像素，x 3
-#   gate_floor 0.5         门内至少有"半个确信事件"的证据（概率和，3x3 格）才算量测
+#   gate_floor 0.5         局部峰至少有"半个确信事件"的证据（概率和，3x3 格）才算量测
 #   birth_floor 1.0        至少"一个确信事件"的证据才出生
 #   death_exist 0.02       存在概率低于 2% 删除；max_coast 20 窗（1 s）没有量测删除
+#   recycle_exist 0.5      没有空槽时，只回收存在概率低于 50% 的航迹（比"不存在"更可能）
 #   match_min_px 8         监督时航迹与标注目标匹配的最小半径（约 1.5 个目标尺寸）
-# 用法（实验室服务器，3 号卡）：
-#   python -u train_track_head.py --config configs/track_head_e3a.yaml --mode train --device cuda:0
-#   python -u train_track_head.py --config configs/track_head_e3a.yaml --mode eval --device cuda:0 --split test \
-#       --checkpoint log/track_head_e3a_seed37/best_val_iou_seed37.pt
+# 用法（实验室服务器，3 号卡；完整流程见 tools/run_track_head.sh 与 tools/queue_track_head_v2.sh）：
+#   python -u train_track_head.py --config configs/track_head_v2.yaml --mode train --device cuda:0
+#   python -u train_track_head.py --config configs/track_head_v2.yaml --mode eval --device cuda:0 --split test \
+#       --checkpoint log/track_head_v2_seed37/best_val_iou_seed37.pt
 DATA:
   root: /media/stephen/nvme0n1/wy_data/datasets/EV-UAV-dataset
   input_device: gpu
@@ -31,9 +36,12 @@ HEAD:
   max_births: 4
   death_exist: 0.02
   max_coast: 20
+  recycle_exist: 0.5
   match_min_px: 8.0
   corr_hidden: 32
   r_min: 0.25
+  decision_lag: 0
+  context: none
 TRAIN:
   seed: 37
   epochs: 20
@@ -45,9 +53,11 @@ TRAIN:
   grad_clip: 1.0
   lambda_exist: 1.0
   lambda_pos: 0.5
+  now_loss_weight: 1.0        # 只在 decision_lag 1 时用：零等待输出的损失权重
+  lag_loss_weight: 1.0        # 只在 decision_lag 1 时用：滞后输出的损失权重
   deterministic: true
   eval_chunk: 32
-  save_root: log/track_head_e3a_seed37
+  save_root: log/track_head_v2_notrack_seed37
 EVAL:
   threshold: 0.9
   pd_detT: 50
