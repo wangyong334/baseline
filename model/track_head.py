@@ -93,7 +93,7 @@ class TrackHead(nn.Module):
                  gate_max_px=24.0, gate_floor=0.5, birth_floor=1.0, max_births=4, death_exist=0.02,
                  max_coast=20, match_min_px=8.0, corr_hidden=32, r_min=0.25, recycle_exist=0.5,
                  decision_lag=0, context="track", existence="gru", defer_max=0, defer_alpha=0.05,
-                 defer_revision="free"):
+                 defer_revision="free", pd_max=1.0):
         super(TrackHead, self).__init__()
         if context not in CONTEXTS:
             raise ValueError("context 必须是 %s 之一" % (CONTEXTS,))
@@ -140,6 +140,11 @@ class TrackHead(nn.Module):
         # 目标级延迟决策：等待单位是目标；判决依据是校准的存在后验越过 +-A（A = log((1 - alpha) / alpha)，
         # alpha = 0 表示 A = 无穷，即所有挂起事件都等满 defer_max 窗，作固定等待的对照）
         self.defer_max, self.defer_revision = int(defer_max), str(defer_revision)
+        # 检测概率上限（v4c）：P_D = pd_max * sigmoid(.)。骨干从不"必然检出"目标，一次漏检的代价至多 log(1 - pd_max)；
+        # 否则 P_D 在几乎总能检出的数据上学到饱和（v3：置信航迹中位 1.00），第一次漏检就让存在概率塌掉
+        self.pd_max = float(pd_max)
+        if not 0.0 < self.pd_max <= 1.0:
+            raise ValueError("pd_max 必须在 (0, 1] 内")
         if self.defer_max:
             if self.existence != "ipda":
                 raise ValueError("延迟决策需要 existence = ipda（判决依据是校准的存在后验）")
@@ -321,7 +326,12 @@ class TrackHead(nn.Module):
             pd_logit = self.pd_head(torch.cat([state["h"], torch.log1p(c_pred)[..., None]], -1)).squeeze(-1)
             log_lr = self.lr_net(torch.cat([f, torch.log1p(d2n)[..., None], torch.log1p(c_meas)[..., None]],
                                            -1)).squeeze(-1)
-            log_pd, log_miss = F.logsigmoid(pd_logit), F.logsigmoid(-pd_logit)
+            if self.pd_max < 1.0:
+                log_pd = math.log(self.pd_max) + F.logsigmoid(pd_logit)
+                log_miss = torch.logaddexp(torch.full_like(pd_logit, math.log(1.0 - self.pd_max)),
+                                           math.log(self.pd_max) + F.logsigmoid(-pd_logit))   # log(1 - P_D)
+            else:
+                log_pd, log_miss = F.logsigmoid(pd_logit), F.logsigmoid(-pd_logit)
             log_det = torch.logaddexp(log_miss, log_pd + log_lr)                          # log(1 - P_D + P_D l)
             beta = torch.where(has, torch.exp(log_pd + log_lr - log_det), torch.zeros_like(log_det))
             bv, bm = beta[..., None], beta[..., None, None]
@@ -329,7 +339,7 @@ class TrackHead(nn.Module):
             vel = vel_pred + bv * K[..., 1:2] * innov
             spread = (beta * (1.0 - beta) * (innov ** 2).mean(-1))[..., None, None] * (K[..., :, None] * K[..., None, :])
             P = bm * P_upd + (1.0 - bm) * Ppred + spread
-            pd_now = torch.sigmoid(pd_logit)
+            pd_now = torch.exp(log_pd) if self.pd_max < 1.0 else torch.sigmoid(pd_logit)
         else:
             hv = has[..., None]
             pos = torch.where(hv, pos_pred + K[..., 0:1] * innov, pos_pred)
@@ -427,7 +437,7 @@ class TrackHead(nn.Module):
             ex_logit = torch.where(born, self.exist(h).squeeze(-1), L_post)
             # 量测来源的后验对数几率（目标存在且量测来自它）：log(r P_D l) - log(1 - r P_D)，供校准监督
             rpd = (rp * torch.exp(log_pd)).clamp(max=1.0 - 1e-6)
-            extra = {"pd_logit": pd_logit, "org_logit": torch.log(rpd) + log_lr - torch.log1p(-rpd), "zpos": zpos,
+            extra = {"pd_logit": (log_pd - log_miss) if self.pd_max < 1.0 else pd_logit, "org_logit": torch.log(rpd) + log_lr - torch.log1p(-rpd), "zpos": zpos,
                      "prior": act & ~born}
         else:
             ex_logit = self.exist(h).squeeze(-1)

@@ -40,7 +40,7 @@ import error_budget  # noqa: E402
 HEAD_KEYS = ("cell", "slots", "hidden", "history", "gate_sigma", "gate_max_px", "gate_floor", "birth_floor",
              "max_births", "death_exist", "max_coast", "match_min_px", "corr_hidden", "r_min", "recycle_exist",
              "decision_lag", "context", "existence", "defer_max", "defer_alpha",
-             "defer_revision")
+             "defer_revision", "pd_max")
 
 
 # ---------------------------------------------------------------------------

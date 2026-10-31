@@ -1,0 +1,82 @@
+# 模块三：目标级航迹头 v4c = v4b + 检测概率上限（Stream-SNN-Innovations.md 13.63；train_track_head.py）。
+# 问题：50 ms 窗内证据不够时，零等待判决只能猜；固定等 d 窗对所有事件一视同仁，延迟浪费在已经确定的事件上。
+# 原理：分离原理（估计 = IPDA 的校准信念；判决 = 贝叶斯序贯判决）+ 多假设跟踪的延迟决策 + 回溯（retrodiction）。
+#   等待的单位是目标；事件进入等待的理由是"它所属目标在那一刻的状态还没被证据确定"：
+#     存在未定 / 那一窗没有可靠量测（缺口）/ 事件发生时目标还没出生（之后被新生目标回溯认领）。
+#   停止：目标的存在后验越过 +-A（A = log((1 - alpha) / alpha)，alpha = 5% 时约 2.94）、缺口后重新捕获、目标丢失，
+#     或等满 defer_max 窗强制终判。所有事件即时给暂定输出，只有挂起的事件之后再给一次终判（暂定 + 修正）。
+# v4b：修正量 = 事件的归属概率（校准的几何模型）x 目标层的修正（defer_revision gated），防止存在证据外溢给不属于目标的事件。
+# v4c：P_D = pd_max x sigmoid(.)，pd_max = 0.95（骨干从不必然检出目标；一次漏检的代价至多 log 0.05），防止 P_D 学到饱和、存在概率在第一次漏检时塌掉。
+# 变体：track_head_v4_fixed.yaml（defer_alpha 0 = 阈值无穷：挂起事件一律等满 defer_max 窗，作固定等待对照）。
+# 常数的来历（13.60）：
+#   cell 4 像素            目标中位 5～6 像素 ≈ 1.5 格；3x3 格 = 12 像素，盖住一个目标
+#   slots 10               训练集同一窗内同时出现的目标最多 5 个，x 2
+#   history 21             当前窗 + 前 20 窗（1 s）：与误差分类里"拖尾 = 0.1～1 s 前目标在这里"同一口径
+#   gate_sigma 3           3 倍标准差的验证门（标准做法）
+#   gate_max_px 24         每窗位移的 99% 分位约 8 像素，x 3
+#   gate_floor 0.5         局部峰至少有"半个确信事件"的证据（概率和，3x3 格）才算量测
+#   birth_floor 1.0        至少"一个确信事件"的证据才出生
+#   death_exist 0.02       存在概率低于 2% 删除；max_coast 20 窗（1 s）没有量测删除
+#   recycle_exist 0.5      没有空槽时，只回收存在概率低于 50% 的航迹（比"不存在"更可能）
+#   match_min_px 8         监督时航迹与标注目标匹配的最小半径（约 1.5 个目标尺寸）
+# 用法（实验室服务器，3 号卡；完整流程见 tools/run_track_head.sh 与 tools/queue_track_head_v2.sh）：
+#   python -u train_track_head.py --config configs/track_head_v4c.yaml --mode train --device cuda:0
+#   python -u train_track_head.py --config configs/track_head_v4c.yaml --mode eval --device cuda:0 --split test \
+#       --checkpoint log/track_head_v4c_seed37/best_val_iou_seed37.pt
+DATA:
+  root: /media/stephen/nvme0n1/wy_data/datasets/EV-UAV-dataset
+  input_device: gpu
+BASE:
+  base_checkpoint: log/stream_tif_commpeak_inv_seed37/best_val_iou_seed37.pt   # E3a（val 最好一轮，第 42 轮）
+HEAD:
+  cell: 4
+  slots: 10
+  hidden: 32
+  history: 21
+  gate_sigma: 3.0
+  gate_max_px: 24.0
+  gate_floor: 0.5
+  birth_floor: 1.0
+  max_births: 4
+  death_exist: 0.02
+  max_coast: 20
+  recycle_exist: 0.5
+  match_min_px: 8.0
+  corr_hidden: 32
+  r_min: 0.25
+  decision_lag: 0
+  context: track
+  existence: ipda
+  defer_max: 10               # 延迟预算：终判最晚 10 窗（500 ms）
+  defer_alpha: 0.05             # 允许的错判率（确认 / 否定的后验阈值 1 - alpha）；0 = 固定等待
+  defer_revision: gated        # 修正量 = 归属概率 x 目标层的修正
+  pd_max: 0.95                 # 检测概率上限（v4c）
+TRAIN:
+  seed: 37
+  epochs: 20
+  lr: 0.001
+  lr_end: 0.0001
+  streams: 4
+  tbptt_k: 16
+  stream_layout: greedy
+  grad_clip: 1.0
+  lambda_exist: 1.0
+  lambda_pos: 0.5
+  lambda_pd: 1.0             # v3：检测概率 P_D 的校准监督（目标本窗有没有产生量测）
+  lambda_membership: 1.0     # v4b：归属概率的校准监督（目标验证门内的事件是不是目标事件）
+  lambda_origin: 1.0         # v3：量测来源概率的校准监督（量测是否落在标注目标上）
+  now_loss_weight: 1.0        # 有终判输出时用（decision_lag 1 或 defer_max > 0）：零等待输出的损失权重
+  lag_loss_weight: 1.0        # 有终判输出时用：终判输出的损失权重
+  deterministic: true
+  eval_chunk: 32
+  save_root: log/track_head_v4c_seed37
+EVAL:
+  threshold: 0.9
+  pd_detT: 50
+  correct_thresh: 0.0001
+  rolling_window: 10
+  segments: [[0, 15], [64, 79], [144, 159]]
+  timing_warmup_windows: 20
+  gate_tail_drop: 0.30        # 关口：拖尾误报至少降 30%
+  gate_gap_drop: 0.30         # 关口：断续漏检至少降 30%
+  gate_near_rise: 0.10        # 关口：目标附近的误报最多增加 10%（IoU 还要不低于 base）

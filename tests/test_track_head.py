@@ -600,6 +600,23 @@ class DeferTests(unittest.TestCase):
         self.assertGreater(float(head.mem_theta.grad.abs().sum()), 0.0)
         self.assertGreater(float(head.mem_bias.grad.abs()), 0.0)
 
+    def test_detection_probability_ceiling(self):
+        for pd_max in (1.0, 0.95):
+            head = make_head(existence="ipda", pd_max=pd_max)
+            with torch.no_grad():
+                head.pd_head.bias.fill_(12.0)                          # 想把 P_D 学到 1
+            st = single_track_state(head, [(20.0, 16.0)], [(0.0, 0.0)], ex=0.9)
+            with torch.no_grad():
+                _, new, info = head.forward_window(st, window_events([(2, 30)] * 3, z=-6.0))   # 本窗漏检
+            rp = 0.9 / (1.0 + math.exp(-math.log(0.995 / 0.005)))
+            L_pred = math.log(rp / (1.0 - rp))
+            drop = float(info["ex_logit"][0, 0]) - L_pred
+            if pd_max < 1.0:
+                self.assertGreater(drop, math.log(1.0 - pd_max) - 1e-4)   # 一次漏检的代价至多 log(1 - pd_max)
+                self.assertAlmostEqual(float(new["pd"][0, 0]), pd_max * 1.0 / (1.0 + math.exp(-12.0)), places=5)
+            else:
+                self.assertLess(drop, -10.0)                            # 没有上限：一次漏检就塌掉
+
     def test_requires_ipda_and_excludes_lag(self):
         with self.assertRaises(ValueError):
             make_head(defer_max=4)
@@ -626,6 +643,14 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual({k for k in base if cfg[k] != base[k]}, {"save_root"})
         self.assertEqual((cfg["defer_revision"], cfg["lambda_membership"]), ("gated", 1.0))
         self.assertEqual(cfg["save_root"], "log/track_head_v4b_seed37")
+
+    def test_v4c_variant(self):
+        from utils.stream_common import load_flat_config
+        base = load_flat_config(os.path.join(ROOT, "configs", "track_head_v4b.yaml"))
+        cfg = load_flat_config(os.path.join(ROOT, "configs", "track_head_v4c.yaml"))
+        self.assertEqual(set(cfg), set(base) | {"pd_max"})
+        self.assertEqual({k for k in base if cfg[k] != base[k]}, {"save_root"})
+        self.assertEqual((cfg["pd_max"], cfg["save_root"]), (0.95, "log/track_head_v4c_seed37"))
 
     def test_v2_variants(self):
         from utils.stream_common import load_flat_config
@@ -696,7 +721,8 @@ class EndToEndTests(unittest.TestCase):
                        segments=[[0, 3], [4, 7], [8, 11]], timing_warmup_windows=1, eval_chunk=4,
                        execution="layer", input_device="gpu", streams=2)
             T.mode_train(SimpleNamespace(device="cpu", mode="train", resume=False), cfg)
-            for name in ("track_head_v2", "track_head_v2_lag1", "track_head_v3", "track_head_v4", "track_head_v4b"):
+            for name in ("track_head_v2", "track_head_v2_lag1", "track_head_v3", "track_head_v4", "track_head_v4b",
+                         "track_head_v4c"):
                 head_cfg = load_flat_config(os.path.join(ROOT, "configs", name + ".yaml"))
                 head_cfg.update(root=str(root), base_checkpoint=str(base_dir / "best_val_iou_seed37.pt"),
                                 save_root=str(root / name), epochs=2, streams=2, tbptt_k=4, eval_chunk=4,
