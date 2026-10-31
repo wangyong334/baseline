@@ -646,6 +646,7 @@ class DeferTests(unittest.TestCase):
         head = defer_head(defer_revision="evidence")
         with torch.no_grad():
             head.kappa_raw.copy_(torch.log(torch.expm1(torch.tensor([0.5, 1.0, 2.0]))))   # kappa = 0.5 / 1 / 2
+            head.orphan_ref.fill_(-1.0)                                    # 新生目标的先验对数几率 l0 = -1
         st = single_track_state(head, [(20.0, 16.0)], [(0.0, 0.0)], ex=0.9)
         L_now = float(_logit(st["ex"])[0, 0])
         n = 6
@@ -666,12 +667,14 @@ class DeferTests(unittest.TestCase):
         self.assertEqual(float(d[2]), 0.0)                                  # 不属于目标（m = 0）：不修正
         self.assertEqual(float(d[3]), 0.0)                                  # 丢失：不知道原目标的结局，不修正
         self.assertAlmostEqual(float(d[5]), 0.6 * 0.5 * -3.0, places=5)     # 证据变少：往下修
-        # 孤儿：参照取 0（事件发生时还没有目标），归属在回推的位置上重算（S = P00 + cell^2 + lag^2 P11），与存的 L_then 无关
+        # 孤儿：参照为新生目标的先验 l0（事件发生时还没有目标，加"后验 - 先验"），归属在回推的位置上重算
+        # （S = P00 + cell^2 + lag^2 P11），与存的 L_then 无关
         m = torch.sigmoid(head._membership_logit(torch.zeros(1), torch.tensor([1.0 + 16.0 + 4.0]), torch.zeros(1)))
-        self.assertAlmostEqual(float(d[4]), float(m) * 2.0 * L_now, places=4)
+        self.assertAlmostEqual(float(d[4]), float(m) * 2.0 * (L_now + 1.0), places=4)
         out.sum().backward()
         self.assertIsNone(exl.grad)                                         # 存在只由自己的校准监督训练
         self.assertGreater(float(head.kappa_raw.grad.abs().sum()), 0.0)
+        self.assertGreater(float(head.orphan_ref.grad.abs()), 0.0)          # l0 只从孤儿事件拿梯度
 
     def test_evidence_revision_in_stream(self):
         head = neutral_birth(defer_head(defer_revision="evidence", provisional_gate=True))
@@ -868,8 +871,9 @@ class EndToEndTests(unittest.TestCase):
                     self.assertTrue((root / name / ("existence_temperature_best_val_iou_seed%d.json" % seed)).exists())
                 if name == "track_head_v4e":                           # 证据修正：三个系数随结果存盘（论文里报）
                     self.assertEqual(result["defer_revision"], "evidence")
-                    self.assertEqual(len(result["kappa"]), 3)
-                    self.assertTrue(all(k > 0.0 for k in result["kappa"]))
+                    self.assertEqual(len(result["evidence"]["kappa"]), 3)
+                    self.assertTrue(all(k > 0.0 for k in result["evidence"]["kappa"]))
+                    self.assertTrue(np.isfinite(result["evidence"]["orphan_ref"]))
                 if name.startswith("track_head_v4"):                   # 延迟决策的统计：比例、平均等待、终判状态
                     hs = result["head_stats"]
                     self.assertTrue(0.0 <= hs["deferred_frac"] <= 1.0)

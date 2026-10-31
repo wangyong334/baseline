@@ -25,7 +25,8 @@
     9. 目标停时判决（defer_max > 0，v4 系列；existence = ipda）：每个事件即时给暂定输出；所属目标的状态还没被证据确定
               （存在未定 / 那一窗缺量测 / 事件发生时目标还没出生、之后被新生目标回溯认领）的事件挂起，
               目标的存在对数几率 L 越过 +-A（A = log((1 - alpha) / alpha)）、缺口后重新捕获、丢失或等满 defer_max 窗时终判。
-              证据修正（defer_revision = evidence，v4e）：z_final = z_now + m x kappa[原因] x (L(终判) - L(事件那一窗))，
+              证据修正（defer_revision = evidence，v4e）：z_final = z_now + m x kappa[原因] x (L(终判) - L_ref)，
+              L_ref = 事件那一窗的 L（暂定输出已用过的证据）；孤儿事件当时没有目标，L_ref = 学出的新生目标先验对数几率 l0。
               m 为校准的归属概率：目标在等待期间新增的存在证据按归属分给事件，证据不变则不修正，不属于目标的事件不被修正
 context = "none" 是对照组：航迹照常运行，但修正项看不到航迹（检验增益来自航迹，而不是"再训一个读出头"）。
 训练监督（标签里的 target_id）：逐窗把航迹与标注目标一一匹配（距离 <= max(match_min_px, 2.5 x 目标扩散)），
@@ -170,9 +171,11 @@ class TrackHead(nn.Module):
                 if self.defer_revision == "gated":
                     self.corr_rev = _zero_last(_mlp(REV_DIM, int(corr_hidden), 1))
                 else:
-                    # 证据修正（v4e）：修正量 = 归属概率 x kappa[等待原因] x 等待期间目标存在对数几率的增量。
-                    # 只学 3 个非负系数（softplus，初始 1）：证据不变就不修正，不属于目标的事件不被修正
+                    # 证据修正（v4e）：修正量 = 归属概率 x kappa[等待原因] x 暂定输出之后目标新增的存在证据。
+                    # 学 3 个非负系数（softplus，初始 1；理论值：存在后验校准时为 1）和孤儿的参照 l0
+                    # （新生目标真实存在的先验对数几率，初始 0）：证据不变就不修正，不属于目标的事件不被修正
                     self.kappa_raw = nn.Parameter(torch.full((3,), math.log(math.e - 1.0)))
+                    self.orphan_ref = nn.Parameter(torch.zeros(()))
             else:
                 self.corr_final = _zero_last(_mlp(base_in + FIN_DIM, int(corr_hidden), 1))
         self.has_delayed = bool(self.decision_lag or self.defer_max)
@@ -694,13 +697,15 @@ class TrackHead(nn.Module):
             m = torch.sigmoid(self._membership_logit(d2g, S_s, r["lc"])).detach()
             m = torch.where(lost & orphan[:, 0], torch.zeros_like(m), m)
             if self.defer_revision == "evidence":
-                # 证据修正（v4e）：z_final = z_now + m x kappa[原因] x (L(终判) - L_ref)。
-                # L_ref：原因 0 / 1 取事件那一窗的存在对数几率（暂定输出已经用过这份证据）；孤儿（原因 2）当时还没有目标，取 0。
+                # 证据修正（v4e）：z_final = z_now + m x kappa[原因] x (L(终判) - L_ref)，只加暂定输出没见过的那部分证据。
+                # L_ref：原因 0 / 1 取事件那一窗的存在对数几率（暂定输出已经用过）；孤儿（原因 2）事件发生时还没有目标，
+                # 暂定输出没用过这个目标的任何证据，按贝叶斯组合应加"后验 - 先验"：L_ref = l0（新生目标的先验对数几率，学出来）。
                 # 归属：原因 0 用事件那一窗的值（与暂定门控是同一个）；缺口 / 孤儿用插值 / 回推后的位置重算（上面的 m）。
                 # 丢失（槽位已换成别的目标）不知道原目标的结局：增量记 0。存在与归属只由各自的校准监督训练（detach）
-                m_ev = torch.where(r["reason"] == 0, r["m_then"], m)
-                ref = torch.where(r["reason"] == 2, torch.zeros_like(lagf), r["L_then"].to(dtype))
-                gain = torch.where(lost, torch.zeros_like(lagf), (L_now - ref).detach())
+                m_ev = torch.where(r["reason"] == 0, r["m_then"], m).detach()
+                ref = torch.where(r["reason"] == 2, self.orphan_ref.to(dtype).expand_as(lagf),
+                                  r["L_then"].to(dtype).detach())
+                gain = torch.where(lost, torch.zeros_like(lagf), L_now.detach() - ref)
                 return r["znow"] + m_ev * F.softplus(self.kappa_raw)[r["reason"]] * gain
             rev = torch.cat([F.one_hot(status, 5).to(dtype), F.one_hot(r["reason"], 3).to(dtype),
                              (L_now / 3.0).clamp(-2.0, 2.0)[:, None], (r["L_then"] / 3.0).clamp(-2.0, 2.0)[:, None],
