@@ -39,7 +39,7 @@ import error_budget  # noqa: E402
 
 HEAD_KEYS = ("cell", "slots", "hidden", "history", "gate_sigma", "gate_max_px", "gate_floor", "birth_floor",
              "max_births", "death_exist", "max_coast", "match_min_px", "corr_hidden", "r_min", "recycle_exist",
-             "decision_lag", "context", "existence")
+             "decision_lag", "context", "existence", "defer_max", "defer_alpha")
 
 
 # ---------------------------------------------------------------------------
@@ -187,7 +187,7 @@ def train_epoch(outputs, head, lengths, optimizer, cfg, pos_weight, device, rng,
     lam_e, lam_p, clip = float(cfg["lambda_exist"]), float(cfg["lambda_pos"]), float(cfg["grad_clip"])
     lam_d, lam_o = float(cfg.get("lambda_pd", 1.0)), float(cfg.get("lambda_origin", 1.0))   # 只在 existence = ipda 时有项
     w_now, w_lag = float(cfg.get("now_loss_weight", 1.0)), float(cfg.get("lag_loss_weight", 1.0))
-    lag = int(cfg.get("decision_lag", 0)) == 1
+    lag = head.has_delayed                                              # 一窗滞后或目标级延迟决策：都有终判输出
     sums = {"event": 0.0, "events": 0, "lag": 0.0, "lag_n": 0, "exist": 0.0, "exist_n": 0, "pos": 0.0, "pos_n": 0,
             "pd": 0.0, "pd_n": 0, "org": 0.0, "org_n": 0,
             "updates": 0, "births": 0, "recycled": 0, "live": 0, "slot_windows": 0}
@@ -264,13 +264,14 @@ def run_split(outputs, head, base, device, split, full=False, dump_dir=None, tra
     dataset = outputs.dataset
     thr = float(base["threshold"])
     chunk = int(base.get("eval_chunk", 32))
-    lag = head.decision_lag == 1
+    lag = head.has_delayed
     kinds = ("base", "track", "track_now") if lag else ("base", "track")
     counts = {kind: np.zeros(3, dtype=np.int64) for kind in kinds}                   # TP, FP, FN
     rocs = {kind: FastRoc(base["pd_detT"], base["correct_thresh"], base["height"], base["width_px"])
             for kind in kinds} if full else None
     rows = {kind: [] for kind in kinds}
     stats = {"births": 0, "recycled": 0, "live": 0, "slot_windows": 0}
+    delays, dstat, n_events, n_target, t_delays = [], np.zeros(5, dtype=np.int64), 0, 0, []
     was_training = head.training
     head.eval()
     with torch.no_grad():
@@ -295,6 +296,12 @@ def run_split(outputs, head, base, device, split, full=False, dump_dir=None, tra
                 if lag and aux["delayed_z"] is not None:
                     lag_key.append(aux["delayed_key"].cpu().numpy().astype(np.int64))
                     lag_prob.append(torch.sigmoid(aux["delayed_z"]).float().cpu().numpy())
+                    if aux.get("delayed_lag") is not None:
+                        lk = lag_key[-1]
+                        lw = aux["delayed_lag"].cpu().numpy().astype(np.int64)
+                        delays.append(lw)
+                        t_delays.append(lw[seq.label[lk] > 0.5])
+                        dstat += np.bincount(aux["delayed_status"].cpu().numpy().astype(np.int64), minlength=5)
             probs = {"base": refill_by_index(seq.n_events, idx_parts, p0_parts),
                      "track": refill_by_index(seq.n_events, idx_parts, p1_parts)}
             if lag:
@@ -302,6 +309,8 @@ def run_split(outputs, head, base, device, split, full=False, dump_dir=None, tra
                 if lag_key:                                   # 最后一窗没有下一窗：保留零等待输出
                     probs["track"][np.concatenate(lag_key)] = np.concatenate(lag_prob)
             pos = seq.label > 0.5
+            n_events += int(seq.n_events)
+            n_target += int(pos.sum())
             for kind in kinds:
                 prob = probs[kind]
                 cached = cache is not None and kind == "base" and seq.name in cache
@@ -339,6 +348,15 @@ def run_split(outputs, head, base, device, split, full=False, dump_dir=None, tra
            "head_stats": {"births_per_window": stats["births"] / windows,
                           "recycled_per_window": stats["recycled"] / windows,
                           "live_per_window": stats["live"] / windows}}
+    if head.defer_max:
+        dl = np.concatenate(delays) if delays else np.zeros(0, dtype=np.int64)
+        tl = np.concatenate(t_delays) if t_delays else np.zeros(0, dtype=np.int64)
+        out["head_stats"].update(
+            deferred_frac=float(dl.size) / max(n_events, 1), target_deferred_frac=float(tl.size) / max(n_target, 1),
+            mean_delay_windows=float(dl.sum()) / max(n_events, 1),
+            target_mean_delay_windows=float(tl.sum()) / max(n_target, 1),
+            deferred_p95_windows=float(np.percentile(dl, 95)) if dl.size else 0.0,
+            status={name: int(c) for name, c in zip(("confirmed", "rejected", "reacquired", "lost", "forced"), dstat)})
     for kind, (tp, fp, fn) in counts.items():
         res = {"iou": tp / max(tp + fp + fn, 1), "acc": tp / max(tp + fn, 1), "tp": int(tp), "fp": int(fp),
                "fn": int(fn)}
@@ -422,6 +440,10 @@ def mode_train(args, cfg):
         torch.save(dict(state, best_val_iou=best), str(root / "last.pt"))
         b, t = val["base"], val["track"]
         now = (" | 零等待 IoU %.4f" % val["track_now"]["iou"]) if "track_now" in val else ""
+        hs = val["head_stats"]
+        if "deferred_frac" in hs:                                     # 延迟决策：多少事件延后终判、目标事件平均等几窗
+            now += " | 延后终判 %.2f%%（目标事件 %.1f%%，平均 %.3f 窗）" % (
+                100.0 * hs["deferred_frac"], 100.0 * hs["target_deferred_frac"], hs["target_mean_delay_windows"])
         calib = "" if out["pd_loss"] is None else " 检测 %.4f 来源 %.4f" % (out["pd_loss"], out["origin_loss"] or 0.0)
         print("epoch %d lr %.2e | 损失 事件 %.4f%s 存在 %.4f 位置 %.4f%s | val IoU base %.4f -> track %.4f%s | "
               "拖尾误报 %d -> %d 断续漏检 %d -> %d 目标附近误报 %d -> %d | 每窗 航迹 %.2f 出生 %.3f 回收 %.4f | "
@@ -449,7 +471,8 @@ def mode_eval(args, cfg):
     result = run_split(outputs, head, base, device, args.split, full=True, dump_dir=args.dump_dir,
                        tracks_dir=args.tracks_dir)
     result.update(checkpoint=args.checkpoint, epoch=ckpt.get("epoch"), base_checkpoint=cfg["base_checkpoint"],
-                  gate=gate_check(result, cfg), context=head.context, decision_lag=head.decision_lag)
+                  gate=gate_check(result, cfg), context=head.context, decision_lag=head.decision_lag,
+                  defer_max=head.defer_max, defer_alpha=cfg.get("defer_alpha"))
     name = Path(args.checkpoint).stem
     path = Path(args.checkpoint).parent / ("eval_%s_%s.json" % (args.split, name))
     T.write_json(path, result)

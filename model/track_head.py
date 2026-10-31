@@ -43,6 +43,31 @@ PEND_KEYS = ("b", "x", "y", "p", "t_local", "z0", "feat", "ctx", "key")
 CONTEXTS = ("track", "none")
 EXISTENCE = ("gru", "ipda")
 CTX_DIM, LAG_DIM = 11, 7
+# Object-level deferred decision (defer_max > 0): entries of events whose object state at their own window is not yet
+# settled by evidence. Status at release: 0 confirmed, 1 rejected, 2 reacquired, 3 lost, 4 forced (deadline).
+# Reason for waiting: 0 existence undecided, 1 object coasting (no reliable measurement), 2 orphan claimed by a newborn.
+DEFER_KEYS = ("b", "x", "y", "p", "t_local", "z0", "feat", "ctx", "key", "znow", "lc", "lag", "slot", "age_off",
+              "reason", "L_then", "m_then", "beta_then", "fx", "fy", "miss_then")
+DEFER_LONG = ("b", "x", "y", "lag", "slot", "age_off", "reason")
+FIN_DIM = 15
+STATUS_NAMES = ("confirmed", "rejected", "reacquired", "lost", "forced")
+
+
+def _q_cat(a, b):
+    if a is None or int(a["b"].shape[0]) == 0:
+        return b
+    if b is None or int(b["b"].shape[0]) == 0:
+        return a
+    return {k: torch.cat([a[k], b[k]]) for k in a}
+
+
+def _q_take(q, mask):
+    return None if q is None else {k: v[mask] for k, v in q.items()}
+
+
+def _logit(p):
+    p = p.clamp(1e-6, 1.0 - 1e-6)
+    return torch.log(p) - torch.log1p(-p)
 
 
 def _mlp(inp, hidden, out):
@@ -65,7 +90,7 @@ class TrackHead(nn.Module):
     def __init__(self, feat_dim, height, width, cell=4, slots=10, hidden=32, history=21, gate_sigma=3.0,
                  gate_max_px=24.0, gate_floor=0.5, birth_floor=1.0, max_births=4, death_exist=0.02,
                  max_coast=20, match_min_px=8.0, corr_hidden=32, r_min=0.25, recycle_exist=0.5,
-                 decision_lag=0, context="track", existence="gru"):
+                 decision_lag=0, context="track", existence="gru", defer_max=0, defer_alpha=0.05):
         super(TrackHead, self).__init__()
         if context not in CONTEXTS:
             raise ValueError("context 必须是 %s 之一" % (CONTEXTS,))
@@ -109,6 +134,20 @@ class TrackHead(nn.Module):
         self.corr = _zero_last(_mlp(base_in, int(corr_hidden), 1))
         if self.decision_lag:
             self.corr_lag = _zero_last(_mlp(base_in + LAG_DIM, int(corr_hidden), 1))
+        # 目标级延迟决策：等待单位是目标；判决依据是校准的存在后验越过 +-A（A = log((1 - alpha) / alpha)，
+        # alpha = 0 表示 A = 无穷，即所有挂起事件都等满 defer_max 窗，作固定等待的对照）
+        self.defer_max = int(defer_max)
+        if self.defer_max:
+            if self.existence != "ipda":
+                raise ValueError("延迟决策需要 existence = ipda（判决依据是校准的存在后验）")
+            if self.decision_lag:
+                raise ValueError("defer_max 与 decision_lag 只能选一个")
+            alpha = float(defer_alpha)
+            if not 0.0 <= alpha < 0.5:
+                raise ValueError("defer_alpha 必须在 [0, 0.5) 内")
+            self.defer_A = math.log((1.0 - alpha) / alpha) if alpha > 0 else float("inf")
+            self.corr_final = _zero_last(_mlp(base_in + FIN_DIM, int(corr_hidden), 1))
+        self.has_delayed = bool(self.decision_lag or self.defer_max)
         gy = torch.arange(self.gh, dtype=torch.float32).repeat_interleave(self.gw)
         gx = torch.arange(self.gw, dtype=torch.float32).repeat(self.gh)
         half = (self.cell - 1) / 2.0
@@ -123,7 +162,7 @@ class TrackHead(nn.Module):
         return {"active": flag(B, N), "pos": zeros(B, N, 2), "vel": zeros(B, N, 2), "P": zeros(B, N, 2, 2),
                 "h": zeros(B, N, D), "ex": zeros(B, N), "pd": zeros(B, N), "beta": zeros(B, N), "age": zeros(B, N),
                 "miss": zeros(B, N), "has": flag(B, N),
-                "hist": zeros(B, N, H, 2), "hist_ok": flag(B, N, H), "pending": None}
+                "hist": zeros(B, N, H, 2), "hist_ok": flag(B, N, H), "pending": None, "defer": None, "orphan": None}
 
     @staticmethod
     def detach_state(state):
@@ -131,8 +170,10 @@ class TrackHead(nn.Module):
             return None
         out = {}
         for key, value in state.items():
-            if key == "pending":
-                out[key] = None if value is None else {k: v.detach() for k, v in value.items()}
+            if value is None:
+                out[key] = None
+            elif isinstance(value, dict):
+                out[key] = {k: v.detach() for k, v in value.items()}
             else:
                 out[key] = value.detach()
         return out
@@ -145,11 +186,9 @@ class TrackHead(nn.Module):
             value = state[key]
             view = mask.view((-1,) + (1,) * (value.dim() - 1))
             out[key] = torch.where(view, torch.zeros_like(value), value)
-        pend = state.get("pending")
-        if pend is not None:
-            keep = ~mask[pend["b"]]
-            pend = {k: v[keep] for k, v in pend.items()}
-        out["pending"] = pend
+        for key in ("pending", "defer", "orphan"):                    # 新录像开始：该流待判的事件保留暂定输出
+            q = state.get(key)
+            out[key] = None if q is None else {k: v[~mask[q["b"]]] for k, v in q.items()}
         return out
 
     # ------------------------------------------------------------------ 量测
@@ -197,6 +236,12 @@ class TrackHead(nn.Module):
         """
         if reset_mask is not None:
             state = self._reset(state, reset_mask)
+        defer_q, orphan_q = state.get("defer"), state.get("orphan")
+        if self.defer_max:                                             # 上一窗以前的条目各多等了一窗
+            if defer_q is not None:
+                defer_q = dict(defer_q, lag=defer_q["lag"] + 1)
+            if orphan_q is not None:
+                orphan_q = _q_take(dict(orphan_q, lag=orphan_q["lag"] + 1), orphan_q["lag"] + 1 < self.defer_max)
         act = state["active"]
         B, N = act.shape
         dev, cell = act.device, float(self.cell)
@@ -387,6 +432,9 @@ class TrackHead(nn.Module):
             info["delayed"] = self._delayed(pend, act & ~born, pos_prev, P_prev, pos_pred, vel_pred, Ppred,
                                             pos, vel, ex, has, sums)
 
+        # 延迟决策的释放读消亡清零之前的状态：因存在概率塌掉而删除的航迹算"否定"，不算"丢失"
+        pre = {"active": live, "pos": pos, "vel": vel, "P": P, "ex": ex, "beta": beta, "age": age, "miss": miss} \
+            if self.defer_max else None
         av, am = alive[..., None], alive[..., None, None]
         pos, vel = torch.where(av, pos, torch.zeros_like(pos)), torch.where(av, vel, torch.zeros_like(vel))
         P, h = torch.where(am, P, torch.zeros_like(P)), torch.where(av, h, torch.zeros_like(h))
@@ -397,17 +445,25 @@ class TrackHead(nn.Module):
         hist = torch.cat([pos[:, :, None], hist[:, :, :-1]], 2)
         hist_ok = torch.cat([alive[:, :, None], hist_ok[:, :, :-1]], 2) & alive[..., None]
         new_state = {"active": alive, "pos": pos, "vel": vel, "P": P, "h": h, "ex": ex, "pd": pd_now, "beta": beta,
-                     "age": age, "miss": miss, "has": has & alive, "hist": hist, "hist_ok": hist_ok, "pending": None}
+                     "age": age, "miss": miss, "has": has & alive, "hist": hist, "hist_ok": hist_ok, "pending": None,
+                     "defer": None, "orphan": None}
 
         # 9. 本窗事件的零等待修正
         if clutter is not None:
             ev = dict(ev, clutter=clutter[ev["b"], self._cells(ev["x"], ev["y"])])        # 事件所在处的杂波量
+        assoc = None
         if int(z0.shape[0]):
-            ctx = self._context(ev, new_state)
+            ctx, assoc = self._context(ev, new_state, with_assoc=True)
             z = self._fuse(self.corr, z0, feat, ev, ctx)
         else:
             ctx = z0.new_zeros((0, CTX_DIM))
             z = z0
+        if self.defer_max:                                             # 10. 目标级延迟决策
+            out = self._defer_step(defer_q, orphan_q, pre, new_state, born & alive, ev, z, ctx, assoc)
+            new_state["defer"], new_state["orphan"] = out[0], out[1]
+            if out[2] is not None:
+                info["delayed"] = (out[2], out[3])
+                info["delayed_lag"], info["delayed_status"] = out[4], out[5]
         if self.decision_lag:
             key = ev["key"] if "key" in ev else torch.zeros_like(z0)
             new_state["pending"] = {"b": ev["b"], "x": ev["x"], "y": ev["y"], "p": ev["p"], "t_local": ev["t_local"],
@@ -436,8 +492,8 @@ class TrackHead(nn.Module):
         cross = torch.where(none, torch.ones_like(cross), cross)
         return j, rows, none, along, cross
 
-    def _context(self, ev, st):
-        """本窗事件与航迹的关系 [Ne, CTX_DIM]（距离按 8 格归一并截到 1）：
+    def _context(self, ev, st, with_assoc=False):
+        """本窗事件与航迹的关系 [Ne, CTX_DIM]（距离按 8 格归一并截到 1；with_assoc 时另返回最近航迹的归属信息）：
         0 无航迹权重 1 加权存在 2 加权归一化距离 3 加权速度 4 到最近航迹当前位置的距离 5 到近期轨迹（2～20 窗前）的距离
         6 本流活航迹数占比 7 沿迹坐标（负 = 在航迹身后） 8 横迹距离 9 最近航迹本窗有无量测 10 最近航迹年龄。"""
         N, cell = self.slots, float(self.cell)
@@ -474,7 +530,110 @@ class TrackHead(nn.Module):
                            (wt * speed.clamp(max=4.0) / 4.0).sum(1), (dcur / scale).clamp(max=1.0),
                            (tail / scale).clamp(max=1.0), act_e.to(dtype).sum(1) / float(N), along, cross,
                            has_j, age_j], 1)
-        return torch.zeros_like(ctx) if self.context == "none" else ctx
+        if self.context == "none":
+            ctx = torch.zeros_like(ctx)
+        if not with_assoc:
+            return ctx
+        spred_j = st["P"][eb][rows, j][:, 0, 0] + cell * cell
+        lc = torch.log1p(ev["clutter"].to(dtype)) if "clutter" in ev else torch.zeros_like(along)
+        return ctx, {"j": j, "none": none, "d2": delta2[rows, j], "spred": spred_j, "lc": lc}
+
+    # ------------------------------------------------------------------ 目标级延迟决策
+    def _defer_step(self, dq, oq, pre, st, newborn, ev, znow, ctx, assoc):
+        """一窗的延迟决策。返回 (挂起队列, 孤儿队列, 终判 logit, key, 等待窗数, 状态码)；没有终判时后四项为 None。
+
+        pre：本窗消亡清零之前的航迹状态（释放用）；st：本窗结束时的航迹状态（认领、分类用）。
+        1. 释放：挂起条目所属目标越过 +-A（确认 / 否定）、缺口后重新捕获、丢失（槽位换成新目标或已不在）或等满 defer_max 窗；
+        2. 回溯认领：本窗新生的目标认领前几窗附近的孤儿事件（第一拍：事件发生时目标还没有出生）；
+        3. 本窗事件分类：落在某目标验证门内、且该目标存在未定或本窗没有可靠量测的挂起；不在任何目标门内的进孤儿队列。
+        """
+        A, D, cell = self.defer_A, self.defer_max, float(self.cell)
+        dtype = znow.dtype
+        exl = _logit(st["ex"])
+        outs = [None, None, None, None]
+        if dq is not None and int(dq["b"].shape[0]):
+            b, j = dq["b"], dq["slot"]
+            same = pre["active"][b, j] & (pre["age"][b, j].long() + dq["age_off"] == dq["lag"])
+            L, beta = _logit(pre["ex"])[b, j], pre["beta"][b, j]
+            coast = dq["reason"] == 1
+            settled = [same & (L >= A) & ~coast, same & (L <= -A), same & coast & (L >= A) & (beta >= 0.5), ~same]
+            status = torch.full_like(b, -1)
+            for code in (3, 2, 1, 0):                                  # 丢失优先，其次重新捕获、否定、确认
+                status = torch.where(settled[code] & (status < 0), torch.full_like(status, code), status)
+            status = torch.where((status < 0) & (dq["lag"] >= D), torch.full_like(status, 4), status)
+            rel = status >= 0
+            if bool(rel.any()):
+                r = _q_take(dq, rel)
+                outs = [self._final(r, status[rel], pre, _logit(pre["ex"])), r["key"], r["lag"], status[rel]]
+            dq = _q_take(dq, ~rel)
+        if oq is not None and int(oq["b"].shape[0]) and bool(newborn.any()):
+            nb_b, nb_j = torch.nonzero(newborn, as_tuple=True)
+            pos_nb = st["pos"][nb_b, nb_j]
+            var_nb = st["P"][nb_b, nb_j][:, 0, 0] + cell * cell
+            lag = oq["lag"].to(dtype)
+            oxy = torch.stack([oq["x"], oq["y"]], 1).to(dtype)
+            d2 = ((oxy[:, None] - pos_nb[None]) ** 2).sum(-1) / (var_nb[None] + torch.exp(self.log_v0).detach()
+                                                                  * lag[:, None] ** 2)
+            d2 = torch.where(oq["b"][:, None] == nb_b[None], d2, torch.full_like(d2, BIG))
+            best, idx = d2.min(1)
+            claim = best <= self.gate_sigma ** 2
+            if bool(claim.any()):
+                c = _q_take(oq, claim)
+                ci = idx[claim]
+                cb, cj = nb_b[ci], nb_j[ci]
+                zf = torch.zeros_like(c["znow"])
+                c.update(slot=cj, age_off=c["lag"].clone(), reason=torch.full_like(c["lag"], 2), L_then=exl[cb, cj],
+                         m_then=zf, beta_then=zf, fx=zf, fy=zf, miss_then=zf)
+                dq = _q_cat(dq, c)
+                oq = _q_take(oq, ~claim)
+        if int(znow.shape[0]):
+            b, j = ev["b"], assoc["j"]
+            L, ones = exl[b, j], torch.ones_like(znow)
+            meas = torch.where(newborn[b, j], ones, st["beta"][b, j])           # 新生航迹由本窗的量测出生
+            gated = ~assoc["none"] & (assoc["d2"] <= self.gate_sigma ** 2)
+            pend = gated & ((L.abs() < A) | ((meas < 0.5) & (L > -A)))
+            none_e = self.none_logit.detach() + assoc["lc"]
+            m_then = torch.sigmoid(-0.5 * assoc["d2"] - torch.log(assoc["spred"]) - none_e)   # 假如目标存在、事件属于它
+            base = {"b": b, "x": ev["x"], "y": ev["y"], "p": ev["p"].to(dtype), "t_local": ev["t_local"].to(dtype),
+                    "z0": ev["z0"], "feat": ev["feat"], "ctx": ctx, "key": ev["key"].to(dtype), "znow": znow,
+                    "lc": assoc["lc"], "lag": torch.zeros_like(b)}
+            pos_j = st["pos"][b, j]
+            full = dict(base, slot=j, age_off=-st["age"][b, j].long(), reason=(meas < 0.5).long(), L_then=L,
+                        m_then=m_then, beta_then=meas, fx=pos_j[:, 0], fy=pos_j[:, 1], miss_then=st["miss"][b, j])
+            if bool(pend.any()):
+                dq = _q_cat(dq, _q_take(full, pend))
+            orphan = ~gated
+            if bool(orphan.any()):
+                oq = _q_cat(oq, _q_take(full, orphan))
+        return (dq, oq) + tuple(outs)
+
+    def _final(self, r, status, st, exl):
+        """挂起事件的终判：暂定 logit + 修正（读目标此刻的状态、事件当时的条件归属、平滑后的位置）。"""
+        cell, dtype = float(self.cell), r["znow"].dtype
+        b, j = r["b"], r["slot"]
+        lost = status == 3
+        lagf = r["lag"].to(dtype)
+        pos, vel = st["pos"][b, j], st["vel"][b, j]
+        spred = torch.where(lost, torch.full_like(lagf, 4.0 * cell * cell), st["P"][b, j][:, 0, 0] + cell * cell)
+        fwd = torch.stack([r["fx"], r["fy"]], 1)
+        back = pos - vel * lagf[:, None]                               # 用目标此刻的状态回推到事件那一窗
+        w_b = (r["miss_then"] / (r["miss_then"] + lagf).clamp(min=1.0))[:, None]   # 缺口：前后两次检测之间插值
+        coast = (r["reason"] == 1)[:, None]
+        orphan = (r["reason"] == 2)[:, None]
+        xs = torch.where(orphan, back, torch.where(coast, (1.0 - w_b) * fwd + w_b * back, fwd))
+        xs = torch.where(lost[:, None] & ~orphan, fwd, xs)
+        exy = torch.stack([r["x"], r["y"]], 1).to(dtype)
+        d2s = ((exy - xs) ** 2).sum(1) / spred
+        m_s = torch.sigmoid(-0.5 * d2s - torch.log(spred) - (self.none_logit + r["lc"]))
+        m_s = torch.where(lost & orphan[:, 0], torch.zeros_like(m_s), m_s)
+        L_now = torch.where(lost, torch.zeros_like(lagf), exl[b, j])
+        fin = torch.cat([F.one_hot(status, 5).to(dtype), F.one_hot(r["reason"], 3).to(dtype),
+                         (L_now / 3.0).clamp(-2.0, 2.0)[:, None], (r["L_then"] / 3.0).clamp(-2.0, 2.0)[:, None],
+                         (lagf / float(self.defer_max))[:, None], r["m_then"][:, None], m_s[:, None],
+                         (torch.sqrt(d2s + 1e-6) / 3.0).clamp(max=1.0)[:, None], r["beta_then"][:, None]], 1)
+        parts = [r["z0"].clamp(-15.0, 15.0)[:, None] / 5.0, r["feat"], r["p"][:, None], r["t_local"][:, None],
+                 r["ctx"], fin]
+        return r["znow"] + self.corr_final(torch.cat(parts, 1)).squeeze(-1)
 
     def _delayed(self, pend, valid, pos_prev, P_prev, pos_pred, vel_pred, Ppred, pos_post, vel_post, ex, has, sums):
         """一窗固定滞后：RTS 平滑出第 k-1 窗的航迹位置，再重判第 k-1 窗的事件。valid [B, N]：第 k-1 窗就在、本窗没有重生的槽。"""
@@ -516,12 +675,12 @@ class TrackHead(nn.Module):
         aux = {"exist_sum": z0.new_zeros(()), "exist_n": 0, "pos_sum": z0.new_zeros(()), "pos_n": 0,
                "pd_sum": z0.new_zeros(()), "pd_n": 0, "org_sum": z0.new_zeros(()), "org_n": 0,
                "births": 0, "recycled": 0, "live": 0, "slot_windows": 0}
-        idx_parts, z_parts, dz, dk = [], [], [], []
+        idx_parts, z_parts, dz, dk, dl, ds = [], [], [], [], [], []
         for t in range(int(steps)):
             idx = torch.nonzero(events["t"] == t, as_tuple=False).flatten()
             ev = {key: events[key][idx] for key in ("b", "x", "y", "p", "t_local")}
             ev["z0"], ev["feat"] = z0[idx], feat[idx]
-            if self.decision_lag:
+            if self.has_delayed:
                 ev["key"] = keys[idx] if keys is not None else idx.to(z0.dtype)
             reset = (keep[t] == 0) if keep is not None else None
             z_t, state, info = self.forward_window(state, ev, reset)
@@ -530,6 +689,9 @@ class TrackHead(nn.Module):
             if info["delayed"] is not None:
                 dz.append(info["delayed"][0])
                 dk.append(info["delayed"][1])
+                if "delayed_lag" in info:
+                    dl.append(info["delayed_lag"])
+                    ds.append(info["delayed_status"])
             aux["births"] += info["births"]
             aux["recycled"] += info["recycled"]
             aux["live"] += int(state["active"].sum())
@@ -545,6 +707,8 @@ class TrackHead(nn.Module):
             z = z0
         aux["delayed_z"] = torch.cat(dz) if dz else None
         aux["delayed_key"] = torch.cat(dk) if dk else None
+        aux["delayed_lag"] = torch.cat(dl) if dl else None             # 延迟决策：每个终判事件等了几窗、按什么状态终判
+        aux["delayed_status"] = torch.cat(ds) if ds else None
         return z, state, aux
 
     # ------------------------------------------------------------------ 监督

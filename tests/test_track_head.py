@@ -117,7 +117,7 @@ class IdentityAndChunkTests(unittest.TestCase):
                 z_split, s_split, d_split = run_split_chunks(head, events, z0, feat, 2, [(0, 3), (3, 8), (8, 12)], keys)
             self.assertTrue(torch.equal(z_full, z_split), lag)
             for key in s_full:
-                if key != "pending":
+                if isinstance(s_full[key], torch.Tensor):
                     self.assertTrue(torch.equal(s_full[key], s_split[key]), (lag, key))
             self.assertEqual(d_full, d_split)
 
@@ -348,7 +348,7 @@ class IpdaTests(unittest.TestCase):
                 z_split, s_split, d_split = run_split_chunks(head, events, z0, feat, 2, [(0, 3), (3, 8), (8, 12)], keys)
             self.assertTrue(torch.equal(z_full, z_split), lag)
             for key in s_full:
-                if key != "pending":
+                if isinstance(s_full[key], torch.Tensor):
                     self.assertTrue(torch.equal(s_full[key], s_split[key]), (lag, key))
             self.assertEqual(d_full, d_split)
 
@@ -456,7 +456,137 @@ class IpdaTests(unittest.TestCase):
             self.assertGreater(float(grads[name].abs().sum()), 0.0, name)
 
 
+def defer_head(**kwargs):
+    params = dict(existence="ipda", defer_max=4, defer_alpha=0.05)
+    params.update(kwargs)
+    return make_head(**params)
+
+
+def neutral_birth(head, logit=0.0):
+    with torch.no_grad():                                              # 出生时的存在对数几率固定（场景可控）
+        head.exist.weight.zero_()
+        head.exist.bias.fill_(logit)
+    return head
+
+
+class DeferTests(unittest.TestCase):
+    def run_defer(self, head, events, z0, feat, n, keep=None):
+        keys = torch.arange(z0.shape[0]).float()
+        with torch.no_grad():
+            return head.forward_chunk(events, z0, feat, None, n, keys=keys, keep=keep)
+
+    def test_identity_once_and_bounded(self):
+        for alpha in (0.05, 0.0):
+            head = defer_head(defer_alpha=alpha)
+            events, z0, feat, _, _ = blob_windows(14, noise=15, gaps=(6, 7))
+            z, _, aux = self.run_defer(head, events, z0, feat, 14)
+            self.assertTrue(torch.equal(z, z0))
+            k, lag, st = aux["delayed_key"].long(), aux["delayed_lag"], aux["delayed_status"]
+            self.assertEqual(len(set(k.tolist())), int(k.numel()))        # 每个事件最多终判一次
+            self.assertTrue(torch.equal(aux["delayed_z"], z[k]))            # 初始化时终判 = 暂定
+            self.assertTrue(bool(((lag >= 1) & (lag <= 4)).all()))
+            if alpha == 0.0:                                              # 阈值无穷：只会因丢失或等满而终判
+                self.assertTrue(bool(((st == 3) | (st == 4)).all()))
+                self.assertTrue(bool((lag[st == 4] == 4).all()))
+
+    def test_chunk_split_invariance(self):
+        head = defer_head()
+        randomize(head)
+        with torch.no_grad():
+            for p in head.corr_final.parameters():
+                p.normal_(0.0, 0.3)
+        events, z0, feat, _, _ = blob_windows(14, batch=2, noise=20, gaps=(6, 7))
+        keys = torch.arange(z0.shape[0]).float()
+        with torch.no_grad():
+            z_full, s_full, d_full = run_split_chunks(head, events, z0, feat, 2, [(0, 14)], keys)
+            z_split, s_split, d_split = run_split_chunks(head, events, z0, feat, 2, [(0, 3), (3, 9), (9, 14)], keys)
+        self.assertTrue(torch.equal(z_full, z_split))
+        self.assertEqual(d_full, d_split)
+        self.assertGreater(len(d_full), 0)
+        for name in ("defer", "orphan"):
+            a, b = s_full[name], s_split[name]
+            self.assertEqual(a is None, b is None)
+            for key in (a or {}):
+                self.assertTrue(torch.equal(a[key], b[key]), (name, key))
+
+    def test_onset_events_wait_until_confirmed(self):
+        head = neutral_birth(defer_head())                             # 出生时存在未定（对数几率 0）
+        events, z0, feat, lab, _ = blob_windows(8, noise=10)
+        _, _, aux = self.run_defer(head, events, z0, feat, 8)
+        k, st = aux["delayed_key"].long(), aux["delayed_status"]
+        first = (events["t"][k] == 0) & (lab[k] > 0.5)                 # 出生窗的目标事件
+        self.assertGreater(int(first.sum()), 0)
+        self.assertTrue(bool((st[first] == 0).all()))                  # 等到目标确认才终判
+        self.assertTrue(bool((aux["delayed_lag"][first] < 4).all()))   # 不用等满
+
+    def test_gap_events_wait_until_reacquired(self):
+        head = neutral_birth(defer_head(), 3.0)                        # 出生即接近确认
+        events, z0, feat, lab, _ = blob_windows(12, noise=10)
+        weak = (lab > 0.5) & ((events["t"] == 6) | (events["t"] == 7))
+        z0 = torch.where(weak, torch.full_like(z0, -4.0), z0)          # 缺口：目标在，但骨干几乎没看见
+        _, _, aux = self.run_defer(head, events, z0, feat, 12)
+        k, st = aux["delayed_key"].long(), aux["delayed_status"]
+        gap = weak[k]
+        self.assertEqual(int(gap.sum()), int(weak.sum()))              # 缺口里的目标事件全部挂起
+        self.assertTrue(bool((st[gap] == 2).all()))                    # 目标重新捕获后终判
+
+    def test_orphans_claimed_by_newborn_target(self):
+        head = neutral_birth(defer_head())
+        events, z0, feat, lab, _ = blob_windows(8, noise=10)
+        early = (lab > 0.5) & (events["t"] == 0)
+        z0 = torch.where(early, torch.full_like(z0, -2.0), z0)         # 第一窗太弱：目标还没出生，事件成了孤儿
+        _, _, aux = self.run_defer(head, events, z0, feat, 8)
+        k, st, lag = aux["delayed_key"].long(), aux["delayed_status"], aux["delayed_lag"]
+        e = early[k]
+        self.assertEqual(int(e.sum()), int(early.sum()))               # 下一窗出生的目标回溯认领了它们
+        self.assertTrue(bool((st[e] == 0).all()))
+        self.assertTrue(bool((lag[e] >= 2).all()))
+
+    def test_transient_blob_is_rejected(self):
+        head = neutral_birth(defer_head())
+        events, z0, feat, lab, _ = blob_windows(6, noise=10, keep_out=range(1, 6))   # 只闪一窗的团
+        _, _, aux = self.run_defer(head, events, z0, feat, 6)
+        k, st = aux["delayed_key"].long(), aux["delayed_status"]
+        blob = lab[k] > 0.5
+        self.assertEqual(int(blob.sum()), int((lab > 0.5).sum()))
+        self.assertTrue(bool((st[blob] == 1).all()))                   # 后续没有证据：存在被否定（不是"丢失"）
+
+    def test_reset_drops_entries_of_that_stream(self):
+        head = defer_head(defer_alpha=0.0)                             # 全部等满：重置时一定有挂起的条目
+        events, z0, feat, _, _ = blob_windows(10, batch=2, stream=1, noise=5)
+        keep = torch.ones(10, 2)
+        keep[5, 1] = 0
+        _, _, aux = self.run_defer(head, events, z0, feat, 10, keep=keep)
+        released = set(aux["delayed_key"].long().tolist())
+        waiting = (events["t"] >= 2) & (events["t"] < 5) & (events["b"] == 1)
+        self.assertGreater(int(waiting.sum()), 0)
+        self.assertFalse(any(int(i) in released for i in torch.nonzero(waiting).flatten()))
+
+    def test_final_loss_reaches_final_head(self):
+        head = defer_head()
+        events, z0, feat, lab, tid = blob_windows(10, noise=20, gaps=(5,))
+        _, _, aux = head.forward_chunk(events, z0, feat, None, 10, labels=lab, tid=tid, keys=lab)
+        torch.nn.functional.binary_cross_entropy_with_logits(aux["delayed_z"], aux["delayed_key"]).backward()
+        self.assertGreater(float(head.corr_final[2].weight.grad.abs().sum()), 0.0)
+
+    def test_requires_ipda_and_excludes_lag(self):
+        with self.assertRaises(ValueError):
+            make_head(defer_max=4)
+        with self.assertRaises(ValueError):
+            make_head(existence="ipda", defer_max=4, decision_lag=1)
+
+
 class ConfigTests(unittest.TestCase):
+    def test_v4_variants(self):
+        from utils.stream_common import load_flat_config
+        base = load_flat_config(os.path.join(ROOT, "configs", "track_head_v3.yaml"))
+        for name, alpha in (("track_head_v4", 0.05), ("track_head_v4_fixed", 0.0)):
+            cfg = load_flat_config(os.path.join(ROOT, "configs", name + ".yaml"))
+            self.assertEqual(set(cfg), set(base) | {"defer_max", "defer_alpha"})
+            self.assertEqual({k for k in base if cfg[k] != base[k]}, {"save_root"}, name)
+            self.assertEqual((cfg["defer_max"], cfg["defer_alpha"]), (10, alpha))
+            self.assertEqual(cfg["save_root"], "log/%s_seed37" % name)
+
     def test_v2_variants(self):
         from utils.stream_common import load_flat_config
         base = load_flat_config(os.path.join(ROOT, "configs", "track_head_v2.yaml"))
@@ -526,7 +656,7 @@ class EndToEndTests(unittest.TestCase):
                        segments=[[0, 3], [4, 7], [8, 11]], timing_warmup_windows=1, eval_chunk=4,
                        execution="layer", input_device="gpu", streams=2)
             T.mode_train(SimpleNamespace(device="cpu", mode="train", resume=False), cfg)
-            for name in ("track_head_v2", "track_head_v2_lag1", "track_head_v3"):
+            for name in ("track_head_v2", "track_head_v2_lag1", "track_head_v3", "track_head_v4"):
                 head_cfg = load_flat_config(os.path.join(ROOT, "configs", name + ".yaml"))
                 head_cfg.update(root=str(root), base_checkpoint=str(base_dir / "best_val_iou_seed37.pt"),
                                 save_root=str(root / name), epochs=2, streams=2, tbptt_k=4, eval_chunk=4,
@@ -540,10 +670,15 @@ class EndToEndTests(unittest.TestCase):
                          "--checkpoint", str(ckpt), "--dump-dir", str(root / ("dump_" + name)),
                          "--tracks-dir", str(root / ("tracks_" + name))])
                 result = json.loads((root / name / "eval_test_best_val_iou_seed37.json").read_text(encoding="utf-8"))
-                kinds = ("base", "track", "track_now") if name.endswith("lag1") else ("base", "track")
+                delayed = name.endswith("lag1") or name == "track_head_v4"
+                kinds = ("base", "track", "track_now") if delayed else ("base", "track")
                 for kind in kinds:
                     for key in ("iou", "acc", "pd", "fa"):
                         self.assertTrue(np.isfinite(result[kind][key]), (name, kind, key))
+                if name == "track_head_v4":                            # 延迟决策的统计：比例、平均等待、终判状态
+                    hs = result["head_stats"]
+                    self.assertTrue(0.0 <= hs["deferred_frac"] <= 1.0)
+                    self.assertEqual(set(hs["status"]), {"confirmed", "rejected", "reacquired", "lost", "forced"})
                 self.assertIn("pass", result["gate"])
                 with np.load(str(root / ("dump_" + name) / "seq_7.npz")) as dump:
                     self.assertEqual(dump["probabilities"].shape, dump["base_probabilities"].shape)
