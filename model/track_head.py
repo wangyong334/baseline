@@ -93,7 +93,7 @@ class TrackHead(nn.Module):
                  gate_max_px=24.0, gate_floor=0.5, birth_floor=1.0, max_births=4, death_exist=0.02,
                  max_coast=20, match_min_px=8.0, corr_hidden=32, r_min=0.25, recycle_exist=0.5,
                  decision_lag=0, context="track", existence="gru", defer_max=0, defer_alpha=0.05,
-                 defer_revision="free", pd_max=1.0):
+                 defer_revision="free", pd_max=1.0, provisional_gate=False):
         super(TrackHead, self).__init__()
         if context not in CONTEXTS:
             raise ValueError("context 必须是 %s 之一" % (CONTEXTS,))
@@ -167,6 +167,12 @@ class TrackHead(nn.Module):
                 self.corr_final = _zero_last(_mlp(base_in + FIN_DIM, int(corr_hidden), 1))
         self.has_delayed = bool(self.decision_lag or self.defer_max)
         self.gated = bool(self.defer_max) and self.defer_revision == "gated"
+        # 暂定修正也按"存在 x 归属"分解（v4d）：零等待的修正量 = 事件对最近目标的归属概率 x 修正项；
+        # 没有目标的事件不被修正（判决层只有一条规则：修正来自目标层的证据，按归属分给事件）
+        self.provisional_gate = bool(provisional_gate)
+        if self.provisional_gate and not self.gated:
+            raise ValueError("provisional_gate 需要门控修正（defer_revision = gated）的归属模型")
+        self.collect_calibration = False                              # 评估时收集存在概率的校准样本
         gy = torch.arange(self.gh, dtype=torch.float32).repeat_interleave(self.gw)
         gx = torch.arange(self.gw, dtype=torch.float32).repeat(self.gh)
         half = (self.cell - 1) / 2.0
@@ -478,7 +484,12 @@ class TrackHead(nn.Module):
         assoc = None
         if int(z0.shape[0]):
             ctx, assoc = self._context(ev, new_state, with_assoc=True)
-            z = self._fuse(self.corr, z0, feat, ev, ctx)
+            if self.provisional_gate:
+                m_now = torch.sigmoid(self._membership_logit(assoc["d2"], assoc["spred"], assoc["lc"])).detach()
+                m_now = torch.where(assoc["none"], torch.zeros_like(m_now), m_now)
+                z = z0 + m_now * self._delta(self.corr, z0, feat, ev, ctx)
+            else:
+                z = self._fuse(self.corr, z0, feat, ev, ctx)
         else:
             ctx = z0.new_zeros((0, CTX_DIM))
             z = z0
@@ -496,12 +507,15 @@ class TrackHead(nn.Module):
                                     "z0": z0, "feat": feat, "ctx": ctx, "key": key}
         return z, new_state, info
 
-    def _fuse(self, mlp, z0, feat, ev, ctx, extra=None):
+    def _delta(self, mlp, z0, feat, ev, ctx, extra=None):
         parts = [z0.clamp(-15.0, 15.0)[:, None] / 5.0, feat, ev["p"].to(z0.dtype)[:, None],
                  ev["t_local"].to(z0.dtype)[:, None], ctx]
         if extra is not None:
             parts.append(extra)
-        return z0 + mlp(torch.cat(parts, 1)).squeeze(-1)
+        return mlp(torch.cat(parts, 1)).squeeze(-1)
+
+    def _fuse(self, mlp, z0, feat, ev, ctx, extra=None):
+        return z0 + self._delta(mlp, z0, feat, ev, ctx, extra)
 
     def _nearest(self, exy, pos_e, vel_e, act_e, delta2):
         """最近航迹（按归一化距离）的沿迹 / 横迹坐标与下标；没有航迹的事件沿迹 0、横迹 1。"""
@@ -814,6 +828,8 @@ class TrackHead(nn.Module):
                 aux["mem_sum"] = aux["mem_sum"] + F.binary_cross_entropy_with_logits(
                     logit, (label[near] > 0.5).to(logit.dtype), reduction="sum")
                 aux["mem_n"] += int(near.sum())
+        if self.collect_calibration and bool(live.any()):
+            aux.setdefault("calib", []).append((ex_logit[live].detach(), target[live].detach()))
         if bool(live.any()):
             aux["exist_sum"] = aux["exist_sum"] + F.binary_cross_entropy_with_logits(
                 ex_logit[live], target[live], reduction="sum")

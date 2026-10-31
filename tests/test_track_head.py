@@ -617,6 +617,34 @@ class DeferTests(unittest.TestCase):
             else:
                 self.assertLess(drop, -10.0)                            # 没有上限：一次漏检就塌掉
 
+    def test_gated_provisional_correction(self):
+        head = defer_head(defer_revision="gated", provisional_gate=True)
+        events, z0, feat, lab, tid = blob_windows(8, noise=30)
+        with torch.no_grad():
+            z, _, _ = self.run_defer(head, events, z0, feat, 8)
+        self.assertTrue(torch.equal(z, z0))                            # 初始化时与 z0 逐位相同
+        randomize(head)
+        with torch.no_grad():
+            z_free, _, _ = self.run_defer(defer_head(defer_revision="gated"), events, z0, feat, 8)
+            head_free = defer_head(defer_revision="gated")
+            head_free.load_state_dict(head.state_dict())
+            z_free, _, _ = self.run_defer(head_free, events, z0, feat, 8)
+            z_gate, _, _ = self.run_defer(head, events, z0, feat, 8)
+        ev_n, z0_n, feat_n, _, _ = blob_windows(6, noise=30, keep_out=range(6))   # 只有噪声：整段没有航迹
+        with torch.no_grad():
+            zg_n, st_n, _ = self.run_defer(head, ev_n, z0_n, feat_n, 6)
+            zf_n, _, _ = self.run_defer(head_free, ev_n, z0_n, feat_n, 6)
+        self.assertEqual(int(st_n["active"].sum()), 0)
+        self.assertTrue(torch.equal(zg_n, z0_n))                       # 没有目标：门控版不修正
+        self.assertFalse(torch.equal(zf_n, z0_n))                      # 不门控的版本照样修正
+        far = (lab < 0.5) & (events["t"] > 2)
+        d_gate, d_free = (z_gate - z0)[far].abs(), (z_free - z0)[far].abs()
+        self.assertLess(float(d_gate.mean()), float(d_free.mean()))    # 远离目标的背景事件修正被压住
+
+    def test_provisional_gate_requires_membership_model(self):
+        with self.assertRaises(ValueError):
+            make_head(existence="ipda", defer_max=4, provisional_gate=True)
+
     def test_requires_ipda_and_excludes_lag(self):
         with self.assertRaises(ValueError):
             make_head(defer_max=4)
@@ -643,6 +671,17 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual({k for k in base if cfg[k] != base[k]}, {"save_root"})
         self.assertEqual((cfg["defer_revision"], cfg["lambda_membership"]), ("gated", 1.0))
         self.assertEqual(cfg["save_root"], "log/track_head_v4b_seed37")
+
+    def test_v4d_variants(self):
+        from utils.stream_common import load_flat_config
+        base = load_flat_config(os.path.join(ROOT, "configs", "track_head_v4c.yaml"))
+        for name, alpha in (("track_head_v4d", 0.05), ("track_head_v4d_fixed", 0.0)):
+            cfg = load_flat_config(os.path.join(ROOT, "configs", name + ".yaml"))
+            self.assertEqual(set(cfg), set(base) | {"provisional_gate", "calibrate_existence"})
+            expect = {"save_root"} | ({"defer_alpha"} if alpha == 0.0 else set())
+            self.assertEqual({k for k in base if cfg[k] != base[k]}, expect, name)
+            self.assertEqual((cfg["provisional_gate"], cfg["calibrate_existence"], cfg["defer_alpha"]), (True, True, alpha))
+            self.assertEqual(cfg["save_root"], "log/%s_seed37" % name)
 
     def test_v4c_variant(self):
         from utils.stream_common import load_flat_config
@@ -722,7 +761,7 @@ class EndToEndTests(unittest.TestCase):
                        execution="layer", input_device="gpu", streams=2)
             T.mode_train(SimpleNamespace(device="cpu", mode="train", resume=False), cfg)
             for name in ("track_head_v2", "track_head_v2_lag1", "track_head_v3", "track_head_v4", "track_head_v4b",
-                         "track_head_v4c"):
+                         "track_head_v4c", "track_head_v4d"):
                 head_cfg = load_flat_config(os.path.join(ROOT, "configs", name + ".yaml"))
                 head_cfg.update(root=str(root), base_checkpoint=str(base_dir / "best_val_iou_seed37.pt"),
                                 save_root=str(root / name), epochs=2, streams=2, tbptt_k=4, eval_chunk=4,
@@ -741,6 +780,10 @@ class EndToEndTests(unittest.TestCase):
                 for kind in kinds:
                     for key in ("iou", "acc", "pd", "fa"):
                         self.assertTrue(np.isfinite(result[kind][key]), (name, kind, key))
+                if name == "track_head_v4d":                           # 停止规则的温度校准：在 val 上拟合并存盘
+                    calib = result["existence_calibration"]
+                    self.assertTrue(0.5 <= calib["temperature"] <= 5.0)
+                    self.assertTrue((root / name / "existence_temperature_best_val_iou_seed37.json").exists())
                 if name.startswith("track_head_v4"):                   # 延迟决策的统计：比例、平均等待、终判状态
                     hs = result["head_stats"]
                     self.assertTrue(0.0 <= hs["deferred_frac"] <= 1.0)

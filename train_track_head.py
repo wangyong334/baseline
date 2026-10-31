@@ -40,7 +40,7 @@ import error_budget  # noqa: E402
 HEAD_KEYS = ("cell", "slots", "hidden", "history", "gate_sigma", "gate_max_px", "gate_floor", "birth_floor",
              "max_births", "death_exist", "max_coast", "match_min_px", "corr_hidden", "r_min", "recycle_exist",
              "decision_lag", "context", "existence", "defer_max", "defer_alpha",
-             "defer_revision", "pd_max")
+             "defer_revision", "pd_max", "provisional_gate")
 
 
 # ---------------------------------------------------------------------------
@@ -477,6 +477,44 @@ def mode_train(args, cfg):
     print("TRAINING FINISHED:", root, flush=True)
 
 
+def fit_existence_temperature(cfg, net, tap, base, q99, head, device):
+    """在 val 上拟合存在对数几率的温度 T（Guo 2017 的温度缩放，只有一个参数）：min_T BCE(sigmoid(L / T), y)。
+    y = 该航迹窗是否匹配上标注目标（与训练时的存在监督同一口径）。只用于停止规则：|L| / T >= A 等价于 |L| >= A T。"""
+    dataset = EvUAVStream(base["root"], "val", base)
+    outputs = BaseOutputs(net, tap, base, q99, device, dataset, keep_all=False)
+    chunk = int(base.get("eval_chunk", 32))
+    logits, targets = [], []
+    head.eval()
+    head.collect_calibration = True
+    with torch.no_grad():
+        for i in range(len(dataset)):
+            seq, z0_all, feat_all = outputs.get(i)
+            hstate = head.init_state(1, device)
+            for start in range(0, seq.n_windows, chunk):
+                end = min(start + chunk, seq.n_windows)
+                part, idx = chunk_events(seq, start, end)
+                events, labels, tid = to_device(part, device)
+                index_t = torch.from_numpy(np.asarray(idx, dtype=np.int64))
+                keys = index_t.to(device) if head.has_delayed else None
+                _, hstate, aux = head.forward_chunk(events, z0_all[index_t].to(device), feat_all[index_t].to(device),
+                                                    hstate, end - start, labels=labels, tid=tid, keys=keys)
+                for lg, tg in aux.get("calib", []):
+                    logits.append(lg.float().cpu())
+                    targets.append(tg.float().cpu())
+    head.collect_calibration = False
+    L, y = torch.cat(logits), torch.cat(targets)
+    grid = torch.exp(torch.linspace(math.log(0.5), math.log(5.0), 91))
+    losses = torch.stack([F.binary_cross_entropy_with_logits(L / t, y) for t in grid])
+    best = int(torch.argmin(losses))
+    one = int(torch.argmin(torch.abs(grid - 1.0)))
+    alpha = float(cfg.get("defer_alpha") or 0.05)
+    hi, hi_t = torch.sigmoid(L) >= 1.0 - alpha, torch.sigmoid(L / grid[best]) >= 1.0 - alpha
+    return {"temperature": float(grid[best]), "n": int(y.numel()), "bce_before": float(losses[one]),
+            "bce_after": float(losses[best]),
+            "precision_at_confirm_before": float(y[hi].mean()) if bool(hi.any()) else None,
+            "precision_at_confirm_after": float(y[hi_t].mean()) if bool(hi_t.any()) else None}
+
+
 def mode_eval(args, cfg):
     device = torch.device(args.device)
     T.seed_everything(int(cfg["seed"]), bool(cfg["deterministic"]))
@@ -484,6 +522,18 @@ def mode_eval(args, cfg):
     head = build_head(cfg, net, base, device)
     ckpt = torch.load(args.checkpoint, map_location=device)
     head.load_state_dict(ckpt["head"])
+    calib = None
+    if head.defer_max and cfg.get("calibrate_existence"):
+        # 停止规则用校准过的存在后验（D14）：温度只在 val 上拟合，存一份，test 直接读
+        cpath = Path(args.checkpoint).parent / ("existence_temperature_%s.json" % Path(args.checkpoint).stem)
+        if cpath.exists():
+            calib = json.loads(cpath.read_text(encoding="utf-8"))
+        else:
+            calib = fit_existence_temperature(cfg, net, tap, base, q99, head, device)
+            T.write_json(cpath, calib)
+        if math.isfinite(head.defer_A):
+            head.defer_A = head.defer_A * calib["temperature"]
+        print("存在后验温度校准（val 拟合）：", json.dumps(calib, ensure_ascii=False), flush=True)
     for d in (args.dump_dir, args.tracks_dir):
         if d:
             os.makedirs(d, exist_ok=True)
@@ -492,7 +542,7 @@ def mode_eval(args, cfg):
                        tracks_dir=args.tracks_dir)
     result.update(checkpoint=args.checkpoint, epoch=ckpt.get("epoch"), base_checkpoint=cfg["base_checkpoint"],
                   gate=gate_check(result, cfg), context=head.context, decision_lag=head.decision_lag,
-                  defer_max=head.defer_max, defer_alpha=cfg.get("defer_alpha"))
+                  defer_max=head.defer_max, defer_alpha=cfg.get("defer_alpha"), existence_calibration=calib)
     name = Path(args.checkpoint).stem
     path = Path(args.checkpoint).parent / ("eval_%s_%s.json" % (args.split, name))
     T.write_json(path, result)
