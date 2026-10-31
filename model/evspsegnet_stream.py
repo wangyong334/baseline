@@ -10,6 +10,9 @@
     up1   ConvT2x2 24->12 (S6)，与 S1 拼接 -> dec1 Conv3x3 24->12 -> 增益 -> LIF7  264x352
     读出  MLP([U_pre7(x,y), p, t_local]) -> 原始 logit（模型内不做 sigmoid）
 所有卷积 bias=False；默认不使用 BN/GN（零输入 -> 零电流）。
+边界（border，细节 D1）：zero = 普通补零（原论文与以往所有版本）；partial = partial-conv 补零（Liu et al. 2018），
+    有效区域固定为传感器：每个 3x3 卷积的输出乘 9 / 窗口内落在传感器上的输入数，传感器外的输出为 0
+    （"没观测到"不等于"没有事件"）。比例图由传感器、画布尺寸算出，不进 state_dict，新旧权重互相可加载。
 原版的问题：ConvT 输出是实数，与跳连脉冲拼接后，解码卷积有一半输入是实数（只能按 MAC 计）。
 
 merged_decoder=True（电流合并解码器）时，每个解码阶段写成两路突触电流之和：
@@ -114,6 +117,41 @@ def make_norm(kind, channels):
     raise ValueError("未知的 norm 类型: %s" % kind)
 
 
+BORDERS = ("zero", "partial")
+
+
+def border_ratio_maps(sensor_hw, canvas_hw):
+    """partial-conv 补零的比例图（细节 D1）：有效区域 = 传感器（画布左上角 sensor_hw，画布只在右、下补零）。
+
+    每个 3x3 卷积（padding 1）的输出乘 r = 9 / 窗口内有效输入数，有效区域外 r = 0。
+    stride 1 的层，输出的有效区域与输入相同；stride 2 的层，输出格只要窗口内有有效输入就有效。
+    返回 {层名: [1, 1, h, w]}，空间尺寸与该层输出电流一致（解码层的输入有效区域取跳连那一路）。
+    """
+    hs, ws = int(sensor_hw[0]), int(sensor_hw[1])
+    hc, wc = int(canvas_hw[0]), int(canvas_hw[1])
+    if not (0 < hs <= hc and 0 < ws <= wc) or hc % 8 or wc % 8:
+        raise ValueError("传感器 %s 必须在画布 %s 之内，画布边长必须是 8 的倍数" % ((hs, ws), (hc, wc)))
+    ones = torch.ones(1, 1, 3, 3, dtype=torch.float64)
+    m0 = torch.zeros(1, 1, hc, wc, dtype=torch.float64)
+    m0[..., :hs, :ws] = 1.0
+
+    def layer(mask, stride):
+        count = F.conv2d(mask, ones, stride=stride, padding=1)
+        valid = (mask > 0) if stride == 1 else (count > 0)
+        ratio = torch.where(valid, 9.0 / count.clamp(min=1.0), torch.zeros_like(count))
+        return ratio.float(), valid.to(mask.dtype)
+
+    maps = {}
+    maps["enc1"], _ = layer(m0, 1)
+    maps["enc2"], m1 = layer(m0, 2)
+    maps["enc3"], m2 = layer(m1, 2)
+    maps["enc4"], _ = layer(m2, 2)
+    maps["dec3"], _ = layer(m2, 1)
+    maps["dec2"], _ = layer(m1, 1)
+    maps["dec1"], _ = layer(m0, 1)
+    return maps
+
+
 class SpikingConvBlock(nn.Module):
     """一个"卷积 -> 归一化插槽 -> 逐通道增益 -> 神经元"单元。
 
@@ -138,12 +176,19 @@ class SpikingConvBlock(nn.Module):
         else:
             raise ValueError("未知的 neuron 类型: %s" % neuron)
         self.out_ch = out_ch
+        # 边界比例图（partial-conv 补零，细节 D1）：None = 普通补零；由网络按传感器 / 画布尺寸写入，不进 state_dict
+        self.register_buffer("border_ratio", None, persistent=False)
 
     def _currents(self, x, extra_current=None):
         """返回（增益后电流，增益前电流）；供普通前向和浅层观测残差共用，避免重复卷积。"""
         current = self.conv(x)
         if extra_current is not None:
             current = current + extra_current
+        if self.border_ratio is not None:              # partial-conv 补零：边缘按有效输入数重新归一化，传感器外为 0
+            if tuple(self.border_ratio.shape[-2:]) != tuple(current.shape[-2:]):
+                raise ValueError("边界比例图 %s 与本层电流 %s 的尺寸不一致：输入画布与配置不符"
+                                 % (tuple(self.border_ratio.shape[-2:]), tuple(current.shape[-2:])))
+            current = current * self.border_ratio
         pre_gain = self.norm(current)
         return self.gain(pre_gain), pre_gain
 
@@ -196,7 +241,8 @@ class EvSpSegNetStream(nn.Module):
     def __init__(self, in_channels=12, channels=(12, 24, 48, 48), neuron="lif", norm="none",
                  state_mode="carry", readout_hidden=32, dt_ms=50.0, tau_init_ms=200.0,
                  tau_min_ms=50.0, tau_max_ms=2000.0, v_threshold=1.0, merged_decoder=False,
-                 dual_memory=None, subthreshold_residual=None, tif=None, invariant=None):
+                 dual_memory=None, subthreshold_residual=None, tif=None, invariant=None, border="zero",
+                 sensor_hw=None, canvas_hw=None):
         super(EvSpSegNetStream, self).__init__()
         if state_mode not in ("carry", "reset_each_window"):
             raise ValueError("state_mode 必须是 carry 或 reset_each_window")
@@ -357,6 +403,15 @@ class EvSpSegNetStream(nn.Module):
         self.v_threshold = float(v_threshold)
         # 标记增益是否已校准；随 checkpoint 保存，评估时禁止重新校准
         self.register_buffer("gain_calibrated", torch.tensor(False))
+        # 边界处理（细节 D1）：zero = 普通补零；partial = partial-conv 补零，有效区域固定为传感器（见 border_ratio_maps）
+        if border not in BORDERS:
+            raise ValueError("border 必须是 %s 之一" % (BORDERS,))
+        self.border = border
+        if border == "partial":
+            if sensor_hw is None or canvas_hw is None:
+                raise ValueError("border = partial 需要 sensor_hw（传感器高、宽）与 canvas_hw（画布高、宽）")
+            for name, ratio in border_ratio_maps(sensor_hw, canvas_hw).items():
+                getattr(self, name).border_ratio = ratio
 
     def message_layers(self):
         """发出消息的层名（见 MESSAGE_LAYERS）；通信预算与消息统计只通过这个接口得知网络连接。"""

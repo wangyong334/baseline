@@ -215,6 +215,8 @@ def build_net(cfg, device):
     """按配置构造网络并移动到设备。"""
     if cfg.get("spiking_decoder", False):
         raise ValueError("spiking_decoder（ConvT 后加 LIF 的 10 层版本）已删除；请改用 merged_decoder")
+    border = cfg.get("border", "zero")                # 细节 D1：zero = 普通补零（默认）；partial = partial-conv 补零
+    partial = border == "partial"
     net = EvSpSegNetStream(
         in_channels=2 + 2 * int(cfg["time_bins"]), channels=tuple(cfg["channels"]),
         neuron=cfg["neuron"], norm=cfg["norm"], state_mode=cfg["state_mode"],
@@ -226,12 +228,18 @@ def build_net(cfg, device):
         tif=cfg.get("tif") if cfg["neuron"] == "tif" else None,
         invariant=(dict(time_bins=int(cfg["time_bins"]), clip=float(cfg["input_clip"]),
                         ref_rate=tuple(cfg.get("invariant_ref_rate", REF_RATE)))
-                   if cfg.get("invariant_input") else None))
+                   if cfg.get("invariant_input") else None),
+        border=border, sensor_hw=(int(cfg["height"]), int(cfg["width_px"])) if partial else None,
+        canvas_hw=(int(cfg["pad_height"]), int(cfg["pad_width"])) if partial else None)
     return net.to(device)
 
 
 def design_version(net):
-    """写入 run_config 与 checkpoint 的设计版本标记。"""
+    """写入 run_config 与 checkpoint 的设计版本标记（partial-conv 补零的版本加 -pconv）。"""
+    return _design_base(net) + ("-pconv" if getattr(net, "border", "zero") == "partial" else "")
+
+
+def _design_base(net):
     if net.is_tif:
         if net.tif_config["adapt"]:
             return "v5-tif-input-adapt"

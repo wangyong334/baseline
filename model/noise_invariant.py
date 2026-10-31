@@ -113,6 +113,10 @@ class InvariantInterface(nn.Module):
         stride, pad = block.conv.stride, block.conv.padding
         mu = F.conv2d(m, W, stride=stride, padding=pad) * g
         var = (F.conv2d(v, W * W, stride=stride, padding=pad) + F.conv2d(c, cov_k, stride=stride, padding=pad)) * g * g
+        ratio = getattr(block, "border_ratio", None)
+        if ratio is not None:                          # partial-conv 补零（D1）：电流乘比例图 r，背景矩同样缩放
+            r = ratio.to(mu.dtype)
+            mu, var = mu * r, var * r * r
         return mu, var.clamp(min=0.0)
 
     def normalize(self, current, bg, block):
