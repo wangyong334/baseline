@@ -746,6 +746,20 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual({k for k in base if cfg[k] != base[k]}, {"defer_revision", "save_root"})
         self.assertEqual((cfg["defer_revision"], cfg["save_root"]), ("evidence", "log/track_head_v4e_seed37"))
 
+    def test_v4f_and_temperature_variants(self):
+        from utils.stream_common import load_flat_config
+        base = load_flat_config(os.path.join(ROOT, "configs", "track_head_v4e.yaml"))
+        cfg = load_flat_config(os.path.join(ROOT, "configs", "track_head_v4f.yaml"))
+        self.assertEqual(set(cfg), set(base))
+        self.assertEqual({k for k in base if cfg[k] != base[k]}, {"provisional_gate", "save_root"})
+        self.assertEqual((cfg["provisional_gate"], cfg["save_root"]), (False, "log/track_head_v4f_seed37"))
+        for name in ("v4b", "v4c"):                                     # 只评估：原权重 + 停止规则的温度校准
+            b = load_flat_config(os.path.join(ROOT, "configs", "track_head_%s.yaml" % name))
+            t = load_flat_config(os.path.join(ROOT, "configs", "track_head_%sT.yaml" % name))
+            self.assertEqual(set(t), set(b) | {"calibrate_existence"})
+            self.assertEqual({k for k in b if t[k] != b[k]}, {"save_root"})
+            self.assertEqual((t["calibrate_existence"], t["save_root"]), (True, "log/track_head_%sT_seed37" % name))
+
     def test_full_model_pipeline_script(self):
         import re
         path = os.path.join(ROOT, "tools", "run_full_model.sh")
@@ -841,7 +855,7 @@ class EndToEndTests(unittest.TestCase):
             T.mode_train(SimpleNamespace(device="cpu", mode="train", resume=False), cfg)
             base_ckpt = str(base_dir / "best_val_iou_seed37.pt")
             for name in ("track_head_v2", "track_head_v2_lag1", "track_head_v3", "track_head_v4", "track_head_v4b",
-                         "track_head_v4c", "track_head_v4d", "track_head_v4e"):
+                         "track_head_v4c", "track_head_v4d", "track_head_v4e", "track_head_v4f"):
                 head_cfg = load_flat_config(os.path.join(ROOT, "configs", name + ".yaml"))
                 # v4e：种子与骨干 checkpoint 走命令行覆盖（整体模型流水线 tools/run_full_model.sh 的用法）
                 cli = name == "track_head_v4e"
@@ -865,11 +879,11 @@ class EndToEndTests(unittest.TestCase):
                 for kind in kinds:
                     for key in ("iou", "acc", "pd", "fa"):
                         self.assertTrue(np.isfinite(result[kind][key]), (name, kind, key))
-                if name in ("track_head_v4d", "track_head_v4e"):        # 停止规则的温度校准：在 val 上拟合并存盘
+                if name in ("track_head_v4d", "track_head_v4e", "track_head_v4f"):   # 停止规则的温度校准：val 上拟合并存盘
                     calib = result["existence_calibration"]
                     self.assertTrue(0.5 <= calib["temperature"] <= 5.0)
                     self.assertTrue((root / name / ("existence_temperature_best_val_iou_seed%d.json" % seed)).exists())
-                if name == "track_head_v4e":                           # 证据修正：三个系数随结果存盘（论文里报）
+                if name in ("track_head_v4e", "track_head_v4f"):        # 证据修正：三个系数随结果存盘（论文里报）
                     self.assertEqual(result["defer_revision"], "evidence")
                     self.assertEqual(len(result["evidence"]["kappa"]), 3)
                     self.assertTrue(all(k > 0.0 for k in result["evidence"]["kappa"]))
