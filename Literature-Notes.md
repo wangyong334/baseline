@@ -321,6 +321,7 @@
 | Deneve, Bayesian Spiking Neurons I（Neural Comput 2008；NIPS 2004 版） | 脉冲神经元怎样做推断 | 膜电位 = 隐藏二值状态的对数几率；每个输入脉冲给一次冲激，漏电来自状态转移；偏离预测到阈值才发放 | 经典原理 | 目标神经元的原理来源：存在对数几率 = 膜电位，事件 = 输入脉冲 |
 | Gilholm & Salmond 2005（扩展目标的泊松量测模型；原文本轮未核对） | 一个目标产生很多量测 | 量测 = 各目标的泊松点过程 + 杂波 | 经典原理 | 事件归属 = softmax(log 强度)，即带背景槽的注意力；存在的似然比 = Σ log(1 + 目标强度 / 杂波强度) − 期望事件数 |
 | SpikeMOT（IEEE Access 2025；arXiv 2309.16987）、SpikeTrack（CVPR 2026）、SpikeFET（NeurIPS 2025）、STNet（CVPR 2022） | 事件 + SNN 跟踪 | Siamese / 脉冲 Transformer | 单目标或框级，不做逐事件分割，也没有目标级判决时间 | 查重：本轮没检到"目标级脉冲判决"的先例 |
+| PACT、PointEvent、ASA-SNN 的代码（11-01 读，用户指定；学写法不搬方法） | 怎样把原理写成网络 | PACT：速度头 + 无参数平流算子 + 多假设 softmax + sigmoid 门残差；PointEvent：前置归一化残差块（位置编码卷积 + Mamba + MLP），线索作输入、门控融合，模块可替换；ASA-SNN：标准 PLIF + 膜电位上的学出注意力 | 都是离线 / 分类；PACT 也有少量手设常数 | 模块三 v6 的写法依据（Inn 13.71）：状态是隐向量，原理只进结构与初始化，信多少交给学出的门，判决 = 输出头或脉冲神经元 |
 | Spike-driven Transformer（NeurIPS 2023 / TPAMI 2025）、Temporal Dynamics Enhancer（arXiv 2512.02447） | SNN 里的注意力 | 脉冲驱动的注意力模块 | 检测框，不是目标槽 | 以后把目标层的注意力做成脉冲驱动时的参考 |
 
 ## 附：下错的文件（V5修订文件夹，10-25 核对）

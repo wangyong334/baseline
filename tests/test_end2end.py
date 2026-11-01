@@ -5,7 +5,8 @@
     2. 多流拼批：每个事件的 target_id 与录像对得上；每个事件的背景率取自模块二的背景图（所在窗、流、极性、像素）
     3. 配置：full_model_v2 与 object_layer_v2 的目标层设置相同（只差训练方式）；object_layer_v2 与 v1 只差两项 v2 机制
     4. SPRINT 整体模型：从头（按骨干配置新建、增益校准）+ 学出来的杂波场 + 目标层一起训练 2 轮并评估；杂波场的损失、
-       衰减系数、权重随结果存盘；选择性分离：归属损失到达骨干输出、存在损失不到达
+       衰减系数、权重随结果存盘；选择性分离：归属损失到达骨干输出、存在损失不到达；v5（手写滤波程序）与 v6（目标 token 层）各跑一遍
+    5. 配置：sprint_tokens 与 sprint_full 只差模块三的设置与输出目录；sprint_tokens 与冻结版 object_tokens_v1 的目标层设置相同
 """
 import os
 import sys
@@ -38,6 +39,21 @@ class ConfigTests(unittest.TestCase):
             diff = {k for k in set(frozen) | set(ctrl) if frozen.get(k) != ctrl.get(k)}
             self.assertEqual(diff, {key, "save_root"}, name)            # controls differ from v2 in one switch only
             self.assertEqual(ctrl[key], value)
+
+
+    def test_tokens_configs(self):
+        from utils.stream_common import load_flat_config
+        from model.object_tokens import TOKEN_KEYS
+        tokens = load_flat_config(os.path.join(ROOT, "configs", "sprint_tokens.yaml"))
+        frozen = load_flat_config(os.path.join(ROOT, "configs", "object_tokens_v1.yaml"))
+        v5 = load_flat_config(os.path.join(ROOT, "configs", "sprint_full.yaml"))
+        for key in TOKEN_KEYS + ("head_kind",):
+            self.assertEqual(tokens.get(key), frozen.get(key), key)
+        self.assertEqual(tokens["head_kind"], "tokens")
+        from model.object_layer import OBJECT_KEYS
+        head_keys = set(TOKEN_KEYS) | set(OBJECT_KEYS) | {"head_kind"}
+        diff = {k for k in set(tokens) | set(v5) if tokens.get(k) != v5.get(k)}
+        self.assertTrue(diff <= head_keys | {"save_root"}, diff - head_keys)   # only module 3 differs
 
 
 class BackgroundLookupTests(unittest.TestCase):
@@ -132,6 +148,11 @@ class ScratchSprintTests(unittest.TestCase):
     """SPRINT 整体模型：从头端到端（骨干按配置新建 + 增益校准 + 学出来的杂波场 + 目标神经元层，选择性分离）。"""
 
     def test_scratch_with_learned_field(self):
+        for name in ("sprint_full", "sprint_tokens"):
+            with self.subTest(config=name):
+                self._scratch_run(name)
+
+    def _scratch_run(self, name):
         try:
             import cv2  # noqa: F401
             import pandas  # noqa: F401
@@ -170,10 +191,10 @@ class ScratchSprintTests(unittest.TestCase):
                       streams=2)
             bb_path = root / "backbone.yaml"
             bb_path.write_text(yaml.safe_dump({"ALL": bb}), encoding="utf-8")
-            full = load_flat_config(os.path.join(ROOT, "configs", "sprint_full.yaml"))
+            full = load_flat_config(os.path.join(ROOT, "configs", name + ".yaml"))
             full.update(root=str(root), backbone_config=str(bb_path), save_root=str(root / "sprint"), epochs=2,
                         eval_chunk=4, slots=4, segments=[[0, 3], [4, 7], [8, 11]], timing_warmup_windows=1)
-            cfg_path = root / "sprint_full.yaml"
+            cfg_path = root / (name + ".yaml")
             cfg_path.write_text(yaml.safe_dump({"ALL": full}), encoding="utf-8")
             E2E.main(["--config", str(cfg_path), "--mode", "train", "--device", "cpu"])
             ckpt_path = root / "sprint" / "best_val_iou_seed37.pt"

@@ -2,9 +2,10 @@
 
 两条通路，一个损失：
     像素通路 = 流式脉冲 U-Net（模块一：BIR 神经元 + 每窗消息峰值约束）+ 不变输入接口（模块二 NISI），给每个事件的证据 z0；
-    目标通路 = 目标神经元层（model/object_layer.py）：事件对"目标槽 + 背景槽"的注意力（PDA）、预测 / 校正（卡尔曼，
-        窗内连续时间、一窗量出位置与速度）、目标神经元（存在对数几率，SPRT 发放）；读骨干的 z0、dec1 特征，
-        背景槽的杂波强度取模块二的本地背景率（环境越吵，每个事件的证据越弱，目标判定越晚）；
+    目标通路 = 目标 token 层（head_kind: tokens，model/object_tokens.py，v6 网络写法）：事件对"背景 token + 槽 token"的
+        交叉注意力、GRU 校正、槽间自注意力、每个槽一个脉冲神经元（膜电位 = 存在对数几率，越过 Wald 界 +-A 发放）、
+        学出的提议；读骨干的 z0、dec1 特征，背景 logit 另读模块二的本地背景率；
+        head_kind: object 为 v5 目标神经元层（model/object_layer.py，手写滤波程序，只作对照）；
     损失 = 像素通路读出的逐事件 BCE（保持为校准的逐事件证据）+ 目标通路零等待 / 终判输出的 BCE（都按本片段事件总数归一）
         + 目标通路的监督（匈牙利匹配后的存在 BCE、归属交叉熵、位置 Smooth-L1）
         + 模块一的每窗消息峰值约束（CommBudget，乘子从骨干训练结束时的值接着走）。
@@ -13,7 +14,7 @@
         clutter_estimator = learned 时模块二的背景率由学出来的杂波场给出（model/clutter_field.py，泊松最大似然，
         损失另加 lambda_clutter x 杂波场的泊松负对数似然），不变接口与目标层都只读它；
     微调（配置给 base_checkpoint）：骨干从已训练的 checkpoint（如 E3a）初始化，学习率乘 backbone_lr_scale。
-目标层从头训练（期望事件数初值取训练集统计）。
+目标层从头训练（v6 只用标准初始化；v5 对照的期望事件数初值取训练集统计）。
 多流 TBPTT 与 train_stream_v1 的 trainer = streams 相同（B 条流、每段 k 窗、片段边界 detach、录像开头 keep 清零），每个片段更新一次。
 模式：train（每轮在 val 上评估：base = 像素通路读出，track_now = 零等待，track = 终判；按 track 的 val IoU 挑最好的一轮）；
       eval（val / test：四个指标、误差类别、关口、可选逐事件预测与逐窗目标槽）。
@@ -64,8 +65,8 @@ def scratch_config(cfg):
 
 def build_models(cfg, base, device, q99):
     """按骨干配置建网络（不读权重）+ 目标神经元层 + 杂波场（clutter_estimator = learned 时）。"""
-    if cfg.get("head_kind") != "object":
-        raise ValueError("端到端训练只用于目标神经元层（head_kind: object）")
+    if cfg.get("head_kind") not in ("object", "tokens"):
+        raise ValueError("端到端训练只用于目标层（head_kind: tokens = v6 目标 token 层，object = v5 对照）")
     net = T.build_net(base, device)
     if net.invariant is not None:
         net.invariant.set_q99(q99)                                   # 模块二：查表用的 q99
@@ -340,8 +341,10 @@ def mode_train(args, cfg):
         T.run_calibration(net, base, q99, device, root)
     train_set = EvUAVStream(base["root"], "train", base)
     lengths = [int(train_set[i].n_windows) for i in range(len(train_set))]
-    rate0 = TH.mean_target_events(train_set)
-    head.init_rate(rate0)
+    rate0 = None
+    if hasattr(head, "init_rate"):                                    # v5 only: its expected-count init is a data statistic
+        rate0 = TH.mean_target_events(train_set)
+        head.init_rate(rate0)
     comm = comm_from_backbone(base, net, cfg, ckpt)
     lr0, lr1, scale = float(cfg["lr"]), float(cfg["lr_end"]), float(cfg["backbone_lr_scale"])
     groups = [{"params": net.parameters(), "lr": lr0 * scale, "scale": scale},
@@ -351,12 +354,13 @@ def mode_train(args, cfg):
     optimizer = torch.optim.Adam(groups)
     seed, epochs = int(cfg["seed"]), int(cfg["epochs"])
     val_set = EvUAVStream(base["root"], "val", base)
-    print("端到端训练：骨干 %s（学习率 x %.3g）+ 目标神经元层（参数 %d；杂波 %s；连续时间 %s；分离 %s）+ 杂波场 %s | "
-          "%d 条流、k=%d | 训练集 %d 条录像 %d 窗 | pos_weight %.2f | 期望事件数初值 %.2f | 长度单位 %.0f px | 消息约束 %s" % (
-              cfg.get("base_checkpoint") or ("从头（%s）" % cfg["backbone_config"]), scale,
-              sum(p.numel() for p in head.parameters()), head.clutter_source, head.continuous_time, head.separation,
+    print("端到端训练：骨干 %s（学习率 x %.3g）+ 目标层 %s（参数 %d；杂波 %s；分离 %s）+ 杂波场 %s | "
+          "%d 条流、k=%d | 训练集 %d 条录像 %d 窗 | pos_weight %.2f | 期望事件数初值 %s | 长度单位 %.0f px | 消息约束 %s" % (
+              cfg.get("base_checkpoint") or ("从头（%s）" % cfg["backbone_config"]), scale, cfg["head_kind"],
+              sum(p.numel() for p in head.parameters()), head.clutter_source, head.separation,
               "学出来（参数 %d）" % sum(p.numel() for p in field.parameters()) if field is not None else "手写估计器",
-              int(base["streams"]), int(base["tbptt_k"]), len(lengths), sum(lengths), pos_weight, rate0, head.unit,
+              int(base["streams"]), int(base["tbptt_k"]), len(lengths), sum(lengths), pos_weight,
+              "无" if rate0 is None else "%.2f" % rate0, head.unit,
               "关" if comm is None else "开（mu 从 %.4f 起）" % comm.mu), flush=True)
     best = -float("inf")
     for epoch in range(epochs):
@@ -389,12 +393,14 @@ def mode_train(args, cfg):
         if out["comm"] is not None:
             comm_txt = " | 消息 p95 %.4g / 预算 %.4g mu %.4f" % (out["comm"].get("messages_window_p95") or 0.0,
                                                            out["comm"]["budget"], out["comm"]["mu_end"])
+        ev_txt = " ".join("%s %.3f" % (name, ev[key]) for key, name in
+                          (("orphan_ref", "l0"), ("llr_scale", "wL"), ("clutter_gain", "杂波增益")) if key in ev)
         print("epoch %d lr %.2e | 损失 %s | val IoU base %.4f now %.4f track %.4f | 延后 %.2f%%（目标事件 %.1f%%，平均 "
-              "%.3f 窗）| 每窗 槽 %.2f 出生 %.3f | l0 %.2f wL %.3f 杂波增益 %.3f%s | %.0fs（训练 %.0fs）| 显存峰值 %.2f GiB" % (
+              "%.3f 窗）| 每窗 槽 %.2f 出生 %.3f | %s%s | %.0fs（训练 %.0fs）| 显存峰值 %.2f GiB" % (
                   epoch, lr, loss_txt, val["base"]["iou"], val["track_now"]["iou"], val["track"]["iou"],
                   100.0 * hs["deferred_frac"], 100.0 * hs["target_deferred_frac"], hs["target_mean_delay_windows"],
-                  hs["live_per_window"], hs["births_per_window"], ev["orphan_ref"], ev["llr_scale"],
-                  ev["clutter_gain"], comm_txt, record["epoch_seconds"], train_s, record["peak_memory_gib"] or 0.0),
+                  hs["live_per_window"], hs["births_per_window"], ev_txt, comm_txt, record["epoch_seconds"], train_s,
+                  record["peak_memory_gib"] or 0.0),
               flush=True)
     print("TRAINING FINISHED:", root, flush=True)
 

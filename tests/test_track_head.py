@@ -10,7 +10,7 @@
     8. 一窗滞后：除最后一窗外每个事件都恰好重判一次，初始化时滞后输出与 z0 相同；RTS 平滑与矩阵公式一致
     9. 监督：标注目标与航迹的匹配、存在 / 位置损失可反传，梯度只到航迹头；确定性模式下前向、反向不报错
    10. 配置：三个 v2 配置只差 decision_lag / context 与输出目录；v3 配置只比 v2 多 existence = ipda（及 decision_lag）
-   11. 端到端：训练一个小骨干 -> 航迹头训练 -> 评估（零等待、一窗滞后、v3、v4 系列、v5 目标神经元层）
+   11. 端到端：训练一个小骨干 -> 航迹头训练 -> 评估（零等待、一窗滞后、v3、v4 系列、v5 目标神经元层、v6 目标 token 层）
    12. v3（existence = ipda）：初始化恒等、片段切分不变；存在概率的伯努利递推与公式一致；检测概率低时航迹撑过缺口；
        卡尔曼更新按关联概率加权（像杂波的量测不拉动航迹）；梯度到达 P_D、似然比、存活概率
 """
@@ -856,7 +856,8 @@ class EndToEndTests(unittest.TestCase):
             T.mode_train(SimpleNamespace(device="cpu", mode="train", resume=False), cfg)
             base_ckpt = str(base_dir / "best_val_iou_seed37.pt")
             for name in ("track_head_v2", "track_head_v2_lag1", "track_head_v3", "track_head_v4", "track_head_v4b",
-                         "track_head_v4c", "track_head_v4d", "track_head_v4e", "track_head_v4f", "object_layer_v1"):
+                         "track_head_v4c", "track_head_v4d", "track_head_v4e", "track_head_v4f", "object_layer_v1",
+                         "object_tokens_v1"):
                 head_cfg = load_flat_config(os.path.join(ROOT, "configs", name + ".yaml"))
                 # v4e：种子与骨干 checkpoint 走命令行覆盖（整体模型流水线 tools/run_full_model.sh 的用法）
                 cli = name == "track_head_v4e"
@@ -875,7 +876,7 @@ class EndToEndTests(unittest.TestCase):
                 result = json.loads((root / name / ("eval_test_best_val_iou_seed%d.json" % seed)).read_text(
                     encoding="utf-8"))
                 self.assertEqual(result["base_checkpoint"], base_ckpt)
-                delayed = name.endswith("lag1") or name.startswith("track_head_v4") or name.startswith("object_layer")
+                delayed = name.endswith("lag1") or name.startswith("track_head_v4") or name.startswith("object_")
                 kinds = ("base", "track", "track_now") if delayed else ("base", "track")
                 for kind in kinds:
                     for key in ("iou", "acc", "pd", "fa"):
@@ -895,7 +896,11 @@ class EndToEndTests(unittest.TestCase):
                     self.assertEqual(result["defer_revision"], "object")
                     self.assertTrue(result["evidence"]["llr_scale"] > 0.0)
                     self.assertTrue(np.isfinite(result["evidence"]["orphan_ref"]))
-                if name.startswith("track_head_v4") or name.startswith("object_layer"):   # 延迟决策的统计
+                if name == "object_tokens_v1":                         # 目标 token 层：只报静息电位，没有数据统计初值
+                    self.assertEqual(result["defer_revision"], "object")
+                    self.assertEqual(set(result["evidence"]), {"orphan_ref"})
+                    self.assertTrue(np.isfinite(result["evidence"]["orphan_ref"]))
+                if name.startswith("track_head_v4") or name.startswith("object_"):   # 延迟决策的统计
                     hs = result["head_stats"]
                     self.assertTrue(0.0 <= hs["deferred_frac"] <= 1.0)
                     self.assertEqual(set(hs["status"]), {"confirmed", "rejected", "reacquired", "lost", "forced"})
@@ -909,7 +914,8 @@ class EndToEndTests(unittest.TestCase):
                         self.assertTrue(bool((w <= 10).all()))
                 with np.load(str(root / ("tracks_" + name) / "seq_7.npz")) as tracks:
                     self.assertEqual(tracks["pos"].shape[1:], (4, 2))
-                    self.assertEqual(tracks["pd"].shape[1:], (4,))
+                    if "pd" in tracks.files:                           # v6 tokens have no detection probability
+                        self.assertEqual(tracks["pd"].shape[1:], (4,))
                     self.assertEqual(tracks["beta"].shape[1:], (4,))
             # base 一列是骨干的原输出：与正式评估（逐窗执行）的 IoU 一致
             args = SimpleNamespace(checkpoint=str(base_dir / "best_val_iou_seed37.pt"), device="cpu", mode="eval",

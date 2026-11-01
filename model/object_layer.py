@@ -37,6 +37,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 try:
     from scipy.optimize import linear_sum_assignment
@@ -258,6 +259,15 @@ class ObjectLayer(nn.Module):
         buf = vals.new_zeros(batch * N * C)
         buf = buf.index_put((flat,), vals.reshape(-1), accumulate=True)
         return buf.view(batch, N, C)
+
+    def _slot_readout(self, qs, qe, eb):
+        """每个事件对本流各槽的读出 [E, N]。中间量 [E, N, attn_hidden] 不存，反向时重算（极密录像一窗几万个事件，
+        16 窗存下来是 GB 级；端到端时与骨干同卡会爆显存）。数值与直接计算相同。"""
+        def f(qs_, qe_, eb_):
+            return self.read_out(F.relu(qs_[eb_] + qe_[:, None, :])).squeeze(-1)
+        if torch.is_grad_enabled() and (qs.requires_grad or qe.requires_grad):
+            return checkpoint(f, qs, qe, eb)
+        return f(qs, qe, eb)
 
     def _assoc_logits(self, exy, eb, key, clut, mu, S, prior, valid, qry, vel=None, se=None, pv=None):
         """[E, N + 1]：第 0 列背景（杂波强度），其余为本流各槽 log(r gamma) + log N(x; mu, S) + 外观相似度。
@@ -506,7 +516,7 @@ class ObjectLayer(nn.Module):
             bd = beta.detach()                                       # separation: decisions do not move beliefs
             qs = self.read_slot(torch.cat([h_new, torch.sigmoid(L_post).detach()[..., None]], -1))
             qe = self.read_event(g)
-            u_slot = self.read_out(F.relu(qs[eb] + qe[:, None, :])).squeeze(-1)
+            u_slot = self._slot_readout(qs, qe, eb)
             u_bg = self.read_bg(g).squeeze(-1)
             if self.object_context:
                 z = z0 + bd[:, 0] * u_bg + (bd[:, 1:] * u_slot).sum(1)

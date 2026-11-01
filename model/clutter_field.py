@@ -20,6 +20,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from model.comod import REF_RATE
 
@@ -105,6 +106,10 @@ class ClutterField(nn.Module):
         rate = (weights * allc).sum(2)
         return torch.log(rate.clamp(min=EPS))
 
+    def _predict_ckpt(self, m, w, _anchor):
+        """检查点用：_anchor（一个要梯度的参数）保证输出带梯度，参数的梯度才能在重算时传回。"""
+        return self.predict({"m": m, "w": w})
+
     def forward_chunk(self, counts, state=None, keep=None):
         T, B = int(counts.shape[0]), int(counts.shape[1])
         if state is None:
@@ -117,7 +122,12 @@ class ClutterField(nn.Module):
                 if bool(reset.any()):
                     state = {"m": torch.where(reset[:, None, None, None, None], torch.zeros_like(state["m"]), state["m"]),
                              "w": torch.where(reset[:, None], torch.zeros_like(state["w"]), state["w"])}
-            out.append(self.predict(state))
+            if torch.is_grad_enabled() and self.decay_logit.requires_grad:
+                # memory: full-resolution candidates / weights are recomputed in backward instead of stored
+                # (about 250 MB per window otherwise; 16 windows x 4 streams ran out of memory on a 24 GB card)
+                out.append(checkpoint(self._predict_ckpt, state["m"], state["w"], self.decay_logit))
+            else:
+                out.append(self.predict(state))
             c = counts[t][:, :, None]                                                    # [B, 2, 1, H, W]
             state = {"m": a[None, None, :, None, None] * state["m"] + (1.0 - a)[None, None, :, None, None] * c,
                      "w": a[None, :] * state["w"] + (1.0 - a)[None, :]}

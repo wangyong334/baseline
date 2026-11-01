@@ -33,6 +33,7 @@ from dataset.stream_windows import refill_by_index  # noqa: E402
 from model.clutter_field import event_count_maps  # noqa: E402
 from model.comod import REF_RATE  # noqa: E402
 from model.object_layer import OBJECT_KEYS, ObjectLayer, backbone_stride  # noqa: E402
+from model.object_tokens import TOKEN_KEYS, ObjectTokenLayer  # noqa: E402
 from model.track_head import TrackHead  # noqa: E402
 from utils.stream_common import linear_epoch_lr, load_flat_config  # noqa: E402
 from utils.stream_metrics import FastRoc  # noqa: E402
@@ -84,17 +85,19 @@ def load_base(cfg, device):
 
 
 def build_head(cfg, net, base, device):
-    """head_kind = track（v2～v4f 的航迹头）或 object（v5 目标神经元层；长度单位 = 骨干总步长，由网络结构读出）。"""
+    """head_kind = track（v2～v4f 的航迹头）、object（v5 目标神经元层，手写滤波程序，作对照）或 tokens（v6 目标 token 层，
+    网络写法；Inn 13.71）。长度单位 = 骨干总步长，由网络结构读出。"""
     feat_dim = int(net.readout[0].in_features) - 2                 # 读出层输入 = [dec1 特征, p, t_local]
     kind = cfg.get("head_kind", "track")
-    if kind == "object":
-        kwargs = {key: cfg[key] for key in OBJECT_KEYS if key in cfg}
-        if kwargs.get("clutter_source") == "background":        # 杂波的空间强度 = 模块二的背景率，下限 = 模块二的参照率
+    if kind in ("object", "tokens"):
+        keys, cls = (OBJECT_KEYS, ObjectLayer) if kind == "object" else (TOKEN_KEYS, ObjectTokenLayer)
+        kwargs = {key: cfg[key] for key in keys if key in cfg}
+        if kwargs.get("clutter_source") == "background":        # 模块二的背景率（以模块二的参照率为单位 / 下限）
             kwargs["ref_rate"] = tuple(base.get("invariant_ref_rate", REF_RATE))
-        return ObjectLayer(feat_dim, int(base["pad_height"]), int(base["pad_width"]), length_unit=backbone_stride(net),
-                           **kwargs).to(device)
+        return cls(feat_dim, int(base["pad_height"]), int(base["pad_width"]), length_unit=backbone_stride(net),
+                   **kwargs).to(device)
     if kind != "track":
-        raise ValueError("head_kind 必须是 track 或 object")
+        raise ValueError("head_kind 必须是 track、object 或 tokens")
     kwargs = {key: cfg[key] for key in HEAD_KEYS if key in cfg}
     return TrackHead(feat_dim, int(base["pad_height"]), int(base["pad_width"]), **kwargs).to(device)
 
@@ -403,10 +406,9 @@ def run_split(outputs, head, base, device, split, full=False, dump_dir=None, tra
                          labels=seq.label.astype(np.float32), probabilities=probs["track"].astype(np.float32),
                          base_probabilities=probs["base"].astype(np.float32),
                          target_id=seq.target_id.astype(np.float64), **extra)
-            if tracks_dir:
+            if tracks_dir and log:                            # every per-window field the head logs (active / pos / ...)
                 np.savez(os.path.join(tracks_dir, seq.name),
-                         **{key: np.stack([w[key][0] for w in log])
-                            for key in ("active", "pos", "vel", "ex", "pd", "beta")})
+                         **{key: np.stack([w[key][0] for w in log]) for key in log[0]})
     head.train(was_training)
     windows = max(stats["slot_windows"], 1)
     out = {"split": split, "n_sequences": len(dataset),
