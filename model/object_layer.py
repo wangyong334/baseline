@@ -46,7 +46,8 @@ except ImportError:  # pragma: no cover - scipy is part of the training environm
 EPS = 1e-6
 L_CLAMP = 30.0                      # smooth numerical bound on the membrane (log-odds); far beyond +-A
 OBJECT_KEYS = ("slots", "hidden", "attn_hidden", "em_iters", "defer_max", "defer_alpha", "clutter_source",
-               "continuous_time")
+               "continuous_time", "object_context", "decision_rule")
+DECISION_RULES = ("sprt", "fixed")
 SLOT_KEYS = ("active", "gen", "mu", "v", "P", "h", "L", "pd", "n", "tid")
 STATUS_NAMES = ("confirmed", "rejected", "reacquired", "lost", "forced")
 
@@ -114,15 +115,21 @@ class ObjectLayer(nn.Module):
     """目标神经元层。forward_chunk(events, z0, feat, state, steps, keep, labels, tid, log, keys) -> (z, state, aux)。"""
 
     def __init__(self, feat_dim, height, width, slots=16, hidden=32, attn_hidden=32, em_iters=2, defer_max=10,
-                 defer_alpha=0.05, length_unit=8.0, clutter_source="learned", continuous_time=False, ref_rate=None):
+                 defer_alpha=0.05, length_unit=8.0, clutter_source="learned", continuous_time=False, ref_rate=None,
+                 object_context=True, decision_rule="sprt"):
         """clutter_source：learned = 杂波强度只由事件特征学出（v1）；background = 杂波的空间强度取模块二的本地背景率
         （每像素每窗、按极性，下限为模块二的参照率），事件特征只学"像不像目标"的标记似然比（v2）。
         continuous_time：True 时每个事件按自己的时间戳与目标在那一刻的位置比较（窗内匀速），校正步用加权最小二乘
-        一窗内同时量出位置与速度（v2）；False 为 v1（事件与窗中心位置比较，只量位置）。"""
+        一窗内同时量出位置与速度（v2）；False 为 v1（事件与窗中心位置比较，只量位置）。
+        消融对照：object_context = False 时读出不看任何目标槽（z = z0 + 背景项，不挂起），检验增益来自目标而不是多了一个读出头；
+        decision_rule = fixed 时挂在目标上的事件一律等满 defer_max 窗（目标被否定、槽被释放时提前终判），作 SPRT 的固定等待对照。"""
         super(ObjectLayer, self).__init__()
         if clutter_source not in ("learned", "background"):
             raise ValueError("clutter_source 必须是 learned 或 background")
         self.clutter_source, self.continuous_time = str(clutter_source), bool(continuous_time)
+        if decision_rule not in DECISION_RULES:
+            raise ValueError("decision_rule 必须是 %s 之一" % (DECISION_RULES,))
+        self.object_context, self.decision_rule = bool(object_context), str(decision_rule)
         self.feat_dim, self.height, self.width = int(feat_dim), int(height), int(width)
         self.slots, self.hidden, self.attn_hidden = int(slots), int(hidden), int(attn_hidden)
         self.em_iters, self.unit = int(em_iters), float(length_unit)
@@ -492,7 +499,10 @@ class ObjectLayer(nn.Module):
             qe = self.read_event(g)
             u_slot = self.read_out(F.relu(qs[eb] + qe[:, None, :])).squeeze(-1)
             u_bg = self.read_bg(g).squeeze(-1)
-            z = z0 + bd[:, 0] * u_bg + (bd[:, 1:] * u_slot).sum(1)
+            if self.object_context:
+                z = z0 + bd[:, 0] * u_bg + (bd[:, 1:] * u_slot).sum(1)
+            else:                                                    # control: same read-out capacity, no objects
+                z = z0 + u_bg
         else:
             z = z0
 
@@ -503,7 +513,8 @@ class ObjectLayer(nn.Module):
             same = valid[b, j] & (gen[b, j] == dq["gen"])
             Lr = L_post[b, j]
             status = torch.full_like(b, -1)
-            for code, cond in ((3, ~same), (0, same & (Lr >= A)), (1, same & (Lr <= -A))):
+            confirm = same & (Lr >= A) if self.decision_rule == "sprt" else torch.zeros_like(same)
+            for code, cond in ((3, ~same), (0, confirm), (1, same & (Lr <= -A))):
                 status = torch.where(cond & (status < 0), torch.full_like(status, code), status)
             status = torch.where((status < 0) & (dq["lag"] >= self.defer_max), torch.full_like(status, 4), status)
             rel = status >= 0
@@ -522,7 +533,12 @@ class ObjectLayer(nn.Module):
             amax = log_beta.argmax(1)
             kk = (amax - 1).clamp(min=0)
             Lk = L_post[eb, kk]
-            pend = (amax > 0) & (Lk.abs() < A)
+            if not self.object_context:
+                pend = torch.zeros_like(amax, dtype=torch.bool)
+            elif self.decision_rule == "fixed":                       # control: every object-attached event waits
+                pend = (amax > 0) & (Lk > -A)
+            else:
+                pend = (amax > 0) & (Lk.abs() < A)
             if bool(pend.any()):
                 rows = torch.arange(E, device=dev)
                 key_e = ev["key"].to(dtype) if "key" in ev else torch.zeros_like(z0)

@@ -31,6 +31,11 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(full["continuous_time"])
         diff = {k for k in set(frozen) | set(v1) if frozen.get(k) != v1.get(k)}
         self.assertEqual(diff, {"clutter_source", "continuous_time", "save_root"})
+        for name, key, value in (("noctx", "object_context", False), ("fixed", "decision_rule", "fixed")):
+            ctrl = load_flat_config(os.path.join(ROOT, "configs", "object_layer_v2_%s.yaml" % name))
+            diff = {k for k in set(frozen) | set(ctrl) if frozen.get(k) != ctrl.get(k)}
+            self.assertEqual(diff, {key, "save_root"}, name)            # controls differ from v2 in one switch only
+            self.assertEqual(ctrl[key], value)
 
 
 class BackgroundLookupTests(unittest.TestCase):

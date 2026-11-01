@@ -11,6 +11,7 @@
        上一窗匹配上的槽在目标仍在时保持同一身份
     8. 配置：手设量只有槽数、宽度、EM 迭代次数、延迟预算、alpha；长度单位由骨干结构读出
     9. v2：窗内连续时间一窗量出速度（v1 量不出）；同样的事件，背景率越高存在证据越弱；没有背景率时报错；分段不变
+   10. 消融对照：读出不看目标时输出与目标状态无关且不挂起；固定等待时已确认目标上的事件也等满 defer_max 窗
 """
 import math
 import os
@@ -296,6 +297,55 @@ class V2MechanismTests(unittest.TestCase):
         z_b, _, d_b = run_split_chunks(layer, events, z0, feat, 2, [(0, 5), (5, 12)], keys=keys)
         self.assertTrue(torch.equal(z_a, z_b))
         self.assertEqual(d_a, d_b)
+
+
+class ControlTests(unittest.TestCase):
+    """消融对照：读出不看目标（object_context = False）；固定等待（decision_rule = fixed）。"""
+
+    def _confirmed_state(self, layer, L=10.0):
+        state = layer.init_state(1, torch.device("cpu"))
+        state["active"][0, 0] = True
+        state["gen"][0, 0] = 1
+        state["mu"][0, 0] = torch.tensor([20.0, 16.0]) / layer.unit
+        state["P"][0, 0] = torch.eye(2) * 0.05
+        state["L"][0, 0] = L
+        return state
+
+    def test_no_object_context_ignores_slots(self):
+        layer = make_layer(object_context=False)
+        randomize_readout(layer)
+        ev = window_events([(20, 16), (21, 16), (20, 17)], z=2.0)
+        ev["key"] = torch.arange(3, dtype=torch.float32)
+        with torch.no_grad():
+            z_obj, st, _ = layer.forward_window(self._confirmed_state(layer), ev)
+            z_none, _, _ = layer.forward_window(layer.init_state(1, torch.device("cpu")), ev)
+            expect = ev["z0"] + layer.read_bg(layer._event_features(ev)).squeeze(-1)
+        self.assertTrue(torch.allclose(z_obj, expect))
+        self.assertTrue(torch.allclose(z_none, expect))
+        self.assertIsNone(st["defer"])
+
+    def test_fixed_rule_waits_full_budget(self):
+        pts = [(20, 16), (21, 16), (20, 17)]
+        for rule, waits in (("sprt", False), ("fixed", True)):
+            layer = make_layer(decision_rule=rule, defer_max=3)
+            state = self._confirmed_state(layer)
+            ev = window_events(pts, z=4.0)
+            ev["key"] = torch.arange(3, dtype=torch.float32)
+            released = []
+            with torch.no_grad():
+                _, state, _ = layer.forward_window(state, ev)
+                self.assertEqual(state["defer"] is not None and int(state["defer"]["b"].shape[0]) > 0, waits, rule)
+                for _ in range(3):
+                    nxt = window_events(pts, z=4.0)
+                    nxt["key"] = torch.arange(100, 103, dtype=torch.float32)
+                    _, state, info = layer.forward_window(state, nxt)
+                    if info["delayed"] is not None:
+                        released.append(info["delayed"])
+            if waits:
+                first = [r for r in released if bool((r[1] < 100).any())]
+                self.assertTrue(first)
+                self.assertTrue(bool((first[0][3] == 4).all()))        # forced at the deadline, not "confirmed"
+                self.assertTrue(bool((first[0][2] == 3).all()))
 
 
 class ConfigTests(unittest.TestCase):
