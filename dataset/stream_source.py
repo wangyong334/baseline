@@ -33,8 +33,9 @@ def make_window_source(seq, cfg, q99, device, dtype=torch.float32):
         source = TorchWindowSource(seq, cfg, q99, device, dtype)
     else:
         raise ValueError("input_device 必须是 %s 之一，收到 %r" % (INPUT_DEVICES, kind))
-    if cfg.get("invariant_input"):
+    if cfg.get("invariant_input") and cfg.get("clutter_estimator", "online") == "online":
         # 模块二：events 另带 "bg"（本窗的因果背景率估计；window: [1,2,H,W]，chunk: [T,1,2,H,W]）
+        # clutter_estimator = learned 时背景率由网络里学出来的杂波场给出（model/clutter_field.py），数据端不再估计
         return BackgroundSource(source, BackgroundTracker(seq, cfg, device))
     return source
 

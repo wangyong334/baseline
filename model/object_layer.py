@@ -46,7 +46,8 @@ except ImportError:  # pragma: no cover - scipy is part of the training environm
 EPS = 1e-6
 L_CLAMP = 30.0                      # smooth numerical bound on the membrane (log-odds); far beyond +-A
 OBJECT_KEYS = ("slots", "hidden", "attn_hidden", "em_iters", "defer_max", "defer_alpha", "clutter_source",
-               "continuous_time", "object_context", "decision_rule")
+               "continuous_time", "object_context", "decision_rule", "separation")
+SEPARATIONS = ("full", "selective")
 DECISION_RULES = ("sprt", "fixed")
 SLOT_KEYS = ("active", "gen", "mu", "v", "P", "h", "L", "pd", "n", "tid")
 STATUS_NAMES = ("confirmed", "rejected", "reacquired", "lost", "forced")
@@ -116,13 +117,15 @@ class ObjectLayer(nn.Module):
 
     def __init__(self, feat_dim, height, width, slots=16, hidden=32, attn_hidden=32, em_iters=2, defer_max=10,
                  defer_alpha=0.05, length_unit=8.0, clutter_source="learned", continuous_time=False, ref_rate=None,
-                 object_context=True, decision_rule="sprt"):
+                 object_context=True, decision_rule="sprt", separation="full"):
         """clutter_source：learned = 杂波强度只由事件特征学出（v1）；background = 杂波的空间强度取模块二的本地背景率
         （每像素每窗、按极性，下限为模块二的参照率），事件特征只学"像不像目标"的标记似然比（v2）。
         continuous_time：True 时每个事件按自己的时间戳与目标在那一刻的位置比较（窗内匀速），校正步用加权最小二乘
         一窗内同时量出位置与速度（v2）；False 为 v1（事件与窗中心位置比较，只量位置）。
         消融对照：object_context = False 时读出不看任何目标槽（z = z0 + 背景项，不挂起），检验增益来自目标而不是多了一个读出头；
-        decision_rule = fixed 时挂在目标上的事件一律等满 defer_max 窗（目标被否定、槽被释放时提前终判），作 SPRT 的固定等待对照。"""
+        decision_rule = fixed 时挂在目标上的事件一律等满 defer_max 窗（目标被否定、槽被释放时提前终判），作 SPRT 的固定等待对照。
+        separation（端到端时与骨干的耦合）：full = 目标层的估计都不回传骨干（v2）；selective = 关联（哪些事件属于同一目标）
+        回传骨干，让骨干学会可聚成目标的事件特征（归属损失按事件平均，量级与像素损失相当），存在证据仍不回传。"""
         super(ObjectLayer, self).__init__()
         if clutter_source not in ("learned", "background"):
             raise ValueError("clutter_source 必须是 learned 或 background")
@@ -130,6 +133,9 @@ class ObjectLayer(nn.Module):
         if decision_rule not in DECISION_RULES:
             raise ValueError("decision_rule 必须是 %s 之一" % (DECISION_RULES,))
         self.object_context, self.decision_rule = bool(object_context), str(decision_rule)
+        if separation not in SEPARATIONS:
+            raise ValueError("separation 必须是 %s 之一" % (SEPARATIONS,))
+        self.separation = str(separation)
         self.feat_dim, self.height, self.width = int(feat_dim), int(height), int(width)
         self.slots, self.hidden, self.attn_hidden = int(slots), int(hidden), int(attn_hidden)
         self.em_iters, self.unit = int(em_iters), float(length_unit)
@@ -398,8 +404,9 @@ class ObjectLayer(nn.Module):
             # separation (2): the object estimates (association, existence, position) read the backbone without pushing
             # gradients back into it; the backbone learns only from per-event losses (its own read-out, this layer's z)
             gd, z0d = g.detach(), z0.detach()
-            key = self.event_key(gd)
-            mark = self.clutter_bias - self.clutter_gain * z0d.clamp(-15.0, 15.0) + self.clutter(gd).squeeze(-1)
+            ga, z0a = (g, z0) if self.separation == "selective" else (gd, z0d)          # association inputs
+            key = self.event_key(ga)
+            mark = self.clutter_bias - self.clutter_gain * z0a.clamp(-15.0, 15.0) + self.clutter(ga).squeeze(-1)
             if self.clutter_source == "background":
                 if ev.get("bg_event") is None:
                     raise ValueError("clutter_source = background 需要每个事件的背景率 ev['bg_event']（模块二）")
@@ -475,6 +482,8 @@ class ObjectLayer(nn.Module):
                     P_post = torch.stack([torch.stack([q00, q01], -1), torch.stack([q01, q11], -1)], -2)
             beta = torch.exp(log_beta)
             lb = log_beta[:, 1:]
+            if self.separation == "selective":                       # existence evidence never trains the backbone
+                lb = lb.detach()
             # 4. object neuron: each event adds log(1 + posterior odds / prior); the leak is the expected count
             log1m = torch.log1p(-torch.exp(lb).clamp(max=1.0 - EPS))
             term = torch.where(valid[eb], F.softplus(lb - log1m - logr[eb]), torch.zeros_like(lb))

@@ -30,6 +30,7 @@ import train_stream_v1 as T  # noqa: E402
 from dataset.ev_uav_stream import EvUAVStream  # noqa: E402
 from dataset.stream_source import make_window_source  # noqa: E402
 from dataset.stream_windows import refill_by_index  # noqa: E402
+from model.clutter_field import event_count_maps  # noqa: E402
 from model.comod import REF_RATE  # noqa: E402
 from model.object_layer import OBJECT_KEYS, ObjectLayer, backbone_stride  # noqa: E402
 from model.track_head import TrackHead  # noqa: E402
@@ -118,9 +119,10 @@ class BaseOutputs(object):
     开头延迟几窗无关：算一次，各轮复用。这样每轮只剩航迹头的计算（骨干与模块二的背景估计不再重复）。
     """
 
-    def __init__(self, net, tap, base, q99, device, dataset, keep_all=True, with_bg=False):
+    def __init__(self, net, tap, base, q99, device, dataset, keep_all=True, with_bg=False, field=None):
         self.net, self.tap, self.base, self.q99, self.device = net, tap, base, q99, device
         self.dataset, self.keep_all, self.with_bg = dataset, keep_all, bool(with_bg)
+        self.field = field          # 学出来的杂波场（model/clutter_field.py）：给出时由它算 events["bg"]
         self.items, self.bg_items = {}, {}
         self.dtype = next(net.parameters()).dtype
 
@@ -134,10 +136,16 @@ class BaseOutputs(object):
         chunk = int(self.base.get("eval_chunk", 32))
         states = None
         bg_all = torch.zeros(seq.n_events, dtype=torch.float32) if self.with_bg else None
+        fstate = None
         with torch.no_grad():
             for start in range(0, seq.n_windows, chunk):
                 end = min(start + chunk, seq.n_windows)
                 x, events, _, idx = source.chunk(start, end)
+                if self.field is not None:                   # 模块二 v2：背景率由学出来的杂波场给出（因果，状态跨片段）
+                    counts = event_count_maps(events, end - start, 1, int(self.base["pad_height"]),
+                                              int(self.base["pad_width"]))
+                    log_rate, fstate = self.field.forward_chunk(counts, fstate)
+                    events = dict(events, bg=torch.exp(log_rate))
                 z0, states, _ = self.net.forward_chunk(x, events, states)
                 if bg_all is not None:
                     if events.get("bg") is None:
