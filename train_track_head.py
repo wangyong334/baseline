@@ -30,6 +30,7 @@ import train_stream_v1 as T  # noqa: E402
 from dataset.ev_uav_stream import EvUAVStream  # noqa: E402
 from dataset.stream_source import make_window_source  # noqa: E402
 from dataset.stream_windows import refill_by_index  # noqa: E402
+from model.changepoint_layer import CHANGEPOINT_KEYS, ChangepointLayer, occupancy_boxes, occupancy_maps  # noqa: E402
 from model.clutter_field import event_count_maps  # noqa: E402
 from model.comod import REF_RATE  # noqa: E402
 from model.object_layer import OBJECT_KEYS, ObjectLayer, backbone_stride  # noqa: E402
@@ -85,11 +86,29 @@ def load_base(cfg, device):
     return net, ReadoutTap(net), base, q99, pos_weight, ckpt
 
 
-def build_head(cfg, net, base, device):
-    """head_kind = track（v2～v4f 的航迹头）、object（v5 目标神经元层，手写滤波程序，作对照）或 tokens（v6 目标 token 层，
-    网络写法；Inn 13.71）。长度单位 = 骨干总步长，由网络结构读出。"""
+def split_dataset(base, split, max_sequences=None):
+    """某个划分的录像；max_sequences 给出时只取文件名排序后的前几条（冒烟用）。"""
+    dataset = EvUAVStream(base["root"], split, base)
+    if max_sequences:
+        dataset = EvUAVStream(base["root"], split, base, names=dataset.names[:int(max_sequences)])
+    return dataset
+
+
+def build_head(cfg, net, base, device, q99=None, pos_weight=None):
+    """head_kind = track（v2～v4f 的航迹头）、object（v5 目标神经元层，手写滤波程序，作对照）、tokens（v6 目标 token 层，
+    网络写法；Inn 13.71）或 changepoint（RCL v1.3 回溯式变点标注层，RCL_V1_PLAN_20261101.md）。
+    长度单位 = 骨干总步长，由网络结构读出。changepoint 另需骨干的 q99（输入编码）与正样本权重（p0 的校准）。"""
     feat_dim = int(net.readout[0].in_features) - 2                 # 读出层输入 = [dec1 特征, p, t_local]
     kind = cfg.get("head_kind", "track")
+    if kind == "changepoint":
+        if q99 is None or pos_weight is None:
+            raise ValueError("head_kind = changepoint 需要骨干的 q99 与 pos_weight")
+        kwargs = {key: cfg[key] for key in CHANGEPOINT_KEYS if key in cfg}
+        if "rings" in kwargs:
+            kwargs["rings"] = tuple(int(r) for r in kwargs["rings"])
+        return ChangepointLayer(feat_dim, int(base["pad_height"]), int(base["pad_width"]), q99=q99,
+                                input_clip=float(base["input_clip"]), time_bins=int(base["time_bins"]),
+                                pos_weight=float(pos_weight), threshold=float(base["threshold"]), **kwargs).to(device)
     if kind in ("object", "tokens"):
         keys, cls = (OBJECT_KEYS, ObjectLayer) if kind == "object" else (TOKEN_KEYS, ObjectTokenLayer)
         kwargs = {key: cfg[key] for key in keys if key in cfg}
@@ -179,28 +198,39 @@ class BaseOutputs(object):
 
 def chunk_events(seq, lo, hi, offset=0, stream=0):
     """录像第 lo..hi-1 窗的事件（与 TorchWindowSource.chunk 同一顺序：先按窗、窗内按时间稳定排序），
-    返回 numpy 字典 t（片段内窗号 + offset）/ b / x / y / p / t_local / label / tid，以及事件在文件中的下标。"""
+    返回 numpy 字典 t（片段内窗号 + offset）/ b / x / y / p / t_local / bin（窗内时间箱）/ label / tid，以及事件在文件中的下标。"""
     a, b = int(seq.bounds[lo]), int(seq.bounds[hi])
     idx = seq.order[a:b]
     window = np.repeat(np.arange(lo, hi, dtype=np.int64), np.diff(seq.bounds[lo:hi + 1]))
     return {"t": window - lo + int(offset), "b": np.full(b - a, stream, dtype=np.int64),
             "x": seq.x[idx].astype(np.int64), "y": seq.y[idx].astype(np.int64),
             "p": seq.p[idx].astype(np.float32), "t_local": seq.t_local[idx].astype(np.float32),
+            "bin": seq.inner_bin[idx].astype(np.int64),
             "label": seq.label[idx].astype(np.float32), "tid": seq.target_id[idx].astype(np.float32)}, idx
 
 
 def to_device(parts, device):
     events = {key: torch.from_numpy(np.ascontiguousarray(parts[key])).to(device)
-              for key in ("t", "b", "x", "y", "p", "t_local")}
+              for key in ("t", "b", "x", "y", "p", "t_local", "bin") if key in parts}
     return events, torch.from_numpy(parts["label"]).to(device), torch.from_numpy(parts["tid"]).to(device)
 
 
-def assemble_cached(outputs, pieces, steps, device):
-    """多流片段：拼接各流的事件与缓存的骨干输出。返回 (events, z0, feat, labels, keep [T, B], tid)。"""
+def sequence_occupancy(outputs, index, seq, cell):
+    """每条训练录像的目标轨迹占据框（RCL 的在场标签，model/changepoint_layer.occupancy_boxes），按录像缓存。"""
+    cache = outputs.__dict__.setdefault("occupancy_cache", {})
+    if index not in cache:
+        cache[index] = occupancy_boxes(seq, cell)
+    return cache[index]
+
+
+def assemble_cached(outputs, pieces, steps, device, occ_spec=None):
+    """多流片段：拼接各流的事件与缓存的骨干输出。返回 (events, z0, feat, labels, keep [T, B], tid)。
+    occ_spec = (cell, hc, wc) 时另给 events['occ'] [T, B, hc, wc]：目标轨迹占据（RCL 训练用）。"""
     batch = len(pieces)
     keep = torch.ones((steps, batch), dtype=torch.float32, device=device)
-    cols = {key: [] for key in ("t", "b", "x", "y", "p", "t_local", "label", "tid")}
+    cols = {key: [] for key in ("t", "b", "x", "y", "p", "t_local", "bin", "label", "tid")}
     z0s, feats, bgs = [], [], []
+    occ = np.zeros((steps, batch, occ_spec[1], occ_spec[2]), dtype=np.float32) if occ_spec else None
     for b, stream in enumerate(pieces):
         for index, lo, hi, offset, new_start in stream:
             seq, z0_all, feat_all = outputs.get(index)
@@ -212,15 +242,23 @@ def assemble_cached(outputs, pieces, steps, device):
             feats.append(feat_all[index_t])
             if getattr(outputs, "with_bg", False):
                 bgs.append(outputs.bg(index)[index_t])
+            if occ is not None:
+                cells = sequence_occupancy(outputs, index, seq, occ_spec[0])
+                occ[offset:offset + hi - lo, b] = occupancy_maps(cells, lo, hi, occ_spec[1], occ_spec[2])
             if new_start:
                 keep[offset, b] = 0
     if not z0s:
-        empty = {key: np.zeros(0, dtype=np.int64 if key in ("t", "b", "x", "y") else np.float32) for key in cols}
+        empty = {key: np.zeros(0, dtype=np.int64 if key in ("t", "b", "x", "y", "bin") else np.float32)
+                 for key in cols}
         events, labels, tid = to_device(empty, device)
+        if occ is not None:
+            events["occ"] = torch.from_numpy(occ).to(device)
         return events, torch.zeros(0, device=device), torch.zeros(0, 1, device=device), labels, keep, tid
     events, labels, tid = to_device({key: np.concatenate(v) for key, v in cols.items()}, device)
     if bgs:
         events["bg_event"] = torch.cat(bgs).to(device)
+    if occ is not None:
+        events["occ"] = torch.from_numpy(occ).to(device)
     return events, torch.cat(z0s).to(device), torch.cat(feats).to(device), labels, keep, tid
 
 
@@ -236,17 +274,20 @@ def train_epoch(outputs, head, lengths, optimizer, cfg, pos_weight, device, rng,
     lam_e, lam_p, clip = float(cfg["lambda_exist"]), float(cfg["lambda_pos"]), float(cfg["grad_clip"])
     lam_d, lam_o = float(cfg.get("lambda_pd", 1.0)), float(cfg.get("lambda_origin", 1.0))   # 只在 existence = ipda 时有项
     lam_m = float(cfg.get("lambda_membership", 1.0))                    # 只在门控修正（defer_revision = gated）时有项
+    lam_v = float(cfg.get("lambda_event", 1.0))                         # RCL：各滞后的事件输出（L_evt）
     w_now, w_lag = float(cfg.get("now_loss_weight", 1.0)), float(cfg.get("lag_loss_weight", 1.0))
     lag = head.has_delayed                                              # 一窗滞后或目标级延迟决策：都有终判输出
+    occ_spec = getattr(head, "occupancy_spec", None)                    # RCL：在场标签（目标轨迹占据）
+    extra = (occ_spec,) if occ_spec else ()
     sums = {"event": 0.0, "events": 0, "lag": 0.0, "lag_n": 0, "exist": 0.0, "exist_n": 0, "pos": 0.0, "pos_n": 0,
-            "pd": 0.0, "pd_n": 0, "org": 0.0, "org_n": 0, "mem": 0.0, "mem_n": 0,
+            "pd": 0.0, "pd_n": 0, "org": 0.0, "org_n": 0, "mem": 0.0, "mem_n": 0, "evt": 0.0, "evt_n": 0,
             "updates": 0, "births": 0, "recycled": 0, "live": 0, "slot_windows": 0}
     norms = []
     hstate = None
     head.train()
     for c in range(n_chunks):
         pieces = T.stream_pieces(plan, c * k, (c + 1) * k)
-        events, z0, feat, labels, keep, tid = assemble_cached(outputs, pieces, k, device)
+        events, z0, feat, labels, keep, tid = assemble_cached(outputs, pieces, k, device, *extra)
         z, hstate, aux = head.forward_chunk(events, z0, feat, hstate, k, keep=keep, labels=labels, tid=tid,
                                             keys=labels if lag else None)
         for key in ("births", "recycled", "live", "slot_windows"):
@@ -272,6 +313,8 @@ def train_epoch(outputs, head, lengths, optimizer, cfg, pos_weight, device, rng,
                 loss = loss + lam_o * aux["org_sum"] / aux["org_n"]
             if aux["mem_n"]:
                 loss = loss + lam_m * aux["mem_sum"] / aux["mem_n"]
+            if aux.get("evt_n"):
+                loss = loss + lam_v * aux["evt_sum"] / aux["evt_n"]
             if not math.isfinite(float(loss.detach())):
                 raise RuntimeError("损失出现非有限值：片段 %d" % c)
             optimizer.zero_grad(set_to_none=True)
@@ -287,6 +330,9 @@ def train_epoch(outputs, head, lengths, optimizer, cfg, pos_weight, device, rng,
             for key in ("pd", "org", "mem"):
                 sums[key] += float(aux[key + "_sum"].detach())
                 sums[key + "_n"] += aux[key + "_n"]
+            if aux.get("evt_n"):
+                sums["evt"] += float(aux["evt_sum"].detach())
+                sums["evt_n"] += aux["evt_n"]
             sums["updates"] += 1
         hstate = head.detach_state(hstate)
     windows = max(sums["slot_windows"], 1)
@@ -297,6 +343,7 @@ def train_epoch(outputs, head, lengths, optimizer, cfg, pos_weight, device, rng,
             "pd_loss": sums["pd"] / sums["pd_n"] if sums["pd_n"] else None,
             "origin_loss": sums["org"] / sums["org_n"] if sums["org_n"] else None,
             "membership_loss": sums["mem"] / sums["mem_n"] if sums["mem_n"] else None,
+            "event_lag_loss": sums["evt"] / sums["evt_n"] if sums["evt_n"] else None,
             "updates": sums["updates"], "chunks": n_chunks,
             "grad_norm_median": float(np.median(norms)) if norms else 0.0,
             "births_per_window": sums["births"] / windows, "recycled_per_window": sums["recycled"] / windows,
@@ -325,6 +372,8 @@ def run_split(outputs, head, base, device, split, full=False, dump_dir=None, tra
     rows = {kind: [] for kind in kinds}
     stats = {"births": 0, "recycled": 0, "live": 0, "slot_windows": 0}
     delays, dstat, n_events, n_target, t_delays = [], np.zeros(5, dtype=np.int64), 0, 0, []
+    flips = {"up_tp": 0, "up_fp": 0, "down_tn": 0, "down_fn": 0}
+    rescued_wait = []
     was_training = head.training
     head.eval()
     with torch.no_grad():
@@ -362,6 +411,18 @@ def run_split(outputs, head, base, device, split, full=False, dump_dir=None, tra
                         dstat += np.bincount(ls, minlength=5)
                         seq_wait.append(lw)
                         seq_status.append(ls)
+            if hasattr(head, "flush"):                        # RCL：录像结束时把仍在等待的事件提交完（状态 3）
+                fl = head.flush(hstate)
+                if fl["delayed_z"] is not None:
+                    lag_key.append(fl["delayed_key"].cpu().numpy().astype(np.int64))
+                    lag_prob.append(torch.sigmoid(fl["delayed_z"]).float().cpu().numpy())
+                    lw = fl["delayed_lag"].cpu().numpy().astype(np.int64)
+                    ls = fl["delayed_status"].cpu().numpy().astype(np.int64)
+                    delays.append(lw)
+                    t_delays.append(lw[seq.label[lag_key[-1]] > 0.5])
+                    dstat += np.bincount(ls, minlength=5)
+                    seq_wait.append(lw)
+                    seq_status.append(ls)
             probs = {"base": refill_by_index(seq.n_events, idx_parts, p0_parts),
                      "track": refill_by_index(seq.n_events, idx_parts, p1_parts)}
             if lag:
@@ -371,6 +432,17 @@ def run_split(outputs, head, base, device, split, full=False, dump_dir=None, tra
             pos = seq.label > 0.5
             n_events += int(seq.n_events)
             n_target += int(pos.sum())
+            if lag:                                           # 输出被改动的事件：往上 / 往下，改对 / 改错
+                now_on, fin_on = probs["track_now"] >= thr, probs["track"] >= thr
+                up, down = ~now_on & fin_on, now_on & ~fin_on
+                flips["up_tp"] += int((up & pos).sum())
+                flips["up_fp"] += int((up & ~pos).sum())
+                flips["down_tn"] += int((down & ~pos).sum())
+                flips["down_fn"] += int((down & pos).sum())
+                if head.defer_max and seq_wait:               # 被未来救回的目标事件（暂定 0、终判 1、真目标）等了几窗
+                    wait = np.full(seq.n_events, -1, dtype=np.int64)
+                    wait[np.concatenate(lag_key)] = np.concatenate(seq_wait)
+                    rescued_wait.append(wait[up & pos])
             for kind in kinds:
                 prob = probs[kind]
                 cached = cache is not None and kind == "base" and seq.name in cache
@@ -424,7 +496,14 @@ def run_split(outputs, head, base, device, split, full=False, dump_dir=None, tra
             mean_delay_windows=float(dl.sum()) / max(n_events, 1),
             target_mean_delay_windows=float(tl.sum()) / max(n_target, 1),
             deferred_p95_windows=float(np.percentile(dl, 95)) if dl.size else 0.0,
-            status={name: int(c) for name, c in zip(("confirmed", "rejected", "reacquired", "lost", "forced"), dstat)})
+            status={name: int(c) for name, c in zip(getattr(head, "status_names", (
+                "confirmed", "rejected", "reacquired", "lost", "forced")), dstat)})
+        rw = np.concatenate(rescued_wait) if rescued_wait else np.zeros(0, dtype=np.int64)
+        out["head_stats"].update(
+            rescued_targets=int(rw.size), rescued_mean_wait_windows=float(rw.mean()) if rw.size else None,
+            rescued_full_wait_frac=float((rw >= head.defer_max).mean()) if rw.size else None)
+    if lag:
+        out["head_stats"]["flips"] = dict(flips)
     for kind, (tp, fp, fn) in counts.items():
         res = {"iou": tp / max(tp + fp + fn, 1), "acc": tp / max(tp + fn, 1), "tp": int(tp), "fp": int(fp),
                "fn": int(fn)}
@@ -502,7 +581,7 @@ def mode_train(args, cfg):
     device = torch.device(args.device)
     T.seed_everything(int(cfg["seed"]), bool(cfg["deterministic"]))
     net, tap, base, q99, pos_weight, _ = load_base(cfg, device)
-    head = build_head(cfg, net, base, device)
+    head = build_head(cfg, net, base, device, q99=q99, pos_weight=pos_weight)
     root = Path(cfg["save_root"])
     root.mkdir(parents=True, exist_ok=True)
     metrics_path = root / "metrics.jsonl"
@@ -510,7 +589,7 @@ def mode_train(args, cfg):
         raise RuntimeError("输出目录已有 metrics.jsonl，请换目录")
     T.write_json(root / "run_config.json", cfg)
     optimizer = torch.optim.Adam(head.parameters(), lr=float(cfg["lr"]))
-    train_set = EvUAVStream(base["root"], "train", base)
+    train_set = split_dataset(base, "train", args.max_sequences)
     lengths = [int(train_set[i].n_windows) for i in range(len(train_set))]
     if hasattr(head, "init_rate"):                                    # 目标神经元层：期望事件数的初值取训练集统计
         rate0 = mean_target_events(train_set)
@@ -519,7 +598,7 @@ def mode_train(args, cfg):
               % (rate0, head.unit), flush=True)
     bg = needs_background(head)
     train_out = BaseOutputs(net, tap, base, q99, device, train_set, with_bg=bg)
-    val_out = BaseOutputs(net, tap, base, q99, device, EvUAVStream(base["root"], "val", base), with_bg=bg)
+    val_out = BaseOutputs(net, tap, base, q99, device, split_dataset(base, "val", args.max_sequences), with_bg=bg)
     seed, epochs = int(cfg["seed"]), int(cfg["epochs"])
     print("航迹头训练：骨干 %s（冻结）| 航迹头参数 %d | context %s | decision_lag %d | %d 条流、k=%d | "
           "训练集 %d 条录像 %d 窗 | pos_weight %.2f" % (
@@ -556,13 +635,25 @@ def mode_train(args, cfg):
         calib = "" if out["pd_loss"] is None else " 检测 %.4f 来源 %.4f" % (out["pd_loss"], out["origin_loss"] or 0.0)
         if out["membership_loss"] is not None:
             calib += " 归属 %.4f" % out["membership_loss"]
+        if out.get("event_lag_loss") is not None:                      # RCL：各滞后的事件输出
+            calib += " 终判 %.4f" % out["event_lag_loss"]
         ev_rec = record["evidence"]
         if ev_rec is not None:                                        # 证据修正（v4e）：证据传递系数 + 孤儿参照
             if ev_rec.get("kappa"):
                 calib += " kappa %s" % "/".join("%.2f" % k for k in ev_rec["kappa"])
-            calib += " l0 %.2f" % ev_rec["orphan_ref"]
+            if "orphan_ref" in ev_rec:
+                calib += " l0 %.2f" % ev_rec["orphan_ref"]
             if "llr_scale" in ev_rec:                                  # 目标神经元层：似然比尺度 w_L（理论 1）
                 calib += " wL %.3f" % ev_rec["llr_scale"]
+            if "survival" in ev_rec:                                   # RCL：存活、出生、沉默代价、不动的概率
+                calib += " 存活 %.3f（寿命 %.1f 窗）出生 %.1e 沉默 %.2f 不动 %.2f" % (
+                    ev_rec["survival"], ev_rec["mean_life_windows"], ev_rec["birth"], ev_rec["silence_cost"],
+                    ev_rec["move_prob_by_ring"].get(0, 0.0))
+        if "rescued_targets" in hs:                                   # RCL：被未来救回的目标事件
+            now += " | 救回目标事件 %d（平均等 %s 窗，等满 %s）" % (
+                hs["rescued_targets"],
+                "%.2f" % hs["rescued_mean_wait_windows"] if hs["rescued_mean_wait_windows"] is not None else "-",
+                "%.0f%%" % (100 * hs["rescued_full_wait_frac"]) if hs["rescued_full_wait_frac"] is not None else "-")
         print("epoch %d lr %.2e | 损失 事件 %.4f%s 存在 %.4f 位置 %.4f%s | val IoU base %.4f -> track %.4f%s | "
               "拖尾误报 %d -> %d 断续漏检 %d -> %d 目标附近误报 %d -> %d | 每窗 航迹 %.2f 出生 %.3f 回收 %.4f | "
               "%.0fs（训练 %.0fs）| 显存峰值 %.2f GiB" % (
@@ -616,8 +707,8 @@ def fit_existence_temperature(cfg, net, tap, base, q99, head, device):
 def mode_eval(args, cfg):
     device = torch.device(args.device)
     T.seed_everything(int(cfg["seed"]), bool(cfg["deterministic"]))
-    net, tap, base, q99, _, _ = load_base(cfg, device)
-    head = build_head(cfg, net, base, device)
+    net, tap, base, q99, pos_weight, _ = load_base(cfg, device)
+    head = build_head(cfg, net, base, device, q99=q99, pos_weight=pos_weight)
     ckpt = torch.load(args.checkpoint, map_location=device)
     head.load_state_dict(ckpt["head"])
     calib = None
@@ -635,8 +726,8 @@ def mode_eval(args, cfg):
     for d in (args.dump_dir, args.tracks_dir):
         if d:
             os.makedirs(d, exist_ok=True)
-    outputs = BaseOutputs(net, tap, base, q99, device, EvUAVStream(base["root"], args.split, base), keep_all=False,
-                          with_bg=needs_background(head))
+    outputs = BaseOutputs(net, tap, base, q99, device, split_dataset(base, args.split, args.max_sequences),
+                          keep_all=False, with_bg=needs_background(head))
     result = run_split(outputs, head, base, device, args.split, full=True, dump_dir=args.dump_dir,
                        tracks_dir=args.tracks_dir)
     result.update(checkpoint=args.checkpoint, epoch=ckpt.get("epoch"), base_checkpoint=cfg["base_checkpoint"],
@@ -671,6 +762,7 @@ def parse_args(argv=None):
     parser.add_argument("--base-checkpoint", default=None, help="覆盖配置中的骨干 checkpoint（接新训练的估计器）")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--max-chunks", type=int, default=None, help="train：每轮最多几个片段（冒烟用）")
+    parser.add_argument("--max-sequences", type=int, default=None, help="每个划分只取前几条录像（冒烟用）")
     return parser.parse_args(argv)
 
 
