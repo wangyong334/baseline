@@ -19,6 +19,8 @@ HEAD:
   defer_max: 10               # D：终判最晚 10 窗（500 ms）
   defer_alpha: 0.05           # 第二阶段的提交阈值 alpha / 1 - alpha；固定滞后时不用
   commit: fixed
+  evidence_form: log1p        # v1 写法（v2 改为 linear）；显式写出，第一阶段结果可复现
+  fusion: bayes               # v1 写法（v2 改为 product）
 TRAIN:
   seed: 37
   epochs: 20
@@ -34,6 +36,7 @@ TRAIN:
   lambda_event: 1.0           # L_evt：各滞后的事件输出 BCE（只训练归属头）
   now_loss_weight: 0.0        # 暂定输出 = 骨干 z0，没有可训练的部分
   lag_loss_weight: 0.0        # 提交输出已在 L_evt 里训练；这里只记录数值
+  lambda_dynamics: 0.0        # v1 没有转移损失
   deterministic: true
   eval_chunk: 32
   save_root: log/changepoint_v1_seed37

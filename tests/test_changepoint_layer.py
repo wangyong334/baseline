@@ -10,6 +10,9 @@
     T8 融合的数值例子（Res/rcl_backward_check_20261101/fusion_output.txt 的 v1.3 final）
     另：目标轨迹占据（插值、编号 0 的目标）；配置接上 build_head（端到端训练 / 评估在 test_track_head）；
         第一阶段关口工具 tools/rcl_stage1_check 的计数
+    v2：证据两种写法（linear = g - mu，log1p = v1）；product 提交 = 平滑在场 x 归属（逐事件按定义重算）；
+        转移损失 L_dyn 能从标签占据学出运动（位移核集中到真实位移、存活升高）；流内 dyn_sum 与逐窗计算一致、换录像不算；
+        v2 配置只在三处诊断点、轮数、输出目录上与 v1 不同
 """
 import math
 import os
@@ -596,8 +599,107 @@ class LabelAndConfigTests(unittest.TestCase):
         self.assertEqual((head.defer_max, head.commit, head.cell, len(head.offsets)), (10, "fixed", 4, 33))
         self.assertEqual(head.occupancy_spec, (4, 66, 88))
         self.assertAlmostEqual(head.tau_logit, math.log(9.0) - math.log(30.0))
+        self.assertEqual((head.evidence_form, head.fusion, cfg["lambda_dynamics"]), ("log1p", "bayes", 0.0))
         with self.assertRaises(ValueError):
             TH.build_head(cfg, net, base, torch.device("cpu"))
+        # v2 differs from v1 only in the three diagnosed points, the epoch count and the output directory
+        cfg2 = load_flat_config(os.path.join(ROOT, "configs", "changepoint_v2.yaml"))
+        self.assertEqual({k for k in set(cfg) | set(cfg2) if cfg.get(k) != cfg2.get(k)},
+                         {"evidence_form", "fusion", "lambda_dynamics", "epochs", "save_root"})
+        head2 = TH.build_head(cfg2, net, base, torch.device("cpu"), q99=np.ones(12, dtype=np.float32), pos_weight=30.0)
+        self.assertEqual((head2.evidence_form, head2.fusion, cfg2["lambda_dynamics"], cfg2["epochs"]),
+                         ("linear", "product", 1.0, 50))
+
+
+class V2Tests(unittest.TestCase):
+    def test_evidence_forms(self):
+        """linear：l = g - mu；log1p（v1）：l = log(1 + g) - mu；两者共用同一个 g，零输入都等于 -mu。"""
+        lin = make_layer(evidence_form="linear")
+        old = make_layer(evidence_form="log1p")
+        old.load_state_dict(lin.state_dict())
+        density_evidence(lin)
+        density_evidence(old)
+        x = torch.rand(2, 12, H, W) * 3.0
+        mu = float(lin.mu())
+        g = lin.evidence(x) + mu
+        torch.testing.assert_allclose(old.evidence(x) + mu, torch.log1p(g))
+        self.assertGreater(float(g.max()), 5.0)            # linear form reaches strong evidence directly
+        with self.assertRaises(ValueError):
+            make_layer(fusion="mean")
+
+    def test_product_commit(self):
+        """fusion = product：在第 D 窗提交的校准概率 = 平滑在场 P(s|s+D)(c_e) x 归属 m（逐个事件按定义重算）。"""
+        D = 3
+        layer = make_layer(defer_max=D)
+        density_evidence(layer)
+        ev, z0, feat = make_events(9, seed=8)
+        out = run_eval(layer, ev, z0, feat, 9, cuts=(4,))
+        with torch.no_grad():
+            k = layer.kernel()
+            P = layer.init_state(1, torch.device("cpu"))["P"]
+            filt, pred = [], []
+            for t in range(9):
+                sel = ev["t"] == t
+                e = {key: torch.from_numpy(ev[key][sel]) for key in ("b", "x", "y", "p", "bin")}
+                P, pr = layer.forward_step(P, layer.evidence(layer.encode(e, 1)), k)
+                filt.append(P)
+                pred.append(pr)
+            for key, (z, lag, st) in out.items():
+                s = int(ev["t"][key])
+                if st != STATUS_DEADLINE:
+                    continue
+                sm = filt[s + D]
+                for j in range(s + D - 1, s - 1, -1):
+                    sm = layer.rts_step(filt[j], pred[j + 1], sm, k)
+                cy, cx = int(ev["y"][key]) // 4, int(ev["x"][key]) // 4
+                lp0 = torch.tensor([float(z0[key]) - layer.log_w])
+                m = layer.membership(torch.from_numpy(feat[key:key + 1]), torch.tensor([float(ev["p"][key])]),
+                                     torch.tensor([float(ev["t_local"][key])]), lp0)
+                want = float(sm[0, cy, cx] * m[0])
+                self.assertAlmostEqual(1.0 / (1.0 + math.exp(-(z - layer.log_w))), want, delta=1e-4)
+
+    def test_transition_loss_learns_motion(self):
+        """L_dyn：一个占 1 格、每窗右移 1 格的目标（标签占据），只用 L_dyn 训练出生 / 存活 / 位移核：
+        位移核把概率集中到 (0, +1)，存活升高，出生降低。"""
+        layer = make_layer(rings=(1, 2))
+        k_before = float(torch.softmax(layer.pi_logit, 0)[layer.offsets.index((0, 1))])
+        occ = torch.zeros(12, 1, H // 4, W // 4)
+        for t in range(12):
+            occ[t, 0, 1, t % (W // 4)] = 1.0
+        opt = torch.optim.Adam([layer.rho_raw, layer.p_raw, layer.pi_logit], lr=0.05)
+        for _ in range(300):
+            k = layer.kernel()
+            loss = sum(layer.transition_loss(occ[t - 1], occ[t], k).sum() for t in range(1, 12) if t % (W // 4))
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+        w = torch.softmax(layer.pi_logit, 0).detach()
+        self.assertGreater(float(w[layer.offsets.index((0, 1))]), 0.8)
+        self.assertGreater(float(w[layer.offsets.index((0, 1))]), 10 * k_before)
+        self.assertGreater(float(layer.p()), 0.95)
+        self.assertLess(float(layer.rho()), 1e-3)
+
+    def test_transition_loss_in_stream(self):
+        """训练时 forward_chunk 给出 dyn_sum：换录像的那一窗不算（上一窗属于别的录像）；与逐窗直接计算一致。"""
+        layer = make_layer(defer_max=3)
+        ev, z0, feat = make_events(8, batch=2, seed=9)
+        occ = torch.from_numpy(occ_from_events(ev, 8, 2))
+        events, z, f, labels, _ = chunk_slice(ev, z0, feat, 0, 8)
+        events["occ"] = occ
+        keep = torch.ones(8, 2)
+        keep[0] = 0
+        keep[5, 1] = 0
+        _, _, aux = layer.forward_chunk(events, z, f, None, 8, keep=keep, labels=labels, keys=labels)
+        k = layer.kernel()
+        want, n = 0.0, 0
+        for t in range(1, 8):
+            for b in range(2):
+                if t == 5 and b == 1:
+                    continue
+                want += float(layer.transition_loss(occ[t - 1, b:b + 1], occ[t, b:b + 1], k).sum())
+                n += (H // 4) * (W // 4)
+        self.assertAlmostEqual(float(aux["dyn_sum"]), want, delta=1e-3 * max(1.0, want))
+        self.assertEqual(aux["dyn_n"], n)
 
 
 class StageCheckTests(unittest.TestCase):

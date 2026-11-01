@@ -275,12 +275,14 @@ def train_epoch(outputs, head, lengths, optimizer, cfg, pos_weight, device, rng,
     lam_d, lam_o = float(cfg.get("lambda_pd", 1.0)), float(cfg.get("lambda_origin", 1.0))   # 只在 existence = ipda 时有项
     lam_m = float(cfg.get("lambda_membership", 1.0))                    # 只在门控修正（defer_revision = gated）时有项
     lam_v = float(cfg.get("lambda_event", 1.0))                         # RCL：各滞后的事件输出（L_evt）
+    lam_y = float(cfg.get("lambda_dynamics", 0.0))                      # RCL v2：标签占据上的转移损失（L_dyn）
     w_now, w_lag = float(cfg.get("now_loss_weight", 1.0)), float(cfg.get("lag_loss_weight", 1.0))
     lag = head.has_delayed                                              # 一窗滞后或目标级延迟决策：都有终判输出
     occ_spec = getattr(head, "occupancy_spec", None)                    # RCL：在场标签（目标轨迹占据）
     extra = (occ_spec,) if occ_spec else ()
     sums = {"event": 0.0, "events": 0, "lag": 0.0, "lag_n": 0, "exist": 0.0, "exist_n": 0, "pos": 0.0, "pos_n": 0,
             "pd": 0.0, "pd_n": 0, "org": 0.0, "org_n": 0, "mem": 0.0, "mem_n": 0, "evt": 0.0, "evt_n": 0,
+            "dyn": 0.0, "dyn_n": 0,
             "updates": 0, "births": 0, "recycled": 0, "live": 0, "slot_windows": 0}
     norms = []
     hstate = None
@@ -315,6 +317,8 @@ def train_epoch(outputs, head, lengths, optimizer, cfg, pos_weight, device, rng,
                 loss = loss + lam_m * aux["mem_sum"] / aux["mem_n"]
             if aux.get("evt_n"):
                 loss = loss + lam_v * aux["evt_sum"] / aux["evt_n"]
+            if lam_y > 0.0 and aux.get("dyn_n"):
+                loss = loss + lam_y * aux["dyn_sum"] / aux["dyn_n"]
             if not math.isfinite(float(loss.detach())):
                 raise RuntimeError("损失出现非有限值：片段 %d" % c)
             optimizer.zero_grad(set_to_none=True)
@@ -333,6 +337,9 @@ def train_epoch(outputs, head, lengths, optimizer, cfg, pos_weight, device, rng,
             if aux.get("evt_n"):
                 sums["evt"] += float(aux["evt_sum"].detach())
                 sums["evt_n"] += aux["evt_n"]
+            if aux.get("dyn_n"):
+                sums["dyn"] += float(aux["dyn_sum"].detach())
+                sums["dyn_n"] += aux["dyn_n"]
             sums["updates"] += 1
         hstate = head.detach_state(hstate)
     windows = max(sums["slot_windows"], 1)
@@ -344,6 +351,7 @@ def train_epoch(outputs, head, lengths, optimizer, cfg, pos_weight, device, rng,
             "origin_loss": sums["org"] / sums["org_n"] if sums["org_n"] else None,
             "membership_loss": sums["mem"] / sums["mem_n"] if sums["mem_n"] else None,
             "event_lag_loss": sums["evt"] / sums["evt_n"] if sums["evt_n"] else None,
+            "dynamics_loss": sums["dyn"] / sums["dyn_n"] if sums["dyn_n"] else None,
             "updates": sums["updates"], "chunks": n_chunks,
             "grad_norm_median": float(np.median(norms)) if norms else 0.0,
             "births_per_window": sums["births"] / windows, "recycled_per_window": sums["recycled"] / windows,
@@ -637,6 +645,8 @@ def mode_train(args, cfg):
             calib += " 归属 %.4f" % out["membership_loss"]
         if out.get("event_lag_loss") is not None:                      # RCL：各滞后的事件输出
             calib += " 终判 %.4f" % out["event_lag_loss"]
+        if out.get("dynamics_loss") is not None:                       # RCL v2：标签占据上的转移损失
+            calib += " 动态 %.5f" % out["dynamics_loss"]
         ev_rec = record["evidence"]
         if ev_rec is not None:                                        # 证据修正（v4e）：证据传递系数 + 孤儿参照
             if ev_rec.get("kappa"):

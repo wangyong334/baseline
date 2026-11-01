@@ -1,23 +1,35 @@
-"""模块三 RCL v1.3：回溯式变点标注层（Retrospective Change-point Labeling；方案 RCL_V1_PLAN_20261101.md）。
+"""模块三 RCL：回溯式变点标注层（Retrospective Change-point Labeling；方案 RCL_V1_PLAN_20261101.md）。
+
+v2（11-01，第一阶段诊断后的修正，CLAUDE.md 1.0.0）：
+  - 证据改为线性对数似然比 l = g(X) - mu（v1 的 log(1 + g) 把证据压到 <= 2.4 nats，目标格的在场平均只有 0.06～0.10）；
+  - 事件输出改为"在场 x 归属"：P = P_{s|s+D}(c_e) x m。目标事件必在占据格内，所以 P(y=1) = P(占据) P(y=1 | 占据)，
+    是恒等分解（不是近似）；v1 的贝叶斯因子以 V5 的 p0 为先验锚，V5 漏掉的第一拍离阈值 7.65 nats，
+    即使未来在场完美也只救得回 22%（val 1102 个中的 245 个）；
+  - 训练加转移损失 L_dyn：训练时状态（占据）已知，出生 / 存活 / 位移核按"已知上一窗占据预测下一窗占据"直接拟合
+    （有监督 HMM 的标准做法）；v1 只靠后验 BCE 间接学，位移核学成了均匀的（不动 0.05，标签 0.38）。
+  v1 的写法保留为选项（evidence_form = log1p、fusion = bayes，configs/changepoint_v1.yaml），用于复现第一阶段。
 
 两条通路 + 融合提交头：
   通路 A（冻结骨干，训练脚本缓存后传入）：每个事件的零等待 logit z0 与 dec1 读出特征。
   通路 B（本层，可训练）：每窗由原始事件重建与骨干同一编码的 12 通道表示 X_t，在 4x4 像素的判决格上做在场递推：
-    (E1)  l_t = log(1 + g(X_t)) - mu                          证据卷积（无偏置，零输入零证据），Lam = exp(l)
+    (E1)  l_t = g(X_t) - mu（v1：log(1 + g) - mu）               证据卷积（无偏置，零输入零证据），Lam = exp(l)
     (E2)  pred_t = (1 - P) rho + p (pi * P)                    预测在场；* = 卷积（散布）
     (E3)  Z_t = (1 - P)[(1 - rho) + rho Lam] + P[(1 - p) + p (pi (x) Lam)]   按来源归一化；(x) = 相关（收集，画布外取 1）
     (E4)  P_t = (1 - P) rho Lam / Z_t + Lam p (pi * (P / Z_t))   过滤在场：同一来源的目标只能去一处
     (E5)  P_{u|t} = P_{u|u} [(1 - p)(1 - P_{u+1|t}) / (1 - pred_{u+1}) + p (pi (x) (P_{u+1|t} / pred_{u+1}))]   RTS 平滑
     (E6)  L = logit P_{s|t} - logit P_{s|s}                     未来对数似然比
   融合提交头：
-    (E7)  q = P_{s|s}(c_e)
-    (E8)  m = sigmoid(h([dec1 特征, p, t_local, logit p0]))；BF = Lam (1 - m q) / ((1 - q) + q (1 - m) Lam)
-    (E9)  P = min(max(m, p0), sigmoid(logit p0 + log BF))；p0 = sigmoid(z0 - log w)（w = 骨干训练用的正样本权重）
-    (E10) 暂定输出 = z0（零额外等待）；commit = fixed：第 s+D 窗提交 1[P >= tau*]；
+    (E7)  q = P_{s|s}(c_e)；m = sigmoid(h([dec1 特征, p, t_local, logit p0]))（归属：占据格内的事件是不是目标）
+    (E8)  fusion = product（v2）：P = P_{s|t}(c_e) x m
+          fusion = bayes（v1）：BF = Lam (1 - m q) / ((1 - q) + q (1 - m) Lam)，
+                               P = min(max(m, p0), sigmoid(logit p0 + log BF))；p0 = sigmoid(z0 - log w)
+    (E10) 暂定输出 = z0（零额外等待）；commit = fixed：第 s+D 窗提交 1[P >= tau*]，tau* = sigmoid(logit 0.9 - log w)
+          （w = 骨干训练用的正样本权重，P 与 tau* 都在校准尺度上）；
           commit = adaptive：P >= 1 - alpha 提交 1；暂定为 1 且 P <= alpha 提交 0；否则 s+D 提交。提交后不再改写。
   训练（E11）：L_pres（过滤与 1..D 各滞后平滑的在场 BCE，标签 = 目标轨迹占据）-> exist_sum；
               L_mem（占据格内事件的归属 BCE，同格正负事件都参与）-> mem_sum；
-              L_evt（1..D 各滞后的事件输出 BCE，在场部分不回传，只训练归属头）-> evt_sum。
+              L_evt（1..D 各滞后的事件输出 BCE；product 时在场与归属都回传，bayes 时只训练归属头）-> evt_sum；
+              L_dyn（v2：由上一窗的标签占据预测这一窗的标签占据，只训练出生 / 存活 / 位移核）-> dyn_sum。
 没有为 V7 那种外挂程序留的东西：没有目标列表、关联、编号、出生消亡规则；在场是网格上的概率场，转移是一个学出的卷积核，
 前向用它卷积、后向用它相关。固定的只有递推的形式（由原理推出）、需求量 alpha 与 D、结构量（格子步长、位移集合）。
 接口与 model/object_tokens.ObjectTokenLayer 相同（init_state / detach_state / forward_chunk），另有 flush（序列结束时提交）。
@@ -31,8 +43,11 @@ import torch.nn.functional as F
 
 EPS = 1e-6
 CLAMP = 30.0
-CHANGEPOINT_KEYS = ("defer_max", "defer_alpha", "commit", "rings", "cell", "evidence_channels", "member_hidden")
+CHANGEPOINT_KEYS = ("defer_max", "defer_alpha", "commit", "rings", "cell", "evidence_channels", "member_hidden",
+                    "evidence_form", "fusion")
 COMMITS = ("fixed", "adaptive")
+EVIDENCE_FORMS = ("linear", "log1p")
+FUSIONS = ("product", "bayes")
 DIRECTIONS = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
 STATUS_CONFIRM, STATUS_REJECT, STATUS_FLUSH, STATUS_DEADLINE = 0, 1, 3, 4
 QUEUE_KEYS = ("b", "cy", "cx", "lag", "key", "z0", "lp0", "m", "q", "y", "prov", "zlast")
@@ -126,10 +141,13 @@ class ChangepointLayer(nn.Module):
 
     def __init__(self, feat_dim, height, width, q99, input_clip, time_bins, pos_weight, threshold=0.9,
                  defer_max=10, defer_alpha=0.05, commit="fixed", rings=(1, 2, 4, 8), cell=4,
-                 evidence_channels=8, member_hidden=32):
+                 evidence_channels=8, member_hidden=32, evidence_form="linear", fusion="product"):
         super(ChangepointLayer, self).__init__()
         if commit not in COMMITS:
             raise ValueError("commit 必须是 %s 之一" % (COMMITS,))
+        if evidence_form not in EVIDENCE_FORMS or fusion not in FUSIONS:
+            raise ValueError("evidence_form 必须是 %s 之一，fusion 必须是 %s 之一" % (EVIDENCE_FORMS, FUSIONS))
+        self.evidence_form, self.fusion = str(evidence_form), str(fusion)
         self.cell = int(cell)
         if self.cell < 1 or int(height) % self.cell or int(width) % self.cell:
             raise ValueError("画布 %dx%d 必须能被判决格 %d 整除" % (height, width, self.cell))
@@ -218,9 +236,14 @@ class ChangepointLayer(nn.Module):
         return x.clamp(0.0, self.input_clip)
 
     def evidence(self, x):
-        """(E1) l = log(1 + g(X)) - mu，[B, hc, wc]。"""
+        """(E1) l = g(X) - mu（linear）或 log(1 + g(X)) - mu（log1p，v1），[B, hc, wc]；g >= 0 且 g(0) = 0。"""
         g = F.relu(self.ev2(F.relu(self.ev1(x)))).squeeze(1)
-        return torch.log1p(g) - self.mu()
+        return (g if self.evidence_form == "linear" else torch.log1p(g)) - self.mu()
+
+    def transition_loss(self, prev, cur, k):
+        """L_dyn：已知上一窗的占据 prev（标签），按 (E2) 预测这一窗的占据，与标签 cur 的逐格 BCE（未求和）。"""
+        pred = ((1.0 - prev) * self.rho() + self.p() * self._scatter(prev, k)).clamp(EPS, 1.0 - EPS)
+        return F.binary_cross_entropy(pred, cur, reduction="none")
 
     def _gather(self, f, k, fill):
         """(pi (x) f)(d) = sum_o pi_o f(d + o)；画布外取 fill。"""
@@ -320,7 +343,7 @@ class ChangepointLayer(nn.Module):
         zero = z0.new_zeros(())
         aux = {"exist_sum": zero, "exist_n": 0, "pos_sum": zero, "pos_n": 0, "pd_sum": zero, "pd_n": 0,
                "org_sum": zero, "org_n": 0, "mem_sum": zero, "mem_n": 0, "evt_sum": zero, "evt_n": 0,
-               "births": 0, "recycled": 0, "live": 0, "slot_windows": 0}
+               "dyn_sum": zero, "dyn_n": 0, "births": 0, "recycled": 0, "live": 0, "slot_windows": 0}
         out = []
         k = self.kernel()
         lp0_all = z0 - self.log_w
@@ -346,6 +369,10 @@ class ChangepointLayer(nn.Module):
             if train:
                 occ = (occ + [occ_all[t]])[-(D + 1):]
             age = (age + 1).clamp(max=D + 2)
+            if train and len(occ) >= 2:                     # L_dyn: previous window must be the same recording
+                valid = (age >= 2).to(P.dtype)[:, None, None]
+                aux["dyn_sum"] = aux["dyn_sum"] + (self.transition_loss(occ[-2], occ[-1], k) * valid).sum()
+                aux["dyn_n"] += int(valid.sum()) * self.hc * self.wc
             # (E5) RTS smoothing over the buffer (index -1 = this window)
             n = len(filt)
             smooth = [None] * n
@@ -369,8 +396,11 @@ class ChangepointLayer(nn.Module):
                 stack = torch.stack(smooth)                                       # [n, B, hc, wc]
                 j = (n - 1 - q["lag"]).clamp(min=0)
                 s_val = stack[j, q["b"], q["cy"], q["cx"]]
-                L = (logit(s_val) - logit(q["q"])).detach()
-                z_cal = fuse(q["lp0"], q["m"], q["q"], L)
+                if self.fusion == "product":                  # P = presence x membership (both trained by L_evt)
+                    z_cal = logit((s_val * q["m"]).clamp(EPS, 1.0 - EPS))
+                else:                                         # v1: Bayes factor on the V5 prior, presence detached
+                    L = (logit(s_val) - logit(q["q"])).detach()
+                    z_cal = fuse(q["lp0"], q["m"], q["q"], L)
                 if train:
                     aux["evt_sum"] = aux["evt_sum"] + F.binary_cross_entropy_with_logits(z_cal, q["y"], reduction="sum")
                     aux["evt_n"] += int(z_cal.shape[0])

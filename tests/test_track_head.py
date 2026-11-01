@@ -858,7 +858,7 @@ class EndToEndTests(unittest.TestCase):
             base_ckpt = str(base_dir / "best_val_iou_seed37.pt")
             for name in ("track_head_v2", "track_head_v2_lag1", "track_head_v3", "track_head_v4", "track_head_v4b",
                          "track_head_v4c", "track_head_v4d", "track_head_v4e", "track_head_v4f", "object_layer_v1",
-                         "object_tokens_v1", "changepoint_v1"):
+                         "object_tokens_v1", "changepoint_v1", "changepoint_v2"):
                 head_cfg = load_flat_config(os.path.join(ROOT, "configs", name + ".yaml"))
                 # v4e：种子与骨干 checkpoint 走命令行覆盖（整体模型流水线 tools/run_full_model.sh 的用法）
                 cli = name == "track_head_v4e"
@@ -906,7 +906,7 @@ class EndToEndTests(unittest.TestCase):
                     hs = result["head_stats"]
                     self.assertTrue(0.0 <= hs["deferred_frac"] <= 1.0)
                     self.assertEqual(set(hs["status"]), {"confirmed", "rejected", "reacquired", "lost", "forced"})
-                if name == "changepoint_v1":                           # RCL：每个事件都挂起、恰好提交一次；学习量随结果存盘
+                if name.startswith("changepoint"):                     # RCL：每个事件都挂起、恰好提交一次；学习量随结果存盘
                     hs = result["head_stats"]
                     self.assertAlmostEqual(hs["deferred_frac"], 1.0)
                     self.assertEqual(set(hs["status"]), {"confirmed", "rejected", "unused", "flushed", "deadline"})
@@ -917,15 +917,15 @@ class EndToEndTests(unittest.TestCase):
                 self.assertIn("pass", result["gate"])
                 with np.load(str(root / ("dump_" + name) / "seq_7.npz")) as dump:
                     self.assertEqual(dump["probabilities"].shape, dump["base_probabilities"].shape)
-                    if name.startswith("track_head_v4") or name == "changepoint_v1":   # 逐事件的判决延迟与终判状态
+                    if name.startswith("track_head_v4") or name.startswith("changepoint"):   # 逐事件的判决延迟与终判状态
                         w, st = dump["decision_wait"], dump["decision_status"]
                         self.assertEqual(w.shape, dump["probabilities"].shape)
                         self.assertTrue(bool(((w == -1) == (st == -1)).all()))
                         self.assertTrue(bool((w <= 10).all()))
-                        if name == "changepoint_v1":
+                        if name.startswith("changepoint"):
                             self.assertTrue(bool((w >= 0).all()))
                 with np.load(str(root / ("tracks_" + name) / "seq_7.npz")) as tracks:
-                    if name == "changepoint_v1":                       # RCL 只记录每窗的在场场
+                    if name.startswith("changepoint"):                 # RCL 只记录每窗的在场场
                         self.assertEqual(tracks["presence"].shape[1:], (SH // 4, SW // 4))
                         continue
                     self.assertEqual(tracks["pos"].shape[1:], (4, 2))
