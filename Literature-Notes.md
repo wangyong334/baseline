@@ -309,5 +309,19 @@
 | PACT（ECCV'26）、PointEvent、ES-UAV、EV-Flying、CETUS | 竞品 | 记忆 `evuav-competitors-2026` |
 | HsVT、RGBE-UAV / TMAF、Residual Kalman、SFDNet、MvHeat-DET | 与底座机制关系不大 | CLAUDE.md 第 9 节 |
 
+## J. 模块三重做：把跟踪的数学放进网络（10-31 检索，都只读过检索摘要）
+
+| 文献 | 问题 | 方法 | 前提 / 局限 | 对我们的用处 |
+|---|---|---|---|---|
+| Neural Enhanced Belief Propagation（Liang & Meyer, IEEE TSP 2024；arXiv 2212.08340、2203.09948） | 多目标跟踪的关联与虚警 | 带存在概率的 BP 消息传递 + 从原始数据学出的网络修正关联、剔除虚警 | 输入是检测框（LiDAR）；BP 规则和剪枝阈值仍是手写程序 | "数学 + 网络"的先例，但数学仍写成程序；我们要把关联和存在本身做成网络层 |
+| SPRT-TANDEM（ICLR 2021；arXiv 2006.05587）+ ICASSP 2023（似然比饱和，B2Bsqrt） | 又快又准的序贯判决 | 网络学对数似然比（LLLR 损失），停止仍用 SPRT | 整段序列分类；不是逐事件，也不涉及目标 | "学似然比、保留 SPRT"：目标神经元的输入用学出的似然比，阈值仍是 Wald 的 ±A |
+| SAVi（ICLR 2022；arXiv 2111.12594）/ SAVi++（2022） | 视频里的目标中心表示 | 槽 = 目标；Transformer 预测器 + Slot Attention 校正器逐帧跟踪 | 帧式；没有存在概率，也没有判决时间 | 预测–校正就是卡尔曼的结构；目标槽沿用它，再加存在神经元 |
+| MOTIP（CVPR 2025；arXiv 2403.16848） | 关联规则手写 | 把关联当作 ID 预测，端到端学 | 没有运动估计，拥挤场景落后 | 关联可以完全学出来；保留学出的运动预测补它的短板 |
+| KalmanNet（IEEE TSP 2022）/ SIKNet（arXiv 2509.11323） | 模型失配下的卡尔曼滤波 | 保留滤波结构，网络学增益 | 单目标，或接在检测器之后 | "保留结构、学未知量"的标准做法 |
+| Deneve, Bayesian Spiking Neurons I（Neural Comput 2008；NIPS 2004 版） | 脉冲神经元怎样做推断 | 膜电位 = 隐藏二值状态的对数几率；每个输入脉冲给一次冲激，漏电来自状态转移；偏离预测到阈值才发放 | 经典原理 | 目标神经元的原理来源：存在对数几率 = 膜电位，事件 = 输入脉冲 |
+| Gilholm & Salmond 2005（扩展目标的泊松量测模型；原文本轮未核对） | 一个目标产生很多量测 | 量测 = 各目标的泊松点过程 + 杂波 | 经典原理 | 事件归属 = softmax(log 强度)，即带背景槽的注意力；存在的似然比 = Σ log(1 + 目标强度 / 杂波强度) − 期望事件数 |
+| SpikeMOT（IEEE Access 2025；arXiv 2309.16987）、SpikeTrack（CVPR 2026）、SpikeFET（NeurIPS 2025）、STNet（CVPR 2022） | 事件 + SNN 跟踪 | Siamese / 脉冲 Transformer | 单目标或框级，不做逐事件分割，也没有目标级判决时间 | 查重：本轮没检到"目标级脉冲判决"的先例 |
+| Spike-driven Transformer（NeurIPS 2023 / TPAMI 2025）、Temporal Dynamics Enhancer（arXiv 2512.02447） | SNN 里的注意力 | 脉冲驱动的注意力模块 | 检测框，不是目标槽 | 以后把目标层的注意力做成脉冲驱动时的参考 |
+
 ## 附：下错的文件（V5修订文件夹，10-25 核对）
 `Asymmetric_Contextual_Modulation_for_Infrared…`（实为 GDN）、`Fast_and_Slow_Contrast_Adaptation…`、`Low_Cost_and_Latency…`（无前缀"2、"的那份，实为 Attention U-Net）、`Focal_Loss…`、`Normalization_as_a_Canonical…`（实为 SLS）、`Spike2Former=…`（实为 PIT）。正确版本是带"2、"前缀的文件和 `Spike2Former_Efficient…`。

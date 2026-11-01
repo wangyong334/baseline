@@ -1,0 +1,58 @@
+# 全局端到端 v2（train_end2end.py；model/object_layer.py；Stream-SNN-Innovations.md 13.67）：模块一 + 二 + 三一起训练。
+# 10-31 用户要求：深度学习不能靠手写，把数学放进网络结构，整体端到端重构。各层的改动（问题 -> 原理 -> 机制）：
+#   事件表示：像素通路仍是标准 12 通道帧；目标通路直接读原始事件（位置 + 窗内时间戳），每个事件与目标"在它自己那一刻"
+#            的位置比较（窗内匀速），一窗之内用加权最小二乘同时量出位置与速度（帧做不到；快目标第一窗就有速度）。
+#   神经元：  目标神经元（Deneve 贝叶斯脉冲神经元）：膜电位 = 存在对数几率，每个事件给一次输入 log(1 + 后验几率 / 先验)，
+#            漏电 = 期望事件数，越过 +-A（Wald 阈值）发放；像素通路的 BIR 神经元不变。
+#   结构：    像素通路（BIR U-Net + 不变接口）+ 目标通路（目标槽、PDA 注意力、卡尔曼式预测 / 校正），端到端耦合；
+#            背景槽的杂波强度 = 模块二的本地背景率（PDA 的杂波密度），环境越吵、每个事件的证据越弱、判定越晚。
+#   检测头：  零等待输出 = 像素证据 + 注意力加权的目标读出；目标未定的事件等它的目标神经元发放后，用同一个读出按判决时刻的
+#            目标状态重读。读出看到的存在概率与归属不回传梯度（分离原理：判决不改动估计）。
+#   损失：    像素通路 BCE + 目标通路零等待 / 终判 BCE + 匈牙利匹配后的存在 BCE、归属交叉熵、位置 Smooth-L1 + 消息峰值约束。
+# 手设量：槽数（容量）、宽度、EM 迭代次数、延迟预算、alpha；长度单位 = 骨干总步长（8 px，由网络结构读出）。
+# 训练：骨干从 E3a 初始化（学习率 x backbone_lr_scale），目标层从头训练；流、k 等多流设置沿用骨干的训练配置（4 条流、k = 16）。
+# 通过标准（事先定）：val IoU >= v4f 的 0.9073，且 test 只报一次（四个指标）；第一拍召回 >= 0.62、目标事件平均等待 <= 0.24 窗；
+#   val 上确认错判率 <= alpha；每窗消息数 p95 不超过预算。
+# 用法（服务器，GPU 由 GPU= 指定）：CFG=configs/full_model_v2.yaml GPU=2 nohup bash tools/run_end2end.sh > run/full_model_v2_all.log 2>&1 &
+DATA:
+  root: /media/stephen/nvme0n1/wy_data/datasets/EV-UAV-dataset
+  input_device: gpu
+BASE:
+  base_checkpoint: log/stream_tif_commpeak_inv_seed37/best_val_iou_seed37.pt   # E3a（val 最好一轮，第 42 轮）：骨干的初始化
+HEAD:
+  head_kind: object
+  slots: 16                   # 每条流的目标槽数（容量）
+  hidden: 32
+  attn_hidden: 32
+  em_iters: 2
+  defer_max: 10               # 延迟预算：终判最晚 10 窗（500 ms）
+  defer_alpha: 0.05           # 允许的错判率：A = log((1 - alpha) / alpha)；检测概率上限 1 - alpha
+  clutter_source: background  # 杂波的空间强度 = 模块二的本地背景率
+  continuous_time: true       # 事件按自己的时间戳与目标比较，一窗量出位置与速度
+TRAIN:
+  seed: 37
+  epochs: 20
+  lr: 0.001                   # 目标层的学习率（线性降到 lr_end）
+  lr_end: 0.0001
+  backbone_lr_scale: 0.1      # 骨干的学习率 = 目标层的 0.1 倍（从已训练好的 E3a 微调）
+  grad_clip: 1.0
+  lambda_pixel: 1.0           # 像素通路读出的逐事件 BCE
+  now_loss_weight: 1.0        # 目标通路零等待输出的 BCE
+  lag_loss_weight: 1.0        # 目标通路终判输出的 BCE
+  lambda_exist: 1.0
+  lambda_pos: 0.5
+  lambda_membership: 1.0
+  deterministic: true
+  eval_chunk: 32
+  save_root: log/full_model_v2_seed37
+EVAL:
+  calibrate_existence: false
+  threshold: 0.9
+  pd_detT: 50
+  correct_thresh: 0.0001
+  rolling_window: 10
+  segments: [[0, 15], [64, 79], [144, 159]]
+  timing_warmup_windows: 20
+  gate_tail_drop: 0.30
+  gate_gap_drop: 0.30
+  gate_near_rise: 0.10

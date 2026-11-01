@@ -30,6 +30,8 @@ import train_stream_v1 as T  # noqa: E402
 from dataset.ev_uav_stream import EvUAVStream  # noqa: E402
 from dataset.stream_source import make_window_source  # noqa: E402
 from dataset.stream_windows import refill_by_index  # noqa: E402
+from model.comod import REF_RATE  # noqa: E402
+from model.object_layer import OBJECT_KEYS, ObjectLayer, backbone_stride  # noqa: E402
 from model.track_head import TrackHead  # noqa: E402
 from utils.stream_common import linear_epoch_lr, load_flat_config  # noqa: E402
 from utils.stream_metrics import FastRoc  # noqa: E402
@@ -81,7 +83,17 @@ def load_base(cfg, device):
 
 
 def build_head(cfg, net, base, device):
+    """head_kind = track（v2～v4f 的航迹头）或 object（v5 目标神经元层；长度单位 = 骨干总步长，由网络结构读出）。"""
     feat_dim = int(net.readout[0].in_features) - 2                 # 读出层输入 = [dec1 特征, p, t_local]
+    kind = cfg.get("head_kind", "track")
+    if kind == "object":
+        kwargs = {key: cfg[key] for key in OBJECT_KEYS if key in cfg}
+        if kwargs.get("clutter_source") == "background":        # 杂波的空间强度 = 模块二的背景率，下限 = 模块二的参照率
+            kwargs["ref_rate"] = tuple(base.get("invariant_ref_rate", REF_RATE))
+        return ObjectLayer(feat_dim, int(base["pad_height"]), int(base["pad_width"]), length_unit=backbone_stride(net),
+                           **kwargs).to(device)
+    if kind != "track":
+        raise ValueError("head_kind 必须是 track 或 object")
     kwargs = {key: cfg[key] for key in HEAD_KEYS if key in cfg}
     return TrackHead(feat_dim, int(base["pad_height"]), int(base["pad_width"]), **kwargs).to(device)
 
@@ -89,6 +101,13 @@ def build_head(cfg, net, base, device):
 # ---------------------------------------------------------------------------
 # 多流训练
 # ---------------------------------------------------------------------------
+
+
+def event_background(events):
+    """每个事件所在像素、所在极性的背景率（模块二，events["bg"] [T, B, 2, H, W]；通道 0 = ON（p = 1），1 = OFF）。"""
+    ch = (events["p"] < 0.5).long()
+    return events["bg"][events["t"], events["b"] if "b" in events else torch.zeros_like(events["t"]), ch,
+                        events["y"], events["x"]]
 
 
 class BaseOutputs(object):
@@ -99,10 +118,10 @@ class BaseOutputs(object):
     开头延迟几窗无关：算一次，各轮复用。这样每轮只剩航迹头的计算（骨干与模块二的背景估计不再重复）。
     """
 
-    def __init__(self, net, tap, base, q99, device, dataset, keep_all=True):
+    def __init__(self, net, tap, base, q99, device, dataset, keep_all=True, with_bg=False):
         self.net, self.tap, self.base, self.q99, self.device = net, tap, base, q99, device
-        self.dataset, self.keep_all = dataset, keep_all
-        self.items = {}
+        self.dataset, self.keep_all, self.with_bg = dataset, keep_all, bool(with_bg)
+        self.items, self.bg_items = {}, {}
         self.dtype = next(net.parameters()).dtype
 
     def get(self, index):
@@ -114,11 +133,16 @@ class BaseOutputs(object):
         feat_all = None
         chunk = int(self.base.get("eval_chunk", 32))
         states = None
+        bg_all = torch.zeros(seq.n_events, dtype=torch.float32) if self.with_bg else None
         with torch.no_grad():
             for start in range(0, seq.n_windows, chunk):
                 end = min(start + chunk, seq.n_windows)
                 x, events, _, idx = source.chunk(start, end)
                 z0, states, _ = self.net.forward_chunk(x, events, states)
+                if bg_all is not None:
+                    if events.get("bg") is None:
+                        raise ValueError("目标层要模块二的背景率，但骨干的输入没有 events['bg']（invariant_input 未开）")
+                    bg_all[torch.from_numpy(np.asarray(idx, dtype=np.int64))] = event_background(events).float().cpu()
                 feat = self.tap.feat.float().cpu()
                 if feat_all is None:
                     feat_all = torch.zeros((seq.n_events, int(feat.shape[1])), dtype=torch.float32)
@@ -130,7 +154,15 @@ class BaseOutputs(object):
         item = (seq, z0_all, feat_all)
         if self.keep_all:
             self.items[index] = item
+        if bg_all is not None:
+            if not self.keep_all:
+                self.bg_items.clear()
+            self.bg_items[index] = bg_all
         return item
+
+    def bg(self, index):
+        """第 index 条录像每个事件的背景率（模块二；顺序与文件相同）；没有开 with_bg 时为 None。"""
+        return self.bg_items.get(index) if self.with_bg else None
 
 
 def chunk_events(seq, lo, hi, offset=0, stream=0):
@@ -156,7 +188,7 @@ def assemble_cached(outputs, pieces, steps, device):
     batch = len(pieces)
     keep = torch.ones((steps, batch), dtype=torch.float32, device=device)
     cols = {key: [] for key in ("t", "b", "x", "y", "p", "t_local", "label", "tid")}
-    z0s, feats = [], []
+    z0s, feats, bgs = [], [], []
     for b, stream in enumerate(pieces):
         for index, lo, hi, offset, new_start in stream:
             seq, z0_all, feat_all = outputs.get(index)
@@ -166,6 +198,8 @@ def assemble_cached(outputs, pieces, steps, device):
             index_t = torch.from_numpy(np.asarray(idx, dtype=np.int64))
             z0s.append(z0_all[index_t])
             feats.append(feat_all[index_t])
+            if getattr(outputs, "with_bg", False):
+                bgs.append(outputs.bg(index)[index_t])
             if new_start:
                 keep[offset, b] = 0
     if not z0s:
@@ -173,6 +207,8 @@ def assemble_cached(outputs, pieces, steps, device):
         events, labels, tid = to_device(empty, device)
         return events, torch.zeros(0, device=device), torch.zeros(0, 1, device=device), labels, keep, tid
     events, labels, tid = to_device({key: np.concatenate(v) for key, v in cols.items()}, device)
+    if bgs:
+        events["bg_event"] = torch.cat(bgs).to(device)
     return events, torch.cat(z0s).to(device), torch.cat(feats).to(device), labels, keep, tid
 
 
@@ -282,6 +318,7 @@ def run_split(outputs, head, base, device, split, full=False, dump_dir=None, tra
     with torch.no_grad():
         for i in range(len(dataset)):
             seq, z0_all, feat_all = outputs.get(i)
+            bg_all = outputs.bg(i) if getattr(outputs, "with_bg", False) else None
             hstate = head.init_state(1, device)
             idx_parts, p0_parts, p1_parts, lag_key, lag_prob = [], [], [], [], []
             seq_wait, seq_status = [], []                          # 延迟决策：每个终判事件等了几窗、终判状态
@@ -292,6 +329,8 @@ def run_split(outputs, head, base, device, split, full=False, dump_dir=None, tra
                 events, _, _ = to_device(part, device)
                 index_t = torch.from_numpy(np.asarray(idx, dtype=np.int64))
                 z0, feat = z0_all[index_t].to(device), feat_all[index_t].to(device)
+                if bg_all is not None:
+                    events["bg_event"] = bg_all[index_t].to(device)
                 keys = index_t.to(device) if lag else None
                 z, hstate, aux = head.forward_chunk(events, z0, feat, hstate, end - start, log=log, keys=keys)
                 for key in stats:
@@ -414,9 +453,34 @@ def gate_check(result, cfg):
 # ---------------------------------------------------------------------------
 
 
+def needs_background(head):
+    """目标层的杂波强度取模块二的背景率时，骨干输出缓存要同时存每个事件的背景率。"""
+    return getattr(head, "clutter_source", None) == "background"
+
+
+def mean_target_events(dataset):
+    """训练集上每个标注目标每窗的平均事件数（目标神经元层期望事件数的初值，一次最大似然估计）。"""
+    total = count = 0
+    for i in range(len(dataset)):
+        seq = dataset[i]
+        idx = seq.order[int(seq.bounds[0]):int(seq.bounds[seq.n_windows])]       # same order as chunk_events
+        win = np.repeat(np.arange(seq.n_windows, dtype=np.int64), np.diff(seq.bounds[:seq.n_windows + 1]))
+        lab = seq.label[idx] > 0.5
+        tid = seq.target_id[idx].astype(np.int64)
+        sel = lab & (tid > 0)
+        if sel.any():
+            _, counts = np.unique(win[sel] * 1000003 + tid[sel], return_counts=True)
+            total += int(counts.sum())
+            count += int(counts.size)
+    return total / float(count) if count else 1.0
+
+
 def head_evidence(head):
     """证据修正（v4e）的参数：kappa = [存在未定, 缺口, 孤儿] 三个证据传递系数（理论值 1），
-    orphan_ref = 孤儿事件的参照（新生目标的先验对数几率）；其他修正方式返回 None。"""
+    orphan_ref = 孤儿事件的参照（新生目标的先验对数几率）；其他修正方式返回 None。
+    目标神经元层（v5）：orphan_ref = 新生目标的先验 l0，另有似然比尺度 llr_scale（理论 1）与杂波增益 clutter_gain。"""
+    if hasattr(head, "evidence_summary"):
+        return head.evidence_summary()
     if getattr(head, "kappa_raw", None) is None:
         return None
     return {"kappa": [float(k) for k in F.softplus(head.kappa_raw.detach()).cpu()],
@@ -437,8 +501,14 @@ def mode_train(args, cfg):
     optimizer = torch.optim.Adam(head.parameters(), lr=float(cfg["lr"]))
     train_set = EvUAVStream(base["root"], "train", base)
     lengths = [int(train_set[i].n_windows) for i in range(len(train_set))]
-    train_out = BaseOutputs(net, tap, base, q99, device, train_set)
-    val_out = BaseOutputs(net, tap, base, q99, device, EvUAVStream(base["root"], "val", base))
+    if hasattr(head, "init_rate"):                                    # 目标神经元层：期望事件数的初值取训练集统计
+        rate0 = mean_target_events(train_set)
+        head.init_rate(rate0)
+        print("目标神经元层：期望事件数初值 %.2f（训练集每个目标每窗的平均事件数）| 长度单位 %.0f px（骨干总步长）"
+              % (rate0, head.unit), flush=True)
+    bg = needs_background(head)
+    train_out = BaseOutputs(net, tap, base, q99, device, train_set, with_bg=bg)
+    val_out = BaseOutputs(net, tap, base, q99, device, EvUAVStream(base["root"], "val", base), with_bg=bg)
     seed, epochs = int(cfg["seed"]), int(cfg["epochs"])
     print("航迹头训练：骨干 %s（冻结）| 航迹头参数 %d | context %s | decision_lag %d | %d 条流、k=%d | "
           "训练集 %d 条录像 %d 窗 | pos_weight %.2f" % (
@@ -475,9 +545,13 @@ def mode_train(args, cfg):
         calib = "" if out["pd_loss"] is None else " 检测 %.4f 来源 %.4f" % (out["pd_loss"], out["origin_loss"] or 0.0)
         if out["membership_loss"] is not None:
             calib += " 归属 %.4f" % out["membership_loss"]
-        if record["evidence"] is not None:                            # 证据修正（v4e）：三个证据传递系数 + 孤儿参照
-            calib += " kappa %s l0 %.2f" % ("/".join("%.2f" % k for k in record["evidence"]["kappa"]),
-                                           record["evidence"]["orphan_ref"])
+        ev_rec = record["evidence"]
+        if ev_rec is not None:                                        # 证据修正（v4e）：证据传递系数 + 孤儿参照
+            if ev_rec.get("kappa"):
+                calib += " kappa %s" % "/".join("%.2f" % k for k in ev_rec["kappa"])
+            calib += " l0 %.2f" % ev_rec["orphan_ref"]
+            if "llr_scale" in ev_rec:                                  # 目标神经元层：似然比尺度 w_L（理论 1）
+                calib += " wL %.3f" % ev_rec["llr_scale"]
         print("epoch %d lr %.2e | 损失 事件 %.4f%s 存在 %.4f 位置 %.4f%s | val IoU base %.4f -> track %.4f%s | "
               "拖尾误报 %d -> %d 断续漏检 %d -> %d 目标附近误报 %d -> %d | 每窗 航迹 %.2f 出生 %.3f 回收 %.4f | "
               "%.0fs（训练 %.0fs）| 显存峰值 %.2f GiB" % (
@@ -494,7 +568,7 @@ def fit_existence_temperature(cfg, net, tap, base, q99, head, device):
     """在 val 上拟合存在对数几率的温度 T（Guo 2017 的温度缩放，只有一个参数）：min_T BCE(sigmoid(L / T), y)。
     y = 该航迹窗是否匹配上标注目标（与训练时的存在监督同一口径）。只用于停止规则：|L| / T >= A 等价于 |L| >= A T。"""
     dataset = EvUAVStream(base["root"], "val", base)
-    outputs = BaseOutputs(net, tap, base, q99, device, dataset, keep_all=False)
+    outputs = BaseOutputs(net, tap, base, q99, device, dataset, keep_all=False, with_bg=needs_background(head))
     chunk = int(base.get("eval_chunk", 32))
     logits, targets = [], []
     head.eval()
@@ -550,7 +624,8 @@ def mode_eval(args, cfg):
     for d in (args.dump_dir, args.tracks_dir):
         if d:
             os.makedirs(d, exist_ok=True)
-    outputs = BaseOutputs(net, tap, base, q99, device, EvUAVStream(base["root"], args.split, base), keep_all=False)
+    outputs = BaseOutputs(net, tap, base, q99, device, EvUAVStream(base["root"], args.split, base), keep_all=False,
+                          with_bg=needs_background(head))
     result = run_split(outputs, head, base, device, args.split, full=True, dump_dir=args.dump_dir,
                        tracks_dir=args.tracks_dir)
     result.update(checkpoint=args.checkpoint, epoch=ckpt.get("epoch"), base_checkpoint=cfg["base_checkpoint"],
