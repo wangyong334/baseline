@@ -125,6 +125,14 @@ class ObjectTokenLayer(nn.Module):
         if self.defer_max < 1:
             raise ValueError("defer_max 至少为 1 窗")
         self.unit = float(length_unit)
+        if not math.isfinite(self.unit) or self.unit < 1.0:
+            raise ValueError("length_unit must be finite and at least one pixel")
+        # Spatial resolution supplies the variance floor; raw=0 still gives variance=1.
+        # At unit stride use variance=2, since variance=1 is the strict lower bound.
+        self.min_variance = (1.0 / self.unit) ** 2
+        self.width_offset = math.log(math.expm1(1.0 - self.min_variance if self.unit > 1.0 else 1.0))
+        self.register_buffer("xy_limit", torch.tensor([(self.width - 1) / self.unit,
+                                                       (self.height - 1) / self.unit]), persistent=False)
         # interface attributes read by the trainers
         self.context, self.decision_lag, self.defer_revision = "object", 0, "object"
         self.has_delayed, self.continuous_time = True, True
@@ -137,7 +145,7 @@ class ObjectTokenLayer(nn.Module):
         self.event_value = nn.Linear(g, D)
         self.slot_query = _zero(nn.Linear(D, Hd))                     # content term starts at 0
         self.slot_bias = _zero(nn.Linear(D, 1))
-        self.width_head = _zero(nn.Linear(D, 1))                      # log spread of the position modulation (units^2)
+        self.width_head = _zero(nn.Linear(D, 1))                      # softplus variance, floored at one pixel squared
         self.bg_head = _mlp(g + (1 if self.clutter_source == "background" else 0), Hd, 1)
         _zero(self.bg_head[2])
         if self.clutter_source == "background":
@@ -235,6 +243,18 @@ class ObjectTokenLayer(nn.Module):
     def _bg_logit(self, g, cf):
         return self.bg_head(g if cf is None else torch.cat([g, cf], 1)).squeeze(-1)
 
+    def _precision(self, h):
+        variance = self.min_variance + F.softplus(self.width_head(h).squeeze(-1) + self.width_offset)
+        return variance.reciprocal()
+
+    def _position(self, r):
+        return torch.minimum(r.clamp(min=0.0), self.xy_limit.to(r.dtype))
+
+    def _displacement(self, h):
+        # No target can traverse more than the observed canvas in one window.
+        limit = self.xy_limit.to(h.dtype).clamp(min=1.0 / self.unit)
+        return limit * torch.tanh(self.step_head(h) / limit)
+
     @staticmethod
     def _stream_sum(weights, vals, onehot):
         """weights [E, N]、vals [E, C]、onehot [E, B]（事件所在的流）-> 每个流每个槽对本流事件的加权和 [B, N, C]。"""
@@ -249,7 +269,7 @@ class ObjectTokenLayer(nn.Module):
         B, N = valid.shape
         q = self.slot_query(h).reshape(B * N, -1)
         content = ((key @ q.t()).view(E, B, N) * onehot[:, :, None]).sum(1) / math.sqrt(float(self.attn_hidden))
-        prec = torch.exp(-self.width_head(h).squeeze(-1))
+        prec = self._precision(h)
         center = r[eb] + se[:, None, None] * u[eb]                                         # [E, N, 2]
         d2 = ((exy[:, None, :] - center) ** 2).sum(-1)
         a = content + self.slot_bias(h).squeeze(-1)[eb] - 0.5 * d2 * prec[eb]
@@ -340,7 +360,7 @@ class ObjectTokenLayer(nn.Module):
 
         # 1. predict: residual MLP on the tokens, learned displacement, leak of the existence membrane
         hp = state["h"] + self.pred(self.pred_norm(state["h"]))
-        r_p = state["r"] + self.step_head(hp)
+        r_p = self._position(state["r"] + self._displacement(hp))
         rest = self.rest.to(dtype)
         L_p = rest + torch.sigmoid(self.leak_head(hp).squeeze(-1)) * (state["L"] - rest)
 
@@ -366,7 +386,7 @@ class ObjectTokenLayer(nn.Module):
             free = ~alive
             if bool(free.any()):
                 with torch.no_grad():
-                    lg = torch.log_softmax(self._logits(key_d, gb_d, exy, se, eb, onehot, hp, r_p, self.step_head(hp),
+                    lg = torch.log_softmax(self._logits(key_d, gb_d, exy, se, eb, onehot, hp, r_p, self._displacement(hp),
                                                         alive), 1)
                     pb, ps, pe = self._propose(F.logsigmoid(z0) + lg[:, 0], free, onehot)
                 if int(pb.shape[0]):
@@ -384,9 +404,9 @@ class ObjectTokenLayer(nn.Module):
         n = zBN
         stats = torch.zeros(B, N, N_STATS, device=dev, dtype=dtype)
         for _ in range(self.iters):
-            u_c = self.step_head(h_c)
+            u_c = self._displacement(h_c)
             if E:
-                prec = torch.exp(-self.width_head(h_c).squeeze(-1))
+                prec = self._precision(h_c)
                 bs = torch.softmax(self._logits(key_d, gb_d, exy, se, eb, onehot, h_c, r_c, u_c, valid), 1)[:, 1:]
                 vbar, stats, innov, n = self._aggregate(bs, val, exy, se, onehot, r_c, u_c, prec)
             else:                                                    # an empty window is evidence too (a miss)
@@ -394,11 +414,11 @@ class ObjectTokenLayer(nn.Module):
                 innov = torch.zeros_like(r_c)
             h_n = self.gru(torch.cat([vbar, stats], -1).reshape(B * N, -1), h_c.reshape(B * N, -1)).view(B, N, -1)
             h_n = h_n + self.ffn(self.ffn_norm(h_n))
-            r_n = r_c + torch.sigmoid(self.gate_head(torch.cat([h_n, stats], -1))) * innov
+            r_n = self._position(r_c + torch.sigmoid(self.gate_head(torch.cat([h_n, stats], -1))) * innov)
             h_n = self._token_mix(h_n, r_n, valid, p_old)
             vv = valid[..., None]
             h_c, r_c = torch.where(vv, h_n, h_c), torch.where(vv, r_n, r_c)
-        u_c = self.step_head(h_c)
+        u_c = self._displacement(h_c)
 
         # 4. existence neuron: leaked membrane + learned evidence current; fires at +-A
         L_new = torch.where(valid, L_old + self.evid_head(torch.cat([h_c, stats], -1)).squeeze(-1), zBN)

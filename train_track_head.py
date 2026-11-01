@@ -37,6 +37,7 @@ from model.object_tokens import TOKEN_KEYS, ObjectTokenLayer  # noqa: E402
 from model.track_head import TrackHead  # noqa: E402
 from utils.stream_common import linear_epoch_lr, load_flat_config  # noqa: E402
 from utils.stream_metrics import FastRoc  # noqa: E402
+from utils.train_numerics import clip_grad_norm_checked_  # noqa: E402
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools"))
 import error_budget  # noqa: E402
@@ -275,7 +276,7 @@ def train_epoch(outputs, head, lengths, optimizer, cfg, pos_weight, device, rng,
                 raise RuntimeError("损失出现非有限值：片段 %d" % c)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            norms.append(float(torch.nn.utils.clip_grad_norm_(head.parameters(), clip)))
+            norms.append(clip_grad_norm_checked_(head.named_parameters(), clip, "head chunk %d" % c))
             optimizer.step()
             sums["event"] += float(ev_loss.detach()) * n_ev
             sums["events"] += n_ev

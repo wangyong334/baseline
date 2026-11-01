@@ -44,6 +44,7 @@ from model.comod import REF_RATE  # noqa: E402
 from model.lif2d_stream import detach_states  # noqa: E402
 from utils.comm_budget import CommBudget  # noqa: E402
 from utils.stream_common import linear_epoch_lr, load_flat_config  # noqa: E402
+from utils.train_numerics import clip_grad_norm_checked_  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -213,8 +214,8 @@ def train_epoch(net, tap, head, dataset, lengths, optimizer, cfg, base, q99, pos
     dtype = next(net.parameters()).dtype
     sources = Sources(dataset, base, q99, device, dtype)
     weight = torch.tensor([pos_weight], dtype=dtype, device=device)
-    params = [p for p in list(net.parameters()) + list(head.parameters())
-              + (list(field.parameters()) if field is not None else []) if p.requires_grad]
+    named_params = [(prefix + name, p) for prefix, module in (("backbone.", net), ("head.", head), ("field.", field))
+                    if module is not None for name, p in module.named_parameters() if p.requires_grad]
     H, W = int(base["pad_height"]), int(base["pad_width"])
     lam_clutter = float(cfg.get("lambda_clutter", 1.0))
     clip = float(cfg["grad_clip"])
@@ -279,7 +280,7 @@ def train_epoch(net, tap, head, dataset, lengths, optimizer, cfg, base, q99, pos
                 raise RuntimeError("损失出现非有限值：片段 %d" % c)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            norms.append(float(torch.nn.utils.clip_grad_norm_(params, clip)))
+            norms.append(clip_grad_norm_checked_(named_params, clip, "end2end chunk %d" % c))
             optimizer.step()
             if comm is not None:
                 comm.end_update()

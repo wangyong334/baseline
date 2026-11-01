@@ -89,6 +89,46 @@ class IdentityAndChunkTests(unittest.TestCase):
 
 
 class StructureTests(unittest.TestCase):
+    def test_extreme_width_has_finite_logits_loss_and_gradients(self):
+        for width in (-1000.0, -100.0, 100.0, 1000.0):
+            layer = make_layer()
+            randomize(layer, std=0.1, evidence=1.5)
+            with torch.no_grad():
+                layer.width_head.bias.fill_(width)
+            events, z0, feat, lab, tid = blob_windows(4, noise=10, velocity=(1., 0.5))
+            z, state, aux = layer.forward_chunk(events, z0, feat, None, 4, labels=lab, tid=tid, keys=lab)
+            loss = F.binary_cross_entropy_with_logits(z, lab)
+            for key in ("exist", "pos", "mem"):
+                loss = loss + aux[key + "_sum"] / max(aux[key + "_n"], 1)
+            self.assertTrue(bool(torch.isfinite(loss)), width)
+            loss.backward()
+            for name, p in layer.named_parameters():
+                if p.grad is not None:
+                    self.assertTrue(bool(torch.isfinite(p.grad).all()), (width, name))
+            for key in ("h", "r", "u", "L"):
+                self.assertTrue(bool(torch.isfinite(state[key]).all()), (width, key))
+
+    def test_precision_initial_value_and_subpixel_floor(self):
+        layer = make_layer()
+        h = torch.zeros(1, layer.slots, layer.hidden)
+        self.assertTrue(torch.allclose(layer._precision(h), torch.ones(1, layer.slots)))
+        with torch.no_grad():
+            layer.width_head.bias.fill_(-1000.)
+        self.assertLessEqual(float(layer._precision(h).max()), layer.unit ** 2)
+
+    def test_large_displacement_stays_on_canvas_across_empty_windows(self):
+        layer = make_layer()
+        randomize(layer, evidence=1.5)
+        with torch.no_grad():
+            layer.step_head.bias.copy_(torch.tensor([1e20, -1e20]))
+        state = single_token_state(layer, L=5.)
+        for _ in range(20):
+            _, state, _ = layer.forward_window(state, window_events([]))
+            self.assertTrue(bool(torch.isfinite(state["r"]).all()))
+            self.assertTrue(bool((state["r"] >= 0).all()))
+            self.assertTrue(bool((state["r"] <= layer.xy_limit).all()))
+            self.assertTrue(bool((state["u"].abs() <= layer.xy_limit).all()))
+
     def test_wald_bound_and_initialisation(self):
         layer = make_layer()
         self.assertFalse(hasattr(layer, "init_rate"))               # no data-statistic initial values
