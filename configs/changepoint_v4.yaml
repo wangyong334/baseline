@@ -1,0 +1,74 @@
+# 模块三 RCL v4（11-02，Inn 13.81）：回溯式变点标注层 + 在场门控的专家混合，挂在冻结的 V5 上。
+# 一句话：每窗用 V5 的分数更新"格里有目标"的变点后验（计算），每个事件在等待期内用回溯平滑的后验修正自己的判决（判决）。
+# 事件输出（全概率公式，E8m）：P_e = S_e x m_e + (1 - S_e) x b_e
+#   S_e = 事件所在格、事件所在窗的回溯平滑在场（Shiryaev 前向 + RTS 后向，"未来确认这里有目标"的概率）；
+#   m_e = 在场条件下事件是不是目标（归属专家，MLP）；
+#   b_e = 在场不成立时的后备专家 = sigmoid(V5 校准 logit + MLP(本格与足迹场的平滑 / 过滤在场、滞后))，最后一层零初始化，
+#         所以未来不提供信息时输出退回 V5；未来确认时由 m 救回（第一拍、缺口、同窗补全），未来否定时由 b 压低。
+# 为什么是这个结构（Inn 13.80～13.81 的本地核对）：
+#   - 乘积式 S x m（v2 / v3）：在场低的格（框尾部格）被一票否决；以 V5 为锚的贝叶斯更新也一样；
+#   - 加性写法（u + log 场、z0 + kappa x 似然比、z0 + MLP(统计量)）只用 L_evt 训练时都学成"不用未来"，救回 0～50 个；
+#   - 门控混合在本地子集第 0 轮：IoU 0.7241 -> 0.7622、救回 753 个、误压 65 个、第一拍 0.116 -> 0.193；
+#     归属 m 若再加 L_mem（只在标签占据格里训练）会学成"凡在占据格里就是目标"，用在平滑在场高的晕圈格上误报暴涨，
+#     所以 m 只由 L_evt 训练（训练目标与推理用途一致）。
+# 其余：证据 = 格内 V5 分数的标记泊松叠加 + 原始计数残差；有界递推（来源间求并，RTS softcap）；各因子按自己的标签训练
+#   （证据只由 L_pres，出生 / 存活 / 位移核只由 L_dyn 且先按标签做最大似然）；足迹场的形状按标签初始化。
+# 第一阶段 = 固定滞后（commit: fixed，D = 10 窗）；第二阶段（计算与判决解耦）= 同一份权重只换提交规则，
+#   configs/changepoint_v4_adaptive.yaml。关口工具 tools/rcl_stage1_check.py。val 挑轮次，test 只报一次。
+# 手设量：判决格 cell、位移环 rings、足迹半径（结构量）；D = defer_max、alpha（需求量）。按标签统计初始化 / 拟合的：
+#   足迹形状、转移参数（规则写在 ChangepointLayer.init_from_labels / train_track_head.fit_dynamics）。
+# 用法（服务器）：CFG=configs/changepoint_v4.yaml GPU=2 nohup bash tools/run_track_head.sh > run/changepoint_v4_all.log 2>&1 &
+DATA:
+  root: /media/stephen/nvme0n1/wy_data/datasets/EV-UAV-dataset
+  input_device: gpu
+BASE:
+  base_checkpoint: log/stream_tif_commpeak_msg_seed37/best_val_iou_seed37.pt   # V5（val 0.8668 / test 0.8766）
+HEAD:
+  head_kind: changepoint
+  cell: 4                     # 判决格 4x4 像素
+  rings: [1, 2, 4, 8]         # 位移环（格）：不动 + 4 个半径 x 8 个方向 = 33 个位移
+  evidence_channels: 8
+  member_hidden: 32
+  defer_max: 10               # D：终判最晚 10 窗（500 ms）
+  defer_alpha: 0.05           # 第二阶段的提交阈值 alpha / 1 - alpha；固定滞后时不用
+  commit: fixed
+  evidence_form: linear       # 证据 = 线性对数似然比
+  fusion: mixture             # P = S m + (1 - S) b：在场门控的归属 / 后备专家（后备初始化 = V5）
+  evidence_source: backbone   # 证据读骨干分数（标记泊松）+ 原始计数残差
+  recursion: union            # 有界递推
+  factor_training: true       # 每个因子按自己的标签训练
+  state: box                  # 框占据（逐格证据强、回溯强）；尾部格的低估由后备专家兜住
+  footprint_radius: 3         # 足迹场半径（格，7x7 = 28 px）：盖住两个数据集目标尺寸的 p95
+  presence_tolerance: 0       # 框占据本身是展开的标签，逐格监督
+TRAIN:
+  seed: 37
+  epochs: 50                  # 与 v2 同一训练协议（学习率按轮线性衰减 1e-3 -> 1e-4），按 val 挑轮次
+  lr: 0.001
+  lr_end: 0.0001
+  streams: 4
+  tbptt_k: 16
+  stream_layout: greedy
+  grad_clip: 1.0
+  lambda_exist: 1.0           # L_pres：过滤与各滞后平滑的在场 BCE（只训练证据）
+  lambda_pos: 0.0
+  lambda_membership: 0.0      # 归属 m 只由 L_evt 训练（L_mem 只看标签占据格，与使用分布不一致）
+  lambda_event: 1.0           # L_evt：各滞后的事件输出 BCE（平滑在场 detach，训练 m 与后备专家）
+  now_loss_weight: 0.0        # 暂定输出 = 骨干 z0，没有可训练的部分
+  lag_loss_weight: 0.0        # 提交输出已在 L_evt 里训练；这里只记录数值
+  lambda_dynamics: 1.0        # L_dyn：由上一窗标签占据预测这一窗（只训练出生 / 存活 / 位移核）
+  dynamics_prefit_steps: 400  # 训练证据前，先按训练集标签占据对出生 / 存活 / 位移核做最大似然（有监督 HMM）
+  label_init: true            # 足迹场的形状按标签初始化（之后照常学习）
+  deterministic: true
+  eval_chunk: 32
+  save_root: log/changepoint_v4_seed37
+EVAL:
+  calibrate_existence: false
+  threshold: 0.9
+  pd_detT: 50
+  correct_thresh: 0.0001
+  rolling_window: 10
+  segments: [[0, 15], [64, 79], [144, 159]]
+  timing_warmup_windows: 20
+  gate_tail_drop: 0.0
+  gate_gap_drop: 0.0
+  gate_near_rise: 0.10

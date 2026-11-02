@@ -30,7 +30,8 @@ import train_stream_v1 as T  # noqa: E402
 from dataset.ev_uav_stream import EvUAVStream  # noqa: E402
 from dataset.stream_source import make_window_source  # noqa: E402
 from dataset.stream_windows import refill_by_index  # noqa: E402
-from model.changepoint_layer import CHANGEPOINT_KEYS, ChangepointLayer, occupancy_boxes, occupancy_maps  # noqa: E402
+from model.changepoint_layer import (CHANGEPOINT_KEYS, ChangepointLayer, footprint_statistics,  # noqa: E402
+                                     occupancy_boxes, occupancy_maps)
 from model.clutter_field import event_count_maps  # noqa: E402
 from model.comod import REF_RATE  # noqa: E402
 from model.object_layer import OBJECT_KEYS, ObjectLayer, backbone_stride  # noqa: E402
@@ -215,17 +216,18 @@ def to_device(parts, device):
     return events, torch.from_numpy(parts["label"]).to(device), torch.from_numpy(parts["tid"]).to(device)
 
 
-def sequence_occupancy(outputs, index, seq, cell):
-    """每条训练录像的目标轨迹占据框（RCL 的在场标签，model/changepoint_layer.occupancy_boxes），按录像缓存。"""
+def sequence_occupancy(outputs, index, seq, cell, centre=False):
+    """每条训练录像的目标轨迹占据框（RCL 的在场标签，model/changepoint_layer.occupancy_boxes），按录像缓存。
+    centre = True（RCL v4，state = centre）：每个目标只取外接框中心所在的格。"""
     cache = outputs.__dict__.setdefault("occupancy_cache", {})
-    if index not in cache:
-        cache[index] = occupancy_boxes(seq, cell)
-    return cache[index]
+    if (index, centre) not in cache:
+        cache[(index, centre)] = occupancy_boxes(seq, cell, centre=centre)
+    return cache[(index, centre)]
 
 
-def assemble_cached(outputs, pieces, steps, device, occ_spec=None):
+def assemble_cached(outputs, pieces, steps, device, occ_spec=None, centre=False):
     """多流片段：拼接各流的事件与缓存的骨干输出。返回 (events, z0, feat, labels, keep [T, B], tid)。
-    occ_spec = (cell, hc, wc) 时另给 events['occ'] [T, B, hc, wc]：目标轨迹占据（RCL 训练用）。"""
+    occ_spec = (cell, hc, wc) 时另给 events['occ'] [T, B, hc, wc]：目标轨迹占据（RCL 训练用；centre 见 sequence_occupancy）。"""
     batch = len(pieces)
     keep = torch.ones((steps, batch), dtype=torch.float32, device=device)
     cols = {key: [] for key in ("t", "b", "x", "y", "p", "t_local", "bin", "label", "tid")}
@@ -243,7 +245,7 @@ def assemble_cached(outputs, pieces, steps, device, occ_spec=None):
             if getattr(outputs, "with_bg", False):
                 bgs.append(outputs.bg(index)[index_t])
             if occ is not None:
-                cells = sequence_occupancy(outputs, index, seq, occ_spec[0])
+                cells = sequence_occupancy(outputs, index, seq, occ_spec[0], centre)
                 occ[offset:offset + hi - lo, b] = occupancy_maps(cells, lo, hi, occ_spec[1], occ_spec[2])
             if new_start:
                 keep[offset, b] = 0
@@ -279,7 +281,7 @@ def train_epoch(outputs, head, lengths, optimizer, cfg, pos_weight, device, rng,
     w_now, w_lag = float(cfg.get("now_loss_weight", 1.0)), float(cfg.get("lag_loss_weight", 1.0))
     lag = head.has_delayed                                              # 一窗滞后或目标级延迟决策：都有终判输出
     occ_spec = getattr(head, "occupancy_spec", None)                    # RCL：在场标签（目标轨迹占据）
-    extra = (occ_spec,) if occ_spec else ()
+    extra = (occ_spec, getattr(head, "state", "box") == "centre") if occ_spec else ()
     sums = {"event": 0.0, "events": 0, "lag": 0.0, "lag_n": 0, "exist": 0.0, "exist_n": 0, "pos": 0.0, "pos_n": 0,
             "pd": 0.0, "pd_n": 0, "org": 0.0, "org_n": 0, "mem": 0.0, "mem_n": 0, "evt": 0.0, "evt_n": 0,
             "dyn": 0.0, "dyn_n": 0,
@@ -573,6 +575,37 @@ def mean_target_events(dataset):
     return total / float(count) if count else 1.0
 
 
+def fit_dynamics(head, occs, device, steps, lr=0.05, seed=0):
+    """RCL v3：出生 rho、存活 p、位移核 pi 按训练集的标签占据做最大似然（有监督 HMM 的标准做法：状态已知时转移参数
+    直接由标签估计），在训练证据之前拟合好。factor_training 下这三个量本来就只由 L_dyn 训练，先拟合与边训边拟合是
+    同一个目标；不先拟合时位移核要几千步才离开均匀初值（v2 第 0 轮"不动" 0.04、第 47 轮 0.36），这期间回溯在场
+    每往回一窗乘 p x pi_o ~ 0.03，第一拍抬不起来。occs：每条训练录像的占据 [T, hc, wc]（occupancy_maps）。
+    每步取一条录像的全部相邻窗对、Adam。返回拟合前后的 L_dyn（每格平均）与学到的量。"""
+    occs = [o for o in occs if int(o.shape[0]) >= 2]
+    if not occs:
+        raise ValueError("没有可用于拟合转移参数的占据序列")
+    params = [head.rho_raw, head.p_raw, head.pi_logit]
+    opt = torch.optim.Adam(params, lr=lr)
+    rng = np.random.RandomState(seed)
+
+    def loss_of(o):
+        o = o.to(device)
+        return head.transition_loss(o[:-1], o[1:], head.kernel()).mean()
+
+    def mean_loss():
+        with torch.no_grad():
+            return float(np.mean([float(loss_of(o)) for o in occs]))
+
+    before = mean_loss()
+    for _ in range(int(steps)):
+        loss = loss_of(occs[rng.randint(len(occs))])
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+    head.zero_grad(set_to_none=True)
+    return dict(dyn_loss_before=before, dyn_loss_after=mean_loss(), steps=int(steps), **head.evidence_summary())
+
+
 def head_evidence(head):
     """证据修正（v4e）的参数：kappa = [存在未定, 缺口, 孤儿] 三个证据传递系数（理论值 1），
     orphan_ref = 孤儿事件的参照（新生目标的先验对数几率）；其他修正方式返回 None。
@@ -606,6 +639,27 @@ def mode_train(args, cfg):
               % (rate0, head.unit), flush=True)
     bg = needs_background(head)
     train_out = BaseOutputs(net, tap, base, q99, device, train_set, with_bg=bg)
+    centre = getattr(head, "state", "box") == "centre"
+    if cfg.get("label_init") and hasattr(head, "init_from_labels"):   # RCL v4：足迹与期望事件数按标签初始化
+        size = 2 * int(head.foot_radius) + 1
+        hist, n_ev, n_c = np.zeros((size, size)), 0, 0
+        for i in range(len(train_set)):
+            h, e, c = footprint_statistics(train_set[i], head.cell, head.foot_radius)
+            hist, n_ev, n_c = hist + h, n_ev + e, n_c + c
+        init = head.init_from_labels(hist, n_ev, n_c)
+        T.write_json(root / "label_init.json", dict(init, footprint=hist.tolist(), target_events=n_ev, centres=n_c))
+        print("扩展目标模型按标签初始化：每个目标每窗 %.2f 个事件 | 足迹峰值 %.3f | 半径内的目标事件 %.3f" % (
+            init["target_events_per_window"], init["footprint_peak"], init["footprint_inside"]), flush=True)
+    prefit = int(cfg.get("dynamics_prefit_steps", 0))
+    if prefit > 0:                                                    # RCL v3：转移参数先按标签做最大似然
+        cell, hc, wc = head.occupancy_spec
+        occs = [torch.from_numpy(occupancy_maps(sequence_occupancy(train_out, i, train_set[i], cell, centre), 0,
+                                                int(lengths[i]), hc, wc)) for i in range(len(train_set))]
+        fit = fit_dynamics(head, occs, device, prefit)
+        T.write_json(root / "dynamics_prefit.json", fit)
+        print("转移参数预拟合（标签最大似然，%d 步）：L_dyn %.5f -> %.5f | 存活 %.3f（寿命 %.1f 窗）出生 %.1e | 各环 %s" % (
+            prefit, fit["dyn_loss_before"], fit["dyn_loss_after"], fit["survival"], fit["mean_life_windows"],
+            fit["birth"], {k: round(v, 3) for k, v in fit["move_prob_by_ring"].items()}), flush=True)
     val_out = BaseOutputs(net, tap, base, q99, device, split_dataset(base, "val", args.max_sequences), with_bg=bg)
     seed, epochs = int(cfg["seed"]), int(cfg["epochs"])
     print("航迹头训练：骨干 %s（冻结）| 航迹头参数 %d | context %s | decision_lag %d | %d 条流、k=%d | "
@@ -659,6 +713,12 @@ def mode_train(args, cfg):
                 calib += " 存活 %.3f（寿命 %.1f 窗）出生 %.1e 沉默 %.2f 不动 %.2f" % (
                     ev_rec["survival"], ev_rec["mean_life_windows"], ev_rec["birth"], ev_rec["silence_cost"],
                     ev_rec["move_prob_by_ring"].get(0, 0.0))
+            if "obs_bias" in ev_rec:                                   # RCL v3：骨干标记泊松证据的 beta、本格增益
+                calib += " beta %.2f 增益 %.2f" % (ev_rec["obs_bias"], ev_rec["obs_gain"])
+            if "att_slope" in ev_rec:                                  # RCL v4：归属的 z0 斜率、未检出项、足迹
+                calib += " 归属 a %.2f c %.2f 未检出 %.2f 足迹中心 %.2f 最大 %.2f" % (
+                    ev_rec["att_slope"], ev_rec["att_bias"], ev_rec["att_undetected"], ev_rec["att_foot_centre"],
+                    ev_rec["att_foot_max"])
         if "rescued_targets" in hs:                                   # RCL：被未来救回的目标事件
             now += " | 救回目标事件 %d（平均等 %s 窗，等满 %s）" % (
                 hs["rescued_targets"],
