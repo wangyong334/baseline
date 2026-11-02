@@ -6,12 +6,8 @@ run/
 Res/
 .venv-stream-check/
 .venv-gpu/
-configs/stream_v1_train_stats.json
 References/
 .idea/
 .pytest_cache/
-CLAUDE/
-CLAUDE.md
 outputs/
 tmp/
-AGENTS.md
