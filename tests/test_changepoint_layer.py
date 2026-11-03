@@ -667,6 +667,9 @@ class LabelAndConfigTests(unittest.TestCase):
         self.assertEqual(cfg4e["epochs"], 16)
         cfg4ea = load_flat_config(os.path.join(ROOT, "configs", "changepoint_v4_evflying_adaptive.yaml"))
         self.assertEqual({k for k in set(cfg4e) | set(cfg4ea) if cfg4e.get(k) != cfg4ea.get(k)}, {"commit"})
+        # attribution control: v4.1 structure trained on in-sample full-V5 outputs (no train_outputs)
+        cfg41i = load_flat_config(os.path.join(ROOT, "configs", "changepoint_v41_insample.yaml"))
+        self.assertEqual({k for k in set(cfg41) | set(cfg41i) if cfg41.get(k) != cfg41i.get(k)}, {"train_outputs", "save_root"})
 
 
 class V2Tests(unittest.TestCase):
