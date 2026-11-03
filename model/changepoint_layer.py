@@ -55,7 +55,9 @@ v4（11-02，Inn 13.81；configs/changepoint_v4.yaml = 框占据 + fusion mixtur
                                P = min(max(m, p0), sigmoid(logit p0 + log BF))；p0 = sigmoid(z0 - log w)
     (E10) 暂定输出 = z0（零额外等待）；commit = fixed：第 s+D 窗提交 1[P >= tau*]，tau* = sigmoid(logit 0.9 - log w)
           （w = 骨干训练用的正样本权重，P 与 tau* 都在校准尺度上）；
-          commit = adaptive：P >= 1 - alpha 提交 1；暂定为 1 且 P <= alpha 提交 0；否则 s+D 提交。提交后不再改写。
+          commit = adaptive：以判决阈值为中心的 SPRT 边界，logit P >= logit tau* + logit(1 - alpha) 提交 1；
+          暂定为 1 且 logit P <= logit tau* - logit(1 - alpha) 提交 0；否则 s+D 提交。提交后不再改写。
+          等价于"一种判法的贝叶斯风险 <= 另一种的 alpha / (1 - alpha)"，代价与 tau* 相同；tau* = 0.5 时即 P >= 1 - alpha / P <= alpha。
   训练（E11）：L_pres（过滤与 1..D 各滞后平滑的在场 BCE，标签 = 目标轨迹占据）-> exist_sum；
               L_mem（占据格内事件的归属 BCE，同格正负事件都参与）-> mem_sum；
               L_evt（1..D 各滞后的事件输出 BCE；product 时在场与归属都回传，bayes 时只训练归属头）-> evt_sum；
@@ -404,6 +406,11 @@ class ChangepointLayer(nn.Module):
     def p(self):
         return torch.sigmoid(self.p_raw)
 
+    def commit_bounds(self):
+        """自适应提交的 (lo, hi)，校准 logit 尺度：以判决阈值 tau* 为中心、各差 logit(1 - alpha)。"""
+        half = _scalar_logit(1.0 - self.alpha)
+        return self.tau_logit - half, self.tau_logit + half
+
     def kernel(self):
         """转移核 [K, K]：33 个位移上的 softmax 概率放在对应位置（前向卷积、后向相关共用）。"""
         w = torch.softmax(self.pi_logit, 0)
@@ -721,7 +728,7 @@ class ChangepointLayer(nn.Module):
         dyn = self.dynamics(detach=train and self.factor_training)
         k_rec = dyn[3]
         lp0_all = z0 - self.log_w
-        lo_commit, hi_commit = _scalar_logit(self.alpha), _scalar_logit(1.0 - self.alpha)
+        lo_commit, hi_commit = self.commit_bounds()
         adaptive = self.commit == "adaptive" and not train
         P, filt, pred, occ, age, q = (state["P"], list(state["filt"]), list(state["pred"]), list(state["occ"]),
                                       state["age"], state["queue"])

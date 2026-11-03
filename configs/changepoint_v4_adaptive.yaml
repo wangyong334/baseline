@@ -15,8 +15,8 @@ HEAD:
   evidence_channels: 8
   member_hidden: 32
   defer_max: 10               # D：终判最晚 10 窗（500 ms）
-  defer_alpha: 0.05           # 第二阶段的提交阈值 alpha / 1 - alpha；固定滞后时不用
-  commit: adaptive            # 第二阶段：后验 >= 1 - alpha 立即判 1；暂定为 1 且 <= alpha 立即判 0；否则第 D 窗
+  defer_alpha: 0.05           # 自适应提交的风险比 alpha / (1 - alpha)：边界 = logit tau* +- logit(1 - alpha)，即 P >= 0.851 / <= 0.0155；固定滞后时不用
+  commit: adaptive            # 第二阶段：P 越过以 tau* 为中心的上界立即判 1；暂定为 1 且越过下界立即判 0；否则第 D 窗
   evidence_form: linear       # 证据 = 线性对数似然比
   fusion: mixture             # P = S m + (1 - S) b：在场门控的归属 / 后备专家（后备初始化 = V5）
   evidence_source: backbone   # 证据读骨干分数（标记泊松）+ 原始计数残差

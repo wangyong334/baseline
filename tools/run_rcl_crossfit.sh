@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # RCL v4.1 的完整流程（交叉拟合 = 堆叠泛化，configs/changepoint_v41.yaml 文件头）：
-#   1. K 个折骨干：与 V5 同一配方（BACKBONE），第 k 个留出第 k 折（连续 BLOCK 条录像为一块，块轮流分折），同时跑 PAR 个；
+#   1. K 个折骨干：与 V5 同一配方（BACKBONE），第 k 个留出第 k 折（连续 BLOCK 条录像为一块，块轮流分折），同时跑 PAR 个
+#      （一个骨干训练约占 15.5 GB 显存，24 GB 的卡只能跑一个，所以默认 PAR = 1；11-03 两个并行时第二个 OOM）；
 #   2. 样本外输出：第 k 个骨干推理第 k 折录像（tools/export_oof_outputs.py），写到判决层配置的 train_outputs；
 #   3. 判决层：tools/run_track_head.sh（训练 50 轮 -> val / test 评估）。验证 / 测试用完整的 V5（配置里的 base_checkpoint）。
 # 已完成的步骤自动跳过（折骨干目录里有 summary.json 视为训练完；样本外文件存在则不再导出），中途退出后原命令重跑即可续上。
@@ -12,7 +13,7 @@ export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=${GPU:-3}
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4} MKL_NUM_THREADS=${MKL_NUM_THREADS:-4}
 K=${K:-4}
 BLOCK=${BLOCK:-5}
-PAR=${PAR:-2}
+PAR=${PAR:-1}
 BACKBONE=${BACKBONE:-configs/evisseg_stream_tif_comm_peak.yaml}
 HEAD=${HEAD:-configs/changepoint_v41.yaml}
 OOF=$(python -c "import sys, yaml; print(yaml.safe_load(open(sys.argv[1], encoding='utf-8'))['TRAIN']['train_outputs'])" "$HEAD") \

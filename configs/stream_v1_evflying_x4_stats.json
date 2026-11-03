@@ -1,0 +1,94 @@
+{
+  "q99": [
+    3.7376696182833684,
+    3.8918202981106265,
+    2.833213344056216,
+    2.639057329615259,
+    2.9444389791664403,
+    2.639057329615259,
+    2.8903717578961645,
+    2.5649493574615367,
+    2.833213344056216,
+    2.5649493574615367,
+    2.833213344056216,
+    2.639057329615259
+  ],
+  "channel_names": [
+    "pos_count",
+    "neg_count",
+    "bin0_pos",
+    "bin0_neg",
+    "bin1_pos",
+    "bin1_neg",
+    "bin2_pos",
+    "bin2_neg",
+    "bin3_pos",
+    "bin3_neg",
+    "bin4_pos",
+    "bin4_neg"
+  ],
+  "nonzero_pixels_per_channel": [
+    3882493,
+    5503765,
+    1190312,
+    2687503,
+    1192506,
+    2690389,
+    1193433,
+    2680823,
+    1185980,
+    2686346,
+    1187509,
+    2690972
+  ],
+  "train_pos": 6796995,
+  "train_neg": 58909185,
+  "train_neg_pos_ratio": 8.666945466342112,
+  "pos_weight_cap": 30.0,
+  "pos_weight": 8.666945466342112,
+  "audit": {
+    "train": {
+      "files": 17,
+      "events": 65706180,
+      "t_max": 300050,
+      "events_per_window_mean": 1303.2286088301796,
+      "events_per_window_p99": 4804.0,
+      "events_per_window_max": 127452,
+      "empty_windows": 0,
+      "nonempty_windows_without_target": 35685,
+      "windows": 50418
+    },
+    "val": {
+      "files": 4,
+      "events": 11081394,
+      "t_max": 180000,
+      "events_per_window_mean": 1025.6751203258052,
+      "events_per_window_p99": 3505.6999999999935,
+      "events_per_window_max": 12495,
+      "empty_windows": 0,
+      "nonempty_windows_without_target": 8128,
+      "windows": 10804
+    },
+    "test": {
+      "files": 6,
+      "events": 26042432,
+      "t_max": 180000,
+      "events_per_window_mean": 1446.3196712207043,
+      "events_per_window_p99": 2833.600000000006,
+      "events_per_window_max": 105926,
+      "empty_windows": 0,
+      "nonempty_windows_without_target": 13943,
+      "windows": 18006
+    }
+  },
+  "config_used": {
+    "window_ms": 50,
+    "n_windows": 0,
+    "time_bins": 5,
+    "height": 180,
+    "width_px": 320,
+    "pad_height": 184,
+    "pad_width": 320
+  },
+  "seconds": 139.8
+}

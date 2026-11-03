@@ -375,8 +375,21 @@ class ProtocolTests(unittest.TestCase):
                 self.assertEqual((lag, st), (11 - t, STATUS_FLUSH))
             self.assertTrue(math.isfinite(z))
 
+    def test_commit_bounds(self):
+        """自适应提交边界以判决阈值为中心：tau* +- logit(1 - alpha)；上界处两种判法的风险比 = alpha / (1 - alpha)；
+        代价相等（tau* = 0.5）时退回 P >= 1 - alpha / P <= alpha。"""
+        layer = make_layer(commit="adaptive", defer_alpha=0.05)
+        lo, hi = layer.commit_bounds()
+        self.assertAlmostEqual(hi - layer.tau_logit, math.log(19.0), places=12)
+        self.assertAlmostEqual(layer.tau_logit - lo, math.log(19.0), places=12)
+        p_hi, tau = 1.0 / (1.0 + math.exp(-hi)), 1.0 / (1.0 + math.exp(-layer.tau_logit))
+        self.assertAlmostEqual((1.0 - p_hi) * tau / (p_hi * (1.0 - tau)), 0.05 / 0.95, places=12)
+        lo, hi = make_layer(commit="adaptive", defer_alpha=0.05, pos_weight=1.0, threshold=0.5).commit_bounds()
+        self.assertAlmostEqual(1.0 / (1.0 + math.exp(-hi)), 0.95, places=12)
+        self.assertAlmostEqual(1.0 / (1.0 + math.exp(-lo)), 0.05, places=12)
+
     def test_adaptive_commit(self):
-        """T5（自适应）：P >= 1 - alpha 提交 1；只有暂定为 1 的事件可以因 P <= alpha 提前提交 0；其余等到第 D 窗。"""
+        """T5（自适应）：P 越过以 tau* 为中心的上界提交 1；只有暂定为 1 的事件可以因越过下界提前提交 0；其余等到第 D 窗。"""
         layer = make_layer(defer_max=4, commit="adaptive", defer_alpha=0.05)
         density_evidence(layer, w1=0.8, w2=0.5)
         with torch.no_grad():
@@ -385,8 +398,8 @@ class ProtocolTests(unittest.TestCase):
         z0 = np.where(np.arange(z0.size) % 7 == 0, 8.0, z0).astype(np.float32)     # some commit at arrival
         out = run_eval(layer, ev, z0, feat, 16, cuts=(6, 11))
         self.assertEqual(set(out), set(range(len(z0))))
-        hi = math.log(0.95 / 0.05) + math.log(POS_W)
-        lo = math.log(0.05 / 0.95) + math.log(POS_W)
+        hi = layer.tau_logit + math.log(0.95 / 0.05) + math.log(POS_W)
+        lo = layer.tau_logit + math.log(0.05 / 0.95) + math.log(POS_W)
         prov = z0 - math.log(POS_W) >= layer.tau_logit
         seen = set()
         for key, (z, lag, st) in out.items():
@@ -647,6 +660,13 @@ class LabelAndConfigTests(unittest.TestCase):
                           head41.member[0].in_features), (False, "score", None, (1, 1, 3, 3), 3))
         cfg41a = load_flat_config(os.path.join(ROOT, "configs", "changepoint_v41_adaptive.yaml"))
         self.assertEqual({k for k in set(cfg41) | set(cfg41a) if cfg41.get(k) != cfg41a.get(k)}, {"commit"})
+        # EV-Flying check of v4: same model and hyperparameters, only data, backbone, epochs and output dir differ
+        cfg4e = load_flat_config(os.path.join(ROOT, "configs", "changepoint_v4_evflying.yaml"))
+        self.assertEqual({k for k in set(cfg4) | set(cfg4e) if cfg4.get(k) != cfg4e.get(k)},
+                         {"root", "base_checkpoint", "epochs", "save_root"})
+        self.assertEqual(cfg4e["epochs"], 16)
+        cfg4ea = load_flat_config(os.path.join(ROOT, "configs", "changepoint_v4_evflying_adaptive.yaml"))
+        self.assertEqual({k for k in set(cfg4e) | set(cfg4ea) if cfg4e.get(k) != cfg4ea.get(k)}, {"commit"})
 
 
 class V2Tests(unittest.TestCase):
