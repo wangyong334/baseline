@@ -688,6 +688,24 @@ class LabelAndConfigTests(unittest.TestCase):
                                 pos_weight=30.0)
         self.assertEqual((head41f.raw_residual, head41f.expert_input, head41f.ev1, head41f.member[0].in_features),
                          (False, "feature", None, head4.member[0].in_features))
+        # adopted structure (feature experts): adaptive evaluation, capacity-matched causal head, EV-Flying check
+        cfg41fa = load_flat_config(os.path.join(ROOT, "configs", "changepoint_v41_insample_feature_adaptive.yaml"))
+        self.assertEqual({k for k in set(cfg41f) | set(cfg41fa) if cfg41f.get(k) != cfg41fa.get(k)}, {"commit"})
+        cfg41fc = load_flat_config(os.path.join(ROOT, "configs", "changepoint_v41_insample_feature_causal.yaml"))
+        self.assertEqual({k for k in set(cfg41f) | set(cfg41fc) if cfg41f.get(k) != cfg41fc.get(k)},
+                         {"future_stats", "save_root"})
+        head41fc = TH.build_head(cfg41fc, net, base, torch.device("cpu"), q99=np.ones(12, dtype=np.float32),
+                                 pos_weight=30.0)
+        self.assertEqual(head41fc.future_stats, "past")
+        self.assertEqual({k: tuple(v.shape) for k, v in head41fc.state_dict().items()},
+                         {k: tuple(v.shape) for k, v in head41f.state_dict().items()})       # same capacity
+        cfg41ef = load_flat_config(os.path.join(ROOT, "configs", "changepoint_v41_evflying_feature.yaml"))
+        self.assertEqual({k for k in set(cfg41e) | set(cfg41ef) if cfg41e.get(k) != cfg41ef.get(k)},
+                         {"expert_input", "save_root"})
+        self.assertEqual({k for k in set(cfg41f) | set(cfg41ef) if cfg41f.get(k) != cfg41ef.get(k)},
+                         {"root", "base_checkpoint", "epochs", "save_root"})
+        cfg41efa = load_flat_config(os.path.join(ROOT, "configs", "changepoint_v41_evflying_feature_adaptive.yaml"))
+        self.assertEqual({k for k in set(cfg41ef) | set(cfg41efa) if cfg41ef.get(k) != cfg41efa.get(k)}, {"commit"})
 
 
 class V2Tests(unittest.TestCase):
