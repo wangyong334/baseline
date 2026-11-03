@@ -264,7 +264,40 @@ def assemble_cached(outputs, pieces, steps, device, occ_spec=None, centre=False)
     return events, torch.cat(z0s).to(device), torch.cat(feats).to(device), labels, keep, tid
 
 
-def train_epoch(outputs, head, lengths, optimizer, cfg, pos_weight, device, rng, max_chunks=None):
+class ParamEMA(object):
+    """权重的指数滑动平均（Polyak 平均）：训练照常更新原始权重，评估与保存用平均后的权重。
+    衰减 d = 1 - 1 / (窗口轮数 x 每轮更新数)，即"平均最近若干轮"，与数据集大小无关；开头按 d_t = min(d, (1 + t) / (10 + t))
+    爬升（TF / YOLO 的做法），避免偏向初值。swap() 把原始权重与平均权重互换，调用两次复原。"""
+
+    def __init__(self, module, decay):
+        self.decay, self.steps = float(decay), 0
+        self.shadow = {n: p.detach().clone() for n, p in module.named_parameters()}
+
+    def update(self, module):
+        self.steps += 1
+        d = min(self.decay, (1.0 + self.steps) / (10.0 + self.steps))
+        with torch.no_grad():
+            for n, p in module.named_parameters():
+                self.shadow[n].mul_(d).add_(p.detach(), alpha=1.0 - d)
+
+    def swap(self, module):
+        with torch.no_grad():
+            for n, p in module.named_parameters():
+                tmp = p.detach().clone()
+                p.copy_(self.shadow[n])
+                self.shadow[n].copy_(tmp)
+
+
+def ema_for(head, cfg, lengths):
+    """cfg["ema_epochs"] > 0 时按"平均最近多少轮"建 ParamEMA；否则 None。每轮更新数 = ceil(总窗数 / (流数 x k))。"""
+    window = float(cfg.get("ema_epochs", 0.0) or 0.0)
+    if window <= 0.0:
+        return None
+    per_epoch = max(1, int(math.ceil(sum(lengths) / float(int(cfg["streams"]) * int(cfg["tbptt_k"])))))
+    return ParamEMA(head, 1.0 - 1.0 / (window * per_epoch))
+
+
+def train_epoch(outputs, head, lengths, optimizer, cfg, pos_weight, device, rng, max_chunks=None, ema=None):
     k, n_streams = int(cfg["tbptt_k"]), int(cfg["streams"])
     if cfg.get("stream_layout", "greedy") != "greedy":
         raise ValueError("骨干输出缓存要求每条录像整段放进一条流（stream_layout = greedy）")
@@ -327,6 +360,8 @@ def train_epoch(outputs, head, lengths, optimizer, cfg, pos_weight, device, rng,
             loss.backward()
             norms.append(clip_grad_norm_checked_(head.named_parameters(), clip, "head chunk %d" % c))
             optimizer.step()
+            if ema is not None:
+                ema.update(head)
             sums["event"] += float(ev_loss.detach()) * n_ev
             sums["events"] += n_ev
             sums["exist"] += float(aux["exist_sum"].detach())
@@ -575,6 +610,24 @@ def mean_target_events(dataset):
     return total / float(count) if count else 1.0
 
 
+def load_crossfit_outputs(outputs, path):
+    """RCL v4.1：训练录像的骨干输出换成交叉拟合的样本外输出（tools/export_oof_outputs.py；堆叠泛化：判决层要学骨干在
+    没见过的录像上的错误，样本内输出里骨干几乎不漏整个目标）。每条训练录像都必须有、事件数必须一致；返回清单。"""
+    blob = torch.load(path, map_location="cpu")
+    table = blob["outputs"]
+    names = outputs.dataset.names
+    missing = [n for n in names if n not in table]
+    if missing:
+        raise RuntimeError("样本外输出缺这些训练录像：%s" % missing[:5])
+    for i, name in enumerate(names):
+        seq = outputs.dataset[i]
+        z0, feat = table[name]
+        if int(z0.shape[0]) != int(seq.n_events) or int(feat.shape[0]) != int(seq.n_events):
+            raise RuntimeError("%s 的样本外输出事件数 %d 与录像 %d 不一致" % (name, int(z0.shape[0]), int(seq.n_events)))
+        outputs.items[i] = (seq, z0.float(), feat.float())
+    return blob.get("manifest", {})
+
+
 def fit_dynamics(head, occs, device, steps, lr=0.05, seed=0):
     """RCL v3：出生 rho、存活 p、位移核 pi 按训练集的标签占据做最大似然（有监督 HMM 的标准做法：状态已知时转移参数
     直接由标签估计），在训练证据之前拟合好。factor_training 下这三个量本来就只由 L_dyn 训练，先拟合与边训边拟合是
@@ -639,6 +692,13 @@ def mode_train(args, cfg):
               % (rate0, head.unit), flush=True)
     bg = needs_background(head)
     train_out = BaseOutputs(net, tap, base, q99, device, train_set, with_bg=bg)
+    if cfg.get("train_outputs"):                                      # RCL v4.1: cross-fitted backbone outputs
+        if bg:
+            raise ValueError("train_outputs（样本外骨干输出）不含模块二的背景率")
+        manifest = load_crossfit_outputs(train_out, cfg["train_outputs"])
+        T.write_json(root / "train_outputs_manifest.json", manifest)
+        print("训练录像用交叉拟合的样本外骨干输出：%s（%d 折）；验证 / 测试用完整骨干" % (
+            cfg["train_outputs"], len(manifest.get("folds", []))), flush=True)
     centre = getattr(head, "state", "box") == "centre"
     if cfg.get("label_init") and hasattr(head, "init_from_labels"):   # RCL v4：足迹与期望事件数按标签初始化
         size = 2 * int(head.foot_radius) + 1
@@ -662,6 +722,10 @@ def mode_train(args, cfg):
             fit["birth"], {k: round(v, 3) for k, v in fit["move_prob_by_ring"].items()}), flush=True)
     val_out = BaseOutputs(net, tap, base, q99, device, split_dataset(base, "val", args.max_sequences), with_bg=bg)
     seed, epochs = int(cfg["seed"]), int(cfg["epochs"])
+    ema = ema_for(head, cfg, lengths)                                 # after the label init / dynamics pre-fit
+    if ema is not None:
+        print("权重指数滑动平均：平均最近 %.2f 轮（衰减 %.5f），评估与保存用平均后的权重" % (
+            float(cfg["ema_epochs"]), ema.decay), flush=True)
     print("航迹头训练：骨干 %s（冻结）| 航迹头参数 %d | context %s | decision_lag %d | %d 条流、k=%d | "
           "训练集 %d 条录像 %d 窗 | pos_weight %.2f" % (
               cfg["base_checkpoint"], sum(p.numel() for p in head.parameters()), head.context, head.decision_lag,
@@ -675,8 +739,10 @@ def mode_train(args, cfg):
             torch.cuda.reset_peak_memory_stats(device)
         t0 = time.perf_counter()
         out = train_epoch(train_out, head, lengths, optimizer, cfg, pos_weight, device,
-                          np.random.RandomState(seed * 1000 + epoch + 7), args.max_chunks)
+                          np.random.RandomState(seed * 1000 + epoch + 7), args.max_chunks, ema=ema)
         train_s = time.perf_counter() - t0
+        if ema is not None:                                           # evaluate / save the averaged weights
+            ema.swap(head)
         val = run_split(val_out, head, base, device, "val", cache=val_cache)
         record = dict(epoch=epoch, lr=lr, train=out, val=val, gate=gate_check(val, cfg), train_seconds=train_s,
                       epoch_seconds=time.perf_counter() - t0, peak_memory_gib=T.peak_memory_gib(device),
@@ -688,6 +754,8 @@ def mode_train(args, cfg):
             best = val["track"]["iou"]
             torch.save(dict(state, best_val_iou=best), str(root / ("best_val_iou_seed%d.pt" % seed)))
         torch.save(dict(state, best_val_iou=best), str(root / "last.pt"))
+        if ema is not None:                                           # back to the raw weights for training
+            ema.swap(head)
         b, t = val["base"], val["track"]
         now = (" | 零等待 IoU %.4f" % val["track_now"]["iou"]) if "track_now" in val else ""
         hs = val["head_stats"]
@@ -715,6 +783,8 @@ def mode_train(args, cfg):
                     ev_rec["move_prob_by_ring"].get(0, 0.0))
             if "obs_bias" in ev_rec:                                   # RCL v3：骨干标记泊松证据的 beta、本格增益
                 calib += " beta %.2f 增益 %.2f" % (ev_rec["obs_bias"], ev_rec["obs_gain"])
+                if "obs_gain_sum" in ev_rec:                           # RCL v4.1：独立求和通道的增益（稳健通道 = 增益）
+                    calib += " 求和增益 %.2f" % ev_rec["obs_gain_sum"]
             if "att_slope" in ev_rec:                                  # RCL v4：归属的 z0 斜率、未检出项、足迹
                 calib += " 归属 a %.2f c %.2f 未检出 %.2f 足迹中心 %.2f 最大 %.2f" % (
                     ev_rec["att_slope"], ev_rec["att_bias"], ev_rec["att_undetected"], ev_rec["att_foot_centre"],
@@ -803,9 +873,10 @@ def mode_eval(args, cfg):
     result.update(checkpoint=args.checkpoint, epoch=ckpt.get("epoch"), base_checkpoint=cfg["base_checkpoint"],
                   gate=gate_check(result, cfg), context=head.context, decision_lag=head.decision_lag,
                   defer_max=head.defer_max, defer_alpha=cfg.get("defer_alpha"), existence_calibration=calib,
-                  defer_revision=head.defer_revision if head.defer_max else None, evidence=head_evidence(head))
+                  defer_revision=head.defer_revision if head.defer_max else None, evidence=head_evidence(head),
+                  future_stats=getattr(head, "future_stats", None), commit_lag=getattr(head, "commit_lag", None))
     name = Path(args.checkpoint).stem
-    path = Path(args.checkpoint).parent / ("eval_%s_%s.json" % (args.split, name))
+    path = Path(args.checkpoint).parent / ("eval_%s_%s%s.json" % (args.split, name, "_" + args.tag if args.tag else ""))
     T.write_json(path, result)
     for kind in ("base", "track", "track_now"):
         if kind in result:
@@ -833,6 +904,10 @@ def parse_args(argv=None):
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--max-chunks", type=int, default=None, help="train：每轮最多几个片段（冒烟用）")
     parser.add_argument("--max-sequences", type=int, default=None, help="每个划分只取前几条录像（冒烟用）")
+    parser.add_argument("--future-stats", choices=("smoothed", "past"), default=None,
+                        help="eval（RCL 消融）：past = 同一个头只用事件到达时已知的统计量（无未来）")
+    parser.add_argument("--commit-lag", type=int, default=None, help="eval（RCL 消融）：固定在第 k 窗提交（k <= defer_max）")
+    parser.add_argument("--tag", default=None, help="eval：评估 JSON 文件名后缀（同一权重的多种评估不互相覆盖）")
     return parser.parse_args(argv)
 
 
@@ -847,6 +922,13 @@ def main(argv=None):
         cfg["seed"] = int(args.seed)
     if args.base_checkpoint:
         cfg["base_checkpoint"] = args.base_checkpoint
+    if args.future_stats or args.commit_lag:
+        if args.mode != "eval":
+            raise ValueError("--future-stats / --commit-lag 只用于 eval（消融评估）")
+        if args.future_stats:
+            cfg["future_stats"] = args.future_stats
+        if args.commit_lag:
+            cfg["commit_lag"] = int(args.commit_lag)
     if args.mode == "train":
         mode_train(args, cfg)
     else:

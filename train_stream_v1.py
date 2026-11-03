@@ -105,6 +105,9 @@ def parse_args():
                         help="sequence：原实现（每条序列一次更新）| streams：标准有状态 TBPTT（B 条并行流，每 n 个片段一次更新）")
     parser.add_argument("--streams", type=int, default=None, help="trainer=streams 的并行流数 B")
     parser.add_argument("--accumulate", type=int, default=None, help="trainer=streams 每几个片段更新一次参数（n）")
+    parser.add_argument("--cv-folds", type=int, default=None, help="交叉拟合的折数 K（训练时留出第 --cv-fold 折）")
+    parser.add_argument("--cv-fold", type=int, default=None, help="交叉拟合：留出的折号 0..K-1")
+    parser.add_argument("--cv-block", type=int, default=None, help="交叉拟合：连续几条录像为一块（默认 1）")
     parser.add_argument("--device", default="cuda:0")
     return parser.parse_args()
 
@@ -143,9 +146,13 @@ def build_config(args):
         if args.tbptt_k < 1:
             raise ValueError("--tbptt-k 必须 >= 1")
         cfg["tbptt_k"] = args.tbptt_k
-    for key in ("trainer", "streams", "accumulate"):
+    for key in ("trainer", "streams", "accumulate", "cv_folds", "cv_fold", "cv_block"):
         if getattr(args, key, None) is not None:
             cfg[key] = getattr(args, key)
+    if int(cfg.get("cv_folds", 0) or 0) > 0:
+        if not 0 <= int(cfg.get("cv_fold", -1)) < int(cfg["cv_folds"]):
+            raise ValueError("交叉拟合需要 0 <= cv_fold < cv_folds")
+        cfg.setdefault("cv_block", 1)
     cfg.setdefault("trainer", "sequence")
     cfg.setdefault("streams", 4)
     cfg.setdefault("accumulate", 1)
@@ -249,10 +256,25 @@ def _design_base(net):
     return "v1-dual-memory" if net.has_dual_memory else "v1-3"
 
 
+def crossfit_folds(names, folds, block):
+    """交叉拟合的分折：排序后第 i 条录像属于第 (i // block) % folds 折。连续 block 条为一块（相邻片段常是同一段视频
+    的连续剪辑，同一块留在同一折，样本外才真是没见过的录像），块轮流分到各折。返回 {文件名: 折号}。"""
+    folds, block = int(folds), int(block)
+    if folds < 2 or block < 1:
+        raise ValueError("交叉拟合需要 folds >= 2、block >= 1")
+    return {n: (i // block) % folds for i, n in enumerate(sorted(names))}
+
+
 def train_file_names(cfg):
-    """返回训练集全部 NPZ 文件名（排序）。"""
+    """返回训练集全部 NPZ 文件名（排序）。cv_folds > 0 时去掉第 cv_fold 折（交叉拟合：留出的一折由
+    tools/export_oof_outputs.py 用本模型做样本外推理，供判决层训练；Wolpert 1992 的堆叠泛化）。"""
     directory = os.path.join(cfg["root"], "train")
-    return sorted(n for n in os.listdir(directory) if n.endswith(".npz"))
+    names = sorted(n for n in os.listdir(directory) if n.endswith(".npz"))
+    folds = int(cfg.get("cv_folds", 0) or 0)
+    if folds > 0:
+        fold = crossfit_folds(names, folds, int(cfg.get("cv_block", 1)))
+        names = [n for n in names if fold[n] != int(cfg["cv_fold"])]
+    return names
 
 
 def source_hashes():
@@ -1332,7 +1354,7 @@ def mode_train(args, cfg):
         print("通信预算训练（每窗消息数的峰值约束）：每窗消息预算 %.4g，违约比例上限 %.0f%%，对偶步长 %g，"
               "发送层 %s" % (comm.budget, 100.0 * comm.alpha, comm.dual_lr, " ".join(net.message_layers())), flush=True)
     subset = select_subset(train_file_names(cfg), int(cfg["train_subset_size"]), seed + 2000)
-    train_set = EvUAVStream(cfg["root"], "train", cfg)
+    train_set = EvUAVStream(cfg["root"], "train", cfg, train_file_names(cfg))
     execution, input_device = speed_options(cfg)
     trainer = cfg.get("trainer", "sequence")
     lengths = None

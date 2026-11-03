@@ -638,6 +638,15 @@ class LabelAndConfigTests(unittest.TestCase):
                                pos_weight=30.0)
         head4a.load_state_dict(head4.state_dict())
         self.assertEqual(head4a.commit, "adaptive")
+        # v4.1 = v4 + backbone-only evidence + score-only experts + cross-fitted training outputs
+        cfg41 = load_flat_config(os.path.join(ROOT, "configs", "changepoint_v41.yaml"))
+        self.assertEqual({k for k in set(cfg4) | set(cfg41) if cfg4.get(k) != cfg41.get(k)},
+                         {"raw_residual", "expert_input", "train_outputs", "save_root"})
+        head41 = TH.build_head(cfg41, net, base, torch.device("cpu"), q99=np.ones(12, dtype=np.float32), pos_weight=30.0)
+        self.assertEqual((head41.raw_residual, head41.expert_input, head41.ev1, tuple(head41.ev2.weight.shape),
+                          head41.member[0].in_features), (False, "score", None, (1, 1, 3, 3), 3))
+        cfg41a = load_flat_config(os.path.join(ROOT, "configs", "changepoint_v41_adaptive.yaml"))
+        self.assertEqual({k for k in set(cfg41) | set(cfg41a) if cfg41.get(k) != cfg41a.get(k)}, {"commit"})
 
 
 class V2Tests(unittest.TestCase):
@@ -1451,6 +1460,218 @@ class MixtureFusionTests(unittest.TestCase):
             totals.append(tot)
         for a, b in zip(*totals):
             self.assertAlmostEqual(a, b, delta=1e-6 * max(1.0, abs(a)))
+
+
+class AblationSwitchTests(unittest.TestCase):
+    """只用于评估的消融开关（审阅 11.18 要求的同头对照）：不改训练好的模型。"""
+
+    def _layer(self, **kw):
+        layer = make_layer(defer_max=3, **dict(MIXTURE, **kw))
+        torch.manual_seed(5)
+        with torch.no_grad():
+            layer.fuse_out.weight.add_(0.5 * torch.randn_like(layer.fuse_out.weight))
+            layer.member[2].bias.fill_(1.0)
+        return layer
+
+    def test_past_only_ignores_future_events(self):
+        """future_stats = past：去掉 s0 之后的全部事件，s0 及以前事件的提交值不变（同一个头没有用到未来）；
+        默认（smoothed）时提交值会变（未来确实进入了判决）。"""
+        ev, z0, feat = make_events(12, seed=21)
+        keep = ev["t"] <= 5
+        cut = {key: v[keep] for key, v in ev.items()}
+        idx = np.nonzero(keep)[0]
+        changed = 0
+        for stats in ("past", "smoothed"):
+            layer = self._layer(future_stats=stats)
+            full = run_eval(layer, ev, z0, feat, 12, cuts=(6,))
+            part = run_eval(layer, cut, z0[keep], feat[keep], 12, cuts=(6,))
+            for j, key in enumerate(idx):
+                if full[key][2] != STATUS_DEADLINE:
+                    continue
+                if stats == "past":
+                    self.assertAlmostEqual(full[key][0], part[j][0], places=5)
+                    self.assertEqual(full[key][1:], part[j][1:])
+                elif abs(full[key][0] - part[j][0]) > 1e-4:
+                    changed += 1
+        self.assertGreater(changed, 0)
+
+    def test_commit_lag(self):
+        """commit_lag = k：每个事件在第 k 窗提交（录像末 flush 的除外）；k = defer_max 与默认逐位相同；非法值报错。"""
+        ev, z0, feat = make_events(10, seed=22)
+        out = run_eval(self._layer(commit_lag=1), ev, z0, feat, 10, cuts=(4,))
+        lags = {lag for z, lag, st in out.values() if st == STATUS_DEADLINE}
+        self.assertEqual(lags, {1})
+        a = run_eval(self._layer(), ev, z0, feat, 10, cuts=(4,))
+        b = run_eval(self._layer(commit_lag=3), ev, z0, feat, 10, cuts=(4,))
+        self.assertEqual(a, b)
+        with self.assertRaises(ValueError):
+            self._layer(commit_lag=4)
+        with self.assertRaises(ValueError):
+            make_layer(future_stats="past")                    # only for the learned / mixture fusions
+
+
+class RobustPoolTests(unittest.TestCase):
+    """v4.1 evidence_pool = robust：格内骨干项在独立求和之外再加一个对相关分数稳健的通道。"""
+
+    def test_channels_and_start(self):
+        """通道 0 = sum softplus(z0 + beta)，通道 1 = softplus(log sum exp(z0 + beta))（约等于格内最可信的事件）；
+        没有事件的格两个通道都是 0；初始化时证据 = 通道 1 - mu（求和通道与原始残差权重为 0）。"""
+        layer = make_layer(double=True, **dict(MIXTURE, evidence_pool="robust"))
+        with torch.no_grad():
+            layer.obs_bias.fill_(0.3)
+        rng = np.random.RandomState(9)
+        n = 80
+        b, cy, cx = (rng.randint(0, hi, n).astype(np.int64) for hi in (2, H // 4, W // 4))
+        z0 = rng.normal(-1.0, 6.0, n)
+        v = layer.backbone_map(torch.from_numpy(z0), torch.from_numpy(b), torch.from_numpy(cy), torch.from_numpy(cx), 2)
+        self.assertEqual(tuple(v.shape), (2, 2, H // 4, W // 4))
+        want_sum = np.zeros((2, H // 4, W // 4))
+        groups = {}
+        for i in range(n):
+            want_sum[b[i], cy[i], cx[i]] += np.logaddexp(0.0, z0[i] + 0.3)
+            groups.setdefault((b[i], cy[i], cx[i]), []).append(z0[i] + 0.3)
+        want_lse = np.zeros_like(want_sum)
+        for key, zs in groups.items():
+            want_lse[key] = np.logaddexp(0.0, np.logaddexp.reduce(zs))
+        np.testing.assert_allclose(v[:, 0].detach().numpy(), want_sum, rtol=1e-9, atol=1e-9)
+        np.testing.assert_allclose(v[:, 1].detach().numpy(), want_lse, rtol=1e-9, atol=1e-9)
+        ell = layer.evidence(torch.zeros(2, 12, H, W, dtype=torch.float64), v)
+        np.testing.assert_allclose(ell.detach().numpy(), want_lse - float(layer.mu()), rtol=1e-9, atol=1e-9)
+        with self.assertRaises(ValueError):
+            make_layer(evidence_pool="robust")                     # needs the backbone evidence (box state)
+
+    def test_gradient_and_chunks(self):
+        """稳健通道下 L_pres 对 beta、两个通道增益的梯度与中心差分一致；片段切分的训练损失之和不变。"""
+        layer = make_layer(double=True, defer_max=3, **dict(MIXTURE, evidence_pool="robust"))
+        with torch.no_grad():
+            layer.ev2.weight[0, -2, 1, 1] = 0.3
+            layer.obs_bias.fill_(-0.5)
+        ev, z0, feat = make_events(8, seed=17)
+        occ = torch.from_numpy(occ_from_events(ev, 8, 1))
+
+        def value():
+            _, _, aux = v3_chunk(layer, ev, z0, feat, occ, 0, 8, None, True)
+            return aux["exist_sum"]
+
+        for prm, index in ((layer.obs_bias, ()), (layer.ev2.weight, (0, -1, 1, 1)), (layer.ev2.weight, (0, -2, 1, 1))):
+            layer.zero_grad()
+            value().backward()
+            grad = float(prm.grad[index]) if index else float(prm.grad)
+            h = 1e-6
+            with torch.no_grad():
+                base = float(prm[index]) if index else float(prm)
+                prm[index] = base + h
+                up = float(value())
+                prm[index] = base - h
+                down = float(value())
+                prm[index] = base
+            fd = (up - down) / (2 * h)
+            self.assertAlmostEqual(grad, fd, delta=1e-5 * max(1.0, abs(fd)), msg=index)
+        totals = []
+        for cuts in ((), (3, 5)):
+            state, tot = None, 0.0
+            bounds = [0] + list(cuts) + [8]
+            for lo, hi in zip(bounds[:-1], bounds[1:]):
+                _, state, aux = v3_chunk(layer, ev, z0, feat, occ, lo, hi, state, lo == 0)
+                tot += float(aux["exist_sum"]) + float(aux["evt_sum"])
+                state = layer.detach_state(state)
+            totals.append(tot)
+        self.assertAlmostEqual(totals[0], totals[1], delta=1e-6 * max(1.0, abs(totals[0])))
+
+
+class GateTaskTests(unittest.TestCase):
+    def test_event_loss_reaches_evidence_not_dynamics(self):
+        """gate_grad = task：L_evt 经门控 S 与后备的在场统计量到达证据参数（ev1、ev2、mu、beta）与两位专家，
+        但不到达转移参数（出生 / 存活 / 位移仍只由 L_dyn）；默认（presence）时 L_evt 不到证据。"""
+        evidence = {"ev1.weight", "ev2.weight", "mu_raw", "obs_bias"}
+        experts = {"member", "att_foot", "fuse_static", "fuse_dyn", "fuse_out"}
+        for gate, want in (("task", evidence | experts), ("presence", experts)):
+            layer = make_layer(double=True, defer_max=3, **dict(MIXTURE, gate_grad=gate))
+            with torch.no_grad():
+                layer.ev2.weight.add_(0.1 * torch.randn_like(layer.ev2.weight))
+                layer.fuse_out.weight.add_(0.2 * torch.randn_like(layer.fuse_out.weight))
+            ev, z0, feat = make_events(8, seed=18)
+            occ = torch.from_numpy(occ_from_events(ev, 8, 1))
+            _, _, aux = v3_chunk(layer, ev, z0, feat, occ, 0, 8, None, True)
+            (aux["evt_sum"] / aux["evt_n"]).backward()
+            got = {n.split(".")[0] if (n.startswith("fuse_") or n.startswith("member")) else n
+                   for n, prm in layer.named_parameters() if prm.grad is not None and float(prm.grad.abs().sum()) > 0}
+            self.assertEqual(got, want, gate)
+        with self.assertRaises(ValueError):
+            make_layer(gate_grad="task")                       # only for the learned / mixture fusions
+
+
+class ParamEMATests(unittest.TestCase):
+    def test_average_swap_and_window(self):
+        """train_track_head.ParamEMA：衰减按步爬升 d_t = min(d, (1 + t) / (10 + t))，平均值逐步可算；swap 两次复原；
+        ema_for 按"平均最近若干轮"换算 d = 1 - 1 / (轮数 x 每轮更新数)，0 = 关闭。"""
+        try:
+            import train_track_head as TH
+        except ImportError as error:
+            self.skipTest("训练入口需要 cv2/pandas/tqdm: %s" % error)
+        layer = make_layer(double=True, **MIXTURE)
+        ema = TH.ParamEMA(layer, 0.9)
+        p0 = layer.mu_raw.detach().clone()
+        want = p0.clone()
+        for t, value in enumerate((1.0, 2.0, 3.0), start=1):
+            with torch.no_grad():
+                layer.mu_raw.fill_(value)
+            ema.update(layer)
+            d = min(0.9, (1.0 + t) / (10.0 + t))
+            want = d * want + (1 - d) * value
+        torch.testing.assert_allclose(ema.shadow["mu_raw"], want)
+        raw = {n: p.detach().clone() for n, p in layer.named_parameters()}
+        ema.swap(layer)
+        torch.testing.assert_allclose(layer.mu_raw.detach(), want)
+        ema.swap(layer)
+        for n, p in layer.named_parameters():
+            torch.testing.assert_allclose(p.detach(), raw[n])
+        cfg = {"ema_epochs": 2.0, "streams": 4, "tbptt_k": 16}
+        e = TH.ema_for(layer, cfg, [160] * 10)                   # 1600 windows / 64 per update = 25 updates per epoch
+        self.assertAlmostEqual(e.decay, 1.0 - 1.0 / 50.0)
+        self.assertIsNone(TH.ema_for(layer, dict(cfg, ema_epochs=0.0), [160] * 10))
+
+
+class RawResidualTests(unittest.TestCase):
+    def test_backbone_only_evidence(self):
+        """raw_residual = False：没有原始计数卷积 ev1；证据 = h(V) - mu，初始化 h 只取本格 V，所以 l = V - mu；
+        片段切分的提交与训练损失之和不变；非框占据 / 非骨干证据时报错。"""
+        layer = make_layer(defer_max=3, **dict(MIXTURE, raw_residual=False))
+        self.assertIsNone(layer.ev1)
+        self.assertNotIn("ev1.weight", dict(layer.named_parameters()))
+        rng = np.random.RandomState(10)
+        n = 50
+        b, cy, cx = (rng.randint(0, hi, n).astype(np.int64) for hi in (2, H // 4, W // 4))
+        z0 = rng.normal(0.0, 4.0, n).astype(np.float32)
+        v = layer.backbone_map(torch.from_numpy(z0), torch.from_numpy(b), torch.from_numpy(cy), torch.from_numpy(cx), 2)
+        torch.testing.assert_allclose(layer.evidence(None, v), v - layer.mu())
+        ev, z0e, feat = make_events(10, batch=2, seed=19)
+        one = run_eval(layer, ev, z0e, feat, 10, cuts=(), batch=2)
+        two = run_eval(layer, ev, z0e, feat, 10, cuts=(4,), batch=2)
+        for key in one:
+            self.assertAlmostEqual(one[key][0], two[key][0], places=4)
+        with self.assertRaises(ValueError):
+            make_layer(raw_residual=False)
+
+
+class ExpertInputTests(unittest.TestCase):
+    def test_score_only_experts(self):
+        """expert_input = score：归属专家与后备专家的事件输入只有 [p, t_local, V5 校准 logit]（第一层输入维度 3），
+        dec1 特征怎么变输出都不变；片段切分不变；非 mixture 时报错。默认 feature 时第一层维度 = 特征维 + 3。"""
+        layer = make_layer(defer_max=3, **dict(MIXTURE, raw_residual=False, expert_input="score"))
+        self.assertEqual(layer.member[0].in_features, 3)
+        self.assertEqual(layer.fuse_static.in_features, 3)
+        self.assertEqual(make_layer(**MIXTURE).member[0].in_features, FEAT + 3)
+        ev, z0e, feat = make_events(10, batch=2, seed=23)
+        one = run_eval(layer, ev, z0e, feat, 10, cuts=(), batch=2)
+        other = run_eval(layer, ev, z0e, feat + 5.0 * np.random.RandomState(3).standard_normal(feat.shape).astype(feat.dtype),
+                         10, cuts=(), batch=2)
+        two = run_eval(layer, ev, z0e, feat, 10, cuts=(4,), batch=2)
+        for key in one:
+            self.assertAlmostEqual(one[key][0], other[key][0], places=6)
+            self.assertAlmostEqual(one[key][0], two[key][0], places=4)
+        with self.assertRaises(ValueError):
+            make_layer(**dict(V3, expert_input="score"))
 
 
 class DynamicsPrefitTests(unittest.TestCase):

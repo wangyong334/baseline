@@ -76,7 +76,8 @@ CLAMP = 30.0
 SOFTCAP = 1e-3
 CHANGEPOINT_KEYS = ("defer_max", "defer_alpha", "commit", "rings", "cell", "evidence_channels", "member_hidden",
                     "evidence_form", "fusion", "evidence_source", "recursion", "factor_training", "state",
-                    "footprint_radius", "presence_tolerance")
+                    "footprint_radius", "presence_tolerance", "future_stats", "commit_lag", "evidence_pool",
+                    "gate_grad", "raw_residual", "expert_input")
 COMMITS = ("fixed", "adaptive")
 EVIDENCE_FORMS = ("linear", "log1p")
 FUSIONS = ("product", "bayes", "attribution", "evidence", "learned", "mixture")
@@ -244,7 +245,8 @@ class ChangepointLayer(nn.Module):
                  defer_max=10, defer_alpha=0.05, commit="fixed", rings=(1, 2, 4, 8), cell=4,
                  evidence_channels=8, member_hidden=32, evidence_form="linear", fusion="product",
                  evidence_source="raw", recursion="additive", factor_training=False, state="box",
-                 footprint_radius=3, presence_tolerance=0):
+                 footprint_radius=3, presence_tolerance=0, future_stats="smoothed", commit_lag=None,
+                 evidence_pool="sum", gate_grad="presence", raw_residual=True, expert_input="feature"):
         super(ChangepointLayer, self).__init__()
         if commit not in COMMITS:
             raise ValueError("commit 必须是 %s 之一" % (COMMITS,))
@@ -259,6 +261,47 @@ class ChangepointLayer(nn.Module):
         if state == "centre" and evidence_source != "backbone":
             raise ValueError("state = centre 的证据是足迹加权的骨干标记泊松项（evidence_source = backbone）")
         self.state, self.foot_radius, self.pres_tol = str(state), int(footprint_radius), int(presence_tolerance)
+        # evaluation-only ablations (do not change the trained model):
+        #   future_stats = past: the same head reads only the statistics known at the event's arrival (no future);
+        #   commit_lag = k: fixed commit at lag k <= defer_max (the lag input stays normalised by defer_max)
+        if future_stats not in ("smoothed", "past"):
+            raise ValueError("future_stats 必须是 smoothed 或 past")
+        if future_stats == "past" and fusion not in ("learned", "mixture"):
+            raise ValueError("future_stats = past 只用于 fusion = learned / mixture 的同头对照")
+        self.future_stats = str(future_stats)
+        # v4.1: evidence_pool = robust adds a dependence-robust channel log(1 + sum_e exp(z0_e + beta)) (~ the strongest
+        # event of the cell) next to the independent-marks sum; the conv starts on the robust channel only
+        if evidence_pool not in ("sum", "robust"):
+            raise ValueError("evidence_pool 必须是 sum 或 robust")
+        if evidence_pool == "robust" and (evidence_source != "backbone" or state != "box"):
+            raise ValueError("evidence_pool = robust 只用于框占据状态的骨干证据")
+        self.evidence_pool = str(evidence_pool)
+        # gate_grad = task (v4.1): the event loss also trains the presence evidence through the mixture gate
+        # (standard mixture-of-experts gate training; L_pres stays as the auxiliary occupancy supervision);
+        # the transition parameters stay label-only under factor_training
+        if gate_grad not in ("presence", "task"):
+            raise ValueError("gate_grad 必须是 presence 或 task")
+        if gate_grad == "task" and fusion not in ("learned", "mixture"):
+            raise ValueError("gate_grad = task 只用于 fusion = learned / mixture")
+        self.gate_task = gate_grad == "task"
+        # raw_residual = False (v4.1): the presence evidence is the backbone term only (hybrid NN-HMM). The raw-count
+        # residual measures absolute activity, which shifts with the background density: in dense noise it exceeded the
+        # silence cost and opened the gate over the background (local diagnosis, Inn 13.84)
+        self.raw_residual = bool(raw_residual)
+        if not self.raw_residual and (evidence_source != "backbone" or state != "box"):
+            raise ValueError("raw_residual = False 只用于框占据状态的骨干证据")
+        # expert_input = score (v4.1): the mixture experts read only the backbone's per-event score (+ polarity, time in
+        # window), not its internal dec1 features: the backbone judges appearance, this layer judges temporal consistency,
+        # and a head trained on cross-fitted backbone outputs transfers to the full backbone (same score semantics)
+        if expert_input not in ("feature", "score"):
+            raise ValueError("expert_input 必须是 feature 或 score")
+        if expert_input == "score" and fusion != "mixture":
+            raise ValueError("expert_input = score 只用于 fusion = mixture")
+        self.expert_input = str(expert_input)
+        n_in = int(feat_dim) + 3 if self.expert_input == "feature" else 3
+        self.commit_lag = int(defer_max) if commit_lag is None else int(commit_lag)
+        if not 1 <= self.commit_lag <= int(defer_max):
+            raise ValueError("需要 1 <= commit_lag <= defer_max")
         self.evidence_form, self.fusion = str(evidence_form), str(fusion)
         self.evidence_source, self.recursion = str(evidence_source), str(recursion)
         self.factor_training = bool(factor_training)
@@ -289,14 +332,17 @@ class ChangepointLayer(nn.Module):
             basis[i, self.radius + dy, self.radius + dx] = 1.0
         self.register_buffer("basis", basis, persistent=False)
         # learned: evidence, silence cost, birth, survival, transition kernel, membership
-        self.ev1 = nn.Conv2d(self.channels, int(evidence_channels), self.cell, stride=self.cell, bias=False)
+        n_raw = int(evidence_channels) if self.raw_residual else 0
+        self.ev1 = (nn.Conv2d(self.channels, n_raw, self.cell, stride=self.cell, bias=False)
+                    if self.raw_residual else None)
         backbone = self.evidence_source == "backbone"
         centre = self.state == "centre"
-        self.ev2 = nn.Conv2d(int(evidence_channels) + int(backbone and not centre), 1, 3, padding=1, bias=False)
+        n_back = 0 if (not backbone or centre) else (2 if self.evidence_pool == "robust" else 1)
+        self.ev2 = nn.Conv2d(n_raw + n_back, 1, 3, padding=1, bias=False)
         if backbone:
             with torch.no_grad():
                 self.ev2.weight.zero_()
-                if not centre:                       # box: start at the backbone's marked-Poisson evidence of the cell
+                if not centre:                       # box: start at the backbone term of the own cell (robust: max-like)
                     self.ev2.weight[0, -1, 1, 1] = 1.0
             self.obs_bias = nn.Parameter(torch.zeros(()))
         size_f = 2 * self.foot_radius + 1
@@ -321,12 +367,12 @@ class ChangepointLayer(nn.Module):
                 self.att_res[2].weight.zero_()
                 self.att_res[2].bias.zero_()
         if self.fusion == "mixture":                # (E8m) presence-gated experts: S m + (1 - S) b
-            self.member = nn.Sequential(nn.Linear(int(feat_dim) + 3, int(member_hidden)), nn.ReLU(),
+            self.member = nn.Sequential(nn.Linear(n_in, int(member_hidden)), nn.ReLU(),
                                         nn.Linear(int(member_hidden), 1))
         if self.fusion in ("learned", "mixture"):   # (E8l) z0 + MLP(sufficient statistics of past / future presence)
             self.att_foot = nn.Parameter(torch.zeros(size_f, size_f))
             hid = int(member_hidden)
-            self.fuse_static = nn.Linear(int(feat_dim) + 3, hid)
+            self.fuse_static = nn.Linear(n_in, hid)
             self.fuse_dyn = nn.Linear(5, hid, bias=False)
             self.fuse_out = nn.Linear(hid, 1)
             with torch.no_grad():                    # zero last layer: the output starts at V5
@@ -384,6 +430,8 @@ class ChangepointLayer(nn.Module):
                    "silence_cost": float(self.mu()), "move_prob_by_ring": by_ring}
             if self.evidence_source == "backbone" and self.state == "box":   # marked-Poisson: beta, own-cell gain
                 out.update(obs_bias=float(self.obs_bias), obs_gain=float(self.ev2.weight[0, -1, 1, 1]))
+                if self.evidence_pool == "robust":                         # gain of the independent-sum channel
+                    out.update(obs_gain_sum=float(self.ev2.weight[0, -2, 1, 1]))
             if self.state == "centre":
                 out.update(obs_bias=float(self.obs_bias), obs_gain=float(torch.exp(self.foot_logit).sum()),
                            foot_centre=float(self.foot_logit[self.foot_radius, self.foot_radius]))
@@ -422,13 +470,17 @@ class ChangepointLayer(nn.Module):
         """(E1) l = g(X) - mu（linear）或 log(1 + g(X)) - mu（log1p，v1），[B, hc, wc]；g >= 0 且 g(0) = 0。
         evidence_source = backbone（v3）：l = h([relu(ev1(X)), v]) - mu，v = backbone_map（格内骨干的标记泊松项），
         h 是无偏置的 3x3 卷积、不再取 ReLU（证据可正可负）；零输入、没有事件时仍是 -mu。"""
+        if self.ev1 is None:                            # backbone term only (raw_residual = False)
+            v = v.to(self.mu_raw.dtype) if v.dim() == 4 else v[:, None].to(self.mu_raw.dtype)
+            return self.ev2(v).squeeze(1) - self.mu()
         h = F.relu(self.ev1(x))
         if self.evidence_source == "backbone":
             if v is None:
                 raise ValueError("evidence_source = backbone 需要格内骨干项 v（backbone_map）")
             if self.state == "centre":                  # (E1c) footprint-weighted backbone term + raw residual
                 return v.to(h.dtype) + self.ev2(h).squeeze(1) - self.mu()
-            return self.ev2(torch.cat([h, v[:, None].to(h.dtype)], 1)).squeeze(1) - self.mu()
+            v = v.to(h.dtype) if v.dim() == 4 else v[:, None].to(h.dtype)     # robust pool: [B, 2, hc, wc]
+            return self.ev2(torch.cat([h, v], 1)).squeeze(1) - self.mu()
         g = F.relu(self.ev2(h)).squeeze(1)
         return (g if self.evidence_form == "linear" else torch.log1p(g)) - self.mu()
 
@@ -451,7 +503,18 @@ class ChangepointLayer(nn.Module):
         if int(flat.shape[0]):
             # accumulate=True: deterministic on CUDA in torch 1.9 (same path as encode)
             out = out.index_put((flat,), val, accumulate=True)
-        return out.view(batch, self.hc, self.wc)
+        out = out.view(batch, self.hc, self.wc)
+        if self.evidence_pool != "robust":
+            return out
+        # (E1r) dependence-robust pool: softplus(log sum_e exp(z_e)) per cell (shift by the window max for stability)
+        lse = torch.zeros(batch * self.hc * self.wc, device=z.device, dtype=z.dtype)
+        if int(flat.shape[0]):
+            k = z.detach().max()
+            lse = lse.index_put((flat,), torch.exp(z - k), accumulate=True)
+        has = lse > 0
+        lse = torch.where(has, F.softplus(torch.log(lse.clamp(min=1e-30)) + (k if int(flat.shape[0]) else 0.0)),
+                          torch.zeros_like(lse))
+        return torch.stack([out, lse.view(batch, self.hc, self.wc)], 1)
 
     def event_term(self, feat, p, t_local, z0):
         """(E8a) 事件自身的一项 u_e = a z0_e + c + r(特征)；r 是零初始化的残差 MLP（输入同骨干读出层 + z0）。"""
@@ -463,10 +526,14 @@ class ChangepointLayer(nn.Module):
         x = torch.cat([feat.to(z0.dtype), p.to(z0.dtype)[:, None], t_local.to(z0.dtype)[:, None], z0[:, None]], 1)
         return F.softplus(self.kappa(x).squeeze(-1))
 
+    def _expert_x(self, feat, p, t_local, lp0):
+        """专家的事件输入：[dec1 特征, p, t_local, V5 校准 logit]；expert_input = score 时去掉 dec1 特征。"""
+        parts = [p.to(lp0.dtype)[:, None], t_local.to(lp0.dtype)[:, None], lp0[:, None]]
+        return torch.cat(([feat.to(lp0.dtype)] if self.expert_input == "feature" else []) + parts, 1)
+
     def fuse_static_term(self, feat, p, t_local, lp0):
         """(E8l) 融合 MLP 第一层里只依赖事件本身的部分（到达时算一次）：W_s [dec1 特征, p, t_local, V5 校准 logit] + b。"""
-        x = torch.cat([feat.to(lp0.dtype), p.to(lp0.dtype)[:, None], t_local.to(lp0.dtype)[:, None], lp0[:, None]], 1)
-        return self.fuse_static(x)
+        return self.fuse_static(self._expert_x(feat, p, t_local, lp0))
 
     def fuse_learned(self, h_static, lp0, s_now, f_now, past, lag):
         """(E8l) 校准 logit = V5 + MLP(充分统计量)：本格平滑 / 过滤在场的 logit、足迹场的平滑 / 过滤值、滞后比例。
@@ -575,7 +642,11 @@ class ChangepointLayer(nn.Module):
         return s.clamp(EPS, 1.0 - EPS)
 
     def membership(self, feat, p, t_local, lp0):
-        x = torch.cat([feat.to(lp0.dtype), p.to(lp0.dtype)[:, None], t_local.to(lp0.dtype)[:, None], lp0[:, None]], 1)
+        if self.fusion == "mixture":
+            x = self._expert_x(feat, p, t_local, lp0)
+        else:
+            x = torch.cat([feat.to(lp0.dtype), p.to(lp0.dtype)[:, None], t_local.to(lp0.dtype)[:, None],
+                           lp0[:, None]], 1)
         return torch.sigmoid(self.member(x).squeeze(-1)).clamp(EPS, 1.0 - EPS)
 
     # ------------------------------------------------------------------ state
@@ -670,7 +741,7 @@ class ChangepointLayer(nn.Module):
             cx = torch.div(ev["x"].long(), self.cell, rounding_mode="floor").clamp(max=self.wc - 1)
             # (E1)~(E4) evidence and forward
             v = self.backbone_map(z0[idx], eb, cy, cx, batch) if self.evidence_source == "backbone" else None
-            ell = self.evidence(self.encode(ev, batch), v)
+            ell = self.evidence(self.encode(ev, batch) if self.ev1 is not None else None, v)
             P, pr = self.forward_step(P, ell, k_rec, dyn)
             filt, pred = (filt + [P])[-(D + 1):], (pred + [pr])[-(D + 1):]
             if train:
@@ -715,9 +786,11 @@ class ChangepointLayer(nn.Module):
                 j = (n - 1 - q["lag"]).clamp(min=0)
                 s_val = stack[j, q["b"], q["cy"], q["cx"]]
                 if self.fusion in ("learned", "mixture"):     # (E8l) V5 + MLP(statistics of past / future presence)
-                    S_all = stack.detach() if (train and self.factor_training) else stack
+                    S_all = stack.detach() if (train and self.factor_training and not self.gate_task) else stack
                     fld = self.target_field(S_all)[j, q["b"], q["cy"], q["cx"]]
                     s_now = S_all[j, q["b"], q["cy"], q["cx"]]
+                    if self.future_stats == "past":          # same head, statistics at arrival only (ablation)
+                        s_now, fld = torch.sigmoid(q["q"][:, 0]), q["q"][:, 1]
                     z_cal = self.fuse_learned(q["h"] if self.fusion == "mixture" else q["m"], q["lp0"], s_now, fld,
                                               q["q"], q["lag"])
                     if self.fusion == "mixture":              # (E8m) P = S m + (1 - S) b, b = the fallback above
@@ -742,7 +815,7 @@ class ChangepointLayer(nn.Module):
                     aux["evt_sum"] = aux["evt_sum"] + F.binary_cross_entropy_with_logits(z_cal, q["y"], reduction="sum")
                     aux["evt_n"] += int(z_cal.shape[0])
                 z_cal = z_cal.detach()
-                deadline = q["lag"] >= D
+                deadline = q["lag"] >= self.commit_lag
                 if adaptive:
                     up = z_cal >= hi_commit
                     down = (q["prov"] > 0.5) & (z_cal <= lo_commit)
@@ -780,7 +853,7 @@ class ChangepointLayer(nn.Module):
                 if self.fusion == "evidence":                 # past-only field of the event's place (E8e)
                     q_val = self.target_field(P.detach() if (train and self.factor_training) else P)[eb, cy, cx]
                 elif self.fusion in ("learned", "mixture"):   # past-only statistics: logit S_filt, log F_filt
-                    Pd = P.detach() if (train and self.factor_training) else P
+                    Pd = P.detach() if (train and self.factor_training and not self.gate_task) else P
                     q_val = torch.stack([logit(Pd[eb, cy, cx]), self.target_field(Pd)[eb, cy, cx]], 1)
                 else:
                     q_val = P[eb, cy, cx].detach()
