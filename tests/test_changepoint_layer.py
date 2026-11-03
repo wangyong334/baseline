@@ -670,6 +670,24 @@ class LabelAndConfigTests(unittest.TestCase):
         # attribution control: v4.1 structure trained on in-sample full-V5 outputs (no train_outputs)
         cfg41i = load_flat_config(os.path.join(ROOT, "configs", "changepoint_v41_insample.yaml"))
         self.assertEqual({k for k in set(cfg41) | set(cfg41i) if cfg41.get(k) != cfg41i.get(k)}, {"train_outputs", "save_root"})
+        cfg41ia = load_flat_config(os.path.join(ROOT, "configs", "changepoint_v41_insample_adaptive.yaml"))
+        self.assertEqual({k for k in set(cfg41i) | set(cfg41ia) if cfg41i.get(k) != cfg41ia.get(k)}, {"commit"})
+        # EV-Flying check of v4.1 (in-sample): same model, only data, backbone, epochs and output dir differ
+        cfg41e = load_flat_config(os.path.join(ROOT, "configs", "changepoint_v41_evflying.yaml"))
+        self.assertEqual({k for k in set(cfg41i) | set(cfg41e) if cfg41i.get(k) != cfg41e.get(k)},
+                         {"root", "base_checkpoint", "epochs", "save_root"})
+        self.assertEqual((cfg41e["epochs"], cfg41e["root"], cfg41e["base_checkpoint"]),
+                         (16, cfg4e["root"], cfg4e["base_checkpoint"]))
+        cfg41ea = load_flat_config(os.path.join(ROOT, "configs", "changepoint_v41_evflying_adaptive.yaml"))
+        self.assertEqual({k for k in set(cfg41e) | set(cfg41ea) if cfg41e.get(k) != cfg41ea.get(k)}, {"commit"})
+        # expert-input control: v4.1 in-sample with dec1-feature experts (raw residual still off)
+        cfg41f = load_flat_config(os.path.join(ROOT, "configs", "changepoint_v41_insample_feature.yaml"))
+        self.assertEqual({k for k in set(cfg41i) | set(cfg41f) if cfg41i.get(k) != cfg41f.get(k)},
+                         {"expert_input", "save_root"})
+        head41f = TH.build_head(cfg41f, net, base, torch.device("cpu"), q99=np.ones(12, dtype=np.float32),
+                                pos_weight=30.0)
+        self.assertEqual((head41f.raw_residual, head41f.expert_input, head41f.ev1, head41f.member[0].in_features),
+                         (False, "feature", None, head4.member[0].in_features))
 
 
 class V2Tests(unittest.TestCase):

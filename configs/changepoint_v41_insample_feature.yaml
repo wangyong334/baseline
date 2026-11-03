@@ -1,0 +1,62 @@
+# 模块三 v4.1（样本内）的专家输入对照（11-03）：与 configs/changepoint_v41_insample.yaml 只差 expert_input（与 save_root）。
+# 动机：v4.1 样本内在 val / test 上都比 v4 好（0.8813 / 0.8893 对 0.8791 / 0.8820），test 极密录像的新增误报也消失了，
+#   但第一拍召回的提升只有 v4 的一半（+0.043 / +0.044 对 +0.075 / +0.080），没过关口 "first_beat_gain >= 0.08"。
+#   v4.1 的"专家只读分数"是交叉拟合逼出来的（各折骨干的内部特征不通用）；交叉拟合已证明有害（样本内对样本外：val +0.0066、test +0.0049），
+#   不再需要它，所以检验专家读 dec1 特征能否在保住 v4.1 其余收益的同时找回第一拍。原始计数残差仍关闭（它随背景密度漂移）。
+# 用法（服务器）：CFG=configs/changepoint_v41_insample_feature.yaml GPU=3 nohup bash tools/run_track_head.sh > run/changepoint_v41_insample_feature_all.log 2>&1 &
+DATA:
+  root: /media/stephen/nvme0n1/wy_data/datasets/EV-UAV-dataset
+  input_device: gpu
+BASE:
+  base_checkpoint: log/stream_tif_commpeak_msg_seed37/best_val_iou_seed37.pt   # V5（val 0.8668 / test 0.8766）
+HEAD:
+  head_kind: changepoint
+  cell: 4                     # 判决格 4x4 像素
+  rings: [1, 2, 4, 8]         # 位移环（格）：不动 + 4 个半径 x 8 个方向 = 33 个位移
+  evidence_channels: 8
+  member_hidden: 32
+  defer_max: 10               # D：终判最晚 10 窗（500 ms）
+  defer_alpha: 0.05           # 自适应提交的风险比 alpha / (1 - alpha)：边界 = logit tau* +- logit(1 - alpha)，即 P >= 0.851 / <= 0.0155；固定滞后时不用
+  commit: fixed
+  evidence_form: linear       # 证据 = 线性对数似然比
+  fusion: mixture             # P = S m + (1 - S) b：在场门控的归属 / 后备专家（后备初始化 = V5）
+  evidence_source: backbone   # 证据读骨干分数（标记泊松）
+  recursion: union            # 有界递推
+  factor_training: true       # 每个因子按自己的标签训练
+  state: box                  # 框占据（逐格证据强、回溯强）；尾部格的低估由后备专家兜住
+  footprint_radius: 3         # 足迹场半径（格，7x7 = 28 px）：盖住两个数据集目标尺寸的 p95
+  presence_tolerance: 0       # 框占据本身是展开的标签，逐格监督
+  raw_residual: false         # v4.1：在场证据只用 V5 的缩放似然
+  expert_input: feature       # 本配置唯一的结构改动：专家读 dec1 特征 + 极性、窗内时间 + V5 分数（v4 的写法）
+TRAIN:
+  seed: 37
+  epochs: 50                  # 与 v2 / v4 同一训练协议（学习率按轮线性衰减 1e-3 -> 1e-4），按 val 挑轮次
+  lr: 0.001
+  lr_end: 0.0001
+  streams: 4
+  tbptt_k: 16
+  stream_layout: greedy
+  grad_clip: 1.0
+  lambda_exist: 1.0           # L_pres：过滤与各滞后平滑的在场 BCE（只训练证据）
+  lambda_pos: 0.0
+  lambda_membership: 0.0      # 归属 m 只由 L_evt 训练
+  lambda_event: 1.0           # L_evt：各滞后的事件输出 BCE（平滑在场 detach，训练 m 与后备专家）
+  now_loss_weight: 0.0        # 暂定输出 = 骨干 z0，没有可训练的部分
+  lag_loss_weight: 0.0        # 提交输出已在 L_evt 里训练；这里只记录数值
+  lambda_dynamics: 1.0        # L_dyn：由上一窗标签占据预测这一窗（只训练出生 / 存活 / 位移核）
+  dynamics_prefit_steps: 400  # 训练证据前，先按训练集标签占据对出生 / 存活 / 位移核做最大似然（有监督 HMM）
+  label_init: true            # 足迹场的形状按标签初始化（之后照常学习）
+  deterministic: true
+  eval_chunk: 32
+  save_root: log/changepoint_v41_insample_feature_seed37
+EVAL:
+  calibrate_existence: false
+  threshold: 0.9
+  pd_detT: 50
+  correct_thresh: 0.0001
+  rolling_window: 10
+  segments: [[0, 15], [64, 79], [144, 159]]
+  timing_warmup_windows: 20
+  gate_tail_drop: 0.0
+  gate_gap_drop: 0.0
+  gate_near_rise: 0.10
