@@ -30,16 +30,11 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from final_analysis import (ALPHAS, THRESHOLD, PolicyStats, _logit, lag_adaptive, lag_fixed,  # noqa: E402
-                            load_split, references, report_prob, value_at)
+from final_analysis import (ALPHAS, THRESHOLD, PolicyStats, _logit, anchored, lag_adaptive,  # noqa: E402
+                            lag_fixed, load_split, references, report_prob, value_at)
 from utils.recording_groups import dense_names  # noqa: E402
 
 T_MIN, T_MAX = 0.05, 20.0
-
-
-def anchored(z, tau, temperature):
-    """Threshold-anchored temperature: c(z) = tau + (z - tau) / T (NaN stays NaN)."""
-    return tau + (z - tau) / float(temperature)
 
 
 def equivalent_alpha(alpha, temperature):

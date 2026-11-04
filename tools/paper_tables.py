@@ -19,10 +19,18 @@ import os
 
 import numpy as np
 
+import sys  # noqa: E402
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from utils.stream_metrics import algorithmic_latency  # noqa: E402
+
 PUBLISHED = [   # test IoU / ACC / Pd / Fa as reported by the original papers (EV-UAV); offline, 8 s clips
     {"name": "EV-SpSegNet (ICCV'25)", "iou": 0.5518, "acc": None, "pd": 0.7753, "fa": 1.63e-4},
     {"name": "SpTopoNet (CVPR'26)", "iou": 0.6662, "acc": 0.7443, "pd": 0.8336, "fa": 1.29e-4},
     {"name": "PointEvent", "iou": 0.7556, "acc": None, "pd": None, "fa": None},
+    # PACT counts the false-alarm components inside the per-event loop of its utils/eval.py (re-counted and summed for
+    # every false event), so its Fa is not on the original EV-UAV scale; its IoU / ACC / Pd use the original code
+    {"name": "PACT (ECCV\u201926)", "iou": 0.7590, "acc": None, "pd": None, "fa": None, "fa_note": "口径不同"},
 ]
 SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4"]     # reference palette, fixed order (validated)
 INK, INK2, GRID, SURFACE = "#0b0b0b", "#52514e", "#e4e3df", "#fcfcfb"
@@ -54,12 +62,18 @@ def loads(value, base):
 
 
 def backbone_metrics(d):
-    """carry-mode metrics of a train_stream_v1 eval JSON."""
+    """carry-mode metrics of a train_stream_v1 eval JSON; latency is algorithmic (no compute), compute reported apart."""
     c = d["carry"]
-    lat = c.get("latency") or {}
     return {"iou": c["iou"], "acc": c["acc"], "pd": c.get("pd"), "fa": c.get("fa"),
-            "first_det_ms": lat.get("latency_median_ms"), "messages": c.get("messages_mean"),
-            "decision_ms": None}
+            "first_det_ms": algorithmic_latency(c), "messages": c.get("messages_mean"),
+            "proc_ms": (c.get("timing") or {}).get("total_ms_mean"), "decision_ms": None}
+
+
+def pick_policy(a, name):
+    """The calibrated variant of a commit policy when the analysis has it (alpha with its calibrated meaning)."""
+    kind, _, rest = name.partition("_")
+    cal = kind + "_cal_" + rest if rest and not rest.startswith("cal_") else name
+    return cal if cal in a["policies"] else name
 
 
 def head_metrics(d, kind="track"):
@@ -89,11 +103,13 @@ def fmt(vals, digits=4, sci=False):
 
 
 def table_main(man, base, notes):
-    rows = ["| 方法 | 因果 / 流式 | IoU | ACC | Pd | Fa | 首检中位 ms | 目标事件判决延迟 均值 ms |", "|---|---|---|---|---|---|---|---|"]
+    rows = ["| 方法 | 因果 / 流式 | IoU | ACC | Pd | Fa | 首检中位 ms | 逐事件判决延迟 均值 ms | 每窗处理 ms |",
+            "|---|---|---|---|---|---|---|---|---|"]
     for p in PUBLISHED:
-        rows.append("| %s | 否（离线 8 s 片段） | %.4f | %s | %s | %s | 约 4000（片段结束才出结果） | - |" % (
+        rows.append("| %s | 否（离线 8 s 片段） | %.4f | %s | %s | %s | - | 约 4000（片段结束才出结果） | - |" % (
             p["name"], p["iou"], "%.4f" % p["acc"] if p["acc"] else "-", "%.4f" % p["pd"] if p["pd"] else "-",
-            "%.2e" % p["fa"] if p["fa"] else "-"))
+            p.get("fa_note") or ("%.2e" % p["fa"] if p["fa"] else "-")))
+    notes.append("T1 延迟为算法延迟（等窗口结束 + 等待窗数 x 窗长，不含计算）；计算另列每窗处理 ms（骨干逐窗推理，含输入构造）")
     for r in man.get("main", []):
         ms = []
         if r.get("backbone_eval"):
@@ -103,16 +119,25 @@ def table_main(man, base, notes):
         if not ms:
             notes.append("T1 缺：%s" % r["name"])
             continue
-        lat, fd = [], []
+        lat, fd, pols, temps = [], [], [], []
         for a in loads(r.get("analysis"), base):
-            pol = a["policies"][r.get("policy", "zero")]
+            name = pick_policy(a, r.get("policy", "zero"))
+            pol = a["policies"][name]
             lat.append(pol["latency_ms"]["target_mean"])
             fd.append(pol["first_detection_ms"]["median"])
+            if "_cal_" in name:
+                pols.append(pol)
+                temps.append(a.get("temperature"))
+        if r.get("head_eval") and pols and len(pols) == len(ms):   # the four metrics of the calibrated commit itself
+            ms = [{"iou": p["iou"], "acc": p["acc"], "pd": p.get("pd"), "fa": p.get("fa")} for p in pols]
+            notes.append("T1 %s：提交用校准后的 α（%s），温度 T = %s（val 拟合）" % (
+                r["name"], r.get("policy"), ", ".join("%.3f" % t for t in temps if t is not None)))
         if not fd:
             fd = [m.get("first_det_ms") for m in ms]
-        rows.append("| %s | 是 | %s | %s | %s | %s | %s | %s |" % (
+        proc = [m.get("proc_ms") for m in ms if m.get("proc_ms") is not None]
+        rows.append("| %s | 是 | %s | %s | %s | %s | %s | %s | %s |" % (
             r["name"], fmt([m["iou"] for m in ms]), fmt([m["acc"] for m in ms]), fmt([m["pd"] for m in ms]),
-            fmt([m["fa"] for m in ms], sci=True), fmt(fd, 1), fmt(lat, 1)))
+            fmt([m["fa"] for m in ms], sci=True), fmt(fd, 1), fmt(lat, 1), fmt(proc, 1) if proc else "-"))
     return "### T1 主表（EV-UAV test，阈值 0.9；离线方法只用原论文的数字）\n\n" + "\n".join(rows)
 
 
@@ -167,8 +192,10 @@ def table_policies(man, base, notes):
         return ""
     a = an[0]
     D = a["D"]
-    order = (["zero"] + ["fixed_%d" % k for k in (1, 3, 5, D)] + ["simple_0.05_1", "simple_0.05_%d" % D]
-             + ["adaptive_%g" % x for x in (0.2, 0.1, 0.05, 0.01)] + ["slice_0.2", "slice_0.05", "window_0.05"])
+    cal = "_cal_" if a.get("temperature") is not None else "_"
+    order = (["zero"] + ["fixed_%d" % k for k in (1, 3, 5, D)] + ["simple_0.05_1", "simple%s0.05_%d" % (cal, D)]
+             + ["adaptive%s%g" % (cal, x) for x in (0.2, 0.1, 0.05, 0.01)]
+             + ["slice%s0.2" % cal, "slice%s0.05" % cal, "window_0.05"])
     rows = ["| 提交策略 | IoU | 普通 / 极密 | 目标延迟 均值 / 中位 / p90 ms | 到达即判 | 首检中位 ms | 第一拍召回 |",
             "|---|---|---|---|---|---|---|"]
     for n in order:
@@ -183,7 +210,9 @@ def table_policies(man, base, notes):
             p["latency_ms"]["target_mean"], p["latency_ms"]["target_median"], p["latency_ms"]["target_p90"], arrival,
             "%.1f" % p["first_detection_ms"]["median"] if p["first_detection_ms"]["median"] is not None else "-",
             p["first_beat_recall"]))
-    title = "### T3 同一份权重的提交策略（%s，%d ms 窗，D = %d）\n\n" % (man.get("policies_title", ""), a["window_ms"], D)
+    title = "### T3 同一份权重的提交策略（%s，%d ms 窗，D = %d%s）\n\n" % (
+        man.get("policies_title", ""), a["window_ms"], D,
+        "；α 为校准后的风险，T = %.3f" % a["temperature"] if a.get("temperature") is not None else "")
     return title + "\n".join(rows)
 
 
@@ -314,15 +343,16 @@ def fig_frontier(man, base, path, notes):
         ax.annotate("等 %d 窗" % D, (xs[-1], ys[-1]), xytext=(-4, -11), textcoords="offset points", fontsize=7,
                     color=INK2, ha="right")
         alphas = (0.2, 0.1, 0.05, 0.01)
-        ad = ["adaptive_%g" % x for x in alphas]
+        cal = "_cal_" if a.get("temperature") is not None else "_"
+        ad = ["adaptive%s%g" % (cal, x) for x in alphas]
         xa = [a["policies"][n]["latency_ms"]["target_mean"] for n in ad]
         ya = [a["policies"][n]["iou"] for n in ad]
         ax.plot(xa, ya, color=col, linewidth=1.8, marker="D", markersize=4.5,
-                label="%s：逐事件自适应提交" % s["name"])
+                label="%s：逐事件自适应提交%s" % (s["name"], "（α 已校准）" if cal == "_cal_" else ""))
         for x, y, al in zip(xa, ya, alphas):
             ax.annotate("α %g" % al, (x, y), xytext=(0, 5), textcoords="offset points", fontsize=6.5, color=INK2,
                         ha="center")
-        sl = ["slice_%g" % x for x in alphas if "slice_%g" % x in a["policies"]]
+        sl = ["slice%s%g" % (cal, x) for x in alphas if "slice%s%g" % (cal, x) in a["policies"]]
         if sl:
             xs_ = [a["policies"][n]["latency_ms"]["target_mean"] for n in sl]
             ys_ = [a["policies"][n]["iou"] for n in sl]

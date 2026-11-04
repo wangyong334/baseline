@@ -154,3 +154,24 @@ nohup bash -c 'until grep -q "CHAIN gpu1 FINISHED" run/final/chain_gpu1.log 2>/d
 ```
 
 查看：`tail -n 3 run/final/bg_ablation_e3b.log run/final/commit_cal.log run/final/queue_25ms_full.log`。打包照旧用 `bash tools/final/pack.sh`（消融与校准的结果都在 log/final 与 run/final/analysis 里）。
+
+## 6. 延迟口径统一 + α 用校准后的含义（11-04 傍晚，用户批准第 2、3 项）
+
+- 改的都是 Python 分析与报告文件，外加一个新脚本 `tools/final/cal_analysis.sh`，不动任何正在运行的 shell 脚本。
+- `final_analysis.py` 不加 `--temperature` 时输出与原来逐位相同（只多一个值为 null 的 temperature 字段），本地用真实轨迹核对过。
+- 上传 `v9_opt2_20261104.tgz`，然后：
+
+```bash
+cd /media/stephen/nvme0n1/wy_data/EV-UAV-v8-rcl41
+conda activate evuav
+sha256sum v9_opt2_20261104.tgz                           # 与我给的值核对
+tar -xzf v9_opt2_20261104.tgz                            # 解出文件与 V9_OPT2_SHA256SUMS（几秒钟）
+sha256sum -c V9_OPT2_SHA256SUMS | grep -vc ': OK$'       # 应输出 0
+sed -i 's/\r$//' tools/final/cal_analysis.sh
+python -m unittest tests.test_v9_opt 2>&1 | tail -n 3    # Ran 19 tests ... OK
+# 用 val 上拟合的温度重算各判决头的分析（只用 CPU；等 commit_cal 给出温度后依次处理）
+nohup bash tools/final/cal_analysis.sh > run/final/cal_analysis.log 2>&1 &
+```
+
+- 结果写回 `run/final/analysis/<run>_seed37_{val,test}.json`。新文件是旧文件的超集：旧策略逐位不变，另加校准后的 adaptive_cal / slice_cal / simple_cal。
+- 汇总表与论文表有校准结果时优先用它；延迟一律是算法延迟（不含计算），计算时间另列每窗处理 ms。

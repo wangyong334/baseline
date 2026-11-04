@@ -101,3 +101,19 @@
     - 最终流水线（两个训练脚本 + 8 个分析工具）传递引用 30 个本地模块，其中 `model/track_head.py`、`object_layer.py`、`object_tokens.py`、`clutter_field.py`、`tools/error_budget.py` 只因旧的分派代码被引用，最终配置不用；`model/evspsegnet.py`、`evspsegnet_mp.py`、`basemodel.py`、`dataset/ev_uav.py`、`basedataset.py`、`utils/aggregate.py`、`stcloss.py`、`vis.py` 完全不被引用（离线基线 K5 只作内部对照）。
     - 选项层面要删：骨干的双仓记忆、亚阈值残差、合并解码器、读出 / 记忆消融、tif 的 adapt 与 surrogate、partial-conv 补零；判决层 v1～v4 的写法（log1p 证据、bayes / product / attribution / evidence / learned 融合、centre 状态、原始计数残差、robust 汇聚）；CoMod 零训练插件的各模式与 oracle 背景。保留：LIF（模块一消融）、BIR、NISI、RCL 的 feature / score 专家与 past 对照、B2。
     - tools 38 个只留 8 个 + `tools/final/`；configs 顶层 88 个历史配置只留 `configs/final/` 与统计文件；测试只留覆盖保留路径的，另加"发布版与研究版对同一权重输出逐位相同"的等价测试。
+- 14:4x 用户截图确认：三条链 `chains.sh gpu0 / gpu1 / gpu3` 于 11:02:33 启动（evuav 的 python）；优化包已上传（sha256 05dd2bd2…b7de67 一致，解包校验 0 个失败，`tests.test_v9_opt` 14 项 OK），`bg_ablation.sh`、`commit_cal.sh`、25 ms 完整模型的等待任务已挂上（PID 3638549～3638551）。CLAUDE.md 1.0.0 的【11-04 交接页】已改为"已确认在跑"。下一步：等基础实验的汇总表 `run/final/summary_basic.md`（约 17:30 起，选中 E3a 时更晚）。
+- 16:xx **用户批准第 1、2、3 项，第 4 项（联合微调消融）以后再做**：
+  - **第 1 项（长流评估）改方案**：用户指出状态跨窗携带，把不相干的 EV-UAV 片段拼起来会在接缝处造出人为的场景突变，测到的是"突变后恢复"，不是"长时间运行不漂移"，所以不拼接。
+    - 改为用 EV-Flying 的真实长录像（最长约 3600 窗、3 分钟，评估本来就是整段连续、不清零），比较前段与后段的精度、每窗消息、状态饱和。
+    - 需要评估里加"按时间输出逐窗统计"的选项，再补跑一次 EV-Flying 评估（约 1～2 h）。**待用户确认后再做。**
+  - **第 2 项（延迟口径统一）已做**：
+    - 新增 `utils/stream_metrics.algorithmic_latency`：骨干评估 JSON 里的首检延迟减去 net_ms_mean，即算法延迟。每个目标加的是同一个常数，旧结果不用重跑。
+    - `paper_tables.py` 的主表、`final_summary.py` 的骨干表都改成算法延迟，并新增每窗处理 ms（timing.total_ms_mean）。
+    - 发现：E1 首检中位 60.59 − 10.59 = 50.0 ms，EV-UAV 多数目标从录像一开始就在，首检延迟信息量有限，主延迟指标应用逐事件判决延迟。
+    - 已提交输出的首检会因第一拍等待而变晚（V5 上读特征头，校准 α 0.05：val 207 ms），所以首检应按暂定输出（报警）算，判决延迟按提交输出算。
+  - **第 3 项（α 用校准后的含义）已做**：
+    - `final_analysis.py --temperature T` 增加校准后的 adaptive_cal / slice_cal / simple_cal，并把等待分析换成校准后的 α 0.05；`commit_calibration.py` 改为共用 `final_analysis.anchored`；新脚本 `tools/final/cal_analysis.sh` 在服务器上等 commit_cal 给出温度后重算分析。
+    - `paper_tables.py` 有校准策略时优先用它：主表的完整模型行取校准提交本身的四个指标；T3 与前沿图换成校准后的 α 并标注 T。
+    - 主表补了 PACT（IoU 0.7590），Fa 标为"口径不同"。
+    - 本地核对（V5 上读特征头，val）：校准 α 0.05 为 0.8809 @ 134 ms、到达即提交 74.8%；同 α 的切片级为 0.8809 @ 460 ms，所以"逐事件明显快于切片级"在校准口径下仍成立。
+  - 测试：`tests/test_v9_opt.py` 共 19 项。

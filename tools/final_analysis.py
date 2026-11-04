@@ -19,6 +19,10 @@ decision latency (ms, publish time - event time, compute time excluded), first-d
 commit sources and flips against V5 by error class (never / same / onset / gap, as tools/error_budget.py).
 Also: the information-arrival curve (fixed denominator, k = 0..D) and the adaptive wait against local background
 density and target phase (analysis only).
+--temperature T (V9 optimisation; tools/commit_calibration.py fits T on val): adds adaptive_cal_a, slice_cal_a and
+simple_cal_a_D, the same rules on the threshold-anchored calibrated logit c(z) = tau + (z - tau) / T, so that alpha is the
+risk the rule states (the committed value is still the head's own value at the commit lag); the wait analysis then uses
+adaptive_cal_0.05. Without --temperature every output is unchanged.
 Usage:
     python tools/final_analysis.py --traj-dir run/traj/<name>_val --split val --data-root <root> --window-ms 50 \
         --out run/analysis/<name>_val.json
@@ -43,6 +47,11 @@ FN_CATS = ("never", "same", "onset", "gap")
 
 def _logit(p):
     return math.log(p / (1.0 - p))
+
+
+def anchored(z, tau, temperature):
+    """Threshold-anchored temperature: c(z) = tau + (z - tau) / T (keeps every decision z >= tau; NaN stays NaN)."""
+    return tau + (z - tau) / float(temperature)
 
 
 # ---------------------------------------------------------------------------
@@ -344,18 +353,25 @@ def references(rec, tau_cal, window_ms):
             "n_targets": n_targets}
 
 
-def policy_table(depth, alphas=ALPHAS, simple_k=(1, 3, 5)):
+def policy_table(depth, alphas=ALPHAS, simple_k=(1, 3, 5), calibrated=False):
     names = ["zero"] + ["fixed_%d" % k for k in range(1, depth + 1)]
     names += ["adaptive_%g" % a for a in alphas] + ["window_%g" % a for a in alphas] + ["slice_%g" % a for a in alphas]
     names += ["simple_%g_%d" % (a, k) for a in alphas for k in sorted(set(list(simple_k) + [depth]))]
+    if calibrated:
+        names += (["adaptive_cal_%g" % a for a in alphas] + ["slice_cal_%g" % a for a in alphas]
+                  + ["simple_cal_%g_%d" % (a, depth) for a in alphas])
     return names
 
 
-def policy_lag(name, traj, tau_cal, win):
-    """(L, source or None) of a named policy."""
+def policy_lag(name, traj, tau_cal, win, temperature=None):
+    """(L, source or None) of a named policy; *_cal_* policies test the anchored calibrated logit (needs temperature)."""
     if name == "zero":
         return np.zeros(traj.shape[0], dtype=np.int64), None
     kind, _, rest = name.partition("_")
+    if rest.startswith("cal_"):
+        if temperature is None:
+            raise ValueError("%s 需要 --temperature" % name)
+        return policy_lag(kind + "_" + rest[4:], anchored(traj, tau_cal, temperature), tau_cal, win)
     if kind == "fixed":
         return lag_fixed(traj, int(rest)), None
     if kind == "adaptive":
@@ -371,26 +387,28 @@ def policy_lag(name, traj, tau_cal, win):
     raise ValueError(name)
 
 
-def analyse(recs, dense, window_ms, alphas=ALPHAS, full=True, sensor=(260, 346)):
+def analyse(recs, dense, window_ms, alphas=ALPHAS, full=True, sensor=(260, 346), temperature=None):
     depth = recs[0]["traj"].shape[1] - 1
     log_w = recs[0]["log_w"]
     tau_cal = _logit(THRESHOLD) - log_w
-    names = policy_table(depth, alphas)
+    names = policy_table(depth, alphas, calibrated=temperature is not None)
     stats = {n: PolicyStats(n, window_ms, full=full, sensor=sensor) for n in names}
     density_rows = []
     for rec in recs:
         ref = references(rec, tau_cal, window_ms)
         is_dense = rec["name"] in dense
         for n in names:
-            lag, source = policy_lag(n, rec["traj"], tau_cal, ref["win"])
+            lag, source = policy_lag(n, rec["traj"], tau_cal, ref["win"], temperature)
             prob = report_prob(value_at(rec["traj"], lag), rec["log_w"])
             stats[n].add(rec, prob, lag, ref, source, is_dense)
-        lag05, src05 = lag_adaptive(rec["traj"], tau_cal, 0.05)
+        wait_traj = rec["traj"] if temperature is None else anchored(rec["traj"], tau_cal, temperature)
+        lag05, src05 = lag_adaptive(wait_traj, tau_cal, 0.05)
         pos = rec["pos"]
         bgc = local_background(rec["x"], rec["y"], ref["win"], pos)
         phase = np.where(ref["first_beat"], 0, np.where(ref["fn_cat"] == 4, 2, np.where(ref["fn_cat"] == 1, 3, 1)))
         density_rows.append((lag05[pos], src05[pos], bgc[pos], phase[pos], np.full(int(pos.sum()), is_dense)))
     result = {"window_ms": float(window_ms), "D": depth, "tau_cal": tau_cal, "log_w": log_w,
+              "temperature": None if temperature is None else float(temperature),
               "n_events": int(sum(r["traj"].shape[0] for r in recs)), "n_target": int(sum(r["pos"].sum() for r in recs)),
               "dense": sorted(dense), "policies": {n: s.result() for n, s in stats.items()}}
     result["info_arrival"] = [dict(k=k, ms=k * float(window_ms), **{key: result["policies"][n][key] for key in
@@ -437,6 +455,8 @@ def markdown(result, title):
              "|---|---|---|---|---|---|---|---|---|---|"]
     show = ["zero"] + ["fixed_%d" % k for k in (1, 3, 5, result["D"])] + ["adaptive_0.05", "simple_0.05_%d" % result["D"],
                                                                          "window_0.05", "slice_0.05", "slice_0.2"]
+    if result.get("temperature") is not None:
+        show += ["adaptive_cal_%g" % a for a in (0.2, 0.1, 0.05, 0.01)] + ["slice_cal_0.05", "slice_cal_0.2"]
     for n in show:
         if n not in p:
             continue
@@ -462,12 +482,16 @@ def main(argv=None):
     parser.add_argument("--no-roc", action="store_true", help="skip Pd / Fa (faster)")
     parser.add_argument("--height", type=int, default=260, help="sensor height (px): Fa and the dense rule")
     parser.add_argument("--width", type=int, default=346, help="sensor width (px)")
+    parser.add_argument("--temperature", type=float, default=None,
+                        help="threshold-anchored temperature fitted on val (tools/commit_calibration.py): adds the "
+                             "calibrated policies *_cal_*; omitted = unchanged output")
     args = parser.parse_args(argv)
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
     recs = load_split(args.traj_dir, args.data_root, args.split)
     names = dense_names(args.data_root, (args.split,), args.height, args.width)
-    result = analyse(recs, set(names[args.split]), args.window_ms, full=not args.no_roc, sensor=(args.height, args.width))
+    result = analyse(recs, set(names[args.split]), args.window_ms, full=not args.no_roc, sensor=(args.height, args.width),
+                     temperature=args.temperature)
     result.update(traj_dir=args.traj_dir, split=args.split)
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as fh:

@@ -222,6 +222,17 @@ def first_detection_latencies(t, label, target_id, pred_prob, window_ms, thresho
     return results
 
 
+def algorithmic_latency(carry, key="latency_median_ms"):
+    """报告口径（V9 优化 2）：评估 JSON 里的首次检出延迟含每窗网络计算时间（first_detection_latencies 的
+    net_ms_per_window）；论文与汇总统一用算法延迟（等窗口结束 + 等待窗数 x 窗长，不含计算），与
+    tools/final_analysis.py 同口径，计算时间另报（timing 的 total_ms_mean）。每个目标加的是同一个常数，
+    所以均值 / 中位数 / P90 直接减去 net_ms_mean 即可，旧结果不用重跑。carry = 评估 JSON 的 "carry" 部分。"""
+    lat = (carry.get("latency") or {}).get(key)
+    if lat is None:
+        return None
+    return float(lat) - float((carry.get("timing") or {}).get("net_ms_mean", 0.0))
+
+
 def summarize_latencies(records):
     """汇总所有序列的首次检出延迟：目标数、检出数、检出率、延迟均值/中位数/P90（只统计已检出目标）。"""
     lat = np.array([r["latency_ms"] for r in records if r["latency_ms"] is not None], dtype=np.float64)

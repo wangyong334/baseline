@@ -9,6 +9,7 @@
        final_analysis' adaptive policy
     4. The 25 ms full-model config differs from V5 @ 25 ms exactly as bb_e3b_50 differs from bb_v5_50
 """
+import json
 import math
 import os
 import sys
@@ -186,6 +187,58 @@ class CommitCalibrationTests(unittest.TestCase):
             self.assertEqual(ours[name]["iou"], ref[name]["iou"], name)
             self.assertEqual(ours[name]["latency_ms"], ref[name]["latency_ms"], name)
         self.assertEqual(ours["adaptive_cal_0.05"]["iou"], ref["adaptive_0.05"]["iou"])
+
+
+class CalibratedAnalysisTests(unittest.TestCase):
+    """final_analysis --temperature (alpha with its calibrated meaning) and the report helpers (latency convention)."""
+
+    def test_unit_temperature_reproduces_uncalibrated_policies(self):
+        from final_analysis import analyse
+        recs, _ = synthetic_recs(depth=4, seed=4)
+        plain = analyse(recs, set(), 50.0, alphas=(0.05, 0.2), full=False)
+        cal = analyse(recs, set(), 50.0, alphas=(0.05, 0.2), full=False, temperature=1.0)
+        self.assertIsNone(plain["temperature"])
+        self.assertFalse(any("_cal_" in n for n in plain["policies"]))
+        same = lambda x, y: json.dumps(x, sort_keys=True) == json.dumps(y, sort_keys=True)  # noqa: E731 (NaN-safe)
+        for n, r in plain["policies"].items():
+            self.assertTrue(same(cal["policies"][n], r), n)                    # every old policy unchanged
+        for a in ("0.05", "0.2"):
+            for fam in ("adaptive", "slice"):
+                self.assertTrue(same(cal["policies"]["%s_cal_%s" % (fam, a)], plain["policies"]["%s_%s" % (fam, a)]))
+
+    def test_temperature_maps_alpha(self):
+        from commit_calibration import equivalent_alpha
+        from final_analysis import policy_lag
+        recs, tau = synthetic_recs(depth=6, seed=5)
+        for rec in recs:
+            win = rec["t"] // 50
+            lag_c, _ = policy_lag("adaptive_cal_0.05", rec["traj"], tau, win, temperature=1.6)
+            lag_u, _ = policy_lag("adaptive_%r" % equivalent_alpha(0.05, 1.6), rec["traj"], tau, win)
+            self.assertGreater((lag_c == lag_u).mean(), 0.999)
+        with self.assertRaises(ValueError):
+            policy_lag("adaptive_cal_0.05", recs[0]["traj"], tau, recs[0]["t"] // 50)   # needs a temperature
+
+    def test_algorithmic_latency_removes_compute(self):
+        from utils.stream_metrics import algorithmic_latency
+        carry = {"latency": {"latency_median_ms": 60.594, "latency_mean_ms": 113.428},
+                 "timing": {"net_ms_mean": 10.594, "total_ms_mean": 19.7}}
+        self.assertAlmostEqual(algorithmic_latency(carry), 50.0, places=9)
+        self.assertAlmostEqual(algorithmic_latency(carry, "latency_mean_ms"), 102.834, places=9)
+        self.assertIsNone(algorithmic_latency({"latency": {}}))
+        self.assertEqual(algorithmic_latency({"latency": {"latency_median_ms": 40.0}}), 40.0)    # no timing recorded
+
+    def test_paper_tables_prefer_calibrated_policy(self):
+        import paper_tables
+        a = {"policies": {"adaptive_0.05": {}, "adaptive_cal_0.05": {}, "zero": {}}}
+        self.assertEqual(paper_tables.pick_policy(a, "adaptive_0.05"), "adaptive_cal_0.05")
+        self.assertEqual(paper_tables.pick_policy(a, "zero"), "zero")
+        self.assertEqual(paper_tables.pick_policy({"policies": {"adaptive_0.05": {}}}, "adaptive_0.05"), "adaptive_0.05")
+
+    def test_cal_analysis_script_is_lf(self):
+        with open(os.path.join(ROOT, "tools", "final", "cal_analysis.sh"), "rb") as fh:
+            body = fh.read()
+        self.assertNotIn(b"\r", body)
+        self.assertIn(b"--temperature", body)
 
 
 class FullModel25msConfigTests(unittest.TestCase):

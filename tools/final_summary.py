@@ -17,6 +17,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.recording_groups import dense_names, group_report  # noqa: E402
+from utils.stream_metrics import algorithmic_latency  # noqa: E402
 
 
 def load(path):
@@ -56,7 +57,8 @@ def runs(log_root, prefixes):
 
 def backbone_table(log_root, dense):
     rows = ["| 骨干 | 选中轮次（只看 val 会选） | val IoU | val 普通 / 极密 | test IoU / ACC / Pd / Fa | test 普通 / 极密 |"
-            " 4 Hz/px IoU / Fa | 每窗消息 | 首检中位 ms（含每窗计算） |", "|---|---|---|---|---|---|---|---|---|"]
+            " 4 Hz/px IoU / Fa | 每窗消息 | 首检中位 ms（算法，不含计算） | 每窗处理 ms |",
+            "|---|---|---|---|---|---|---|---|---|---|"]
     for name, seed, path, marks in runs(log_root, ("bb_",)):
         stem = os.path.join(path, "eval_%%s_selected_seed%d%%s.json" % seed)
         sel = load(os.path.join(path, "selection.json")) or {}
@@ -68,18 +70,20 @@ def backbone_table(log_root, dense):
         vn, vd = groups(v.get("per_sequence"), dense.get("val"))
         tn, td = groups(t.get("per_sequence"), dense.get("test"))
         n = (noisy or {}).get("carry", {})
-        lat = (t.get("latency") or {}).get("latency_median_ms")
-        rows.append("| %s%s | %s（%s） | %s | %s / %s | %s / %s / %s / %s | %s / %s | %s / %s | %s | %s |" % (
+        lat = algorithmic_latency(t) if t else None
+        proc = (t.get("timing") or {}).get("total_ms_mean")
+        rows.append("| %s%s | %s（%s） | %s | %s / %s | %s / %s / %s / %s | %s / %s | %s / %s | %s | %s | %s |" % (
             name, " ← %s" % ", ".join(marks) if marks else "",
             "冻结权重" if sel.get("frozen") else sel.get("epoch", "-"), "-" if sel.get("frozen") else sel.get("best_val_epoch", "-"),
             f4(v.get("iou")), vn, vd, f4(t.get("iou")), f4(t.get("acc")), f4(t.get("pd")),
             "%.2e" % t["fa"] if "fa" in t else "-", tn, td, f4(n.get("iou")), "%.2e" % n["fa"] if "fa" in n else "-",
-            "%.3g" % t["messages_mean"] if t.get("messages_mean") else "-", "%.1f" % lat if lat else "-"))
+            "%.3g" % t["messages_mean"] if t.get("messages_mean") else "-", "%.1f" % lat if lat is not None else "-",
+            "%.1f" % proc if proc else "-"))
     return "### 骨干（模块一 / 模块二）\n\n" + "\n".join(rows)
 
 
 def head_table(log_root, run_root, dense):
-    rows = ["| 判决头（骨干） | val 不等 → 固定 D | test 不等 → 固定 D | test 普通 / 极密 | test 自适应 α 0.05 | 目标延迟 均值 / 中位 ms |"
+    rows = ["| 判决头（骨干） | val 不等 → 固定 D | test 不等 → 固定 D | test 普通 / 极密 | test 自适应 α 0.05（校准 T） | 目标延迟 均值 / 中位 ms |"
             " test 不给未来 | 第一拍召回 不等 → D | test 救回 / 误压 / 压掉误报 / 新增误报 | 完整模型 4 Hz/px |",
             "|---|---|---|---|---|---|---|---|---|---|"]
     for name, seed, path, marks in runs(log_root, ("rcl_", "b2_")):
@@ -92,7 +96,11 @@ def head_table(log_root, run_root, dense):
         an = load(os.path.join(run_root, "analysis", "%s_seed%d_test.json" % (name, seed)))
         tn, td = groups((test.get("per_sequence") or {}).get("track"), dense.get("test"))
         pol = (an or {}).get("policies", {})
-        a05, zero = pol.get("adaptive_0.05", {}), pol.get("zero", {})
+        cal = pol.get("adaptive_cal_0.05")                 # alpha with its calibrated meaning when available
+        a05, zero = cal or pol.get("adaptive_0.05", {}), pol.get("zero", {})
+        temp = (an or {}).get("temperature")
+        ada_cell = ("%.4f（T %.2f）" % (cal["iou"], temp) if cal and temp else
+                    f4((ada or {}).get("track", {}).get("iou")) + "（未校准）")
         fixed = pol.get("fixed_%d" % an["D"], {}) if an else {}
         fl = fixed.get("flips") or {}
         lat = a05.get("latency_ms") or {}
@@ -100,7 +108,7 @@ def head_table(log_root, run_root, dense):
         rows.append("| %s%s（%s） | %s → %s | %s → %s | %s / %s | %s | %s / %s | %s | %s → %s | %s / %s / %s / %s | %s |" % (
             name, " ← %s" % ", ".join(marks) if marks else "", base or "-",
             f4((val or {}).get("base", {}).get("iou")), f4((val or {}).get("track", {}).get("iou")),
-            f4(test["base"]["iou"]), f4(test["track"]["iou"]), tn, td, f4((ada or {}).get("track", {}).get("iou")),
+            f4(test["base"]["iou"]), f4(test["track"]["iou"]), tn, td, ada_cell,
             "%.1f" % lat["target_mean"] if lat.get("target_mean") is not None else "-",
             "%.1f" % lat["target_median"] if lat.get("target_median") is not None else "-",
             f4((past or {}).get("track", {}).get("iou")),
