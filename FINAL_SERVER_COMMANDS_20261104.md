@@ -104,7 +104,23 @@ bash tools/final/pack.sh                             # 生成 final_results_<时
 ls -lh final_results_*.tgz                           # 下载回本地 Res/ 发我
 ```
 
-## 4. 第二批（基础实验之后再定）
+## 4. 第二批、第三批：用 `tools/final/chains.sh` 在每张卡上接着跑（11-04 用户定）
+
+`tools/final/chains.sh` 等每张卡上的基础队列结束，再一个接一个启动下表的队列；选定骨干从 `run/final/backbone_choice_seed37.json` 自动读，某个队列失败不影响后面的。
+
+| 卡 | 等什么 | 接着跑 |
+|---|---|---|
+| 1 | `queue_basic_e1.log` 末行 FINISHED / FAILED | `queue_25ms` → `queue_evf`（只有选中 E3b 时才真跑） |
+| 0 | `queue_basic_e3b.log` 末行 FINISHED / FAILED | `queue_seed` 种子 38（`B2OCC=1`） |
+| 3 | `log/final/bb_e3a_50_seed37/BACKBONE_DONE` | `queue_b2_evf` → `queue_seed` 种子 39（`B2OCC=1`） |
+
+```bash
+nohup bash tools/final/chains.sh gpu1 > run/final/chain_gpu1.log 2>&1 &
+nohup bash tools/final/chains.sh gpu0 > run/final/chain_gpu0.log 2>&1 &
+nohup bash tools/final/chains.sh gpu3 > run/final/chain_gpu3.log 2>&1 &
+```
+
+下面是原来手动启动各队列的写法，留作参考：
 
 | 队列 | 内容 | 预计 |
 |---|---|---|
