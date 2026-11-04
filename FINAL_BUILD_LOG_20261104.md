@@ -61,3 +61,13 @@
   - 本地 sftp 配置核对：默认 profile `lab` → `/media/stephen/nvme0n1/wy_data/EV-UAV-v8-rcl41`（正是截图里的目录），`.tgz` 不在忽略列表里，无需修改。
   - `pack.sh` 补上 `run/final/*.json`（选骨干的结果）。
   - 上传包重建：`final_v9_code_20261104.tgz` 142075 字节，sha256 a2e9a1a5…140fa4，37 个文件全部校验 OK。
+- 09:3x 用户定：**先做基础实验，验证最终模型的有效性**。
+  - 第一批改为三条并行队列 `tools/final/queue_basic_{v5,e3b,e1}.sh`，约 10 h：
+    - E1 / E3b / E3a 按新协议在三张卡上并行重训；
+    - 模块三分别接到 E1、E3b 上；
+    - V5 上的现有判决头直接接入新评估；
+    - 选骨干后把完整模型标为 `*_m2`，并自动生成汇总表 `tools/final_summary.py` → `run/final/summary_basic.md`。
+  - 第二批 `queue_25ms` / `queue_b2_evf`，第三批 `queue_seed` / `queue_evf`。删掉没用过的 `queue_m2` / `queue_m3`。
+  - 本地模拟选骨干后的链接段：Linux 下 `ln -s` 正常（Windows 需管理员权限，用默认模式验证流程走通）。
+  - 汇总脚本用本地现有结果拼的假目录测过，另加 1 项单元测试。
+  - 完整测试 **433 项 OK**。上传包 40 个文件，校验全 OK，脚本无 CR。

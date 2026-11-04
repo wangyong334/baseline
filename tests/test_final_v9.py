@@ -344,6 +344,52 @@ class BackboneChoiceTests(unittest.TestCase):
         self.assertEqual(SB.choose(table)[0], "e1")
 
 
+class SummaryTests(unittest.TestCase):
+    def test_summary_tables(self):
+        """tools/final_summary.py lists real runs once (symlinked names as markers) and reads the eval / analysis files."""
+        import final_summary as FS
+        with tempfile.TemporaryDirectory() as d:
+            log, run = Path(d) / "log", Path(d) / "run"
+            bb, head = log / "bb_e3b_50_seed37", log / "rcl_feature_50_on_e3b_seed37"
+            for p in (bb, head, run / "analysis"):
+                p.mkdir(parents=True)
+            carry = {"iou": 0.88, "acc": 0.96, "pd": 0.95, "fa": 1e-5, "messages_mean": 7e4,
+                     "per_sequence": {"a.npz": [80, 10, 10], "b.npz": [10, 5, 5]}, "latency": {"latency_median_ms": 58.0}}
+            for split in ("val", "test"):
+                (bb / ("eval_%s_selected_seed37.json" % split)).write_text(json.dumps({"carry": carry}), encoding="utf-8")
+            (bb / "selection.json").write_text(json.dumps({"epoch": 40, "best_val_epoch": 24}), encoding="utf-8")
+            track = {"iou": 0.89, "acc": 0.97, "tp": 1, "fp": 1, "fn": 1}
+            ev = {"base": dict(track, iou=0.87), "track": track, "per_sequence": {"track": {"a.npz": [80, 9, 9]}},
+                  "base_checkpoint": str(bb / "selected_seed37.pt")}
+            for split in ("val", "test"):
+                (head / ("eval_%s_selected_seed37.json" % split)).write_text(json.dumps(ev), encoding="utf-8")
+            pol = {"iou": 0.89, "first_beat_recall": 0.7, "latency_ms": {"target_mean": 64.0, "target_median": 28.0},
+                   "flips": {"rescued": {"same": 3, "onset": 1, "gap": 1, "never": 0}, "suppressed": 2, "fp_removed": 9,
+                             "fp_added": 4}}
+            (run / "analysis" / "rcl_feature_50_on_e3b_seed37_test.json").write_text(
+                json.dumps({"D": 10, "policies": {"zero": pol, "fixed_10": pol, "adaptive_0.05": pol}}), encoding="utf-8")
+            (run / "backbone_choice_seed37.json").write_text(json.dumps(
+                {"winner": "e3b", "winner_run": str(bb), "claim_branch": "A: ...", "log": ["x"]}), encoding="utf-8")
+            try:
+                os.symlink("bb_e3b_50_seed37", str(log / "bb_m2_50_seed37"))
+                linked = True
+            except (OSError, NotImplementedError):                 # no symlink privilege on this Windows account
+                linked = False
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                FS.main(["--log-root", str(log), "--run-root", str(run)])
+            text = out.getvalue()
+            self.assertIn("| bb_e3b_50", text)
+            self.assertIn("40（24）", text)
+            self.assertIn("0.8700 → 0.8900", text)
+            self.assertIn("64.0 / 28.0", text)
+            self.assertIn("5 / 2 / 9 / 4", text)
+            self.assertIn("选定：**e3b**", text)
+            self.assertEqual(text.count("| bb_e3b_50"), 1)
+            if linked:
+                self.assertIn("← bb_m2_50_seed37", text)
+
+
 class StreamGroupTests(unittest.TestCase):
     def test_groups_match_ungrouped_training(self):
         import train_stream_v1 as T

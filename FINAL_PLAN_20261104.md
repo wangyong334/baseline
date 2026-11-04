@@ -404,6 +404,14 @@ B2 的设计：
 
 ## 6. 实验矩阵
 
+**11-04 用户定：先做基础实验，验证最终模型的有效性**（`FINAL_SERVER_COMMANDS_20261104.md` §3，三张卡约 10 h）。内容是下表的 1、3、4，再加 B1：
+- 2×2 的三个骨干在三张卡上并行重训；
+- 模块三分别接到 E1、E3b 上；
+- V5 上的现有判决头不重训，直接接入新评估；
+- 按规则选骨干，自动生成汇总表。
+
+第二批是 5、6、8；第三批是 9。
+
 | # | 实验 | 主张 | 配置 / 脚本 | 状态 | GPU 时间（估） |
 |---|---|---|---|---|---|
 | 1 | E1 / E3a / E3b / V5 重训（逐轮存权重、护栏选轮次）+ val / test 加噪 4 档 | 模块二 2×2 | `bb_{v5,e1,e3a,e3b}_50` + `backbone.sh` | 待跑 | 每个约 2～3.3 h + 评估约 1.5 h |
@@ -467,12 +475,12 @@ B2 的设计：
 | `train_track_head.py` | `--trajectory-dir`、`--eval-noise-hz`（与骨干评估同一份噪声）、`--commit`、`--data-root`；`per_sequence`；`save_epochs`；head_kind `lookahead`；没有可训练项的片段跳过反传 | 不变 |
 | `utils/recording_groups.py`（新） | 物理分组规则、分组 IoU | — |
 | `tools/select_checkpoint.py`、`tools/select_backbone.py`、`tools/final_analysis.py`、`tools/b1_delayed_confirm.py`、`tools/paper_tables.py`（新） | 选择协议、评估套件、B1、论文表图 | — |
-| `tools/final/{backbone,head,pack}.sh`（新，LF） | 服务器流水线 | — |
+| `tools/final/*.sh`（新，LF；流水线 `backbone` / `head` / `pack`，基础实验 `queue_basic_{v5,e3b,e1}`，第二批 `queue_25ms` / `queue_b2_evf` / `queue_seed` / `queue_evf`）、`tools/final_summary.py`（基础实验跑完自动出汇总表） | 服务器流水线 | — |
 | `configs/final/*.yaml`（14 个）+ `paper_manifest.json`；`configs/stream_v1_train_stats_w25.json` | 最终轮配置 | 与来源配置只差 save_root / save_epochs（测试核对）；bb_e3b_evf 另改掩码为关（D9） |
-| `tests/test_final_v9.py`（新，19 项） | 上述全部 + 端到端小流程 | — |
+| `tests/test_final_v9.py`（新，20 项） | 上述全部 + 端到端小流程 | — |
 | `FINAL_PLAN_20261104.md`、`FINAL_BUILD_LOG_20261104.md`、`FINAL_SERVER_COMMANDS_20261104.md`、`FINAL_V9_SHA256SUMS` | 文档 | — |
 
-本地测试：py3.8 / torch 1.9.1，全部 432 项 OK（旧 413 + 新 19）。
+本地测试：py3.8 / torch 1.9.1，全部 433 项 OK（旧 413 + 新 20）。
 
 ---
 
