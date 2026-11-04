@@ -18,8 +18,9 @@ ROOT=$(python -c "import sys; sys.path.insert(0, '.'); from utils.stream_common 
 V5=log/stream_tif_commpeak_msg_seed37/best_val_iou_seed37.pt
 [ -f $V5 ] || { echo "没有冻结 V5 的权重：$V5"; exit 1; }
 mkdir -p log/final/bb_v5_frozen_seed37
-cp -n log/stream_tif_commpeak_msg_seed37/best_val_iou_seed37.pt log/stream_tif_commpeak_msg_seed37/metrics.jsonl \
-  log/final/bb_v5_frozen_seed37/
+for f in best_val_iou_seed37.pt metrics.jsonl; do      # the archived V5 may have no metrics.jsonl: then used as is
+  [ -f log/stream_tif_commpeak_msg_seed37/$f ] && cp -n log/stream_tif_commpeak_msg_seed37/$f log/final/bb_v5_frozen_seed37/
+done
 NAME=bb_v5_50 RUN=bb_v5_frozen TRAIN=0 bash tools/final/backbone.sh || { echo "QUEUE BASIC V5 FAILED at frozen V5"; exit 1; }
 # name : source run (log/<src>) : final run name : B1 : past-only eval : noise levels
 for spec in "rcl_feature_50:changepoint_v41_insample_feature_seed37:rcl_feature_50_on_v5:1:1:0.8 1.6 2.4 4" \

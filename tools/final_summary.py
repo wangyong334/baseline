@@ -70,7 +70,8 @@ def backbone_table(log_root, dense):
         n = (noisy or {}).get("carry", {})
         lat = (t.get("latency") or {}).get("latency_median_ms")
         rows.append("| %s%s | %s（%s） | %s | %s / %s | %s / %s / %s / %s | %s / %s | %s / %s | %s | %s |" % (
-            name, " ← %s" % ", ".join(marks) if marks else "", sel.get("epoch", "-"), sel.get("best_val_epoch", "-"),
+            name, " ← %s" % ", ".join(marks) if marks else "",
+            "冻结权重" if sel.get("frozen") else sel.get("epoch", "-"), "-" if sel.get("frozen") else sel.get("best_val_epoch", "-"),
             f4(v.get("iou")), vn, vd, f4(t.get("iou")), f4(t.get("acc")), f4(t.get("pd")),
             "%.2e" % t["fa"] if "fa" in t else "-", tn, td, f4(n.get("iou")), "%.2e" % n["fa"] if "fa" in n else "-",
             "%.3g" % t["messages_mean"] if t.get("messages_mean") else "-", "%.1f" % lat if lat else "-"))

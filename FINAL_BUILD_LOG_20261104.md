@@ -71,3 +71,7 @@
   - 本地模拟选骨干后的链接段：Linux 下 `ln -s` 正常（Windows 需管理员权限，用默认模式验证流程走通）。
   - 汇总脚本用本地现有结果拼的假目录测过，另加 1 项单元测试。
   - 完整测试 **433 项 OK**。上传包 40 个文件，校验全 OK，脚本无 CR。
+- 09:4x 用户启动基础实验：卡 0（E3b）、卡 1（E1）正常；**卡 3 的 `queue_basic_v5.sh` 30 秒内 Exit 1**。
+  - 判断：存档 / 迁移来的 V5 目录只有权重与评估 JSON，没有 `metrics.jsonl`（本地 `Res/weights_20261029/.../stream_tif_commpeak_msg_seed37/` 同样没有），冻结 V5 的选轮次一步读不到文件而退出。
+  - 修：`select_checkpoint.py` 遇到没有 `metrics.jsonl` 的冻结运行时，直接用其 `best_val_iou_seed*.pt`，记 `frozen: true`；`final_summary.py` 显示"冻结权重"；`queue_basic_v5.sh` 只复制存在的文件。本地用真实 V5 目录验证，新增单元测试，20 项新测试 OK。
+  - 让用户只上传这 3 个文件后重启卡 3（不重解整个包，避免碰正在运行的脚本）。

@@ -315,6 +315,16 @@ class GroupsAndSelectionTests(unittest.TestCase):
         self.assertEqual(res["candidates"], [1, 3])
         legacy = SC.select(SC.epoch_table([{"epoch": 0, "val_iou": 0.5}, {"epoch": 1, "val_iou": 0.6}]), dense)
         self.assertEqual(legacy["epoch"], 1)
+        with tempfile.TemporaryDirectory() as d:                    # frozen run without metrics.jsonl (the 10-23 V5)
+            run = Path(d) / "bb_v5_frozen_seed37"
+            run.mkdir()
+            (run / "best_val_iou_seed37.pt").write_bytes(b"frozen-weights")
+            with contextlib.redirect_stdout(io.StringIO()):
+                SC.main(["--run", str(run), "--data-root", str(Path(d) / "no-data"), "--copy"])
+            self.assertEqual((run / "selected_seed37.pt").read_bytes(), b"frozen-weights")
+            sel = json.loads((run / "selection.json").read_text(encoding="utf-8"))
+            self.assertTrue(sel["frozen"])
+            self.assertEqual(sel["seed"], 37)
         bad = copy.deepcopy(records)
         bad[0]["val_iou"] = 0.1
         with self.assertRaises(RuntimeError):                       # counts must reproduce the official IoU

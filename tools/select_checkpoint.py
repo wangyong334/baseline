@@ -17,6 +17,7 @@ Works on train_stream_v1.py runs (val_sequences per epoch) and train_track_head.
 import argparse
 import json
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -106,6 +107,22 @@ def main(argv=None):
     parser.add_argument("--copy", action="store_true", help="把选中的轮次复制为 selected_seed<seed>.pt")
     args = parser.parse_args(argv)
     run = Path(args.run)
+    if not (run / "metrics.jsonl").exists():           # frozen run kept without its training log (the 10-23 V5)
+        frozen = sorted(run.glob("best_val_iou_seed*.pt"))
+        if not frozen:
+            raise FileNotFoundError("%s 既没有 metrics.jsonl，也没有 best_val_iou_seed*.pt" % run)
+        src = frozen[0]
+        seed = int(re.search(r"seed(\d+)", src.name).group(1))
+        result = {"rule": "frozen checkpoint without metrics.jsonl: used as is (its own best-val selection)",
+                  "epoch": None, "best_val_epoch": None, "frozen": True, "run": str(run), "seed": seed, "epochs": []}
+        if args.copy:
+            dst = run / ("selected_seed%d.pt" % seed)
+            shutil.copyfile(str(src), str(dst))
+            result.update(selected_checkpoint=str(dst), source_checkpoint=str(src))
+        (run / "selection.json").write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+        print("没有 metrics.jsonl：直接用冻结的权重 %s（它自己按 val 选的轮次）" % src.name)
+        print("SELECTION FINISHED:", run / "selection.json", flush=True)
+        return
     records = [json.loads(line) for line in (run / "metrics.jsonl").read_text(encoding="utf-8").splitlines() if line]
     names = dense_names(args.data_root, ("val",), args.height, args.width)
     result = select(epoch_table(records), names["val"], args.delta)
