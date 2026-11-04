@@ -213,3 +213,17 @@ tail -n 4 run/final/plan_a_*.log                      # 查看进度
 
 - 只做干净评估，只报官方合并口径。
 - `HEADS="rcl"` / `HEADS25="rcl"` 可去掉 B2；已完成的判决头自动跳过，没完成的旧目录会先移开。
+
+查看进度（18:39 起用这一组）：
+
+```bash
+cd /media/stephen/nvme0n1/wy_data/EV-UAV-v8-rcl41
+# 1) 我们的全部进程（队列脚本 + python），按启动时间排，含已运行时长
+ps -eo pid,ppid,etime,args --sort=start_time | grep -E "tools/final/|train_stream_v1|train_track_head|select_checkpoint|final_analysis|commit_calibration|b1_delayed" | grep -v grep | cut -c1-170
+# 2) 每张卡上的 python 各是哪个实验
+nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader | while IFS=', ' read uuid pid mem unit; do echo "卡$(nvidia-smi --query-gpu=index,uuid --format=csv,noheader | grep "$uuid" | cut -d, -f1) | $mem$unit | $(ps -o etime=,args= -p $pid | cut -c1-120)"; done
+# 3) 正在训的（30 分钟内有更新的训练日志）到第几轮
+for f in $(find run/final -maxdepth 1 -name '*_train.log' -mmin -30); do echo "$(basename $f _train.log)：$(grep -c '^epoch' $f) 轮"; done
+# 4) plan_a 与旧队列日志的最后两行
+for f in run/final/plan_a_*.log run/final/queue_25ms.log run/final/commit_cal.log run/final/cal_analysis.log; do [ -f "$f" ] && echo "== $(basename $f)" && tail -n 2 $f | cut -c1-150; done
+```

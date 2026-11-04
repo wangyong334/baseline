@@ -156,3 +156,8 @@
     - `gpu1` 等旧 25 ms 队列结束后接 B2@25；
     - `seed_queue` 遇到已完成的 V5 直接接判决头。
   - 测试 42 项 OK；包 sha256 05d2245c502dea22d98e5d280d94f1932bbf4fa54e036e3c1f827beeb02d5e5f。
+- **18:34 plan_a 已在服务器执行**（用户截图）：
+  - 停掉 E3b 种子 38（23 轮）、chains gpu0 / gpu3、queue_seed、queue_b2_evf。
+  - 卡 0 开始 RCL 种子 38；卡 1 旧队列 18:27 开始 RCL@25（第 33 轮），plan_a gpu1 等它结束；卡 3 B2 + 占据监督 42 / 50 轮，plan_a gpu3 等它结束后跑种子 39；plan_a cpu 已做 B2 种子 37 的校准。
+  - 新增 `tools/final/compare_heads.py`（三种子 RCL 对 B2 的只读对比）。
+  - CLAUDE.md 交接页重写为【11-04 19:00 交接页】，供 /clear 后接续。
