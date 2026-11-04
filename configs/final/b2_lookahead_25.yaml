@@ -1,0 +1,51 @@
+# [V9-final] 25 ms 的 B2：与 configs/final/b2_lookahead_50.yaml 只差按窗计的量（物理量全部不变，tests/test_final_v9.py 核对），
+#   改法与 rcl_feature_25 对 rcl_feature_50 完全相同：D 10 -> 20 窗（未来预算 500 ms 不变）；TBPTT 片段 16 -> 32 窗（0.8 s 不变）；
+#   验证片段 32 -> 64 窗；滚动窗 10 -> 20、分段与计时预热按窗号加倍；骨干 = 25 ms 的 V5（configs/final/bb_v5_25.yaml）。
+#   B2 网络里只有读出的滞后归一化（lag / D）按窗计，随 D 自动变；没有时间常数。
+#   用途（11-04 晚，方案 A）：B2 在种子 37 的 50 ms 上 val / test 都高于 RCL，25 ms 上同样要两个头都比。
+DATA:
+  root: /media/stephen/nvme0n1/wy_data/datasets/EV-UAV-dataset
+  input_device: gpu
+BASE:
+  base_checkpoint: log/final/bb_v5_25_seed37/selected_seed37.pt   # V5 @ 25 ms（流水线用 --base-checkpoint 显式给出）
+HEAD:
+  head_kind: lookahead
+  cell: 4                     # 与 RCL 相同的判决格
+  defer_max: 20               # 500 ms = 20 x 25 ms
+  defer_alpha: 0.05
+  commit: fixed
+  lookahead_hidden: 3         # 编码 / 前向 / 后向 ConvGRU 的通道数
+  member_hidden: 16           # 读出 MLP 的隐层
+TRAIN:
+  seed: 37
+  epochs: 50
+  lr: 0.001
+  lr_end: 0.0001
+  streams: 4
+  tbptt_k: 32                 # 0.8 s = 32 x 25 ms
+  stream_layout: greedy
+  grad_clip: 1.0
+  lambda_exist: 0.0
+  lambda_pos: 0.0
+  lambda_membership: 0.0
+  lambda_event: 1.0           # 唯一的损失：各滞后的事件输出 BCE（= RCL 的 L_evt）
+  now_loss_weight: 0.0
+  lag_loss_weight: 0.0
+  lambda_dynamics: 0.0
+  dynamics_prefit_steps: 0
+  label_init: false
+  deterministic: true
+  eval_chunk: 64
+  save_root: log/final/b2_lookahead_25_seed37
+  save_epochs: true
+EVAL:
+  calibrate_existence: false
+  threshold: 0.9
+  pd_detT: 50
+  correct_thresh: 0.0001
+  rolling_window: 20
+  segments: [[0, 31], [128, 159], [288, 319]]
+  timing_warmup_windows: 40
+  gate_tail_drop: 0.0
+  gate_gap_drop: 0.0
+  gate_near_rise: 0.10

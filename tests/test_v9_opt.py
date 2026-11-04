@@ -8,6 +8,7 @@
        decision; the NLL fit recovers a known temperature; calibrated alpha = uncalibrated alpha' exactly; T = 1 equals
        final_analysis' adaptive policy
     4. The 25 ms full-model config differs from V5 @ 25 ms exactly as bb_e3b_50 differs from bb_v5_50
+    5. Decision A script (tools/final/plan_a.sh): LF, valid bash, only existing configs, no E3b run, no noise evals
 """
 import json
 import math
@@ -264,6 +265,28 @@ class FullModel25msConfigTests(unittest.TestCase):
             body = fh.read()
         self.assertNotIn(b"\r", body)
         self.assertIn(b"bb_e3b_25", body)
+
+
+
+class PlanATests(unittest.TestCase):
+    """Decision A (11-04 evening): tools/final/plan_a.sh replaces the E3b parts of the running queues."""
+
+    def test_script_is_lf_valid_and_uses_existing_configs(self):
+        import re
+        import shutil
+        import subprocess
+        path = os.path.join(ROOT, "tools", "final", "plan_a.sh")
+        with open(path, "rb") as fh:
+            body = fh.read().decode("utf-8")
+        self.assertNotIn("\r", body)
+        for name in sorted(set(re.findall(r"name=([a-z0-9_]+);", body)) | {"bb_v5_50", "bb_v5_25", "rcl_feature_evf"}):
+            self.assertTrue(os.path.exists(os.path.join(ROOT, "configs", "final", name + ".yaml")), name)
+        self.assertTrue(os.path.exists(os.path.join(ROOT, re.search(r"ref=(configs/\S+\.jsonl)", body).group(1))))
+        self.assertNotIn("bb_e3b_50 ", body.replace("bb_e3b_50.yaml --mode train", ""))    # only stopped, never run
+        self.assertIn('HZ=""', body)                                                         # no noise evals
+        bash = shutil.which("bash")
+        if bash:
+            self.assertEqual(subprocess.call([bash, "-n", path]), 0)
 
 
 if __name__ == "__main__":

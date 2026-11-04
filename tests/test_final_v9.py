@@ -6,11 +6,12 @@
     2. B2 look-ahead head (model/lookahead_head.py): starts at V5, every event committed once, chunk-split invariant,
        causal, a reset clears only that stream, past-only reads nothing after arrival, event loss reaches every
        parameter, adaptive arrival commit follows RCL's bound
-    3. Recording groups (shot-noise rule) and guarded checkpoint selection (tools/select_checkpoint.py)
+    3. Recording groups (shot-noise rule); checkpoint selection (tools/select_checkpoint.py): guarded (default), plain
+       best val, and a stopped bit-exact replica selected on its reference run's full record
     4. stream_groups (ported from v6-3): grouped training = ungrouped; the dense NISI background map is sliced per stream
     5. Noise in physical units: Hz/px -> load L for 50 / 25 ms windows
     6. B1 persistence counts against a direct loop
-    7. End to end: backbone (save_epochs) -> guarded selection -> RCL and B2 heads -> eval with trajectories and noise
+    7. End to end: backbone (save_epochs) -> selection -> RCL and B2 heads -> eval with trajectories and noise
        -> final_analysis -> B1, on synthetic recordings
 """
 import contextlib
@@ -309,11 +310,12 @@ class GroupsAndSelectionTests(unittest.TestCase):
                                                                   "d.npz": [d_tp, 100 - d_tp, 100 - d_tp]},
                     "val_iou": (n_tp + d_tp) / float(n_tp + d_tp + 2 * (1100 - n_tp - d_tp))}
         records = [rec(0, 900, 10), rec(1, 950, 30), rec(2, 930, 95), rec(3, 948, 40)]
-        res = SC.select(SC.epoch_table(records), dense, delta=0.005)
+        res = SC.select(SC.epoch_table(records), dense, delta=0.005, rule="guarded")
         self.assertEqual(res["best_val_epoch"], 2)                  # dense spike with a normal drop
         self.assertEqual(res["epoch"], 3)                           # guarded: best val among normal >= best - 0.005
         self.assertEqual(res["candidates"], [1, 3])
-        legacy = SC.select(SC.epoch_table([{"epoch": 0, "val_iou": 0.5}, {"epoch": 1, "val_iou": 0.6}]), dense)
+        legacy = SC.select(SC.epoch_table([{"epoch": 0, "val_iou": 0.5}, {"epoch": 1, "val_iou": 0.6}]), dense,
+                           rule="guarded")
         self.assertEqual(legacy["epoch"], 1)
         with tempfile.TemporaryDirectory() as d:                    # frozen run without metrics.jsonl (the 10-23 V5)
             run = Path(d) / "bb_v5_frozen_seed37"
@@ -328,7 +330,43 @@ class GroupsAndSelectionTests(unittest.TestCase):
         bad = copy.deepcopy(records)
         bad[0]["val_iou"] = 0.1
         with self.assertRaises(RuntimeError):                       # counts must reproduce the official IoU
-            SC.select(SC.epoch_table(bad), dense)
+            SC.select(SC.epoch_table(bad), dense, rule="guarded")
+        self.assertEqual(SC.select(SC.epoch_table(records), dense)["epoch"], 3)            # default = guarded
+        self.assertEqual(SC.select(SC.epoch_table(records), rule="plain")["epoch"], 2)     # plain: the dense spike
+
+    def test_plain_and_replica_selection(self):
+        import select_checkpoint as SC
+        tie = SC.select(SC.epoch_table([{"epoch": e, "val_iou": v} for e, v in ((0, 0.5), (1, 0.7), (2, 0.7))]),
+                        rule="plain")
+        self.assertEqual(tie["epoch"], 1)                         # first epoch reaching the best = trainer's best_val_iou
+        ref = [{"epoch": e, "val_iou": v, "seed": 37} for e, v in enumerate((0.3, 0.6, 0.8, 0.7, 0.75))]
+        with tempfile.TemporaryDirectory() as d, contextlib.redirect_stdout(io.StringIO()):
+            run, refp = Path(d) / "bb_v5_25_seed37", Path(d) / "reference.jsonl"
+            (run / "epochs").mkdir(parents=True)
+            refp.write_text("".join(json.dumps(r) + "\n" for r in ref), encoding="utf-8")
+            for e in range(4):                                     # stopped after epoch 3, bit-identical so far
+                (run / "epochs" / ("epoch_%03d.pt" % e)).write_bytes(b"w%d" % e)
+            (run / "metrics.jsonl").write_text("".join(json.dumps(r) + "\n" for r in ref[:4]), encoding="utf-8")
+            SC.main(["--run", str(run), "--reference-metrics", str(refp), "--copy"])
+            sel = json.loads((run / "selection.json").read_text(encoding="utf-8"))
+            self.assertEqual((sel["epoch"], sel["replica_epochs_compared"], sel["reference_epochs"]), (2, 4, 5))
+            self.assertEqual((run / "selected_seed37.pt").read_bytes(), b"w2")
+            late = [dict(r, val_iou=0.9) if r["epoch"] == 4 else r for r in ref]   # best epoch not trained yet
+            refp.write_text("".join(json.dumps(r) + "\n" for r in late), encoding="utf-8")
+            with self.assertRaises(RuntimeError):
+                SC.main(["--run", str(run), "--reference-metrics", str(refp)])
+            bad = [dict(r, val_iou=r["val_iou"] + 1e-12) if r["epoch"] == 1 else r for r in ref]
+            refp.write_text("".join(json.dumps(r) + "\n" for r in bad), encoding="utf-8")
+            with self.assertRaises(RuntimeError):                  # not a bit-exact replica
+                SC.main(["--run", str(run), "--reference-metrics", str(refp)])
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                SC.main(["--run", str(run), "--rule", "guarded"])  # guarded needs the data root
+
+    def test_v5_w25_reference_record(self):
+        import select_checkpoint as SC
+        ref = SC.read_records(os.path.join(ROOT, "configs", "final", "reference", "bb_v5_25_seed37_v63_record.jsonl"))
+        self.assertEqual(len(ref), 50)
+        self.assertEqual(SC.select(SC.epoch_table(ref), rule="plain")["epoch"], 18)   # the 10-25 run's best_val_iou
 
 
 class BackboneChoiceTests(unittest.TestCase):
@@ -524,6 +562,13 @@ class FinalConfigTests(unittest.TestCase):
         self.assertEqual(a["comm_budget_messages"] / r, b["comm_budget_messages"])
         self.assertTrue(os.path.exists(os.path.join(ROOT, b["stats_path"])))
         h50, h25 = self.load("configs/final/rcl_feature_50.yaml"), self.load("configs/final/rcl_feature_25.yaml")
+        b50, b25 = self.load("configs/final/b2_lookahead_50.yaml"), self.load("configs/final/b2_lookahead_25.yaml")
+        self.assertEqual(set(b25), set(b50))
+        self.assertEqual({k for k in b50 if b50[k] != b25[k]}, {k for k in h50 if h50[k] != h25[k]})
+        for key in ("defer_max", "tbptt_k", "eval_chunk", "rolling_window", "segments", "timing_warmup_windows",
+                    "base_checkpoint"):                         # B2 @ 25 ms = RCL @ 25 ms's clock
+            self.assertEqual(b25[key], h25[key], key)
+        self.assertEqual(b25["save_root"], "log/final/b2_lookahead_25_seed37")
         self.assertEqual(set(h25), set(h50))
         self.assertEqual({k for k in h50 if h50[k] != h25[k]},
                          {"defer_max", "tbptt_k", "eval_chunk", "rolling_window", "segments", "timing_warmup_windows",

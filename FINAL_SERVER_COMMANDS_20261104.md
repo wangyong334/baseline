@@ -175,3 +175,41 @@ nohup bash tools/final/cal_analysis.sh > run/final/cal_analysis.log 2>&1 &
 
 - 结果写回 `run/final/analysis/<run>_seed37_{val,test}.json`。新文件是旧文件的超集：旧策略逐位不变，另加校准后的 adaptive_cal / slice_cal / simple_cal。
 - 汇总表与论文表有校准结果时优先用它；延迟一律是算法延迟（不含计算），计算时间另列每窗处理 ms。
+
+## 7. 方案 A（11-04 晚，用户定：不要模块二，主模型 = V5 + 判决头）
+
+用 `tools/final/plan_a.sh` 接管还没跑的部分。服务器上正在跑的旧脚本一个字不改。
+上传包 `v9_planA_20261104.tgz`（18:45 第三版，sha256 `05d2245c502dea22d98e5d280d94f1932bbf4fa54e036e3c1f827beeb02d5e5f`）里有：
+- `tools/select_checkpoint.py`：默认仍是事先定的护栏规则；新增 `--rule plain` / `SELECT_RULE=plain` 和 `--reference-metrics`；
+- `tools/final/plan_a.sh`；
+- `configs/final/b2_lookahead_25.yaml`；
+- `configs/final/reference/bb_v5_25_seed37_v63_record.jsonl`（10-25 那次 V5@25 的逐轮 val 记录，用来核对逐位复现）；
+- 两个测试文件。
+
+```bash
+cd /media/stephen/nvme0n1/wy_data/EV-UAV-v8-rcl41
+conda activate evuav
+sha256sum v9_planA_20261104.tgz                      # 应为 05d2245c502dea22d98e5d280d94f1932bbf4fa54e036e3c1f827beeb02d5e5f
+tar -xzf v9_planA_20261104.tgz
+python -m unittest tests.test_final_v9 tests.test_v9_opt 2>&1 | tail -3     # 应为 Ran 42 tests ... OK
+bash tools/final/plan_a.sh stop                      # 只预览：带 * 的行是要结束的
+DRY=0 bash tools/final/plan_a.sh stop                # 核对无误后执行
+nohup bash tools/final/plan_a.sh gpu0 > run/final/plan_a_gpu0.log 2>&1 &
+sleep 60
+nohup bash tools/final/plan_a.sh gpu1 > run/final/plan_a_gpu1.log 2>&1 &
+nohup bash tools/final/plan_a.sh gpu3 > run/final/plan_a_gpu3.log 2>&1 &
+nohup bash tools/final/plan_a.sh cpu  > run/final/plan_a_cpu.log 2>&1 &
+tail -n 4 run/final/plan_a_*.log                      # 查看进度
+```
+
+| 子命令 | 做什么 |
+|---|---|
+| `stop` | 停掉卡 0 的 `chains.sh gpu0`、`queue_seed.sh`、它下面的 `backbone.sh` 和 E3b 种子 38 的训练；停掉卡 3 的 `chains.sh gpu3` 和 `queue_b2_evf.sh`（正在训的 B2 + 占据监督不动，V5 重训不再跑）。卡 1 不动 |
+| `stop25` | 只在改用"只看 val"（`SELECT_RULE=plain`）时用：停掉卡 1 整个旧 25 ms 队列 |
+| `gpu0` | 种子 38：V5 已完成就直接用 → RCL（含 B1）→ B2 → EV-Flying 读特征头的新口径评估（不重训） |
+| `gpu1` | 等卡 1 旧队列（V5@25 → RCL@25）结束 → 同一份骨干上接 B2@25；并报告 50 轮是否与 10-25 逐位相同 |
+| `gpu3` | 等 B2 + 占据监督（种子 37）结束 → 种子 39：V5 → RCL（含 B1）→ B2 |
+| `cpu` | 种子 37 的 B2、B2 + 占据监督做提交校准；种子 38 / 39 的判决头在各自队列里校准 |
+
+- 只做干净评估，只报官方合并口径。
+- `HEADS="rcl"` / `HEADS25="rcl"` 可去掉 B2；已完成的判决头自动跳过，没完成的旧目录会先移开。
