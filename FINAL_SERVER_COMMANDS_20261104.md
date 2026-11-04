@@ -132,3 +132,25 @@ nohup bash tools/final/chains.sh gpu3 > run/final/chain_gpu3.log 2>&1 &
 `M2` 填 `run/final/backbone_choice_seed37.log` 里"选定骨干"对应的配置名：`bb_e3b_50`、`bb_e1_50`、`bb_e3a_50`，选中冻结 V5 时填 `bb_v5_50`。
 
 全部跑完后，同第 3 节打包；论文的表和图用 `tools/paper_tables.py --manifest configs/final/paper_manifest.json`，我在本地生成（服务器缺中文字体）。test 只报告，不用来改任何选择。
+
+## 5. V9 优化（11-04 下午，用户批准；不影响正在跑的实验）
+
+改动在 50 ms 下逐位不变（改动前后 63 组参照输出逐位相同，全套 447 项测试 OK），正在跑的链继续用、结果不变；新增的只是三个只评估的工具和 25 ms 完整模型的配置。上传 `v9_opt_20261104.tgz`（右键 SFTP: Upload File），然后：
+
+```bash
+cd /media/stephen/nvme0n1/wy_data/EV-UAV-v8-rcl41
+conda activate evuav
+sha256sum v9_opt_20261104.tgz                          # 与我给的值核对
+tar -xzf v9_opt_20261104.tgz                           # 解出 11 个文件（9 个代码 + 两份文档）与 V9_OPT_SHA256SUMS（几秒钟）
+sha256sum -c V9_OPT_SHA256SUMS | grep -vc ': OK$'      # 应输出 0
+sed -i 's/\r$//' tools/final/*.sh
+python -m unittest tests.test_v9_opt 2>&1 | tail -n 3  # Ran 14 tests ... OK
+# 优化 2：E3b 背景估计器消融（卡 1，与 E1 的判决头训练共用显存；等 E3b 骨干完成后自动开始，约 1.5～2 h）
+GPU=1 nohup bash tools/final/bg_ablation.sh > run/final/bg_ablation_e3b.log 2>&1 &
+# 优化 1：各判决头的提交接口校准（只用 CPU；按顺序等 V5 / E1 / E3b / EV-Flying / 25 ms 的判决头完成）
+nohup bash tools/final/commit_cal.sh > run/final/commit_cal.log 2>&1 &
+# 优化 3：25 ms 完整模型（卡 1 的链跑完后自动开始；只在规则选中 E3b 时真跑，约 12～16 h）
+nohup bash -c 'until grep -q "CHAIN gpu1 FINISHED" run/final/chain_gpu1.log 2>/dev/null; do sleep 300; done; GPU=1 bash tools/final/queue_25ms_full.sh' > run/final/queue_25ms_full.log 2>&1 &
+```
+
+查看：`tail -n 3 run/final/bg_ablation_e3b.log run/final/commit_cal.log run/final/queue_25ms_full.log`。打包照旧用 `bash tools/final/pack.sh`（消融与校准的结果都在 log/final 与 run/final/analysis 里）。

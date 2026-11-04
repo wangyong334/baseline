@@ -161,12 +161,17 @@ class BackgroundTracker(object):
     def __init__(self, seq, cfg, device):
         self.seq, self.device = seq, device
         self.height, self.width = int(cfg["pad_height"]), int(cfg["pad_width"])
-        eps_b = 0.5 * float(cfg.get("invariant_ref_rate", REF_RATE)[0])
+        window_ms = float(cfg.get("window_ms", 50.0))
+        # reference rates are per 50 ms window (model/comod.REF_RATE); other window lengths keep the same Hz/px
+        eps_b = 0.5 * float(cfg.get("invariant_ref_rate", REF_RATE)[0]) * (window_ms / 50.0)
         mask = None
         if cfg.get("invariant_sensor_mask", False):    # true = 只在传感器像素上估计背景（细节问题 D9，默认关）
             mask = torch.zeros(1, 1, self.height, self.width, dtype=torch.float64, device=device)
             mask[..., :int(cfg["height"]), :int(cfg["width_px"])] = 1.0
-        self.estimator = BackgroundEstimator(eps_b=eps_b, mask=mask)
+        # invariant_bg_center / invariant_bg_forget = False: estimator ablations (evaluation only, V9 optimisation 2)
+        self.estimator = BackgroundEstimator(eps_b=eps_b, mask=mask, window_ms=window_ms,
+                                             center=bool(cfg.get("invariant_bg_center", True)),
+                                             forget=bool(cfg.get("invariant_bg_forget", True)))
         self.next_k = 0
 
     def _counts(self, k):

@@ -42,8 +42,10 @@ BACKGROUNDS = ("online", "oracle")
 R_OUT, R_IN = 10, 4
 SUB = 11
 N_WHOLE, N_BIN = 24, 12       # 泊松级数的截断项数（整窗 / 时间箱）；背景率 <= 约 5 /窗 时截断误差可忽略
-# 参照背景率（每像素每窗，按极性 ON / OFF）：训练集 99 条序列的逐序列平均背景率的中位数（13.45，本地由训练集 zip 统计）
+# 参照背景率（每像素每 50 ms 窗，按极性 ON / OFF）：训练集 99 条序列的逐序列平均背景率的中位数（13.45，本地由训练集 zip 统计）。
+# 其他窗长按 window_ms / 50 换算（train_stream_v1.ref_rate_per_window），即同一个 Hz/px（ON 0.042、OFF 0.0002）。
 REF_RATE = (0.0021, 0.00001)
+FAST_WINDOWS, ALARM_WINDOWS = 2.0, 2   # 突变遗忘：快速平均的时间常数、连续偏离的窗数（50 ms 参照窗，即 100 ms）
 
 
 def box_sum(x, radius):
@@ -102,12 +104,21 @@ def input_moments(b_hat, q99, time_bins, clip):
 class BackgroundEstimator(object):
     """在线背景估计（见模块说明）。step(counts) 先返回本窗可用的 b_hat（只依赖之前的窗），再用本窗计数更新。"""
 
-    def __init__(self, tau_s=20.0, tau_c=100.0, trunc=2.0, z=2.0, forget=True, eps_b=0.0, mask=None):
+    def __init__(self, tau_s=20.0, tau_c=100.0, trunc=2.0, z=2.0, forget=True, eps_b=0.0, mask=None,
+                 center=True, window_ms=50.0):
         """mask: 可选的传感器有效区掩码 [1,1,H,W]（1 = 传感器像素，0 = 画布补零区）。
         给定时按归一化卷积（Knutsson & Westin 1993）只在有效像素上求平均：补零区是"没有观测"，不是"没有事件"，
-        否则靠近补零边的环形参照、邻域与子块速率都会被低估（10-29：下边缘误检）。None 时与原实现逐位相同。"""
-        self.a_s, self.g_c = math.exp(-1.0 / float(tau_s)), math.exp(-1.0 / float(tau_c))
-        self.trunc, self.z, self.forget, self.eps_b = float(trunc), float(z), bool(forget), float(eps_b)
+        否则靠近补零边的环形参照、邻域与子块速率都会被低估（10-29：下边缘误检）。None 时与原实现逐位相同。
+        物理单位（V9 优化 3）：tau_s / tau_c（窗）、trunc（每窗计数）和突变遗忘的两个常数（快速平均 2 窗、连续 2 窗）
+        都按 50 ms 参照窗给出，按 window_ms 换算成同样的物理时间（窗数 x 50 / window_ms，计数 x window_ms / 50）；
+        50 ms 时每个值都不变（逐位相同）。eps_b 由调用方按每窗给出。
+        center = False 去掉中心分量（热像素），forget = False 去掉突变遗忘：只用于评估时的估计器消融（V9 优化 2）。"""
+        scale = 50.0 / float(window_ms)
+        self.a_s, self.g_c = math.exp(-1.0 / (float(tau_s) * scale)), math.exp(-1.0 / (float(tau_c) * scale))
+        self.trunc, self.z, self.forget, self.eps_b = float(trunc) / scale, float(z), bool(forget), float(eps_b)
+        self.a_f = math.exp(-1.0 / (FAST_WINDOWS * scale))
+        self.alarm_windows = max(1, int(round(ALARM_WINDOWS * scale)))
+        self.center = bool(center)
         self.mask = mask
         self.reset()
 
@@ -122,6 +133,8 @@ class BackgroundEstimator(object):
         if self.As is None:
             return None
         ring = self.As / self.Ws
+        if not self.center:                            # estimator ablation: ring reference only
+            return ring
         lcb = (self.Ac - self.z * torch.sqrt(self.Ac.clamp(min=0.0))) / self.Bc
         rate = self.Ac / self.Bc
         ones = self._valid(rate)
@@ -166,12 +179,12 @@ class BackgroundEstimator(object):
             k = ((seen.sum(2, keepdim=True) - 1).clamp(min=0) // 2)
             med = vals.sort(dim=2).values.gather(2, k)[:, :, 0]
             med = torch.where(torch.isinf(med), torch.zeros_like(med), med)
-        a_f = math.exp(-1.0 / 2.0)
+        a_f = self.a_f
         self.fast = med if self.fast is None else a_f * self.fast + (1 - a_f) * med
         off = (self.fast - slow).abs() > torch.maximum(0.5 * slow, torch.full_like(slow, self.eps_b))
         self.alarm = torch.where(off, (self.alarm if self.alarm is not None else torch.zeros_like(slow)) + 1,
                                  torch.zeros_like(slow))
-        trig = self.alarm >= 2
+        trig = self.alarm >= self.alarm_windows
         if self.mask is not None:                                                    # 补零区子块没有观测，不重启
             trig = trig & (cover > 1e-3)
         if bool(trig.any()):

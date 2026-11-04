@@ -86,3 +86,18 @@
   - **因果头（同容量、不用未来）**：val 0.8722、test 0.8842；读特征头（用未来）0.8807 / 0.8927。未来贡献 IoU 增益的 61% / 52%，以及全部第一拍救回：第一拍召回 因果 0.305 / 0.592（比 V5 低 0.021 / 0.036），读特征 0.402 / 0.721；救回目标事件 60 / 58 对 534 / 479；极密目标附近误报 −9% / −10% 对 −20% / −24%。"等未来比不等好"的前提成立（单种子），B2 照计划跑。
   - **EV-Flying 读特征头**（16 轮，val 最好第 6 轮）：val 0.8388 → 0.8414，test 0.7353 → 0.7329；Pd val 0.8128 → 0.7849、test 0.8182 → 0.7978（只读分数版 Pd 不降，val +0.0030、test −0.0016）。test 6 条里 5 条持平或小升（+0.000～+0.008），损失来自杂波录像 test_23（0.2714 → 0.2645，新增误报 8214）。自适应与固定 D 完全相同（D19：到达提交门槛够不着，全部等满 10 窗）。结论：EV-Flying 上模块三目前既不提精度也不降延迟，如实报告；D19 的只评估校准要用户批准，未排。
   - 用户要求把剩下的实验全挂上、一张卡一个接一个跑：新增 `tools/final/chains.sh`（gpu1：25 ms → EV-Flying E3b；gpu0：种子 38；gpu3：E3a 骨干完成后 B2 两版 + EV-Flying 头 + V5 重训 → 种子 39；种子队列都带 `B2OCC=1`，选定骨干从 `run/final/backbone_choice_seed37.json` 自动读）。本地用假队列跑通（等待、选骨干解析、失败跳过）。
+- 11:3x～14:3x **V9 优化（用户批准"可以，你做吧，优化吧"）**：
+  - **优化 3：模块二的常数改成物理单位**。`model/comod.py` 的背景估计器按 50 ms 参照窗给常数，再按 `window_ms` 换算：时间常数 20 / 100 窗 → 1 s / 5 s，计数截断 2 → 每 50 ms 2 个，突变遗忘的快速平均与连续偏离 2 窗 → 100 ms；`train_stream_v1.ref_rate_per_window` 把参照率按 window_ms / 50 换算（同一个 Hz/px）；`model/noise_invariant.BackgroundTracker` 传入窗长。
+    - **50 ms 逐位不变**：改动前后用同一份输入跑背景估计 60 窗、整网（带 NISI）前向，63 组输出逐位相同。
+    - 25 ms 与 50 ms 等价：环形参照严格成比例（rtol 1e-9），完整估计器在阶跃之前与重启稳定后相差 < 3%（中心分量差一个 (1 + g)/2 因子，重启时刻可能差 25 ms）。
+    - 新配置 `configs/final/bb_e3b_25.yaml`（与 bb_v5_25 的差别 = bb_e3b_50 与 bb_v5_50 的差别；加噪率减半，即同样的 0.04～0.8 Hz/px）和队列 `tools/final/queue_25ms_full.sh`（只在选中 E3b 时跑）。
+  - **优化 2：背景估计器消融开关**。`train_stream_v1.py --bg-ablation {no_center, no_forget, ring_only}`（只评估，结果后缀 `_bg_<名字>`）；`tools/final/bg_ablation.sh` 在 E3b 骨干完成后跑 val / test 干净与 4 Hz/px。本地单条录像冒烟（val_022，10-29 的 E3b 权重）：四种都能跑，no_center 与全开相同，no_forget 略高（0.9577 对 0.9563），单条录像不作结论。
+  - **优化 1：提交接口校准**。新工具 `tools/commit_calibration.py`：以判决阈值为锚的温度 c(z) = tau + (z − tau)/T（像标准温度缩放保持 argmax 一样，它保持每个阈值判决），T 在 val 上按 NLL 拟合，提交检验用 c(z)，提交的值仍是判决头在该滞后的输出。
+    - **关键发现：只用一个温度时，校准在数学上等价于换算 α**：校准后 α 的提交 = 未校准 α′ 的提交，logit(1 − α′) = T·logit(1 − α)。所以校准**不移动精度—延迟前沿**，只让 α 在不同数据集上代表同样的风险。
+    - EV-UAV（V5 上读特征头，本地轨迹）：T = 1.567（判决头偏自信，NLL 0.0296 → 0.0249）。校准后 α 0.05 ≡ 未校准 α 0.0098：test 0.8929 @ 141 ms，与未校准 α 0.01 完全相同；校准后 α 0.2 ≡ α 0.102：0.8927 @ 63 ms，与未校准 α 0.1（0.8927 @ 64 ms）相同。
+    - 含义：未校准时 EV-UAV 上标称 α 0.05 的实际风险约为 0.13；EV-Flying 上能否让提交生效，取决于在 EVF 的 val 轨迹上拟合出的 T 是否 < 1（`tools/final/commit_cal.sh` 等 `queue_b2_evf` 出轨迹后自动算）。
+  - 测试：新 `tests/test_v9_opt.py` 14 项；全套 447 项 OK。
+  - **优化 4（发布前清理）的清单，实验全部跑完后执行**（现在动会影响正在跑的链和旧权重的评估）：
+    - 最终流水线（两个训练脚本 + 8 个分析工具）传递引用 30 个本地模块，其中 `model/track_head.py`、`object_layer.py`、`object_tokens.py`、`clutter_field.py`、`tools/error_budget.py` 只因旧的分派代码被引用，最终配置不用；`model/evspsegnet.py`、`evspsegnet_mp.py`、`basemodel.py`、`dataset/ev_uav.py`、`basedataset.py`、`utils/aggregate.py`、`stcloss.py`、`vis.py` 完全不被引用（离线基线 K5 只作内部对照）。
+    - 选项层面要删：骨干的双仓记忆、亚阈值残差、合并解码器、读出 / 记忆消融、tif 的 adapt 与 surrogate、partial-conv 补零；判决层 v1～v4 的写法（log1p 证据、bayes / product / attribution / evidence / learned 融合、centre 状态、原始计数残差、robust 汇聚）；CoMod 零训练插件的各模式与 oracle 背景。保留：LIF（模块一消融）、BIR、NISI、RCL 的 feature / score 专家与 past 对照、B2。
+    - tools 38 个只留 8 个 + `tools/final/`；configs 顶层 88 个历史配置只留 `configs/final/` 与统计文件；测试只留覆盖保留路径的，另加"发布版与研究版对同一权重输出逐位相同"的等价测试。

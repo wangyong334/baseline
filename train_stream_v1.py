@@ -51,6 +51,7 @@ SOURCE_FILES = ("train_stream_v1.py", "dataset/stream_windows.py", "dataset/ev_u
                 "dataset/stream_source.py", "model/lif2d_stream.py", "model/evspsegnet_stream.py",
                 "utils/stream_common.py", "utils/stream_metrics.py", "utils/eval.py", "utils/comm_budget.py")
 EXECUTIONS = ("step", "layer")
+BG_ABLATIONS = ("none", "no_center", "no_forget", "ring_only")   # --bg-ablation (V9 optimisation 2)
 TRAINERS = ("sequence", "streams")
 
 
@@ -95,6 +96,9 @@ def parse_args():
     parser.add_argument("--eval-noise-seed", type=int, default=0, help="仅 eval：注入噪声的随机种子")
     parser.add_argument("--carry-only", action="store_true",
                         help="仅 eval：只跑 carry（不再跑 reset_each_window 对照），加噪评估用，耗时减半")
+    parser.add_argument("--bg-ablation", choices=BG_ABLATIONS, default="none",
+                        help="仅 eval、仅带模块二接口的权重：背景估计器消融（V9 优化 2，不重训）。no_center 去掉中心分量"
+                             "（热像素），no_forget 去掉突变遗忘，ring_only 两者都去掉；结果文件后缀为 _bg_<名字>")
     parser.add_argument("--dump-dir", default=None,
                         help="eval 模式：把训练时状态模式下的逐事件预测按序列保存为 NPZ，供 tools/verify_predictions.py 独立核验")
     parser.add_argument("--reset-every", type=int, default=0,
@@ -224,6 +228,13 @@ def load_stats(cfg):
     return stats, q99, pos_weight
 
 
+def ref_rate_per_window(cfg):
+    """Reference background rate (ON, OFF) per pixel per window. REF_RATE and invariant_ref_rate are given for
+    50 ms windows; other window lengths keep the same rate in Hz/px (V9 optimisation 3; x 1.0 at 50 ms)."""
+    scale = float(cfg["window_ms"]) / 50.0
+    return tuple(float(r) * scale for r in cfg.get("invariant_ref_rate", REF_RATE))
+
+
 def build_net(cfg, device):
     """按配置构造网络并移动到设备。"""
     if cfg.get("spiking_decoder", False):
@@ -240,7 +251,7 @@ def build_net(cfg, device):
         subthreshold_residual=cfg.get("subthreshold_residual"),
         tif=cfg.get("tif") if cfg["neuron"] == "tif" else None,
         invariant=(dict(time_bins=int(cfg["time_bins"]), clip=float(cfg["input_clip"]),
-                        ref_rate=tuple(cfg.get("invariant_ref_rate", REF_RATE)))
+                        ref_rate=ref_rate_per_window(cfg))
                    if cfg.get("invariant_input") else None),
         border=border, sensor_hw=(int(cfg["height"]), int(cfg["width_px"])) if partial else None,
         canvas_hw=(int(cfg["pad_height"]), int(cfg["pad_width"])) if partial else None)
@@ -1578,6 +1589,13 @@ def mode_eval(args, cfg):
         suffix += "_memory_" + memory_ablation
     if subthreshold_ablation != "none":
         suffix += "_subthreshold_" + subthreshold_ablation
+    bg_ablation = getattr(args, "bg_ablation", "none") or "none"
+    if bg_ablation != "none":
+        if not train_cfg.get("invariant_input"):
+            raise ValueError("--bg-ablation 只用于带模块二接口（invariant_input）的权重")
+        train_cfg["invariant_bg_center"] = bg_ablation not in ("no_center", "ring_only")
+        train_cfg["invariant_bg_forget"] = bg_ablation not in ("no_forget", "ring_only")
+        suffix += "_bg_" + bg_ablation
     reset_every, reset_offset = check_periodic_reset(getattr(args, "reset_every", 0),
                                                      getattr(args, "reset_offset", 0))
     if reset_every:
@@ -1611,7 +1629,7 @@ def mode_eval(args, cfg):
                "subthreshold_parameters": subthreshold_parameter_statistics(net),
                "memory_ablation": memory_ablation,
                "memory_off_layers": list(net.dual_memory_layers) if memory_ablation == "off" else (off_layers or []),
-               "reset_every": reset_every, "reset_offset": reset_offset}
+               "reset_every": reset_every, "reset_offset": reset_offset, "bg_ablation": bg_ablation}
     # 周期清零时只跑 carry：M=1 即 reset_each_window，常规评估里已有
     for mode in (("carry",) if (reset_every or getattr(args, "carry_only", False)) else ("carry", "reset_each_window")):
         if device.type == "cuda":
