@@ -34,6 +34,7 @@ from model.changepoint_layer import (CHANGEPOINT_KEYS, ChangepointLayer, footpri
                                      occupancy_boxes, occupancy_maps)
 from model.clutter_field import event_count_maps  # noqa: E402
 from model.comod import REF_RATE  # noqa: E402
+from model.lookahead_head import LOOKAHEAD_KEYS, LookaheadHead  # noqa: E402
 from model.object_layer import OBJECT_KEYS, ObjectLayer, backbone_stride  # noqa: E402
 from model.object_tokens import TOKEN_KEYS, ObjectTokenLayer  # noqa: E402
 from model.track_head import TrackHead  # noqa: E402
@@ -101,6 +102,12 @@ def build_head(cfg, net, base, device, q99=None, pos_weight=None):
     长度单位 = 骨干总步长，由网络结构读出。changepoint 另需骨干的 q99（输入编码）与正样本权重（p0 的校准）。"""
     feat_dim = int(net.readout[0].in_features) - 2                 # 读出层输入 = [dec1 特征, p, t_local]
     kind = cfg.get("head_kind", "track")
+    if kind == "lookahead":                                        # B2: learned look-ahead control (model/lookahead_head.py)
+        if pos_weight is None:
+            raise ValueError("head_kind = lookahead 需要骨干的 pos_weight")
+        kwargs = {key: cfg[key] for key in LOOKAHEAD_KEYS if key in cfg}
+        return LookaheadHead(feat_dim, int(base["pad_height"]), int(base["pad_width"]), pos_weight=float(pos_weight),
+                             threshold=float(base["threshold"]), **kwargs).to(device)
     if kind == "changepoint":
         if q99 is None or pos_weight is None:
             raise ValueError("head_kind = changepoint 需要骨干的 q99 与 pos_weight")
@@ -143,10 +150,13 @@ class BaseOutputs(object):
     开头延迟几窗无关：算一次，各轮复用。这样每轮只剩航迹头的计算（骨干与模块二的背景估计不再重复）。
     """
 
-    def __init__(self, net, tap, base, q99, device, dataset, keep_all=True, with_bg=False, field=None):
+    def __init__(self, net, tap, base, q99, device, dataset, keep_all=True, with_bg=False, field=None, noise=None):
         self.net, self.tap, self.base, self.q99, self.device = net, tap, base, q99, device
         self.dataset, self.keep_all, self.with_bg = dataset, keep_all, bool(with_bg)
         self.field = field          # 学出来的杂波场（model/clutter_field.py）：给出时由它算 events["bg"]
+        # eval-only robustness test: {"eval_noise_load", "eval_noise_seed"} -> the same injected noise as the backbone
+        # evaluation (train_stream_v1.eval_noise, same per-sequence seed), so the full model sees identical events
+        self.noise = noise
         self.items, self.bg_items = {}, {}
         self.dtype = next(net.parameters()).dtype
 
@@ -154,6 +164,8 @@ class BaseOutputs(object):
         if index in self.items:
             return self.items[index]
         seq = self.dataset[index]
+        if self.noise:
+            seq = T.eval_noise(seq, dict(self.base, **self.noise), index)
         source = make_window_source(seq, self.base, self.q99, self.device, self.dtype)
         z0_all = torch.zeros(seq.n_events, dtype=torch.float32)
         feat_all = None
@@ -356,6 +368,9 @@ def train_epoch(outputs, head, lengths, optimizer, cfg, pos_weight, device, rng,
                 loss = loss + lam_y * aux["dyn_sum"] / aux["dyn_n"]
             if not math.isfinite(float(loss.detach())):
                 raise RuntimeError("损失出现非有限值：片段 %d" % c)
+            if not loss.requires_grad:              # nothing trainable in this chunk (B2: no waiting event yet)
+                hstate = head.detach_state(hstate)
+                continue
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             norms.append(clip_grad_norm_checked_(head.named_parameters(), clip, "head chunk %d" % c))
@@ -400,11 +415,24 @@ def train_epoch(outputs, head, lengths, optimizer, cfg, pos_weight, device, rng,
 # ---------------------------------------------------------------------------
 
 
-def run_split(outputs, head, base, device, split, full=False, dump_dir=None, tracks_dir=None, cache=None):
+def trajectory_array(n_events, trace, depth):
+    """trace（forward_chunk 的 (key, lag, 校准 logit) 列表）-> [N, depth + 1] float32：第 d 列 = 事件在滞后 d 的校准 logit
+    （d = 0 为 V5 的暂定值）；录像结束前没有到达的滞后为 NaN（flush 时提交的是最后一个非 NaN 值）。"""
+    out = np.full((int(n_events), int(depth) + 1), np.nan, dtype=np.float32)
+    for key, lag, z in trace:
+        out[key.cpu().numpy().astype(np.int64), lag.cpu().numpy().astype(np.int64)] = z.float().cpu().numpy()
+    return out
+
+
+def run_split(outputs, head, base, device, split, full=False, dump_dir=None, tracks_dir=None, cache=None,
+              trajectory_dir=None):
     """整段连续推理一个划分；返回 base（骨干原输出）、track（航迹头最终输出）的指标，滞后判决时另有 track_now（零等待）。
 
     cache（训练中每轮验证用的字典，跨轮保留）：骨干冻结，base 的计数与误差类别每轮都一样，只在第一轮算一次；
     给出 cache 时 track_now 只算 IoU、不做误差分类（省时间）。正式评估（mode_eval）不传 cache，全部都算。
+    trajectory_dir（只评估）：每条录像另存 [N, D + 1] 的逐滞后校准 logit（trajectory_array），供离线算固定 k 窗、
+    自适应、简单提交、整窗统一等待等全部提交策略（tools/final_analysis.py）；要求固定在第 D 窗提交，所有事件等满。
+    每个划分另给 per_sequence：每条录像各输出的 [TP, FP, FN]（分组护栏与逐录像分析用）。
     """
     dataset = outputs.dataset
     thr = float(base["threshold"])
@@ -412,6 +440,10 @@ def run_split(outputs, head, base, device, split, full=False, dump_dir=None, tra
     lag = head.has_delayed
     kinds = ("base", "track", "track_now") if lag else ("base", "track")
     counts = {kind: np.zeros(3, dtype=np.int64) for kind in kinds}                   # TP, FP, FN
+    per_seq = {kind: {} for kind in kinds}
+    if trajectory_dir and (not head.defer_max or getattr(head, "commit", "fixed") != "fixed"
+                           or int(getattr(head, "commit_lag", head.defer_max)) != int(head.defer_max)):
+        raise ValueError("逐滞后轨迹要求固定在第 D 窗提交（commit = fixed、commit_lag = defer_max）")
     rocs = {kind: FastRoc(base["pd_detT"], base["correct_thresh"], base["height"], base["width_px"])
             for kind in kinds} if full else None
     rows = {kind: [] for kind in kinds}
@@ -429,6 +461,7 @@ def run_split(outputs, head, base, device, split, full=False, dump_dir=None, tra
             idx_parts, p0_parts, p1_parts, lag_key, lag_prob = [], [], [], [], []
             seq_wait, seq_status = [], []                          # 延迟决策：每个终判事件等了几窗、终判状态
             log = [] if tracks_dir else None
+            trace = [] if trajectory_dir else None
             for start in range(0, seq.n_windows, chunk):
                 end = min(start + chunk, seq.n_windows)
                 part, idx = chunk_events(seq, start, end)
@@ -438,7 +471,9 @@ def run_split(outputs, head, base, device, split, full=False, dump_dir=None, tra
                 if bg_all is not None:
                     events["bg_event"] = bg_all[index_t].to(device)
                 keys = index_t.to(device) if lag else None
-                z, hstate, aux = head.forward_chunk(events, z0, feat, hstate, end - start, log=log, keys=keys)
+                extra_kw = {"trace": trace} if trace is not None else {}
+                z, hstate, aux = head.forward_chunk(events, z0, feat, hstate, end - start, log=log, keys=keys,
+                                                    **extra_kw)
                 for key in stats:
                     stats[key] += aux[key]
                 idx_parts.append(idx)
@@ -504,10 +539,14 @@ def run_split(outputs, head, base, device, split, full=False, dump_dir=None, tra
                     if cache is not None and kind == "base":
                         cache[seq.name] = (count, row)
                 counts[kind] += count
+                per_seq[kind][seq.name] = [int(v) for v in count]
                 if full:
                     rocs[kind].update(seq.t, prob, seq.target_id, seq.label, seq.x, seq.y, thr)
                 if row is not None:
                     rows[kind].append(row)
+            if trajectory_dir:
+                np.savez(os.path.join(trajectory_dir, seq.name), traj=trajectory_array(seq.n_events, trace, head.defer_max),
+                         labels=seq.label.astype(np.float32), log_w=np.float32(getattr(head, "log_w", 0.0)))
             if dump_dir:
                 extra = {"now_probabilities": probs["track_now"].astype(np.float32)} if lag else {}
                 if head.defer_max:
@@ -549,6 +588,7 @@ def run_split(outputs, head, base, device, split, full=False, dump_dir=None, tra
             rescued_full_wait_frac=float((rw >= head.defer_max).mean()) if rw.size else None)
     if lag:
         out["head_stats"]["flips"] = dict(flips)
+    out["per_sequence"] = per_seq
     for kind, (tp, fp, fn) in counts.items():
         res = {"iou": tp / max(tp + fp + fn, 1), "acc": tp / max(tp + fn, 1), "tp": int(tp), "fp": int(fp),
                "fn": int(fn)}
@@ -710,6 +750,16 @@ def mode_train(args, cfg):
         T.write_json(root / "label_init.json", dict(init, footprint=hist.tolist(), target_events=n_ev, centres=n_c))
         print("扩展目标模型按标签初始化：每个目标每窗 %.2f 个事件 | 足迹峰值 %.3f | 半径内的目标事件 %.3f" % (
             init["target_events_per_window"], init["footprint_peak"], init["footprint_inside"]), flush=True)
+    if getattr(head, "occupancy_aux", False):                         # B2 + occupancy: prior-probability bias init
+        cell, hc, wc = head.occupancy_spec
+        occ_sum = occ_n = 0.0
+        for i in range(len(train_set)):
+            o = occupancy_maps(sequence_occupancy(train_out, i, train_set[i], cell, False), 0, int(lengths[i]), hc, wc)
+            occ_sum, occ_n = occ_sum + float(o.sum()), occ_n + float(o.size)
+        init = head.init_occupancy_prior(occ_sum / max(occ_n, 1.0))
+        T.write_json(root / "occupancy_prior.json", init)
+        print("B2 占据读出的先验偏置：训练集框占据率 %.2e -> 偏置 %.2f" % (init["occupancy_rate"], init["occupancy_bias"]),
+              flush=True)
     prefit = int(cfg.get("dynamics_prefit_steps", 0))
     if prefit > 0:                                                    # RCL v3：转移参数先按标签做最大似然
         cell, hc, wc = head.occupancy_spec
@@ -754,6 +804,9 @@ def mode_train(args, cfg):
             best = val["track"]["iou"]
             torch.save(dict(state, best_val_iou=best), str(root / ("best_val_iou_seed%d.pt" % seed)))
         torch.save(dict(state, best_val_iou=best), str(root / "last.pt"))
+        if cfg.get("save_epochs"):                                    # guarded selection (tools/select_checkpoint.py)
+            (root / "epochs").mkdir(exist_ok=True)
+            torch.save(dict(state, best_val_iou=best), str(root / "epochs" / ("epoch_%03d.pt" % epoch)))
         if ema is not None:                                           # back to the raw weights for training
             ema.swap(head)
         b, t = val["base"], val["track"]
@@ -844,6 +897,17 @@ def fit_existence_temperature(cfg, net, tap, base, q99, head, device):
             "precision_at_confirm_after": float(y[hi_t].mean()) if bool(hi_t.any()) else None}
 
 
+def noise_settings(args, base):
+    """eval 的受控噪声（物理口径 Hz/px，与窗长无关）-> BaseOutputs 的 noise 字典；不加噪时为 None。"""
+    hz = getattr(args, "eval_noise_hz", None)
+    if not hz:
+        return None
+    if float(hz) < 0:
+        raise ValueError("--eval-noise-hz 不能为负")
+    return {"eval_noise_load": T.noise_load_from_hz(float(hz), float(base["window_ms"])),
+            "eval_noise_seed": int(getattr(args, "eval_noise_seed", 0)), "eval_noise_hz": float(hz)}
+
+
 def mode_eval(args, cfg):
     device = torch.device(args.device)
     T.seed_everything(int(cfg["seed"]), bool(cfg["deterministic"]))
@@ -863,20 +927,25 @@ def mode_eval(args, cfg):
         if math.isfinite(head.defer_A):
             head.defer_A = head.defer_A * calib["temperature"]
         print("存在后验温度校准（val 拟合）：", json.dumps(calib, ensure_ascii=False), flush=True)
-    for d in (args.dump_dir, args.tracks_dir):
+    for d in (args.dump_dir, args.tracks_dir, args.trajectory_dir):
         if d:
             os.makedirs(d, exist_ok=True)
+    noise = noise_settings(args, base)
     outputs = BaseOutputs(net, tap, base, q99, device, split_dataset(base, args.split, args.max_sequences),
-                          keep_all=False, with_bg=needs_background(head))
+                          keep_all=False, with_bg=needs_background(head), noise=noise)
     result = run_split(outputs, head, base, device, args.split, full=True, dump_dir=args.dump_dir,
-                       tracks_dir=args.tracks_dir)
+                       tracks_dir=args.tracks_dir, trajectory_dir=args.trajectory_dir)
     result.update(checkpoint=args.checkpoint, epoch=ckpt.get("epoch"), base_checkpoint=cfg["base_checkpoint"],
                   gate=gate_check(result, cfg), context=head.context, decision_lag=head.decision_lag,
                   defer_max=head.defer_max, defer_alpha=cfg.get("defer_alpha"), existence_calibration=calib,
                   defer_revision=head.defer_revision if head.defer_max else None, evidence=head_evidence(head),
-                  future_stats=getattr(head, "future_stats", None), commit_lag=getattr(head, "commit_lag", None))
+                  future_stats=getattr(head, "future_stats", None), commit_lag=getattr(head, "commit_lag", None),
+                  window_ms=float(base["window_ms"]), noise=noise)
     name = Path(args.checkpoint).stem
-    path = Path(args.checkpoint).parent / ("eval_%s_%s%s.json" % (args.split, name, "_" + args.tag if args.tag else ""))
+    tag = "_" + args.tag if args.tag else ""
+    if noise:
+        tag += "_noise%ghz_seed%d" % (noise["eval_noise_hz"], noise["eval_noise_seed"])
+    path = Path(args.checkpoint).parent / ("eval_%s_%s%s.json" % (args.split, name, tag))
     T.write_json(path, result)
     for kind in ("base", "track", "track_now"):
         if kind in result:
@@ -908,6 +977,14 @@ def parse_args(argv=None):
                         help="eval（RCL 消融）：past = 同一个头只用事件到达时已知的统计量（无未来）")
     parser.add_argument("--commit-lag", type=int, default=None, help="eval（RCL 消融）：固定在第 k 窗提交（k <= defer_max）")
     parser.add_argument("--tag", default=None, help="eval：评估 JSON 文件名后缀（同一权重的多种评估不互相覆盖）")
+    parser.add_argument("--trajectory-dir", default=None,
+                        help="eval：每条录像另存逐滞后的校准 logit [N, D + 1]（离线算全部提交策略；要求固定提交）")
+    parser.add_argument("--eval-noise-hz", type=float, default=None,
+                        help="eval：注入齐次泊松背景噪声，强度 = 每像素每秒的事件数（ON + OFF）；与骨干评估同一份噪声")
+    parser.add_argument("--eval-noise-seed", type=int, default=0, help="eval：注入噪声的随机种子")
+    parser.add_argument("--data-root", default=None, help="覆盖配置中的数据根目录（本地复现用）")
+    parser.add_argument("--commit", choices=("fixed", "adaptive"), default=None,
+                        help="eval：覆盖提交规则（同一权重；adaptive = 以 tau* 为中心的置信提交）")
     return parser.parse_args(argv)
 
 
@@ -922,6 +999,12 @@ def main(argv=None):
         cfg["seed"] = int(args.seed)
     if args.base_checkpoint:
         cfg["base_checkpoint"] = args.base_checkpoint
+    if args.data_root:
+        cfg["root"] = args.data_root
+    if args.mode != "eval" and (args.trajectory_dir or args.eval_noise_hz or args.commit):
+        raise ValueError("--trajectory-dir / --eval-noise-hz / --commit 只用于 eval")
+    if args.commit:
+        cfg["commit"] = args.commit
     if args.future_stats or args.commit_lag:
         if args.mode != "eval":
             raise ValueError("--future-stats / --commit-lag 只用于 eval（消融评估）")

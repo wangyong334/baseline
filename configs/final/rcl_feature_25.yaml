@@ -1,0 +1,62 @@
+# [V9-final] 25 ms 核心实验的模块三：与 configs/final/rcl_feature_50.yaml 只差按窗计的量（物理量全部不变，tests/test_final_v9.py 核对）
+#   D 10 -> 20 窗（未来预算 500 ms 不变，审阅 11.24：按毫秒对齐）；TBPTT 片段 16 -> 32 窗（0.8 s 不变）；验证片段 32 -> 64 窗；
+#   滚动窗 10 -> 20、分段与计时预热按窗号加倍；骨干 = 25 ms 的 V5（configs/final/bb_v5_25.yaml，按护栏选出的轮次）。
+#   结构、提交依据、训练方式、背景参照与 50 ms 版相同（模块三冻结）；位移环 1/2/4/8 格按窗计，25 ms 时每窗位移减半，仍覆盖；
+#   转移参数仍按训练集标签做最大似然预拟合（规则不变，数值随窗长自动变）。
+DATA:
+  root: /media/stephen/nvme0n1/wy_data/datasets/EV-UAV-dataset
+  input_device: gpu
+BASE:
+  base_checkpoint: log/final/bb_v5_25_seed37/selected_seed37.pt   # V5 @ 25 ms（流水线用 --base-checkpoint 显式给出）
+HEAD:
+  head_kind: changepoint
+  cell: 4
+  rings: [1, 2, 4, 8]
+  evidence_channels: 8
+  member_hidden: 32
+  defer_max: 20               # 500 ms = 20 x 25 ms
+  defer_alpha: 0.05
+  commit: fixed
+  evidence_form: linear
+  fusion: mixture
+  evidence_source: backbone
+  recursion: union
+  factor_training: true
+  state: box
+  footprint_radius: 3
+  presence_tolerance: 0
+  raw_residual: false
+  expert_input: feature
+TRAIN:
+  seed: 37
+  epochs: 50
+  lr: 0.001
+  lr_end: 0.0001
+  streams: 4
+  tbptt_k: 32                 # 0.8 s = 32 x 25 ms
+  stream_layout: greedy
+  grad_clip: 1.0
+  lambda_exist: 1.0
+  lambda_pos: 0.0
+  lambda_membership: 0.0
+  lambda_event: 1.0
+  now_loss_weight: 0.0
+  lag_loss_weight: 0.0
+  lambda_dynamics: 1.0
+  dynamics_prefit_steps: 400
+  label_init: true
+  deterministic: true
+  eval_chunk: 64
+  save_root: log/final/rcl_feature_25_seed37
+  save_epochs: true
+EVAL:
+  calibrate_existence: false
+  threshold: 0.9
+  pd_detT: 50
+  correct_thresh: 0.0001
+  rolling_window: 20
+  segments: [[0, 31], [128, 159], [288, 319]]
+  timing_warmup_windows: 40
+  gate_tail_drop: 0.0
+  gate_gap_drop: 0.0
+  gate_near_rise: 0.10

@@ -707,9 +707,12 @@ class ChangepointLayer(nn.Module):
                 "delayed_lag": torch.cat([o[2] for o in out]), "delayed_status": torch.cat([o[3] for o in out])}
 
     # ------------------------------------------------------------------ chunk
-    def forward_chunk(self, events, z0, feat, state, steps, keep=None, labels=None, tid=None, log=None, keys=None):
+    def forward_chunk(self, events, z0, feat, state, steps, keep=None, labels=None, tid=None, log=None, keys=None,
+                      trace=None):
         """events：片段事件（t = 片段内窗号、b = 流号、x / y / p / t_local / bin；训练时另有 occ [steps, B, hc, wc]）。
-        返回 (z0 原样 = 暂定输出, 新状态, aux)；aux 的延后输出是本片段内提交的事件（提交后不再改写）。"""
+        返回 (z0 原样 = 暂定输出, 新状态, aux)；aux 的延后输出是本片段内提交的事件（提交后不再改写）。
+        trace（只读诊断，不改变任何输出）：给出列表时，每窗把 (key, lag, 校准 logit) 追加进去：
+        到达时 lag = 0、值 = V5 的校准 logit；等待中的第 d 窗 lag = d、值 = 该滞后的 P_e(d)（提交判断之前）。"""
         train = labels is not None
         if state is None:
             batch = int(keep.shape[1]) if keep is not None else (int(events["b"].max()) + 1 if events["b"].numel() else 1)
@@ -822,6 +825,8 @@ class ChangepointLayer(nn.Module):
                     aux["evt_sum"] = aux["evt_sum"] + F.binary_cross_entropy_with_logits(z_cal, q["y"], reduction="sum")
                     aux["evt_n"] += int(z_cal.shape[0])
                 z_cal = z_cal.detach()
+                if trace is not None:
+                    trace.append((q["key"], q["lag"], z_cal))
                 deadline = q["lag"] >= self.commit_lag
                 if adaptive:
                     up = z_cal >= hi_commit
@@ -870,6 +875,8 @@ class ChangepointLayer(nn.Module):
                          "prov": (lp0 >= self.tau_logit).to(z0.dtype), "zlast": lp0.detach()}
                 if self.fusion == "mixture":
                     entry["h"] = self.fuse_static_term(feat[idx], events["p"][idx], events["t_local"][idx], lp0)
+                if trace is not None:
+                    trace.append((entry["key"], entry["lag"], lp0.detach()))
                 if adaptive:
                     now = lp0 >= hi_commit
                     if bool(now.any()):

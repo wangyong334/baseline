@@ -1,0 +1,219 @@
+{
+ "_comment": "V9-final paper tables / figures (tools/paper_tables.py --manifest configs/final/paper_manifest.json --out paper). Paths follow tools/final/*.sh; log/final/bb_m2_50_seed<S> and rcl_feature_50_on_m2 are the backbone chosen by tools/select_backbone.py (symlink, FINAL_SERVER_COMMANDS_20261104.md step 3). Missing files are skipped; lists of seeds are reported as mean +- std.",
+ "main": [
+  {
+   "name": "Ours：M1（V5，不等）",
+   "backbone_eval": [
+    "log/final/bb_v5_50_seed37/eval_test_selected_seed37.json",
+    "log/final/bb_v5_50_seed38/eval_test_selected_seed38.json",
+    "log/final/bb_v5_50_seed39/eval_test_selected_seed39.json"
+   ],
+   "analysis": [
+    "run/final/analysis/rcl_feature_50_on_v5_seed37_test.json"
+   ],
+   "policy": "zero"
+  },
+  {
+   "name": "Ours：M1 + M2（选定骨干，不等）",
+   "backbone_eval": [
+    "log/final/bb_m2_50_seed37/eval_test_selected_seed37.json",
+    "log/final/bb_m2_50_seed38/eval_test_selected_seed38.json",
+    "log/final/bb_m2_50_seed39/eval_test_selected_seed39.json"
+   ],
+   "analysis": [
+    "run/final/analysis/rcl_feature_50_on_m2_seed37_test.json"
+   ],
+   "policy": "zero"
+  },
+  {
+   "name": "Ours：M1 + M2 + M3（完整模型，自适应提交 α 0.05）",
+   "head_eval": [
+    "log/final/rcl_feature_50_on_m2_seed37/eval_test_selected_seed37_adaptive.json",
+    "log/final/rcl_feature_50_on_m2_seed38/eval_test_selected_seed38_adaptive.json",
+    "log/final/rcl_feature_50_on_m2_seed39/eval_test_selected_seed39_adaptive.json"
+   ],
+   "analysis": [
+    "run/final/analysis/rcl_feature_50_on_m2_seed37_test.json",
+    "run/final/analysis/rcl_feature_50_on_m2_seed38_test.json",
+    "run/final/analysis/rcl_feature_50_on_m2_seed39_test.json"
+   ],
+   "policy": "adaptive_0.05"
+  }
+ ],
+ "controls": [
+  {
+   "name": "V5（不等）",
+   "analysis_val": "run/final/analysis/rcl_feature_50_on_v5_seed37_val.json",
+   "analysis_test": "run/final/analysis/rcl_feature_50_on_v5_seed37_test.json",
+   "policy": "zero"
+  },
+  {
+   "name": "同一份头、不给未来（past）",
+   "eval_val": "log/final/rcl_feature_50_on_v5_seed37/eval_val_selected_seed37_past.json",
+   "eval_test": "log/final/rcl_feature_50_on_v5_seed37/eval_test_selected_seed37_past.json",
+   "dense_val": [
+    "val_023.npz"
+   ],
+   "dense_test": [
+    "test_022.npz",
+    "test_023.npz"
+   ]
+  },
+  {
+   "name": "同容量因果头（单独训练，只用过去）",
+   "analysis_val": "run/final/analysis/rcl_feature_causal_50_on_v5_seed37_val.json",
+   "analysis_test": "run/final/analysis/rcl_feature_causal_50_on_v5_seed37_test.json",
+   "policy": "fixed_10"
+  },
+  {
+   "name": "B1：不学习的 M-of-N 确认（等 10 窗）",
+   "b1": "run/final/analysis/b1_on_rcl_feature_50_on_v5_seed37.json",
+   "b1_lag": 10
+  },
+  {
+   "name": "B1（val 选的最好等待：1 窗）",
+   "b1": "run/final/analysis/b1_on_rcl_feature_50_on_v5_seed37.json",
+   "b1_lag": 1
+  },
+  {
+   "name": "B2：学出的前瞻头（只读分数，固定 10 窗）",
+   "analysis_val": "run/final/analysis/b2_lookahead_50_on_v5_seed37_val.json",
+   "analysis_test": "run/final/analysis/b2_lookahead_50_on_v5_seed37_test.json",
+   "policy": "fixed_10"
+  },
+  {
+   "name": "B2 + 与 RCL 相同的占据监督（固定 10 窗）",
+   "analysis_val": "run/final/analysis/b2_lookahead_occ_50_on_v5_seed37_val.json",
+   "analysis_test": "run/final/analysis/b2_lookahead_occ_50_on_v5_seed37_test.json",
+   "policy": "fixed_10"
+  },
+  {
+   "name": "RCL 只读分数（固定 10 窗；B2 的配对）",
+   "analysis_val": "run/final/analysis/rcl_score_50_on_v5_seed37_val.json",
+   "analysis_test": "run/final/analysis/rcl_score_50_on_v5_seed37_test.json",
+   "policy": "fixed_10"
+  },
+  {
+   "name": "RCL 读特征（固定 10 窗）",
+   "analysis_val": "run/final/analysis/rcl_feature_50_on_v5_seed37_val.json",
+   "analysis_test": "run/final/analysis/rcl_feature_50_on_v5_seed37_test.json",
+   "policy": "fixed_10"
+  },
+  {
+   "name": "RCL 读特征（自适应 α 0.05）",
+   "analysis_val": "run/final/analysis/rcl_feature_50_on_v5_seed37_val.json",
+   "analysis_test": "run/final/analysis/rcl_feature_50_on_v5_seed37_test.json",
+   "policy": "adaptive_0.05"
+  }
+ ],
+ "policies_analysis": "run/final/analysis/rcl_feature_50_on_m2_seed37_test.json",
+ "policies_title": "完整模型（M1 + M2 + M3），test，seed 37",
+ "robustness": [
+  {
+   "name": "V5",
+   "dir": "log/final/bb_v5_50_seed37",
+   "stem": "selected_seed37"
+  },
+  {
+   "name": "E1（窄加噪）",
+   "dir": "log/final/bb_e1_50_seed37",
+   "stem": "selected_seed37"
+  },
+  {
+   "name": "E3a（NISI）",
+   "dir": "log/final/bb_e3a_50_seed37",
+   "stem": "selected_seed37"
+  },
+  {
+   "name": "E3b（NISI + 窄加噪）",
+   "dir": "log/final/bb_e3b_50_seed37",
+   "stem": "selected_seed37"
+  },
+  {
+   "name": "完整模型（选定骨干 + M3）",
+   "dir": "log/final/rcl_feature_50_on_m2_seed37",
+   "stem": "selected_seed37",
+   "tag": "_adaptive"
+  }
+ ],
+ "frontier": [
+  {
+   "name": "RCL @50 ms",
+   "analysis": "run/final/analysis/rcl_feature_50_on_v5_seed37_test.json"
+  },
+  {
+   "name": "RCL @25 ms",
+   "analysis": "run/final/analysis/rcl_feature_25_on_v5w25_seed37_test.json"
+  }
+ ],
+ "frontier_b1": "run/final/analysis/b1_on_rcl_feature_50_on_v5_seed37.json",
+ "info_arrival": [
+  {
+   "name": "RCL @50 ms",
+   "analysis": "run/final/analysis/rcl_feature_50_on_v5_seed37_test.json"
+  },
+  {
+   "name": "RCL @25 ms",
+   "analysis": "run/final/analysis/rcl_feature_25_on_v5w25_seed37_test.json"
+  },
+  {
+   "name": "B2 前瞻头",
+   "analysis": "run/final/analysis/b2_lookahead_50_on_v5_seed37_test.json"
+  },
+  {
+   "name": "B2 + 占据监督",
+   "analysis": "run/final/analysis/b2_lookahead_occ_50_on_v5_seed37_test.json"
+  }
+ ],
+ "window_length": [
+  {
+   "name": "V5（不等）",
+   "window_ms": 50,
+   "policy": "zero",
+   "analysis_val": "run/final/analysis/rcl_feature_50_on_v5_seed37_val.json",
+   "analysis_test": "run/final/analysis/rcl_feature_50_on_v5_seed37_test.json",
+   "backbone_eval": "log/final/bb_v5_50_seed37/eval_test_selected_seed37.json"
+  },
+  {
+   "name": "V5 + RCL 自适应",
+   "window_ms": 50,
+   "policy": "adaptive_0.05",
+   "analysis_val": "run/final/analysis/rcl_feature_50_on_v5_seed37_val.json",
+   "analysis_test": "run/final/analysis/rcl_feature_50_on_v5_seed37_test.json",
+   "backbone_eval": "log/final/bb_v5_50_seed37/eval_test_selected_seed37.json"
+  },
+  {
+   "name": "V5@25（不等）",
+   "window_ms": 25,
+   "policy": "zero",
+   "analysis_val": "run/final/analysis/rcl_feature_25_on_v5w25_seed37_val.json",
+   "analysis_test": "run/final/analysis/rcl_feature_25_on_v5w25_seed37_test.json",
+   "backbone_eval": "log/final/bb_v5_25_seed37/eval_test_selected_seed37.json"
+  },
+  {
+   "name": "V5@25 + RCL@25 自适应",
+   "window_ms": 25,
+   "policy": "adaptive_0.05",
+   "analysis_val": "run/final/analysis/rcl_feature_25_on_v5w25_seed37_val.json",
+   "analysis_test": "run/final/analysis/rcl_feature_25_on_v5w25_seed37_test.json",
+   "backbone_eval": "log/final/bb_v5_25_seed37/eval_test_selected_seed37.json"
+  }
+ ],
+ "teaser": [
+  {
+   "name": "Ours（不等）",
+   "analysis": "run/final/analysis/rcl_feature_50_on_m2_seed37_test.json",
+   "policy": "zero"
+  },
+  {
+   "name": "Ours 完整模型（自适应 α 0.1）",
+   "analysis": "run/final/analysis/rcl_feature_50_on_m2_seed37_test.json",
+   "policy": "adaptive_0.1"
+  },
+  {
+   "name": "Ours（固定等 10 窗）",
+   "analysis": "run/final/analysis/rcl_feature_50_on_m2_seed37_test.json",
+   "policy": "fixed_10"
+  }
+ ]
+}

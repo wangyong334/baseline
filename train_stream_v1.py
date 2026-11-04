@@ -89,7 +89,12 @@ def parse_args():
     parser.add_argument("--eval-noise-load", type=float, default=0.0,
                         help="仅 eval：测试时注入齐次泊松背景噪声，强度用 5x5 邻域每窗的随机巧合负荷 L 表示"
                              "（L = 25 x 每像素每窗的噪声率；L = 1 是巧合的物理分界）。0 = 不注入")
+    parser.add_argument("--eval-noise-hz", type=float, default=None,
+                        help="仅 eval：同 --eval-noise-load，但强度用物理口径（每像素每秒的事件数，ON + OFF），"
+                             "与窗长无关；给出时覆盖 --eval-noise-load，结果文件后缀为 _noise<Hz>hz_seed<种子>")
     parser.add_argument("--eval-noise-seed", type=int, default=0, help="仅 eval：注入噪声的随机种子")
+    parser.add_argument("--carry-only", action="store_true",
+                        help="仅 eval：只跑 carry（不再跑 reset_each_window 对照），加噪评估用，耗时减半")
     parser.add_argument("--dump-dir", default=None,
                         help="eval 模式：把训练时状态模式下的逐事件预测按序列保存为 NPZ，供 tools/verify_predictions.py 独立核验")
     parser.add_argument("--reset-every", type=int, default=0,
@@ -163,6 +168,7 @@ def build_config(args):
         raise ValueError("stream_layout 必须是 %s 之一" % (STREAM_LAYOUTS,))
     if int(cfg["streams"]) < 1 or int(cfg["accumulate"]) < 1:
         raise ValueError("streams 与 accumulate 必须 >= 1")
+    stream_groups(int(cfg["streams"]), int(cfg.get("stream_groups", 1)))
     if cfg["trainer"] == "streams" and cfg.get("execution", "step") != "layer":
         raise ValueError("trainer=streams 需要 execution=layer")
     speed_options(cfg)
@@ -901,6 +907,24 @@ def stream_valid(pieces, steps, device, dtype):
     return valid
 
 
+def stream_groups(n_streams, groups):
+    """把 B 条流按顺序分成 groups 个连续的组，返回 [(lo, hi), ...]（每组至少一条流；v6-3 d9a6d91 移植）。"""
+    groups = int(groups)
+    if groups < 1 or groups > int(n_streams):
+        raise ValueError("stream_groups 必须在 1..流数（%d）之间，收到 %d" % (int(n_streams), groups))
+    edges = np.linspace(0, int(n_streams), groups + 1).round().astype(int)
+    return [(int(a), int(b)) for a, b in zip(edges[:-1], edges[1:])]
+
+
+def select_streams(x, events, labels, keep, valid, lo, hi):
+    """从一个 [k,B] 片段中取出第 lo..hi-1 条流（事件的流号改成组内编号；模块二的稠密背景图 bg 按流切片）。"""
+    sel = (events["b"] >= lo) & (events["b"] < hi)
+    ev = {key: (value[:, lo:hi].contiguous() if key == "bg" else value[sel]) for key, value in events.items()}
+    ev["b"] = ev["b"] - lo
+    return (x[:, lo:hi].contiguous(), ev, labels[sel], keep[:, lo:hi].contiguous(),
+            valid[:, lo:hi].contiguous())
+
+
 def train_streams(net, dataset, lengths, optimizer, cfg, q99, pos_weight, device, rng, max_chunks=None, plan=None,
                   comm=None):
     """标准有状态 TBPTT（一轮）：B 条并行流一起前向 k 窗、反向 k 窗，每 n 个片段更新一次参数。
@@ -910,6 +934,9 @@ def train_streams(net, dataset, lengths, optimizer, cfg, q99, pos_weight, device
     （与梯度累加的常规做法相同；事件数只读窗口边界、不经过网络，所以可以在反传前算好）。
     因此 n=1 即逐片段更新（原 per_chunk），B=1 且 n = 录像窗数 / k 时即原 per_sequence。没有事件的片段不反传。
     推理不受影响，仍是整段连续。max_chunks 只供冒烟和计时截断；plan 只供测试指定分配。
+    stream_groups = G > 1 时（显存不够用，例如 25 ms 的 k=32）：每个片段的 B 条流分成 G 组依次前向、反向，
+    梯度累加后照常更新。各条流在前向中互不影响，BCE 按整次更新的事件数归一、消息约束按整片段的有效窗数归一，
+    所以梯度与 G = 1 相同（标准的梯度累积，只有浮点求和顺序不同）；显存约为 1/G，计算量不变。
     comm 为 utils.comm_budget.CommBudget（通信预算训练，乘子 mu 跨轮延续）或 None（关闭，与原训练逐位相同）。
     返回字段与 train_sequence 相同（steps = 参数更新次数，grad_norms 为各次更新的平均），另有 chunks；
     开启通信预算时另有 comm（CommBudget.summary()）。
@@ -935,7 +962,8 @@ def train_streams(net, dataset, lengths, optimizer, cfg, q99, pos_weight, device
     loss_sum, events_total, updates, grad_acc, total_norms, missing = 0.0, 0, 0, {}, [], []
     if comm is not None:
         comm.start_epoch()
-    states = None
+    bounds = stream_groups(len(plan), min(int(cfg.get("stream_groups", 1)), len(plan)))
+    group_states = [None] * len(bounds)
     optimizer.zero_grad(set_to_none=True)
     for first in range(0, n_chunks, accumulate):
         block = [stream_pieces(plan, c * k, (c + 1) * k) for c in range(first, min(first + accumulate, n_chunks))]
@@ -943,23 +971,33 @@ def train_streams(net, dataset, lengths, optimizer, cfg, q99, pos_weight, device
                            for pieces in block for stream in pieces for index, lo, hi, _, _ in stream)
         for offset, pieces in enumerate(block):
             x, events, labels, keep = assemble_streams(sources, pieces, k, cfg, device, dtype)
-            prev_states = states
-            logits, states, info = net.forward_chunk(x, events, states, keep=keep, collect=comm is not None)
-            if labels.numel():
-                chunk_loss = F.binary_cross_entropy_with_logits(logits, labels, pos_weight=weight, reduction="sum")
-                total = chunk_loss / float(block_events)
-                if comm is not None:
-                    penalty = comm.chunk_loss(net, info["u_pre"], prev_states, keep, len(block),
-                                              stream_valid(pieces, k, device, dtype))
-                    if penalty is not None:
-                        total = total + penalty
-                total.backward()
-                value = float(chunk_loss.detach())
-                if not math.isfinite(value):
-                    raise RuntimeError("损失出现非有限值: 片段 %d" % (first + offset))
-                loss_sum += value
-                events_total += int(labels.numel())
-            states = detach_states(states)
+            valid = stream_valid(pieces, k, device, dtype)
+            total_valid = float(valid.sum())
+            for g, (lo, hi) in enumerate(bounds):
+                if len(bounds) == 1:
+                    xg, ev, lab, keep_g, valid_g = x, events, labels, keep, valid
+                else:
+                    xg, ev, lab, keep_g, valid_g = select_streams(x, events, labels, keep, valid, lo, hi)
+                prev_states = group_states[g]
+                logits, states, info = net.forward_chunk(xg, ev, prev_states, keep=keep_g, collect=comm is not None)
+                if labels.numel():                          # as before: no backward when the whole chunk is empty
+                    terms = []
+                    if lab.numel():
+                        chunk_loss = F.binary_cross_entropy_with_logits(logits, lab, pos_weight=weight,
+                                                                        reduction="sum")
+                        value = float(chunk_loss.detach())
+                        if not math.isfinite(value):
+                            raise RuntimeError("损失出现非有限值: 片段 %d 组 %d" % (first + offset, g))
+                        terms.append(chunk_loss / float(block_events))
+                        loss_sum += value
+                        events_total += int(lab.numel())
+                    if comm is not None:
+                        penalty = comm.chunk_loss(net, info["u_pre"], prev_states, keep_g, len(block), valid_g)
+                        if penalty is not None:             # per-group mean -> mean over the whole chunk's valid windows
+                            terms.append(penalty * (float(valid_g.sum()) / total_valid))
+                    if terms:
+                        sum(terms).backward()
+                group_states[g] = detach_states(states)
             for stream in pieces:
                 for index, lo, hi, _, _ in stream:
                     if (index, hi) in item_ends:
@@ -1067,6 +1105,12 @@ def run_sequence(net, seq, cfg, q99, device, state_mode, monitor=None, timer=Non
     return probs, confusion
 
 
+def noise_load_from_hz(hz, window_ms):
+    """背景噪声的物理强度（每像素每秒的事件数，ON + OFF 合计）-> eval_noise 的巧合负荷 L = 25 x 每像素每窗的事件数。
+    与窗长无关的口径：同一个 Hz/px 在 50 ms 窗是 L = 1.25 x Hz，在 25 ms 窗是 L = 0.625 x Hz。"""
+    return 25.0 * float(hz) * float(window_ms) / 1000.0
+
+
 def eval_noise(seq, cfg, index):
     """鲁棒性评估（Inn 13.51）：cfg 里有 eval_noise_load > 0 时，给第 index 个序列注入齐次泊松背景噪声（标签 0）。
 
@@ -1106,6 +1150,7 @@ def evaluate_split(net, cfg, q99, device, split, state_mode, names=None, full=Fa
     confusion_sum = np.zeros((0, 4), dtype=np.int64)
     sweep = np.zeros((len(SWEEP_THRESHOLDS), 3), dtype=np.int64)
     kept, total_events, total_windows = [], 0, 0
+    per_sequence = {}                     # name -> [TP, FP, FN] at the report threshold (group guardrails)
     was_training = net.training
     net.eval()
     if monitor is not None:
@@ -1119,6 +1164,7 @@ def evaluate_split(net, cfg, q99, device, split, state_mode, names=None, full=Fa
                 confusion_sum = np.concatenate(
                     [confusion_sum, np.zeros((confusion.shape[0] - confusion_sum.shape[0], 4), dtype=np.int64)])
             confusion_sum[:confusion.shape[0]] += confusion
+            per_sequence[seq.name] = [int(v) for v in confusion[:, :3].sum(0)]
             sweep += threshold_counts(probs, seq.label)
             total_events += seq.n_events
             total_windows += seq.n_windows
@@ -1138,7 +1184,8 @@ def evaluate_split(net, cfg, q99, device, split, state_mode, names=None, full=Fa
     net.train(was_training)
     iou, acc = evaluator.evaluate_iou_and_accuracy(thresh=float(cfg["threshold"]))
     result = {"split": split, "state_mode": state_mode, "n_sequences": len(dataset),
-              "iou": float(iou), "acc": float(acc), "threshold_sweep": sweep_summary(sweep)}
+              "iou": float(iou), "acc": float(acc), "threshold_sweep": sweep_summary(sweep),
+              "per_sequence": per_sequence}
     if monitor is not None:
         result["layers"] = monitor.summary()
         if monitor.residual_summary():
@@ -1306,10 +1353,13 @@ def mode_overfit(args, cfg):
 
 
 def save_checkpoint(path, net, optimizer, epoch, best_val_iou, cfg, stats):
-    """保存权重（含已校准增益与 tau 参数）、优化器状态与配置；不保存膜电位。"""
-    torch.save({"model": net.state_dict(), "optimizer": optimizer.state_dict(), "epoch": epoch,
-                "best_val_iou": best_val_iou, "config": cfg, "stats": stats,
-                "design_version": design_version(net)}, str(path))
+    """保存权重（含已校准增益与 tau 参数）、优化器状态与配置；不保存膜电位。optimizer = None 时不存优化器
+    （逐轮权重 epochs/epoch_XXX.pt：只供按 val 分组护栏挑轮次后评估与接模块三，不用于续训）。"""
+    payload = {"model": net.state_dict(), "epoch": epoch, "best_val_iou": best_val_iou, "config": cfg,
+               "stats": stats, "design_version": design_version(net)}
+    if optimizer is not None:
+        payload["optimizer"] = optimizer.state_dict()
+    torch.save(payload, str(path))
 
 
 def mode_train(args, cfg):
@@ -1364,6 +1414,9 @@ def mode_train(args, cfg):
         print("标准 TBPTT：%d 条并行流（排法 %s）、k=%d、每 %d 个片段更新一次（每次更新 %d 窗）| 训练集 %d 条录像 %d 窗" % (
             int(cfg["streams"]), cfg.get("stream_layout", "greedy"), int(cfg["tbptt_k"]), int(cfg["accumulate"]),
             int(cfg["streams"]) * int(cfg["tbptt_k"]) * int(cfg["accumulate"]), len(lengths), sum(lengths)), flush=True)
+        if int(cfg.get("stream_groups", 1)) > 1:
+            print("显存分组：每个片段的 %d 条流分 %d 组依次前向、反向，梯度累加后更新（梯度与不分组相同）" % (
+                int(cfg["streams"]), int(cfg["stream_groups"])), flush=True)
     print("执行方式 %s | 输入构造 %s | 训练子集每 %d 轮评估 | 验证片段 %d 窗" % (
         execution, input_device, int(cfg.get("train_subset_every", 1)), int(cfg.get("eval_chunk", 32))), flush=True)
     for epoch in range(start_epoch, epochs):
@@ -1417,7 +1470,9 @@ def mode_train(args, cfg):
                   "peak_memory_gib": peak_memory_gib(device), "grad_norms": grad_mean,
                   "grad_clip_stats": grad_clip_stats, "tbptt_k": int(cfg["tbptt_k"]),
                   "trainer": trainer, "streams": int(cfg.get("streams", 1)), "accumulate": int(cfg.get("accumulate", 1)),
+                  "stream_groups": int(cfg.get("stream_groups", 1)),
                   "stream_layout": cfg.get("stream_layout", "greedy"),
+                  "val_sequences": val["per_sequence"],
                   "updates": updates,
                   "val_threshold_sweep": val["threshold_sweep"],
                   "layers": val["layers"], "tau": taus,
@@ -1433,6 +1488,9 @@ def mode_train(args, cfg):
             best = val["iou"]
             save_checkpoint(root / ("best_val_iou_seed%d.pt" % seed), net, optimizer, epoch, best, cfg, stats)
         save_checkpoint(root / "last.pt", net, optimizer, epoch, best, cfg, stats)
+        if cfg.get("save_epochs"):                   # every epoch's weights: guarded selection (tools/select_checkpoint.py)
+            (root / "epochs").mkdir(exist_ok=True)
+            save_checkpoint(root / "epochs" / ("epoch_%03d.pt" % epoch), net, None, epoch, best, cfg, stats)
         print("epoch %d lr %.2e loss/event %.5f val IoU %.4f ACC %.4f | train-subset IoU %s | "
               "更新 %d 次 |g| 中位 %.3f 裁剪 %.0f%% | %.0fs（训练 %.0fs）| 显存峰值 %.2f GiB | 警告 %d" % (
                   epoch, lr, record["loss_per_event"], val["iou"], val["acc"],
@@ -1527,12 +1585,16 @@ def mode_eval(args, cfg):
             raise ValueError("周期清零只对 carry 训练的模型有意义")
         suffix += "_reset_every%d" % reset_every + ("_offset%d" % reset_offset if reset_offset else "")
     noise_load = float(getattr(args, "eval_noise_load", 0.0) or 0.0)
-    if noise_load < 0:
-        raise ValueError("--eval-noise-load 不能为负")
+    noise_hz = getattr(args, "eval_noise_hz", None)
+    if noise_load < 0 or (noise_hz is not None and noise_hz < 0):
+        raise ValueError("--eval-noise-load / --eval-noise-hz 不能为负")
+    if noise_hz:
+        noise_load = noise_load_from_hz(noise_hz, train_cfg["window_ms"])
     if noise_load > 0:
         train_cfg["eval_noise_load"] = noise_load
         train_cfg["eval_noise_seed"] = int(getattr(args, "eval_noise_seed", 0))
-        suffix += "_noiseL%g_seed%d" % (noise_load, train_cfg["eval_noise_seed"])
+        suffix += (("_noise%ghz_seed%d" % (noise_hz, train_cfg["eval_noise_seed"])) if noise_hz else
+                   ("_noiseL%g_seed%d" % (noise_load, train_cfg["eval_noise_seed"])))
     out_path = Path(args.checkpoint).parent / ("eval_%s_%s%s.json" % (
         args.split, Path(args.checkpoint).stem, suffix))
     if out_path.exists() and not args.overwrite:
@@ -1542,6 +1604,7 @@ def mode_eval(args, cfg):
                "trained_state_mode": train_cfg["state_mode"], "neuron": train_cfg["neuron"],
                "readout_ablation": args.readout_ablation, "dual_memory": train_cfg.get("dual_memory"),
                "eval_noise_load": noise_load, "eval_noise_seed": int(train_cfg.get("eval_noise_seed", 0)),
+               "eval_noise_hz": float(noise_hz) if noise_hz else 0.04 * noise_load * 1000.0 / float(train_cfg["window_ms"]),
                "subthreshold_residual": train_cfg.get("subthreshold_residual"),
                "tif": net.tif_config, "tif_parameters": tif_parameter_statistics(net),
                "subthreshold_ablation": subthreshold_ablation,
@@ -1550,7 +1613,7 @@ def mode_eval(args, cfg):
                "memory_off_layers": list(net.dual_memory_layers) if memory_ablation == "off" else (off_layers or []),
                "reset_every": reset_every, "reset_offset": reset_offset}
     # 周期清零时只跑 carry：M=1 即 reset_each_window，常规评估里已有
-    for mode in (("carry",) if reset_every else ("carry", "reset_each_window")):
+    for mode in (("carry",) if (reset_every or getattr(args, "carry_only", False)) else ("carry", "reset_each_window")):
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
         dump = None

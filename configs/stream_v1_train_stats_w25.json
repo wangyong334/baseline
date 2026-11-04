@@ -1,0 +1,94 @@
+{
+  "q99": [
+    1.0986122886681096,
+    1.0986122886681096,
+    0.6931471805599453,
+    0.6931471805599453,
+    0.6931471805599453,
+    0.6931471805599453,
+    0.6931471805599453,
+    0.6931471805599453,
+    0.6931471805599453,
+    0.6931471805599453,
+    0.6931471805599453,
+    0.6931471805599453
+  ],
+  "channel_names": [
+    "pos_count",
+    "neg_count",
+    "bin0_pos",
+    "bin0_neg",
+    "bin1_pos",
+    "bin1_neg",
+    "bin2_pos",
+    "bin2_neg",
+    "bin3_pos",
+    "bin3_neg",
+    "bin4_pos",
+    "bin4_neg"
+  ],
+  "nonzero_pixels_per_channel": [
+    6147225,
+    2838811,
+    1292046,
+    575929,
+    1291547,
+    574036,
+    1230046,
+    580590,
+    1209243,
+    582213,
+    1271959,
+    577397
+  ],
+  "train_pos": 274122,
+  "train_neg": 9050422,
+  "train_neg_pos_ratio": 33.01603665521191,
+  "pos_weight_cap": 30.0,
+  "pos_weight": 30.0,
+  "audit": {
+    "train": {
+      "files": 99,
+      "events": 9324544,
+      "t_max": 7999,
+      "events_per_window_mean": 294.33535353535353,
+      "events_per_window_p99": 2081.209999999999,
+      "events_per_window_max": 2587,
+      "empty_windows": 494,
+      "nonempty_windows_without_target": 4207,
+      "windows": 31680
+    },
+    "val": {
+      "files": 24,
+      "events": 1424330,
+      "t_max": 7999,
+      "events_per_window_mean": 185.45963541666666,
+      "events_per_window_p99": 1286.21,
+      "events_per_window_max": 1580,
+      "empty_windows": 138,
+      "nonempty_windows_without_target": 965,
+      "windows": 7680
+    },
+    "test": {
+      "files": 24,
+      "events": 2074586,
+      "t_max": 7999,
+      "events_per_window_mean": 270.1283854166667,
+      "events_per_window_p99": 2062.0,
+      "events_per_window_max": 2358,
+      "empty_windows": 191,
+      "nonempty_windows_without_target": 925,
+      "windows": 7680
+    }
+  },
+  "config_used": {
+    "window_ms": 25,
+    "n_windows": 320,
+    "time_bins": 5,
+    "height": 260,
+    "width_px": 346,
+    "pad_height": 264,
+    "pad_width": 352
+  },
+  "seconds": 116.0
+}
