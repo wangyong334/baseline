@@ -595,6 +595,46 @@ class FinalConfigTests(unittest.TestCase):
         self.assertEqual(b2["head_kind"], "lookahead")
         self.assertEqual((b2["lambda_exist"], b2["lambda_dynamics"], b2["dynamics_prefit_steps"]), (0.0, 0.0, 0))
 
+    def test_v5lif_swaps_only_the_neuron(self):
+        a, b = self.load("configs/final/bb_v5_50.yaml"), self.load("configs/final/bb_v5lif_50.yaml")
+        comm = {"comm_budget_messages", "comm_dual_lr", "comm_budget_mode", "comm_peak_alpha"}
+        self.assertEqual(set(b), set(a) - comm - {"tif"})          # the budget loss is tif-only
+        self.assertEqual({k for k in b if a[k] != b[k]}, {"neuron", "save_root"})
+        self.assertEqual((a["neuron"], b["neuron"]), ("tif", "lif"))
+        self.assertEqual(b["save_root"], "log/final/bb_v5lif_50_seed37")
+
+
+def write_synthetic_dataset(root):
+    """Small EV-UAV-format splits (train 3 / val 2 / test 1 sequences) + stats.json under root."""
+    from test_stream_layerwise import Q99, synthetic_sequence
+    pos = neg = 0
+    for split, seeds in (("train", (3, 4, 5)), ("val", (6, 8)), ("test", (7,))):
+        (root / split).mkdir()
+        for seed in seeds:
+            seq = synthetic_sequence(seed=seed, n=3000)
+            loc = np.stack((seq.x, seq.y, seq.t), axis=1)
+            norm = np.column_stack((loc, seq.p, seq.label, seq.target_id))
+            np.savez(root / split / ("seq_%d.npz" % seed), ev_loc=loc, evs_norm=norm)
+            if split == "train":
+                pos += int(seq.label.sum())
+                neg += seq.n_events - int(seq.label.sum())
+    stats = dict(q99=Q99.tolist(), train_pos=pos, train_neg=neg, pos_weight=min(neg / pos, 30.0))
+    (root / "stats.json").write_text(json.dumps(stats), encoding="utf-8")
+
+
+def small_backbone_config(name, root, save_root):
+    """A final backbone config shrunk to the synthetic data (2 epochs, tiny network)."""
+    from test_stream_layerwise import H as SH, SMALL, W as SW
+    from utils.stream_common import load_flat_config
+    cfg = load_flat_config(os.path.join(ROOT, "configs", "final", name + ".yaml"))
+    cfg.update(root=str(root), stats_path=str(root / "stats.json"), save_root=str(save_root),
+               channels=list(SMALL), height=SH, width_px=SW, pad_height=SH, pad_width=SW,
+               n_windows=12, epochs=2, num_workers=0, tbptt_k=4, train_subset_size=1,
+               calib_sequences=1, calib_windows=8, calib_samples_per_channel=32, calib_min_positive=4,
+               segments=[[0, 3], [4, 7], [8, 11]], timing_warmup_windows=1, eval_chunk=4,
+               execution="layer", input_device="gpu", streams=2, stream_groups=2)
+    return cfg
+
 
 class EndToEndTests(unittest.TestCase):
     def test_pipeline(self):
@@ -610,31 +650,13 @@ class EndToEndTests(unittest.TestCase):
         import select_checkpoint as SC
         import train_stream_v1 as T
         import train_track_head as TH
-        from test_stream_layerwise import H as SH, Q99, SMALL, W as SW, synthetic_sequence
+        from test_stream_layerwise import H as SH, W as SW
         from utils.stream_common import load_flat_config
         with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
             root = Path(directory)
-            pos = neg = 0
-            for split, seeds in (("train", (3, 4, 5)), ("val", (6, 8)), ("test", (7,))):
-                (root / split).mkdir()
-                for seed in seeds:
-                    seq = synthetic_sequence(seed=seed, n=3000)
-                    loc = np.stack((seq.x, seq.y, seq.t), axis=1)
-                    norm = np.column_stack((loc, seq.p, seq.label, seq.target_id))
-                    np.savez(root / split / ("seq_%d.npz" % seed), ev_loc=loc, evs_norm=norm)
-                    if split == "train":
-                        pos += int(seq.label.sum())
-                        neg += seq.n_events - int(seq.label.sum())
-            stats = dict(q99=Q99.tolist(), train_pos=pos, train_neg=neg, pos_weight=min(neg / pos, 30.0))
-            (root / "stats.json").write_text(json.dumps(stats), encoding="utf-8")
+            write_synthetic_dataset(root)
             base_dir = root / "base"
-            cfg = load_flat_config(os.path.join(ROOT, "configs", "final", "bb_e3b_50.yaml"))
-            cfg.update(root=str(root), stats_path=str(root / "stats.json"), save_root=str(base_dir),
-                       channels=list(SMALL), height=SH, width_px=SW, pad_height=SH, pad_width=SW,
-                       n_windows=12, epochs=2, num_workers=0, tbptt_k=4, train_subset_size=1,
-                       calib_sequences=1, calib_windows=8, calib_samples_per_channel=32, calib_min_positive=4,
-                       segments=[[0, 3], [4, 7], [8, 11]], timing_warmup_windows=1, eval_chunk=4,
-                       execution="layer", input_device="gpu", streams=2, stream_groups=2)
+            cfg = small_backbone_config("bb_e3b_50", root, base_dir)
             self.assertTrue(cfg["save_epochs"])
             T.mode_train(SimpleNamespace(device="cpu", mode="train", resume=False), cfg)
             records = [json.loads(x) for x in (base_dir / "metrics.jsonl").read_text(encoding="utf-8").splitlines()]
@@ -703,6 +725,52 @@ class EndToEndTests(unittest.TestCase):
                              "--height", str(SH), "--width", str(SW)])
                     b1 = json.loads((root / "b1.json").read_text(encoding="utf-8"))
                     self.assertEqual(set(b1["chosen_on_val"]), {"1", "3", "5", "10"})
+
+    def test_lif_backbone_with_b2(self):
+        """The LIF cell of the 2x2: bb_v5lif_50 trains without the budget loss and carries a B2 head (fixed D + past)."""
+        try:
+            import cv2  # noqa: F401
+            import pandas  # noqa: F401
+            import tqdm  # noqa: F401
+            import yaml
+        except ImportError as error:
+            self.skipTest("完整训练入口需要 cv2/pandas/tqdm/yaml: %s" % error)
+        import select_checkpoint as SC
+        import train_stream_v1 as T
+        import train_track_head as TH
+        from test_stream_layerwise import H as SH, W as SW
+        from utils.stream_common import load_flat_config
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+            root = Path(directory)
+            write_synthetic_dataset(root)
+            base_dir = root / "base"
+            cfg = small_backbone_config("bb_v5lif_50", root, base_dir)
+            T.mode_train(SimpleNamespace(device="cpu", mode="train", resume=False), cfg)
+            SC.main(["--run", str(base_dir), "--data-root", str(root), "--copy", "--height", str(SH),
+                     "--width", str(SW)])
+            base_ckpt = str(base_dir / "selected_seed37.pt")
+            saved = torch.load(base_ckpt, map_location="cpu")["config"]
+            self.assertEqual(saved["neuron"], "lif")
+            self.assertIsNone(saved.get("comm_budget_messages"))
+            head_cfg = load_flat_config(os.path.join(ROOT, "configs", "final", "b2_lookahead_50.yaml"))
+            head_cfg.update(root=str(root), base_checkpoint=base_ckpt, save_root=str(root / "b2"), epochs=2,
+                            streams=2, tbptt_k=4, eval_chunk=4, segments=[[0, 3], [4, 7], [8, 11]],
+                            timing_warmup_windows=1, defer_max=3)
+            cfg_path = root / "b2.yaml"
+            cfg_path.write_text(yaml.safe_dump({"ALL": head_cfg}), encoding="utf-8")
+            TH.main(["--config", str(cfg_path), "--mode", "train", "--device", "cpu"])
+            SC.main(["--run", str(root / "b2"), "--data-root", str(root), "--copy", "--height", str(SH),
+                     "--width", str(SW)])
+            ckpt = str(root / "b2" / "selected_seed37.pt")
+            common = ["--config", str(cfg_path), "--mode", "eval", "--device", "cpu", "--split", "test",
+                      "--checkpoint", ckpt]
+            TH.main(common)
+            TH.main(common + ["--future-stats", "past", "--tag", "past"])
+            res = json.loads((root / "b2" / "eval_test_selected_seed37.json").read_text(encoding="utf-8"))
+            past = json.loads((root / "b2" / "eval_test_selected_seed37_past.json").read_text(encoding="utf-8"))
+            self.assertEqual(res["base"], past["base"])              # same frozen LIF backbone in both evals
+            for r in (res, past):
+                self.assertTrue(0.0 <= r["track"]["iou"] <= 1.0)
 
 
 if __name__ == "__main__":
