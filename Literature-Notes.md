@@ -332,5 +332,44 @@
 | PACT、PointEvent、ASA-SNN 的代码（11-01 读，用户指定；学写法不搬方法） | 怎样把原理写成网络 | PACT：速度头 + 无参数平流算子 + 多假设 softmax + sigmoid 门残差；PointEvent：前置归一化残差块（位置编码卷积 + Mamba + MLP），线索作输入、门控融合，模块可替换；ASA-SNN：标准 PLIF + 膜电位上的学出注意力 | 都是离线 / 分类；PACT 也有少量手设常数 | 模块三 v6 的写法依据（Inn 13.71）：状态是隐向量，原理只进结构与初始化，信多少交给学出的门，判决 = 输出头或脉冲神经元 |
 | Spike-driven Transformer（NeurIPS 2023 / TPAMI 2025）、Temporal Dynamics Enhancer（arXiv 2512.02447） | SNN 里的注意力 | 脉冲驱动的注意力模块 | 检测框，不是目标槽 | 以后把目标层的注意力做成脉冲驱动时的参考 |
 
+## K. 立论核查检索：在线逐事件分割、按需等未来、脉冲编码（11-04 晚；分析见 Inn 13.92）
+
+| 文献 | 问题 | 方法 | 前提 / 局限 | 对我们（升级钩子） |
+|---|---|---|---|---|
+| ★ **CETUS**（Liang 等，**ICRA 2026**，pp. 19949–19956，据 DBLP；arXiv 2509.13784 v1；代码在本地 `D:\桌面-D\CETUS`，无权重） | 帧 / 体素 / 点云要预设时间窗，带来窗延迟；点方法太慢 | 原始事件流上做因果邻域编码（k = 16 个更早的邻居、单查询注意力）+ Mamba；推理时 PID 控制器按事件率调步长，平衡窗延迟与推理延迟 | **EV-UAV 逐点分割**、严格因果、无前瞻；IoU 86.40 / ACC 92.29 / Pd 91.82，总延迟 3.40 ms；口径自定（它报的 EV-SpSegNet 72.59，原论文 55.18）；未给硬件。**代码核查（Inn 13.93）**：流式推理不传 Mamba 状态（`forward_chunk` 原样返回旧状态），跨时间信息只来自最近 2000 个事件的 KNN；时间单位错 8.192 倍（实际总延迟约 7.5 ms）；表 I = 逐文件平均、test 上扫阈值、"Acc" 实为精确率；点级 Fa 疑似单位写错 | **在线逐事件分割已有先例，不能写"第一个在线"**；必须引用对比；它的口径下我们的 V5 已是 IoU 89.62 对 86.40；区别 = 按时间的有状态流（它的上下文按事件数，极密录像只剩 26 ms）、逐事件延迟提交、脉冲网络与有界通信；它批评 50 ms 窗带来延迟，正对我们 |
+| ★ ANCAT（Strimel 等，ICML 2023，"Lookahead When It Matters"） | 流式语音：固定前瞻延迟大、纯因果精度低 | 每层注意力调度器逐帧学何时用、用多少未来上下文；端到端训练 + 延迟正则 | 前瞻在计算层（注意力掩码），没有逐元素风险界 | 模块三"按需等未来"的跨领域先例，必须引用；区别：输出端逐事件提交、校准后风险 α、到达即有暂定输出、空间事件流 |
+| ★ Yoon（IEEE TNNLS 2017）"LIF and Simplified SRM Neurons Encode Signals Into Spikes via a Form of Asynchronous Pulse Sigma–Delta Modulation" | LIF 怎样编码连续信号 | LIF / SRM0 = 异步脉冲 Σ-Δ 调制：无时钟、电平穿越、单电平单极性，脉冲密度表示幅值 | 连续时间 | **不能说 LIF"时钟触发"**；离散时间下的真问题是脉冲密度编码 + 每步 ≤ 1 个脉冲（R 线：深层每秒脉冲数与步频成正比） |
+| Predictive Suppression Layers（Attar & Rossi，arXiv 2609.21583，2026） | 前馈 SNN 不管可不可预测都转发每个脉冲 | 用预测残差门控分级层间通道，只转发"意外"的活动 | N-MNIST / SHD 分类 | 与 BIR 的"只发变化"同类，须引用 |
+| ADP-C（Liu 等，ICLR 2022，Anytime Dense Prediction with Confidence Adaptivity） | 稠密预测的随时计算 | 逐像素早退出：有把握的像素被掩掉，后续卷积跳过 | 省的是计算深度，不是等待未来数据 | 逐像素按置信度停的先例；我们停的是"等未来的时间" |
+| FLIPDA-S（EURASIP JASP 2016）、IPDA 固定滞后平滑（2006）、Bernoulli TBD 平滑（IET RSN 2022） | 杂波中的航迹起始与维持 | 前向 + 后向 IPDA 的固定滞后平滑；误差随滞后数、信杂比分析 | 滞后固定；**没检到按目标自适应选滞后** | 模块三"固定滞后平滑"在雷达里的出处；自适应滞后可能是空白 |
+| Multi-latency look-ahead（Interspeech 2024，流式说话人分割，hal-04734819） | 流式分割的延迟—精度 | 训练时混多种前瞻，推理时可调 | 音频；整段统一前瞻 | 流式"分割"里可调前瞻的先例 |
+| All in one timestep（arXiv 2510.24637，多级 SNN） | 二值脉冲每步信息少、要多步 | 多级脉冲，一步内表示 | 分类 | 多级汇报的近邻 |
+| EGRU（Subramoney 等，ICLR 2023；本地 `References/新查阅文献/Efficient Recurrent Architectures…`） | RNN 活动稠密 | 状态越阈才发事件的 GRU | — | 事件触发通信 RNN 的先例 |
+
+## L. "计算–判决解耦"查重（11-05 下午；起因：用户转来另一个 AI 的"神经漂移扩散计算–判决解耦框架"；分析见 Inn 13.96）
+
+结论：
+
+- EV-UAV 上没有做判决时机的工作。
+- "解耦"在雷达、语音、SNN 分类里早已有。可守的空白只有一条：在事件相机逐事件分割中，每个事件按自己的证据决定何时定案，并控制错误率。
+- "computation–decision decoupling"检索不到现成用法。
+- HMT、LCA、Bogacz 三条凭记忆，本轮没有检索核对。
+
+| 文献 | 问题 | 方法 | 前提 / 局限 | 对我们（升级钩子） |
+|---|---|---|---|---|
+| ★ **Ev-ISNet**（Nuo Chen 等，**ECCV 2026 spotlight**，"Instance Segmentation as Tracking"；只读了会议页摘要） | 事件相机多小目标跟踪 | 3D 稀疏卷积逐体素输出目标置信度与运动方向；再建事件图，按学出的边亲和度聚类成轨迹实例。新数据集 EV-UAV-Track，逐事件实例标注 | 自称"高效流式推理"，摘要里没有判决时机，也没有延迟数字；非脉冲网络 | EV-UAV 原作者组的后续工作，审稿人可能来自这个组，必须引用。区别在于：我们决定每个事件何时定案 |
+| ★ **Bend the Clock / ChronoFuse**（Sen 等，arXiv 2609.26919，2026-09-22） | 观测时刻与输出可用时刻错位：评测按输入时刻打分，忽略了计算延迟 | 因果地预测"输出可用时刻"的目标状态，即往前猜；增加 0.17M 参数、0.84 ms | 框级任务，数据集为 1Mpx、FRED、EV-Flying（sAP 20.95 对 2.25）；不决定何时输出 | 方向与我们相反：它往前猜，我们等证据。它批评评测忽略延迟，所以我们必须报逐事件判决延迟。它用了 EV-Flying，须引用 |
+| ATR + TAM + DMR（Jang 等，Mathematics 14(16):2981，2026-08） | EV-UAV 逐事件分割 | 在 EV-SpSegNet 上加三件：自适应时间重分配（体素化前调整时间坐标）、轨迹感知调制、方向掩码正则 | 离线。对自复现基线 IoU 57.10 → 65.74、Fa 2.27 → 0.61e-4；流水线延迟 42.29 ms | 查重：不涉及判决时机 |
+| ASUMOT 补记（arXiv 2607.11303；读了 HTML 全文的相关段） | 异步无人机检测与跟踪 | 1. 按局部运动一致性逐事件触发候选；2. 多任务 CNN 验证：置信度"在短缓冲内"持续过阈才升格，持续偏低则删除；3. 聚类成航迹 | 只在 ES-UAV（检测）和 FRED（跟踪）上测试，EV-UAV 只作训练源；未给阈值和缓冲长度；Jetson TX2 上中位延迟 29.94 ms | 事件相机里"先触发、再确认"式延迟判决的先例，但是团块级、阈值手设。我们是逐事件、证据学出来、提交经过校准 |
+| STDP 可靠性门（Sadoun 等，arXiv 2605.17686） | 少标注下事件检测的可靠性 | 管状 STDP 层 + 候选可靠性门 | EV-UAV 上 Pd ≥ 88% 时 Fa 454 → 331e-4；只读了摘要 | 查重：用了脉冲和 EV-UAV，但没有判决时机 |
+| SIREN，"Decide When Ready"（Zhang 等，ICLR 2026 投稿，OpenReview LUnYc9Grm8；录用状态未核实） | 事件流 SNN 识别要跑多少步 | 逐步增量推理 + 早退；组合多种神经元、脉冲状态空间模型、因果时间自注意力 | 整段分类；平均步数 16 → 9.5 | 事件流 SNN 早退最近的先例 |
+| 自由反应范式（Zhu 等，Neural Computation 2025；arXiv 2404.10599） | SNN 的速度—精度权衡 | 按漂移扩散模型训练；推理时动态停止，停止时刻当作置信度 | 分类 | "DDM + SNN"已有先例，不能当作新意 |
+| SEENN（NeurIPS 2023）、DT-SNN（DAC 2023） | SNN 推理步数自适应 | 置信度或熵过阈就退出；也有用强化学习选步数的 | 整样本分类 | SNN 早退的标准引用（SpikeCP 见 F 节） |
+| CIF（Dong & Xu，ICASSP 2020；arXiv 1905.11235）；HMT（Zhang & Feng，ICLR 2023） | 流式语音和同声传译何时输出 | CIF：逐帧权重积分到阈值就发放一个输出；HMT：由 HMM 隐状态决定何时开始翻译 | 一维序列 | "积分到阈值才输出"在流式序列任务里已经成熟，须引用 |
+| SACT（CVPR 2017）、DVSNet（CVPR 2018）、视频检测时间早退（arXiv 2106.11208）、AnytimeYOLO（arXiv 2503.17497） | 检测、分割中按位置或按帧自适应计算 | 逐位置停算；按区域的期望置信度决定重算还是光流传播；帧间不变就跳过；YOLO 早退 | 省的是计算，不是等未来数据 | 那个方案里"低于下界就跳过检测头"的出处 |
+| Usher & McClelland 2001（漏电竞争累积器 LCA）；Bogacz 等 2006 | 决策的累积器模型 | E ← γE + 输入 − 抑制；DDM 是 SPRT 的连续极限 | 经典 | 那个方案的 EAN 公式就是 LCA |
+| SpikeMS（IROS 2021；arXiv 2105.06562） | 事件运动分割 SNN | 逐事件分前景 / 背景；能用比训练时更短的数据做增量预测 | 不决定何时定案 | 脉冲逐事件分割"随时可输出"的先例 |
+| BRC（Vecoven、Ernst、Drion，PLoS ONE 16(6) e0252676，2021） | RNN 的长时记忆 | 仿生物神经元双稳态的循环单元，只有自连接；nBRC 加循环神经调制 | 只做时序任务 | "双稳态 / 亚稳态记忆模块"的先例（Inn 13.99：Gemini 分岔模板的 MPEM 与之同类） |
+
 ## 附：下错的文件（V5修订文件夹，10-25 核对）
 `Asymmetric_Contextual_Modulation_for_Infrared…`（实为 GDN）、`Fast_and_Slow_Contrast_Adaptation…`、`Low_Cost_and_Latency…`（无前缀"2、"的那份，实为 Attention U-Net）、`Focal_Loss…`、`Normalization_as_a_Canonical…`（实为 SLS）、`Spike2Former=…`（实为 PIT）。正确版本是带"2、"前缀的文件和 `Spike2Former_Efficient…`。
