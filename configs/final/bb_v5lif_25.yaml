@@ -1,0 +1,65 @@
+# [V9-final] 切片长度实验（11-06 用户定）：LIF @ 25 ms，检验"BIR 相对 LIF 的优势随切片变长而增大"
+# 来源：configs/final/bb_v5_25.yaml；改 neuron: lif，删 tif 小节与 TRAIN 的 comm_* 四项（通信预算只用于 tif），
+# 改 save_root（tests/test_final_v9.py 核对）。与 bb_v5lif_50.yaml 对 bb_v5_50.yaml 的改法相同。
+DATA:
+  root: /media/stephen/nvme0n1/wy_data/datasets/EV-UAV-dataset
+  stats_path: configs/stream_v1_train_stats_w25.json   # 由 tools/stream_train_stats.py 生成
+  window_ms: 25
+  n_windows: 320
+  time_bins: 5
+  height: 260
+  width_px: 346
+  pad_height: 264          # 3 次 stride=2 下采样，对齐到 8 的倍数；只补右侧和下侧
+  pad_width: 352
+  input_clip: 3.0          # X = clip(log1p(C)/q99, 0, 3)
+
+NET:
+  channels: [12, 24, 48, 48]
+  neuron: lif                  # 软复位 LIF（逐通道可学的 tau），与 V1 相同；其余与 V5 @ 25 ms 相同
+  state_mode: carry            # carry | reset_each_window
+  norm: none
+  v_threshold: 1.0
+  tau_init_ms: 200.0
+  tau_min_ms: 50.0
+  tau_max_ms: 2000.0
+  readout_hidden: 32
+
+CALIB:
+  calib_sequences: 8
+  calib_windows: 64
+  calib_samples_per_channel: 2048
+  calib_min_positive: 1024
+  calib_quantile: 0.99
+  calib_gain_min: 0.05
+  calib_gain_max: 20.0
+
+TRAIN:
+  seed: 37
+  epochs: 50
+  lr: 0.001
+  lr_end: 0.0001               # 按 epoch 线性衰减
+  tbptt_k: 32
+  trainer: streams             # 标准有状态 TBPTT：B 条并行流，每 n 个片段更新一次（10-16 定稿 B=4、n=1、k=16）
+  streams: 4
+  stream_groups: 2             # 显存分组：k=32 时 4 条流一起反传超出 24 GB；分 2 组依次反传，梯度与不分组相同
+  accumulate: 1
+  optimizer_step: per_sequence # 只对 trainer=sequence 生效
+  grad_clip: 1.0
+  pos_weight_cap: 30.0
+  train_subset_size: 24
+  num_workers: 2
+  execution: layer
+  input_device: gpu
+  train_subset_every: 5
+  eval_chunk: 64
+  deterministic: true
+  save_root: log/final/bb_v5lif_25_seed37
+  save_epochs: true             # 逐轮权重 epochs/epoch_XXX.pt：按 val + 普通组护栏挑轮次（tools/select_checkpoint.py）
+
+EVAL:
+  threshold: 0.9
+  pd_detT: 50
+  correct_thresh: 0.0001
+  rolling_window: 20
+  segments: [[0, 31], [128, 159], [288, 319]]
+  timing_warmup_windows: 40

@@ -1,0 +1,94 @@
+{
+  "q99": [
+    1.3862943611198906,
+    1.3862943611198906,
+    1.0986122886681098,
+    1.0986122886681098,
+    1.0986122886681098,
+    1.0986122886681098,
+    1.0986122886681098,
+    1.0986122886681098,
+    1.0986122886681098,
+    1.0986122886681098,
+    1.0986122886681098,
+    1.0986122886681098
+  ],
+  "channel_names": [
+    "pos_count",
+    "neg_count",
+    "bin0_pos",
+    "bin0_neg",
+    "bin1_pos",
+    "bin1_neg",
+    "bin2_pos",
+    "bin2_neg",
+    "bin3_pos",
+    "bin3_neg",
+    "bin4_pos",
+    "bin4_neg"
+  ],
+  "nonzero_pixels_per_channel": [
+    5667135,
+    2574227,
+    1225198,
+    561037,
+    1228794,
+    564081,
+    1209042,
+    563282,
+    1216886,
+    559693,
+    1198139,
+    563471
+  ],
+  "train_pos": 274122,
+  "train_neg": 9050422,
+  "train_neg_pos_ratio": 33.01603665521191,
+  "pos_weight_cap": 30.0,
+  "pos_weight": 30.0,
+  "audit": {
+    "train": {
+      "files": 99,
+      "events": 9324544,
+      "t_max": 7999,
+      "events_per_window_mean": 2354.6828282828283,
+      "events_per_window_p99": 15896.279999999999,
+      "events_per_window_max": 19710,
+      "empty_windows": 58,
+      "nonempty_windows_without_target": 227,
+      "windows": 3960
+    },
+    "val": {
+      "files": 24,
+      "events": 1424330,
+      "t_max": 7999,
+      "events_per_window_mean": 1483.6770833333333,
+      "events_per_window_p99": 9940.46,
+      "events_per_window_max": 10190,
+      "empty_windows": 16,
+      "nonempty_windows_without_target": 48,
+      "windows": 960
+    },
+    "test": {
+      "files": 24,
+      "events": 2074586,
+      "t_max": 7999,
+      "events_per_window_mean": 2161.0270833333334,
+      "events_per_window_p99": 15753.0,
+      "events_per_window_max": 16880,
+      "empty_windows": 22,
+      "nonempty_windows_without_target": 57,
+      "windows": 960
+    }
+  },
+  "config_used": {
+    "window_ms": 200,
+    "n_windows": 40,
+    "time_bins": 5,
+    "height": 260,
+    "width_px": 346,
+    "pad_height": 264,
+    "pad_width": 352
+  },
+  "seconds": 20.0
+}
