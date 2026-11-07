@@ -1282,6 +1282,7 @@ def mode_smoke(args, cfg):
     optimizer = torch.optim.Adam(net.parameters(), lr=float(cfg["lr"]))
     names = train_file_names(cfg)
     seq = EvUAVStream(cfg["root"], "train", cfg, [names[0]])[0]
+    n_smoke = min(32, int(seq.n_windows))   # 长切片（如 400 ms 每段只有 20 窗）时只看前 n_smoke 窗
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     t0 = time.perf_counter()
@@ -1306,7 +1307,7 @@ def mode_smoke(args, cfg):
         net.eval()
         net.start_tif_stats()
         states = None
-        for k in range(32):
+        for k in range(n_smoke):
             x, events, _, _ = window_to_device(seq, k, q99, cfg, device)
             _, states, info = net(x, events, states, collect=True)
             monitor.update(info)
@@ -1315,7 +1316,7 @@ def mode_smoke(args, cfg):
     layers, taus = monitor.summary(), tau_statistics(net)
     report = {"sequence": seq.name, "events_in_32_windows": out["events"], "loss_per_event":
               out["loss_sum"] / max(out["events"], 1), "grad_norms": out["grad_norms"],
-              "missing_grads": out["missing_grads"], "train_ms_per_window": 1e3 * elapsed / 32,
+              "missing_grads": out["missing_grads"], "train_ms_per_window": 1e3 * elapsed / n_smoke,
               "peak_memory_gib": peak_memory_gib(device), "layers": layers, "tau": taus,
               "tif": tif_stats, "tif_parameters": tif_parameter_statistics(net),
               "subthreshold_diagnostics": monitor.residual_summary(),

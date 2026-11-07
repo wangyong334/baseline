@@ -604,23 +604,24 @@ class FinalConfigTests(unittest.TestCase):
         self.assertEqual(b["save_root"], "log/final/bb_v5lif_50_seed37")
 
     def test_window_sweep_configs(self):
-        """Slice-length sweep (11-06): BIR / LIF at 25 / 50 / 100 / 200 ms change only per-window quantities."""
+        """Slice-length sweep (11-06): BIR / LIF at 25 / 50 / 100 / 200 / 400 ms change only per-window quantities."""
         a = self.load("configs/final/bb_v5_50.yaml")
         comm = {"comm_budget_messages", "comm_dual_lr", "comm_budget_mode", "comm_peak_alpha"}
-        for ms in (100, 200):
+        for ms in (100, 200, 400):
             b = self.load("configs/final/bb_v5_%d.yaml" % ms)
             r = ms // a["window_ms"]
             self.assertEqual(set(b), set(a), ms)
             self.assertEqual({k for k in a if a[k] != b[k]}, CLOCK_KEYS, ms)
             self.assertEqual(a["window_ms"] * a["n_windows"], b["window_ms"] * b["n_windows"])   # 8 s
-            for key in ("tbptt_k", "eval_chunk", "calib_windows", "timing_warmup_windows"):
+            for key in ("tbptt_k", "eval_chunk", "calib_windows"):                            # exact: same time span
                 self.assertEqual(a[key], b[key] * r, (ms, key))
-            self.assertEqual(-(-a["rolling_window"] // r), b["rolling_window"])               # diagnostics only
+            for key in ("rolling_window", "timing_warmup_windows"):                            # diagnostics only: ceil
+                self.assertEqual(-(-a[key] // r), b[key], (ms, key))
             self.assertEqual(a["comm_budget_messages"] * r, b["comm_budget_messages"])        # same budget per second
             self.assertEqual([[s // r, (e + 1) // r - 1] for s, e in a["segments"]], b["segments"])
             self.assertEqual(b["save_root"], "log/final/bb_v5_%d_seed37" % ms)
             self.assertTrue(os.path.exists(os.path.join(ROOT, b["stats_path"])), b["stats_path"])
-        for ms in (25, 100, 200):
+        for ms in (25, 100, 200, 400):
             bir, lif = self.load("configs/final/bb_v5_%d.yaml" % ms), self.load("configs/final/bb_v5lif_%d.yaml" % ms)
             self.assertEqual(set(lif), set(bir) - comm - {"tif"}, ms)
             self.assertEqual({k for k in lif if bir[k] != lif[k]}, {"neuron", "save_root"}, ms)
