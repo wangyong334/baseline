@@ -13,6 +13,13 @@ Options from the 11-07 local probes (DECO_PROBE_LOG section 5; defaults reproduc
                 frame and target that no non-pending event already detects, -log(1 - prod(1 - sigmoid(Lambda_i)))
                 (multiple-instance noisy-OR; raises Pd / ACC, lowers IoU; 0.3 was the knee)
     --norm data token / arrival features as z-scores from training statistics instead of the hand scales
+Design v10 (--design v10, 11-07; DECO_PROBE_LOG 7.5-7.9), adopted after the local pre-checks:
+    evidence without a radius cap (tools/deco/evidence.py --radius 0), 6 token features (dx, dy, dt, window offset,
+    polarity, neighbour z0) z-scored with training statistics, no count features or band flags; attention score of a
+    token for head h = q.k / sqrt(d) + b_h - |dx, dy|^2 / (2 sigma_h^2) (learned receptive field, sigma_h starts at the
+    RMS token distance of the training set; --rf-per head_offset: one per head and window offset); the empty key is
+    always attendable (attention sink), and the evidence mass -log(attention weight of the empty key) per head enters
+    the update through a zero-initialised linear layer. Commit timing: tools/deco/fit_head.py (change-risk head).
 Commit (evaluation): a pending event commits at the first step where Lambda leaves tau +- logit(1 - commit_alpha),
 else at its last available step; non-pending events keep the arrival decision.
 Exports traj_<split>/<recording>.npz (column d = calibrated logit at lag d): non-pending events keep z0 at every lag,
@@ -32,6 +39,7 @@ import torch.nn.functional as F
 
 THRESHOLD = 0.9
 N_FEAT = 11
+N_FEAT_V10 = 6
 
 
 def _logit(p):
@@ -84,6 +92,99 @@ class DecisionNeurons(nn.Module):
             h = h + m[:, None] * dh
             lams.append(lam)
         return torch.stack(lams, 1)
+
+
+class DecisionNeuronsV10(nn.Module):
+    """V10 decision neurons: learned receptive field per head (bias b_h, scale sigma_h), always-on empty key, evidence
+    mass input. Same recurrence as DecisionNeurons otherwise."""
+
+    def __init__(self, n_off, K, sigma0, dim=64, heads=4, dmax=40, per="head"):
+        super(DecisionNeuronsV10, self).__init__()
+        self.dim, self.heads, self.hd, self.dmax = dim, heads, dim // heads, dmax
+        self.h0 = nn.Sequential(nn.Linear(2, dim), nn.GELU(), nn.Linear(dim, dim))
+        self.tok = nn.Sequential(nn.Linear(N_FEAT_V10, dim), nn.GELU(), nn.Linear(dim, dim))
+        self.empty = nn.Parameter(torch.randn(dim) * 0.02)
+        self.age = nn.Embedding(dmax + 1, dim)
+        self.ln_q, self.ln_k, self.ln_f = nn.LayerNorm(dim), nn.LayerNorm(dim), nn.LayerNorm(dim)
+        self.wq, self.wk, self.wv, self.wo = (nn.Linear(dim, dim) for _ in range(4))
+        self.ff = nn.Sequential(nn.Linear(dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
+        self.delta = nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, 1))
+        n_rf = n_off if per == "head_offset" else 1
+        self.log_sigma = nn.Parameter(torch.full((heads, n_rf), math.log(sigma0)))
+        self.rf_bias = nn.Parameter(torch.zeros(heads, n_rf))
+        self.register_buffer("off_idx", torch.arange(n_off).repeat_interleave(K) if n_rf > 1
+                             else torch.zeros(n_off * K, dtype=torch.long))
+        self.wm = nn.Linear(heads, dim)
+        with torch.no_grad():                                        # Lambda starts exactly at z0; mass starts unused
+            self.delta[-1].weight.zero_()
+            self.delta[-1].bias.zero_()
+            self.wm.weight.zero_()
+            self.wm.bias.zero_()
+
+    def forward(self, feat, ok, dw, valid, z_in, z0, p, D, dist2):
+        if D > self.dmax:
+            raise ValueError("D = %d exceeds the age table (%d)" % (D, self.dmax))
+        B, H, hd = z0.shape[0], self.heads, self.hd
+        h = self.h0(torch.stack([z_in, p], 1))
+        lam = z0.clone()
+        kt = self.ln_k(self.tok(feat))
+        Kt, Vt = self.wk(kt).view(B, -1, H, hd), self.wv(kt).view(B, -1, H, hd)
+        ke = self.ln_k(self.empty)
+        Ke, Ve = self.wk(ke).view(1, H, hd), self.wv(ke).view(1, H, hd)
+        sig2 = torch.exp(2.0 * self.log_sigma)[:, self.off_idx]                     # [H, T]
+        prior = self.rf_bias[:, self.off_idx][None] - dist2[:, None, :] / (2.0 * sig2[None])   # [B, H, T]
+        lams = []
+        for d in range(D + 1):
+            q = self.wq(self.ln_q(h + self.age.weight[d])).view(B, H, hd)
+            arrived = ok & (dw <= d)
+            St = torch.einsum("bhd,bthd->bht", q, Kt) / math.sqrt(hd) + prior
+            s0 = (q * Ke).sum(-1) / math.sqrt(hd)                                   # [B, H] empty-key score
+            S = torch.cat([St.masked_fill(~arrived[:, None, :], float("-inf")), s0[..., None]], -1)
+            lse = torch.logsumexp(S, -1)
+            W = torch.exp(S - lse[..., None])
+            out = torch.einsum("bht,bthd->bhd", W[:, :, :-1], Vt) + W[:, :, -1:] * Ve
+            dh = self.wo(out.reshape(B, self.dim))
+            dh = dh + self.wm(lse - s0)                                              # evidence mass per head
+            dh = dh + self.ff(self.ln_f(dh))
+            m = valid[:, d].float()
+            lam = lam + m * self.delta(h + dh)[:, 0]
+            h = h + m[:, None] * dh
+            lams.append(lam)
+        return torch.stack(lams, 1)
+
+
+class FeaturizerV10(object):
+    """V10 inputs: the 6 raw token features z-scored with the training statistics of the valid tokens, the arrival logit
+    z-scored likewise, and the squared pixel distance of every token for the receptive field."""
+
+    def fit(self, g, n, chunk=4096):
+        s1 = torch.zeros(N_FEAT_V10, dtype=torch.float64, device=g["z0"].device)
+        s2, cnt, d2 = torch.zeros_like(s1), 0.0, 0.0
+        for i in range(0, n, chunk):
+            raw, ok, _, dist2 = self.raw(g, torch.arange(i, min(i + chunk, n), device=g["z0"].device))
+            x = raw[ok].double()
+            s1 += x.sum(0)
+            s2 += (x * x).sum(0)
+            cnt += x.shape[0]
+            d2 += float(dist2[ok].double().sum())
+        mu = s1 / cnt
+        self.mu, self.sd = mu.float(), (s2 / cnt - mu * mu).clamp(min=1e-8).sqrt().float()
+        self.z_mu, self.z_sd = float(g["z0"].mean()), float(g["z0"].std())
+        return math.sqrt(d2 / cnt)                                   # RMS token distance: start of every sigma
+
+    def raw(self, g, idx):
+        tok = g["tok"][idx].float()                                  # [B, n_off, K, 6]
+        B = tok.shape[0]
+        tok = tok.reshape(B, -1, 6)
+        dw = tok[..., 3]
+        feat = torch.stack([tok[..., 0], tok[..., 1], tok[..., 2], dw * g["win_s"], tok[..., 4], tok[..., 5]], -1)
+        return feat, g["ok"][idx].reshape(B, -1), dw, tok[..., 0] ** 2 + tok[..., 1] ** 2
+
+    def batch(self, g, idx):
+        feat, ok, dw, dist2 = self.raw(g, idx)
+        z0 = g["z0"][idx]
+        return ((feat - self.mu) / self.sd, ok, dw, g["valid"][idx], (z0 - self.z_mu) / self.z_sd, z0, g["p"][idx],
+                g["y"][idx], dist2)
 
 
 def load_evidence(path, dev, feat_lo, feat_hi):
@@ -162,14 +263,13 @@ def nonpending_counts(z0_dir, names, lo, hi, tau):
     return c
 
 
-def evaluate(net, m, g, D, c_np, tau, clo, chi):
+def evaluate(net, fwd, m, g, D, c_np, tau, clo, chi):
     net.eval()
     outs = []
     with torch.no_grad():
         for i in range(0, len(m["idx"]), 1024):
             b = torch.arange(i, min(i + 1024, len(m["idx"])), device=g["z0"].device)
-            feat, ok, dw, valid, z_in, z0, p, y = batch(g, b)
-            outs.append(net(feat, ok, dw, valid, z_in, z0, p, D).cpu().numpy())
+            outs.append(fwd(g, b)[0].cpu().numpy())
     lt = np.concatenate(outs) if outs else np.zeros((0, D + 1), np.float32)
     F_ = np.minimum(m["F"], D)
     y = m["label"].astype(bool)
@@ -217,7 +317,11 @@ def main():
     ap.add_argument("--lr", type=float, default=2e-3)
     ap.add_argument("--commit-alpha", type=float, default=0.01)
     ap.add_argument("--mil", type=float, default=0.0, help="weight of the target-frame 'at least one' loss (0 = off)")
-    ap.add_argument("--norm", choices=("hand", "data"), default="hand", help="feature scaling")
+    ap.add_argument("--norm", choices=("hand", "data"), default="hand", help="feature scaling (v9)")
+    ap.add_argument("--design", choices=("v9", "v10"), default="v9",
+                    help="v9 = 11-06 design (default, bit-exact); v10 = learned receptive field (--radius 0 evidence)")
+    ap.add_argument("--rf-per", choices=("head", "head_offset"), default="head",
+                    help="v10: one receptive field per head (adopted) or per head and window offset")
     ap.add_argument("--device", default="cuda:0")
     args = ap.parse_args()
     torch.manual_seed(args.seed)
@@ -240,6 +344,11 @@ def main():
                  int(m["k_evid"])), flush=True)
     m_tr, g_tr, _ = data["train"]
     n = len(m_tr["idx"])
+    if args.design == "v10" and (args.mil > 0 or args.norm != "hand"):
+        raise ValueError("--mil and --norm belong to the v9 design (v10 always z-scores its inputs)")
+    if args.design == "v10" and np.isfinite(float(m_tr["radius"])):
+        print("warning: v10 expects evidence without a radius cap (evidence.py --radius 0); got %.0f px"
+              % float(m_tr["radius"]), flush=True)
     if args.norm == "data":                    # the training statistics serve all splits
         stats = fit_norm(g_tr, n)
         for split in data:
@@ -253,7 +362,25 @@ def main():
         n_groups = int(gid.max()) + 1
         mil = (torch.as_tensor(members, device=dev), np.searchsorted(gid[members], np.arange(n_groups + 1)), n_groups)
         print("MIL: %d at-risk target-frame groups, %d pending events in them" % (n_groups, members.size), flush=True)
-    net = DecisionNeurons().to(dev)
+    extra = {}
+    if args.design == "v10":
+        fz = FeaturizerV10()
+        sigma0 = fz.fit(g_tr, n)
+        net = DecisionNeuronsV10(int(m_tr["tok"].shape[1]), int(m_tr["tok"].shape[2]), sigma0,
+                                 per=args.rf_per).to(dev)
+        extra["sigma0"] = sigma0
+        print("v10: receptive field starts at sigma0 = %.1f px (RMS token distance on train), one per %s"
+              % (sigma0, args.rf_per.replace("_", " and ")), flush=True)
+
+        def fwd(g, idx):
+            feat, ok, dw, valid, z_in, z0, p, y, dist2 = fz.batch(g, idx)
+            return net(feat, ok, dw, valid, z_in, z0, p, D, dist2), valid, y
+    else:
+        net = DecisionNeurons().to(dev)
+
+        def fwd(g, idx):
+            feat, ok, dw, valid, z_in, z0, p, y = batch(g, idx)
+            return net(feat, ok, dw, valid, z_in, z0, p, D), valid, y
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.epochs)
     t0 = time.time()
@@ -262,8 +389,7 @@ def main():
         net.train()
         perm = torch.as_tensor(np.random.permutation(n), dtype=torch.long, device=dev)
         for i in range(0, n, args.batch):
-            feat, ok, dw, valid, z_in, z0, p, y = batch(g_tr, perm[i:i + args.batch])
-            lams = net(feat, ok, dw, valid, z_in, z0, p, D)
+            lams, valid, y = fwd(g_tr, perm[i:i + args.batch])
             vm = valid.float()
             ell = F.binary_cross_entropy_with_logits(lams, y[:, None].expand_as(lams), reduction="none")
             loss = (ell * vm).sum() / vm.sum().clamp(min=1)
@@ -280,8 +406,7 @@ def main():
                     parts.append(r)
                     total += r.size
                 rows_t = torch.as_tensor(np.concatenate(parts), device=dev)
-                feat, ok, dw, valid, z_in, z0, p, y = batch(g_tr, members_t[rows_t])
-                lg = net(feat, ok, dw, valid, z_in, z0, p, D)
+                lg, valid, _ = fwd(g_tr, members_t[rows_t])
                 sizes = [len(r) for r in parts]               # groups are contiguous: deterministic segment sums
                 log_neg = F.logsigmoid(-lg) * valid.float()
                 s = torch.stack([x.sum(0) for x in torch.split(log_neg, sizes)])
@@ -295,7 +420,7 @@ def main():
             opt.step()
         sched.step()
         m_va, g_va, c_va = data["val"]
-        _, _, r = evaluate(net, m_va, g_va, D, c_va, tau, clo, chi)
+        _, _, r = evaluate(net, fwd, m_va, g_va, D, c_va, tau, clo, chi)
         hist.append(round(r["crossing_iou"], 4))
         print("ep %d val crossing %.4f arrival %.4f fixed %.4f wait %.2f (%.0f s)" % (
             ep, r["crossing_iou"], r["arrival_iou"], r["fixed_iou"], r["mean_wait_pending"], time.time() - t0), flush=True)
@@ -308,9 +433,13 @@ def main():
                 ("alpha", "filter_alpha", "D", "past", "window_ms", "radius", "k_near", "k_evid")}
     summary = {"args": vars(args), "evidence": evidence, "best_epoch": best_ep, "val_history": hist,
                "seconds": round(time.time() - t0, 1)}
+    if args.design == "v10":                   # the learned receptive field (px) and head biases
+        extra.update(sigma=torch.exp(net.log_sigma).detach().cpu().tolist(),
+                     rf_bias=net.rf_bias.detach().cpu().tolist())
+        summary["v10"] = extra
     for split in ("val", "test"):
         m, g, c_np = data[split]
-        lt, Lc, r = evaluate(net, m, g, D, c_np, tau, clo, chi)
+        lt, Lc, r = evaluate(net, fwd, m, g, D, c_np, tau, clo, chi)
         summary[split] = r
         np.savez(os.path.join(args.out, "raw_%s.npz" % split), lam_traj=lt.astype(np.float32), lags=Lc)
         export(lt, m, os.path.join(args.z0_root, "z0_" + split), os.path.join(args.out, "traj_" + split),

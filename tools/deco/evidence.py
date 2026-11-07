@@ -8,6 +8,8 @@ within --radius px of (x, y) (e itself excluded):
 P and D: whole windows inside --past-ms and --wait-ms. K_NEAR and K_EVID are given per 50 ms and scaled with the window
 length (per window max(1, round(k * window_ms / 50))), so every slice length gets the same evidence budget per second.
 The radius is a plain hyperparameter (val-selected 32 px, flat between 12 and 32 px; DECO_PROBE_LOG 4.9).
+--radius 0 = no cap (V10 design, 11-07): the K nearest events of the whole window; the decision neurons learn their
+receptive field instead (train_dnm.py --design v10), and the counts become the window totals.
 Token features: dx, dy (px), dt (ms), dw (windows), polarity, neighbour z0 (clipped to +-20). No labels of neighbours.
 Usage: python tools/deco/evidence.py --z0-dir <dir>/z0_<split> --split <split> --data-root <root> --alpha 0.01 --out <npz>
 """
@@ -77,6 +79,7 @@ def one_recording(job):
     offsets = list(range(-past, depth + 1))
     K = k_near + k_evid
     n = pend.size
+    unbounded = not np.isfinite(radius)
     tok = np.zeros((n, len(offsets), K, 6), dtype=np.float16)
     tok_valid = np.zeros((n, len(offsets), K), dtype=bool)
     nall = np.zeros((n, len(offsets)), dtype=np.float32)
@@ -105,11 +108,13 @@ def one_recording(job):
             self_a = oa & (ca == me)
             oa &= ~self_a
             near, near_ok = first_k(ca, oa, k_near)
-            nall[q, oi] = tree_a.query_ball_point(qxy, radius, return_length=True) - self_a.any(1)
+            nall[q, oi] = (ids_a.size if unbounded else
+                           tree_a.query_ball_point(qxy, radius, return_length=True)) - self_a.any(1)
             if tree_e is not None:
                 ce, oe = knn(tree_e, ids_e, qxy, k_evid + k_near + 1, radius)
                 self_e = oe & (ce == me)
-                nevid[q, oi] = tree_e.query_ball_point(qxy, radius, return_length=True) - self_e.any(1)
+                nevid[q, oi] = (ids_e.size if unbounded else
+                                tree_e.query_ball_point(qxy, radius, return_length=True)) - self_e.any(1)
                 oe &= ~self_e
                 oe &= ~(ce[:, :, None] == np.where(near_ok, near, -2)[:, None, :]).any(2)
                 evid, evid_ok = first_k(ce, oe, k_evid)
@@ -139,7 +144,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--past-ms", type=float, default=500.0)
     ap.add_argument("--wait-ms", type=float, default=500.0)
-    ap.add_argument("--radius", type=float, default=32.0, help="local radius cap, px")
+    ap.add_argument("--radius", type=float, default=32.0, help="local radius cap, px (0 = no cap)")
     ap.add_argument("--k-near", type=int, default=8, help="nearest events per 50 ms")
     ap.add_argument("--k-evid", type=int, default=8, help="nearest non-background events per 50 ms")
     ap.add_argument("--workers", type=int, default=8)
@@ -154,8 +159,9 @@ def main():
     if depth < 1:
         raise ValueError("--wait-ms %.0f is shorter than one window (%d ms)" % (args.wait_ms, window_ms))
     k_near, k_evid = per_window(args.k_near, window_ms), per_window(args.k_evid, window_ms)
+    radius = args.radius if args.radius > 0 else np.inf
     jobs = [(f, os.path.join(args.data_root, args.split, os.path.basename(f)), args.alpha, args.filter_alpha, past, depth,
-             window_ms, args.radius, k_near, k_evid) for f in files]
+             window_ms, radius, k_near, k_evid) for f in files]
     t0 = time.time()
     parts = []
     with Pool(max(1, args.workers)) as pool:
@@ -173,7 +179,7 @@ def main():
     out.update(names=np.array([os.path.basename(f) for f in files]), log_w=np.float32(parts[0][5]),
                alpha=np.float64(args.alpha), filter_alpha=np.float64(args.filter_alpha), D=np.int64(depth),
                past=np.int64(past), window_ms=np.int64(window_ms), offsets=np.arange(-past, depth + 1),
-               radius=np.float64(args.radius), k_near=np.int64(k_near), k_evid=np.int64(k_evid),
+               radius=np.float64(radius), k_near=np.int64(k_near), k_evid=np.int64(k_evid),
                n_events=np.int64(n_events))
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     np.savez(args.out, **out)

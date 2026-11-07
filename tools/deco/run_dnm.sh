@@ -6,9 +6,14 @@
 #   EXTRA="--epochs 2" ...                       training options (tools/deco/train_dnm.py)
 #   EV_ARGS="--radius 12" EV_SUFFIX=_r12 ...    evidence options; EV_SUFFIX (required with EV_ARGS) names their files
 #   NAME_SUFFIX=_x ...                          result-dir suffix
+#   DESIGN=v10 ...                              V10 decision neurons (11-07): evidence without a radius cap
+#                                               (EV_ARGS "--radius 0", EV_SUFFIX _nr), train_dnm.py --design v10,
+#                                               result dir dnm_a<ALPHA>_s<SEED>_nr_v10
+#   HEAD=0 ...                                  skip the change-risk head (tools/deco/fit_head.py; default on)
 #   DATA_ROOT=<root> (default: from the checkpoint)  DEVICE=cpu  LIMIT=2 (first recordings only)   for smoke tests
 # z0 is dumped once per backbone into run/deco/<TAG>/z0_<split> (shared with tools/deco/run_deco.sh).
-# Results: run/deco/<TAG>/dnm_a<ALPHA>_s<SEED><EV_SUFFIX><NAME_SUFFIX>/{summary.json, official_val.md, official_test.md}
+# Results: run/deco/<TAG>/dnm_a<ALPHA>_s<SEED><EV_SUFFIX><NAME_SUFFIX>/{summary.json, official_val.md, official_test.md,
+#          head/head.json (fixed crossing vs change-risk head, official four metrics)}
 # Last line: "DNM <TAG> FINISHED" (or "DNM <TAG> FAILED at <step>").
 set -u
 cd "$(dirname "$0")/../.."
@@ -17,6 +22,14 @@ TAG=${TAG:?TAG=<name>}
 ALPHAS=${ALPHAS:-0.01}
 SEEDS=${SEEDS:-0}
 EXTRA=${EXTRA:-}
+DESIGN=${DESIGN:-v9}
+HEAD=${HEAD:-1}
+if [ "$DESIGN" = v10 ]; then
+  EV_ARGS=${EV_ARGS:---radius 0}
+  EV_SUFFIX=${EV_SUFFIX:-_nr}
+  NAME_SUFFIX=${NAME_SUFFIX:-_v10}
+  EXTRA="--design v10 $EXTRA"
+fi
 EV_ARGS=${EV_ARGS:-}
 EV_SUFFIX=${EV_SUFFIX:-}
 NAME_SUFFIX=${NAME_SUFFIX:-}
@@ -70,6 +83,11 @@ for a in $ALPHAS; do
       echo "    $split official (zero / fixed D): $(grep -E '^\| (zero|fixed_[0-9]+) ' "$OUT/$name/official_$split.md" \
         | sed -n '1p;$p' | cut -d'|' -f2-6 | tr '\n' ' ')"
     done
+    if [ "$HEAD" = 1 ]; then
+      python -u tools/deco/fit_head.py --run "$OUT/$name" --evidence "$ev" --z0-root "$OUT" --data-root "$ROOT" \
+        --alpha 0.01 > "$OUT/$name/head.log" 2>&1 || fail head_$name "$OUT/$name/head.log"
+      echo "    $(tail -n 1 "$OUT/$name/head.log" | cut -c1-200)"
+    fi
   done
 done
 echo "[$(ts)] DNM $TAG FINISHED"
