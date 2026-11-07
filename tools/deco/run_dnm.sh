@@ -8,7 +8,9 @@
 #   NAME_SUFFIX=_x ...                          result-dir suffix
 #   DESIGN=v10 ...                              V10 decision neurons (11-07): evidence without a radius cap
 #                                               (EV_ARGS "--radius 0", EV_SUFFIX _nr), train_dnm.py --design v10,
-#                                               result dir dnm_a<ALPHA>_s<SEED>_nr_v10
+#                                               result dir dnm_a<ALPHA>_s<SEED>_nr_v10; each alpha of ALPHAS is then
+#                                               the one risk level of the run: band, crossing commit (--commit-alpha)
+#                                               and change-risk head (v9 keeps 0.01 for the last two)
 #   HEAD=0 ...                                  skip the change-risk head (tools/deco/fit_head.py; default on)
 #   DATA_ROOT=<root> (default: from the checkpoint)  DEVICE=cpu  LIMIT=2 (first recordings only)   for smoke tests
 # z0 is dumped once per backbone into run/deco/<TAG>/z0_<split> (shared with tools/deco/run_deco.sh).
@@ -71,10 +73,11 @@ for a in $ALPHAS; do
     fi
     echo "  evidence alpha $a $split: $(tail -n 1 "${ev}_$split.log" | cut -c1-200)"
   done
+  if [ "$DESIGN" = v10 ]; then ca=$a; else ca=0.01; fi     # commit / head risk level (one alpha in V10)
   for seed in $SEEDS; do
     name=dnm_a${a}_s${seed}${EV_SUFFIX}${NAME_SUFFIX}
     python -u tools/deco/train_dnm.py --evidence "$ev" --z0-root "$OUT" --data-root "$ROOT" --out "$OUT/$name" \
-      --seed $seed --device $DEV $EXTRA > "$OUT/$name.log" 2>&1 || fail train_$name "$OUT/$name.log"
+      --seed $seed --device $DEV --commit-alpha $ca $EXTRA > "$OUT/$name.log" 2>&1 || fail train_$name "$OUT/$name.log"
     echo "  $name: $(tail -n 1 "$OUT/$name.log")"
     for split in val test; do
       python tools/final_analysis.py --traj-dir "$OUT/$name/traj_$split" --split $split --data-root "$ROOT" \
@@ -85,7 +88,7 @@ for a in $ALPHAS; do
     done
     if [ "$HEAD" = 1 ]; then
       python -u tools/deco/fit_head.py --run "$OUT/$name" --evidence "$ev" --z0-root "$OUT" --data-root "$ROOT" \
-        --alpha 0.01 > "$OUT/$name/head.log" 2>&1 || fail head_$name "$OUT/$name/head.log"
+        --alpha $ca > "$OUT/$name/head.log" 2>&1 || fail head_$name "$OUT/$name/head.log"
       echo "    $(tail -n 1 "$OUT/$name/head.log" | cut -c1-200)"
     fi
   done

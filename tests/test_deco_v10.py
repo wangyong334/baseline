@@ -7,7 +7,10 @@
     3. V10 featurizer: z-scored token features, RMS token distance as the receptive-field start
     4. Change-risk head (tools/deco/fit_head.py): the state at step d is causal; commit rule; on synthetic trajectories
        whose change risk falls with the margin and towards the deadline, the learned head does the same
+    5. Evidence too big for the GPU (EV-Flying, train_dnm.py --gpu-evidence-gb): the memory-mapped arrays equal np.load,
+       and host and device evidence give identical v10 and v9 features
 """
+import gc
 import os
 import sys
 import tempfile
@@ -153,6 +156,50 @@ class ChangeRiskHeadTests(unittest.TestCase):
         grid = lambda m, d: float(predict(np.r_[np.log1p(m), med[1:5], d / D].astype(np.float32)[None])[0])  # noqa
         self.assertGreater(grid(0.3, 1), grid(4.0, 1))                         # risk falls with the margin
         self.assertGreater(grid(1.5, 1), grid(1.5, 5))                         # and towards the deadline
+
+
+def write_evidence(tmp, n=37, n_off=3, K=4, D=2, seed=4):
+    rng = np.random.RandomState(seed)
+    arrays = {"tok": (rng.randn(n, n_off, K, 6) * 10).astype(np.float16), "tok_valid": rng.rand(n, n_off, K) < 0.7,
+              "nall": rng.randint(0, 50, (n, n_off)).astype(np.int32),
+              "nevid": rng.randint(0, 9, (n, n_off)).astype(np.int32),
+              "z0": rng.randn(n).astype(np.float32), "p": rng.randint(0, 2, n).astype(np.float32),
+              "label": rng.randint(0, 2, n).astype(np.int8), "F": rng.randint(0, D + 1, n).astype(np.int64),
+              "D": np.int64(D), "k_near": np.int64(K // 2), "window_ms": np.int64(50)}
+    path = os.path.join(tmp, "ev_val.npz")
+    np.savez(path, **arrays)
+    return path, arrays
+
+
+class HostEvidenceTests(unittest.TestCase):
+    def test_memmap_equals_np_load(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, arrays = write_evidence(tmp)
+            for k in T.HOST_KEYS:
+                mm = T.npz_memmap(path, k)
+                self.assertIsNotNone(mm)
+                self.assertEqual(mm.dtype, arrays[k].dtype)
+                np.testing.assert_array_equal(np.asarray(mm), arrays[k])
+                del mm
+            self.assertGreater(T.evidence_bytes(path), arrays["tok"].nbytes)
+            gc.collect()                                                       # release the mappings (Windows)
+
+    def test_host_and_device_give_identical_features(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, _ = write_evidence(tmp)
+            _, g_dev, _ = T.load_evidence(path, torch.device("cpu"), -3.0, 2.0, host=False)
+            m_host, g_host, _ = T.load_evidence(path, torch.device("cpu"), -3.0, 2.0, host=True)
+            self.assertIsInstance(g_host["tok"], np.memmap)
+            self.assertTrue(torch.is_tensor(g_dev["tok"]))
+            idx = torch.tensor([5, 0, 36, 5, 12])
+            fz_dev, fz_host = T.FeaturizerV10(), T.FeaturizerV10()
+            self.assertEqual(fz_dev.fit(g_dev, 37, chunk=8), fz_host.fit(g_host, 37, chunk=8))
+            for a, b in zip(fz_dev.batch(g_dev, idx), fz_host.batch(g_host, idx)):          # v10 inputs
+                np.testing.assert_array_equal(a.numpy(), b.numpy())
+            for a, b in zip(T.batch(g_dev, idx), T.batch(g_host, idx)):                    # v9 inputs
+                np.testing.assert_array_equal(a.numpy(), b.numpy())
+            del m_host, g_host
+            gc.collect()
 
 
 if __name__ == "__main__":

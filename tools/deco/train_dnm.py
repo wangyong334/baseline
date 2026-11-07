@@ -24,13 +24,18 @@ Commit (evaluation): a pending event commits at the first step where Lambda leav
 else at its last available step; non-pending events keep the arrival decision.
 Exports traj_<split>/<recording>.npz (column d = calibrated logit at lag d): non-pending events keep z0 at every lag,
 pending ones take Lambda(d); NaN past the recording end.
+Large evidence (11-07; EV-Flying has ~8.4M pending training events, ~30 GiB of tokens): when the per-token arrays of
+the three splits exceed --gpu-evidence-gb, they stay memory-mapped from the evidence files in host memory and only
+the rows of each batch are copied to the GPU. The values are the same, so the results are identical.
 Usage: python tools/deco/train_dnm.py --evidence <prefix> --z0-root <dir with z0_<split>> --data-root <root> --out <dir>
 """
 import argparse
 import json
 import math
 import os
+import struct
 import time
+import zipfile
 
 import numpy as np
 import torch
@@ -49,6 +54,48 @@ def _logit(p):
 def bounds(tau, alpha):
     half = _logit(1.0 - float(alpha))
     return tau - half, tau + half
+
+
+HOST_KEYS = ("tok", "tok_valid", "nall", "nevid")              # per-token / per-window evidence arrays
+
+
+def npz_memmap(path, key):
+    """Read-only memmap of array `key` inside an .npz written by np.savez (members stored uncompressed); None when the
+    member is compressed or has an unknown .npy header version."""
+    with zipfile.ZipFile(path) as zf:
+        info = zf.getinfo(key + ".npy")
+    if info.compress_type != zipfile.ZIP_STORED:
+        return None
+    with open(path, "rb") as fh:
+        fh.seek(info.header_offset)
+        local = fh.read(30)                                      # zip local file header
+        if local[:4] != b"PK\x03\x04":
+            return None
+        n_name, n_extra = struct.unpack("<HH", local[26:30])
+        fh.seek(info.header_offset + 30 + n_name + n_extra)
+        version = np.lib.format.read_magic(fh)
+        if version == (1, 0):
+            shape, fortran, dtype = np.lib.format.read_array_header_1_0(fh)
+        elif version == (2, 0):
+            shape, fortran, dtype = np.lib.format.read_array_header_2_0(fh)
+        else:
+            return None
+        offset = fh.tell()
+    return np.memmap(path, dtype=dtype, mode="r", offset=offset, shape=shape, order="F" if fortran else "C")
+
+
+def evidence_bytes(path):
+    """Uncompressed size of the per-token arrays of one evidence file."""
+    with zipfile.ZipFile(path) as zf:
+        return sum(zf.getinfo(k + ".npy").file_size for k in HOST_KEYS)
+
+
+def take(a, idx):
+    """Rows idx of an evidence array: a tensor (on the GPU), or a host array (memmap) whose rows are copied to the
+    device of idx batch by batch."""
+    if torch.is_tensor(a):
+        return a[idx]
+    return torch.from_numpy(np.ascontiguousarray(a[idx.cpu().numpy()])).to(idx.device)
 
 
 class DecisionNeurons(nn.Module):
@@ -173,12 +220,12 @@ class FeaturizerV10(object):
         return math.sqrt(d2 / cnt)                                   # RMS token distance: start of every sigma
 
     def raw(self, g, idx):
-        tok = g["tok"][idx].float()                                  # [B, n_off, K, 6]
+        tok = take(g["tok"], idx).float()                            # [B, n_off, K, 6]
         B = tok.shape[0]
         tok = tok.reshape(B, -1, 6)
         dw = tok[..., 3]
         feat = torch.stack([tok[..., 0], tok[..., 1], tok[..., 2], dw * g["win_s"], tok[..., 4], tok[..., 5]], -1)
-        return feat, g["ok"][idx].reshape(B, -1), dw, tok[..., 0] ** 2 + tok[..., 1] ** 2
+        return feat, take(g["ok"], idx).reshape(B, -1), dw, tok[..., 0] ** 2 + tok[..., 1] ** 2
 
     def batch(self, g, idx):
         feat, ok, dw, dist2 = self.raw(g, idx)
@@ -187,14 +234,25 @@ class FeaturizerV10(object):
                 g["y"][idx], dist2)
 
 
-def load_evidence(path, dev, feat_lo, feat_hi):
-    m = dict(np.load(path))
+def load_evidence(path, dev, feat_lo, feat_hi, host=False):
+    """Arrays of one evidence split. host=True: the per-token arrays (HOST_KEYS) stay memory-mapped in host memory and
+    take() copies the rows of each batch to the GPU; everything else goes to dev. Same values either way."""
+    with np.load(path) as f:
+        m = {k: f[k] for k in f.files if not (host and k in HOST_KEYS)}
+    if host:
+        for k in HOST_KEYS:
+            mm = npz_memmap(path, k)
+            if mm is None:                                       # compressed member: read it into host memory
+                with np.load(path) as f:
+                    mm = f[k]
+            m[k] = mm
     D = int(m["D"])
     valid = np.arange(D + 1)[None, :] <= m["F"][:, None]
-    g = {"tok": torch.as_tensor(np.ascontiguousarray(m["tok"])).to(dev),
-         "ok": torch.as_tensor(np.ascontiguousarray(m["tok_valid"])).to(dev),
-         "nall": torch.as_tensor(np.ascontiguousarray(m["nall"])).to(dev),
-         "nevid": torch.as_tensor(np.ascontiguousarray(m["nevid"])).to(dev),
+    put = (lambda a: a) if host else (lambda a: torch.as_tensor(np.ascontiguousarray(a)).to(dev))   # noqa: E731
+    g = {"tok": put(m["tok"]),
+         "ok": put(m["tok_valid"]),
+         "nall": put(m["nall"]),
+         "nevid": put(m["nevid"]),
          "valid": torch.as_tensor(valid).to(dev),
          "z0": torch.as_tensor(m["z0"].astype(np.float32)).to(dev),
          "p": torch.as_tensor(m["p"].astype(np.float32)).to(dev),
@@ -205,14 +263,14 @@ def load_evidence(path, dev, feat_lo, feat_hi):
 
 
 def batch(g, idx, raw=False):
-    tok = g["tok"][idx].float()                                  # [B, n_off, K, 6]
+    tok = take(g["tok"], idx).float()                            # [B, n_off, K, 6]
     B, n_off, K = tok.shape[0], tok.shape[1], tok.shape[2]
     tok = tok.reshape(B, -1, 6)
     dw = tok[..., 3]
     z = tok[..., 5]
-    rep = lambda a: a[idx].float()[:, :, None].expand(B, n_off, K).reshape(B, -1)   # noqa: E731
+    rep = lambda a: take(a, idx).float()[:, :, None].expand(B, n_off, K).reshape(B, -1)   # noqa: E731
     flag = (torch.arange(K, device=tok.device) >= g["k_near"]).float()[None, None].expand(B, n_off, K).reshape(B, -1)
-    ok = g["ok"][idx].reshape(B, -1)
+    ok = take(g["ok"], idx).reshape(B, -1)
     if raw or g["mu"] is not None:                               # unscaled features (z-scored below)
         feat = torch.stack([tok[..., 0], tok[..., 1], tok[..., 2], dw * g["win_s"], tok[..., 4], z,
                             (z >= g["hi"]).float(), (z <= g["lo"]).float(), torch.log1p(rep(g["nall"])), flag,
@@ -323,19 +381,28 @@ def main():
     ap.add_argument("--rf-per", choices=("head", "head_offset"), default="head",
                     help="v10: one receptive field per head (adopted) or per head and window offset")
     ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--gpu-evidence-gb", type=float, default=8.0,
+                    help="per-token evidence of the three splits above this size (GiB) stays memory-mapped in host "
+                         "memory and is copied to the GPU per batch (EV-Flying); results are identical")
     args = ap.parse_args()
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     dev = torch.device(args.device)
     os.makedirs(args.out, exist_ok=True)
-    ref = dict(np.load(args.evidence + "_val.npz", allow_pickle=False))
+    with np.load(args.evidence + "_val.npz", allow_pickle=False) as f:      # scalars only: skip the token arrays
+        ref = {k: f[k] for k in f.files if k not in HOST_KEYS}
     tau = _logit(THRESHOLD) - float(ref["log_w"])
     flo, fhi = bounds(tau, float(ref["filter_alpha"]))
     plo, phi = bounds(tau, float(ref["alpha"]))
     clo, chi = bounds(tau, args.commit_alpha)
+    paths = {split: args.evidence + "_%s.npz" % split for split in ("train", "val", "test")}
+    tok_gb = sum(evidence_bytes(p) for p in paths.values()) / 2.0 ** 30
+    host = tok_gb > args.gpu_evidence_gb
+    print("evidence: %.2f GiB of token arrays -> %s" % (
+        tok_gb, "memory-mapped in host memory, copied to the GPU per batch" if host else "on %s" % dev), flush=True)
     data = {}
     for split in ("train", "val", "test"):
-        m, g, D = load_evidence(args.evidence + "_%s.npz" % split, dev, flo, fhi)
+        m, g, D = load_evidence(paths[split], dev, flo, fhi, host)
         c_np = nonpending_counts(os.path.join(args.z0_root, "z0_" + split), list(m["names"]), plo, phi, tau) \
             if split != "train" else None
         data[split] = (m, g, c_np)
@@ -432,7 +499,7 @@ def main():
     evidence = {k: (ref[k].item() if np.ndim(ref[k]) == 0 else None) for k in
                 ("alpha", "filter_alpha", "D", "past", "window_ms", "radius", "k_near", "k_evid")}
     summary = {"args": vars(args), "evidence": evidence, "best_epoch": best_ep, "val_history": hist,
-               "seconds": round(time.time() - t0, 1)}
+               "seconds": round(time.time() - t0, 1), "host_evidence": bool(host)}
     if args.design == "v10":                   # the learned receptive field (px) and head biases
         extra.update(sigma=torch.exp(net.log_sigma).detach().cpu().tolist(),
                      rf_bias=net.rf_bias.detach().cpu().tolist())
