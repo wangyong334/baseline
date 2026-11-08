@@ -20,6 +20,13 @@ Design v10 (--design v10, 11-07; DECO_PROBE_LOG 7.5-7.9), adopted after the loca
     RMS token distance of the training set; --rf-per head_offset: one per head and window offset); the empty key is
     always attendable (attention sink), and the evidence mass -log(attention weight of the empty key) per head enters
     the update through a zero-initialised linear layer. Commit timing: tools/deco/fit_head.py (change-risk head).
+Design v11 (--design v11, 11-08; tools/deco/sdn_v11.py, Res/v11_design/V11_DESIGN.md): spiking decision neurons from
+    sequential decision theory -- membrane = prior z0 + attributed, redundancy-corrected evidence of every arrived event
+    (independent sigmoid attribution gates, learned redundancy rho within / across windows, each event counted once,
+    re-audited every step); options --v11-audit / --v11-rho / --v11-gate for the ablations. Same inputs as v10. Commit
+    timing: tools/deco/fit_range.py (two thresholds from the neuron's own predicted future range).
+All designs: summary.json also gets the per-step calibration slope of Lambda on val / test (1 = calibrated; a slope
+    that falls with the step means evidence is being over-counted).
 Commit (evaluation): a pending event commits at the first step where Lambda leaves tau +- logit(1 - commit_alpha),
 else at its last available step; non-pending events keep the arrival decision.
 Exports traj_<split>/<recording>.npz (column d = calibrated logit at lag d): non-pending events keep z0 at every lag,
@@ -41,6 +48,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+import sdn_v11
 
 THRESHOLD = 0.9
 N_FEAT = 11
@@ -346,6 +355,42 @@ def evaluate(net, fwd, m, g, D, c_np, tau, clo, chi):
                     "mean_wait_pending": float(Lc.mean()) if len(Lc) else 0.0, "pending": int(len(Lc))}
 
 
+def calibration_slopes(lt, y, F_):
+    """Per step d: slope a of the logistic fit y ~ sigmoid(a * Lambda_d + b) over the events still open at d (Lambda
+    clipped to +-20). 1 = calibrated scale, < 1 = over-confident."""
+    from scipy.optimize import minimize
+    out = []
+    yf = y.astype(np.float64)
+    for d in range(lt.shape[1]):
+        ok = F_ >= d
+        if ok.sum() < 50 or yf[ok].min() == yf[ok].max():
+            out.append(None)
+            continue
+        x, t = np.clip(lt[ok, d].astype(np.float64), -20.0, 20.0), yf[ok]
+
+        def f(w):
+            z = w[0] * x + w[1]
+            g = 0.5 * (1.0 + np.tanh(0.5 * z)) - t
+            return float((np.logaddexp(0.0, z) - t * z).mean()), np.array([(g * x).mean(), g.mean()])
+        out.append(round(float(minimize(f, np.array([1.0, 0.0]), jac=True, method="L-BFGS-B").x[0]), 3))
+    return out
+
+
+def collect_extras(net, fwd, m, g):
+    """V11: per-step attributed mass, effective evidence count and per-head evidence of every pending event."""
+    net.eval()
+    net.keep_extras = True
+    parts = {"mass": [], "neff": [], "lam_heads": []}
+    with torch.no_grad():
+        for i in range(0, len(m["idx"]), 1024):
+            fwd(g, torch.arange(i, min(i + 1024, len(m["idx"])), device=g["z0"].device))
+            for k in parts:
+                parts[k].append(net.extras[k].cpu().numpy())
+    net.keep_extras = False
+    net.extras = None
+    return {k: np.concatenate(v).astype(np.float32) for k, v in parts.items() if v}
+
+
 def export(lt, m, z0_dir, out_dir, data_root, split, D):
     os.makedirs(out_dir, exist_ok=True)
     for ri, name in enumerate(list(m["names"])):
@@ -376,10 +421,21 @@ def main():
     ap.add_argument("--commit-alpha", type=float, default=0.01)
     ap.add_argument("--mil", type=float, default=0.0, help="weight of the target-frame 'at least one' loss (0 = off)")
     ap.add_argument("--norm", choices=("hand", "data"), default="hand", help="feature scaling (v9)")
-    ap.add_argument("--design", choices=("v9", "v10"), default="v9",
-                    help="v9 = 11-06 design (default, bit-exact); v10 = learned receptive field (--radius 0 evidence)")
+    ap.add_argument("--design", choices=("v9", "v10", "v11"), default="v9",
+                    help="v9 = 11-06 design (default, bit-exact); v10 = learned receptive field (--radius 0 evidence); "
+                         "v11 = sequential-test spiking decision neurons (tools/deco/sdn_v11.py)")
     ap.add_argument("--rf-per", choices=("head", "head_offset"), default="head",
                     help="v10: one receptive field per head (adopted) or per head and window offset")
+    ap.add_argument("--v11-audit", choices=("reaudit", "ledger"), default="reaudit",
+                    help="v11: re-audit every arrived event each step (default) or add only the new window")
+    ap.add_argument("--v11-rho", choices=("learn", "sum", "mean"), default="learn",
+                    help="v11: learned redundancy (default), plain sum (rho = 0) or attributed mean (rho = 1)")
+    ap.add_argument("--v11-gate", choices=("sigmoid", "softmax"), default="sigmoid",
+                    help="v11: independent attribution gates (default) or a softmax over the arrived events")
+    ap.add_argument("--v11-rho-init", type=float, nargs=2, default=(0.5, 0.12), metavar=("RHO_W", "RATIO_T"),
+                    help="v11: starting rho_w and rho_t / rho_w (identifiability check: different starts should meet)")
+    ap.add_argument("--v11-ctx-mass", choices=("on", "off"), default="on",
+                    help="v11: off = the context / values never see the attributed mass (only rho scales the evidence)")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--gpu-evidence-gb", type=float, default=8.0,
                     help="per-token evidence of the three splits above this size (GiB) stays memory-mapped in host "
@@ -394,6 +450,8 @@ def main():
     tau = _logit(THRESHOLD) - float(ref["log_w"])
     flo, fhi = bounds(tau, float(ref["filter_alpha"]))
     plo, phi = bounds(tau, float(ref["alpha"]))
+    if "band_lo" in ref:                       # band stored by evidence.py (V11 martingale band, or sym)
+        plo, phi = float(ref["band_lo"]), float(ref["band_hi"])
     clo, chi = bounds(tau, args.commit_alpha)
     paths = {split: args.evidence + "_%s.npz" % split for split in ("train", "val", "test")}
     tok_gb = sum(evidence_bytes(p) for p in paths.values()) / 2.0 ** 30
@@ -411,11 +469,11 @@ def main():
                  int(m["k_evid"])), flush=True)
     m_tr, g_tr, _ = data["train"]
     n = len(m_tr["idx"])
-    if args.design == "v10" and (args.mil > 0 or args.norm != "hand"):
-        raise ValueError("--mil and --norm belong to the v9 design (v10 always z-scores its inputs)")
-    if args.design == "v10" and np.isfinite(float(m_tr["radius"])):
-        print("warning: v10 expects evidence without a radius cap (evidence.py --radius 0); got %.0f px"
-              % float(m_tr["radius"]), flush=True)
+    if args.design in ("v10", "v11") and (args.mil > 0 or args.norm != "hand"):
+        raise ValueError("--mil and --norm belong to the v9 design (v10 / v11 always z-score their inputs)")
+    if args.design in ("v10", "v11") and np.isfinite(float(m_tr["radius"])):
+        print("warning: %s expects evidence without a radius cap (evidence.py --radius 0); got %.0f px"
+              % (args.design, float(m_tr["radius"])), flush=True)
     if args.norm == "data":                    # the training statistics serve all splits
         stats = fit_norm(g_tr, n)
         for split in data:
@@ -438,6 +496,20 @@ def main():
         extra["sigma0"] = sigma0
         print("v10: receptive field starts at sigma0 = %.1f px (RMS token distance on train), one per %s"
               % (sigma0, args.rf_per.replace("_", " and ")), flush=True)
+
+        def fwd(g, idx):
+            feat, ok, dw, valid, z_in, z0, p, y, dist2 = fz.batch(g, idx)
+            return net(feat, ok, dw, valid, z_in, z0, p, D, dist2), valid, y
+    elif args.design == "v11":
+        fz = FeaturizerV10()
+        sigma0 = fz.fit(g_tr, n)
+        net = sdn_v11.SpikingDecisionNeuronsV11(int(m_tr["tok"].shape[1]), int(m_tr["tok"].shape[2]), sigma0,
+                                                audit=args.v11_audit, rho=args.v11_rho, gate=args.v11_gate,
+                                                rho_init=tuple(args.v11_rho_init),
+                                                ctx_mass=args.v11_ctx_mass == "on").to(dev)
+        extra.update(sigma0=sigma0, audit=args.v11_audit, rho=args.v11_rho, gate=args.v11_gate)
+        print("v11: audit %s, redundancy %s, gate %s; receptive field starts at sigma0 = %.1f px"
+              % (args.v11_audit, args.v11_rho, args.v11_gate, sigma0), flush=True)
 
         def fwd(g, idx):
             feat, ok, dw, valid, z_in, z0, p, y, dist2 = fz.batch(g, idx)
@@ -495,7 +567,11 @@ def main():
             best, best_ep = r["crossing_iou"], ep
             best_state = {k: v.detach().clone() for k, v in net.state_dict().items()}
     net.load_state_dict(best_state)
-    torch.save({"model": best_state, "args": vars(args)}, os.path.join(args.out, "decision_neurons.pt"))
+    ckpt = {"model": best_state, "args": vars(args)}
+    if args.design in ("v10", "v11"):          # input normalisation, needed to reuse the neurons (nested V11)
+        ckpt["featurizer"] = {"mu": fz.mu.cpu().tolist(), "sd": fz.sd.cpu().tolist(), "z_mu": fz.z_mu,
+                              "z_sd": fz.z_sd, "sigma0": float(extra.get("sigma0", 0.0))}
+    torch.save(ckpt, os.path.join(args.out, "decision_neurons.pt"))
     evidence = {k: (ref[k].item() if np.ndim(ref[k]) == 0 else None) for k in
                 ("alpha", "filter_alpha", "D", "past", "window_ms", "radius", "k_near", "k_evid")}
     summary = {"args": vars(args), "evidence": evidence, "best_epoch": best_ep, "val_history": hist,
@@ -504,11 +580,16 @@ def main():
         extra.update(sigma=torch.exp(net.log_sigma).detach().cpu().tolist(),
                      rf_bias=net.rf_bias.detach().cpu().tolist())
         summary["v10"] = extra
+    if args.design == "v11":                   # receptive fields, head biases, redundancy within / across windows
+        extra.update(net.learned_constants())
+        summary["v11"] = extra
     for split in ("val", "test"):
         m, g, c_np = data[split]
         lt, Lc, r = evaluate(net, fwd, m, g, D, c_np, tau, clo, chi)
+        r["calibration_slope"] = calibration_slopes(lt, m["label"].astype(bool), np.minimum(m["F"], D))
         summary[split] = r
-        np.savez(os.path.join(args.out, "raw_%s.npz" % split), lam_traj=lt.astype(np.float32), lags=Lc)
+        ex = collect_extras(net, fwd, m, g) if args.design == "v11" else {}
+        np.savez(os.path.join(args.out, "raw_%s.npz" % split), lam_traj=lt.astype(np.float32), lags=Lc, **ex)
         export(lt, m, os.path.join(args.z0_root, "z0_" + split), os.path.join(args.out, "traj_" + split),
                args.data_root, split, D)
     with open(os.path.join(args.out, "summary.json"), "w") as fh:

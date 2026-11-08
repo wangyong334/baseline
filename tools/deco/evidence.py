@@ -35,6 +35,19 @@ def bounds(tau, alpha):
     return tau - half, tau + half
 
 
+def band_bounds(tau, alpha, band="sym"):
+    """Pending band. sym: tau +- logit(1 - alpha) (V10). martingale (V11): if the calibrated posterior p is a
+    martingale, Ville's inequality bounds the chance that the decision ever flips by p0 / p_tau (background side) and
+    (1 - p0) / (1 - p_tau) (target side); the event needs a decision neuron unless that bound is <= alpha:
+    (logit(alpha p_tau), logit(1 - alpha (1 - p_tau))), p_tau = sigmoid(tau)."""
+    if band == "sym":
+        return bounds(tau, alpha)
+    if band != "martingale":
+        raise ValueError("unknown band %s" % band)
+    p_tau = 1.0 / (1.0 + math.exp(-tau))
+    return _logit(float(alpha) * p_tau), _logit(1.0 - float(alpha) * (1.0 - p_tau))
+
+
 def per_window(k, window_ms):
     return max(1, int(round(k * window_ms / 50.0)))
 
@@ -62,29 +75,19 @@ def first_k(cand, ok, k):
     return c, o
 
 
-def one_recording(job):
-    (path_z0, path_data, alpha, filter_alpha, past, depth, window_ms, radius, k_near, k_evid) = job
-    with np.load(path_z0) as tr:
-        z0_all = np.asarray(tr["traj"][:, 0], np.float32)
-        log_w = float(tr["log_w"])
-    with np.load(path_data) as d:
-        loc, norm = np.asarray(d["ev_loc"]), np.asarray(d["evs_norm"])
-    tau = _logit(THRESHOLD) - log_w
-    lo, hi = bounds(tau, alpha)
-    flo, _ = bounds(tau, filter_alpha)
-    zc = np.clip(np.nan_to_num(z0_all, nan=-20.0), -20.0, 20.0)
-    win = (loc[:, 2] // window_ms).astype(np.int64)
-    n_win = int(win.max()) + 1
-    pend = np.nonzero((z0_all > lo) & (z0_all < hi))[0]
-    offsets = list(range(-past, depth + 1))
+def candidate_picks(loc, zc, win, n_win, pend, offsets, k_near, k_evid, flo, radius):
+    """Evidence candidates of the pending events `pend` (indices into the recording): for every window offset, the
+    k_near nearest events of any kind and the k_evid nearest non-background events (zc > flo) not already picked,
+    the pending event itself excluded. Returns pick [n, n_off, K] (event indices, -1 = none), pick_ok, nall, nevid.
+    Shared by the evidence files and the nested network's evaluation (tools/deco/train_nested.py)."""
     K = k_near + k_evid
     n = pend.size
     unbounded = not np.isfinite(radius)
-    tok = np.zeros((n, len(offsets), K, 6), dtype=np.float16)
-    tok_valid = np.zeros((n, len(offsets), K), dtype=bool)
+    pick_all = np.full((n, len(offsets), K), -1, dtype=np.int64)
+    ok_all = np.zeros((n, len(offsets), K), dtype=bool)
     nall = np.zeros((n, len(offsets)), dtype=np.float32)
     nevid = np.zeros((n, len(offsets)), dtype=np.float32)
-    s_all, x_all, y_all, t_all = win[pend], loc[pend, 0], loc[pend, 1], loc[pend, 2]
+    s_all, x_all, y_all = win[pend], loc[pend, 0], loc[pend, 1]
     order = np.argsort(win, kind="stable")
     bnd = np.searchsorted(win[order], np.arange(n_win + 1))
     trees = {}
@@ -120,18 +123,39 @@ def one_recording(job):
                 evid, evid_ok = first_k(ce, oe, k_evid)
             else:
                 evid, evid_ok = np.full((q.size, k_evid), -1), np.zeros((q.size, k_evid), bool)
-            pick = np.concatenate([near, evid], 1)
             pick_ok = np.concatenate([near_ok, evid_ok], 1)
-            safe = np.where(pick_ok, pick, 0)
-            block = np.stack([loc[safe, 0] - x_all[q][:, None], loc[safe, 1] - y_all[q][:, None],
-                              loc[safe, 2] - t_all[q][:, None], np.full(safe.shape, dw), norm[safe, 3], zc[safe]],
-                             -1).astype(np.float32)
-            block[~pick_ok] = 0.0
-            tok[q, oi] = block.astype(np.float16)
-            tok_valid[q, oi] = pick_ok
+            pick_all[q, oi] = np.where(pick_ok, np.concatenate([near, evid], 1), -1)
+            ok_all[q, oi] = pick_ok
+    return pick_all, ok_all, nall, nevid
+
+
+def one_recording(job):
+    (path_z0, path_data, alpha, filter_alpha, past, depth, window_ms, radius, k_near, k_evid) = job[:10]
+    band = job[10] if len(job) > 10 else "sym"
+    with np.load(path_z0) as tr:
+        z0_all = np.asarray(tr["traj"][:, 0], np.float32)
+        log_w = float(tr["log_w"])
+    with np.load(path_data) as d:
+        loc, norm = np.asarray(d["ev_loc"]), np.asarray(d["evs_norm"])
+    tau = _logit(THRESHOLD) - log_w
+    lo, hi = band_bounds(tau, alpha, band)
+    flo, _ = bounds(tau, filter_alpha)
+    zc = np.clip(np.nan_to_num(z0_all, nan=-20.0), -20.0, 20.0)
+    win = (loc[:, 2] // window_ms).astype(np.int64)
+    n_win = int(win.max()) + 1
+    pend = np.nonzero((z0_all > lo) & (z0_all < hi))[0]
+    offsets = list(range(-past, depth + 1))
+    pick, pick_ok, nall, nevid = candidate_picks(loc, zc, win, n_win, pend, offsets, k_near, k_evid, flo, radius)
+    s_all, x_all, y_all, t_all = win[pend], loc[pend, 0], loc[pend, 1], loc[pend, 2]
+    safe = np.where(pick_ok, pick, 0)
+    dwv = np.broadcast_to(np.asarray(offsets, np.float64)[None, :, None], safe.shape)
+    block = np.stack([loc[safe, 0] - x_all[:, None, None], loc[safe, 1] - y_all[:, None, None],
+                      loc[safe, 2] - t_all[:, None, None], dwv, norm[safe, 3], zc[safe]], -1).astype(np.float32)
+    block[~pick_ok] = 0.0
+    tok = block.astype(np.float16)
     meta = {"idx": pend, "s": s_all, "x": x_all, "y": y_all, "t": t_all, "p": norm[pend, 3].astype(np.float32),
             "label": norm[pend, 4] > 0.5, "z0": z0_all[pend], "F": np.minimum(depth, n_win - 1 - s_all)}
-    return meta, tok, tok_valid, nall, nevid, log_w, int(z0_all.size)
+    return meta, tok, pick_ok, nall, nevid, log_w, int(z0_all.size)
 
 
 def main():
@@ -148,6 +172,8 @@ def main():
     ap.add_argument("--k-near", type=int, default=8, help="nearest events per 50 ms")
     ap.add_argument("--k-evid", type=int, default=8, help="nearest non-background events per 50 ms")
     ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--band", choices=("sym", "martingale"), default="sym",
+                    help="pending band: sym = tau +- logit(1 - alpha) (V10); martingale = Ville bound (V11)")
     args = ap.parse_args()
     files = sorted(glob.glob(os.path.join(args.z0_dir, "*.npz")))
     if not files:
@@ -161,7 +187,7 @@ def main():
     k_near, k_evid = per_window(args.k_near, window_ms), per_window(args.k_evid, window_ms)
     radius = args.radius if args.radius > 0 else np.inf
     jobs = [(f, os.path.join(args.data_root, args.split, os.path.basename(f)), args.alpha, args.filter_alpha, past, depth,
-             window_ms, radius, k_near, k_evid) for f in files]
+             window_ms, radius, k_near, k_evid, args.band) for f in files]
     t0 = time.time()
     parts = []
     with Pool(max(1, args.workers)) as pool:
@@ -181,6 +207,9 @@ def main():
                past=np.int64(past), window_ms=np.int64(window_ms), offsets=np.arange(-past, depth + 1),
                radius=np.float64(radius), k_near=np.int64(k_near), k_evid=np.int64(k_evid),
                n_events=np.int64(n_events))
+    tau0 = _logit(THRESHOLD) - float(parts[0][5])
+    b_lo, b_hi = band_bounds(tau0, args.alpha, args.band)
+    out.update(band=np.array(args.band), band_lo=np.float64(b_lo), band_hi=np.float64(b_hi))
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     np.savez(args.out, **out)
     print("EVIDENCE FINISHED %s: %d pending of %d events (%.2f%%), window %d ms, offsets %d..%d, radius %.0f px, "

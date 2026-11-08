@@ -46,8 +46,8 @@ def load(args, split):
     else:
         raise FileNotFoundError("no evidence for %s: %s_%s[_meta].npz" % (split, args.evidence, split))
     with np.load(path) as m:
-        ev = {k: m[k] for k in ("idx", "rec", "F", "z0", "label", "names", "log_w", "alpha", "nonpending")
-              if k in m.files}
+        ev = {k: m[k] for k in ("idx", "rec", "F", "z0", "label", "names", "log_w", "alpha", "nonpending",
+                                "band_lo", "band_hi") if k in m.files}
     lt = np.load(os.path.join(args.run, "raw_%s.npz" % split))["lam_traj"].astype(np.float64)
     D = lt.shape[1] - 1
     return ev, lt, np.minimum(ev["F"], D), D
@@ -57,11 +57,12 @@ def nonpending(args, ev, split, tau):
     """TP / FP / FN of the events that keep their arrival decision (outside the pending band)."""
     if args.z0_root:
         half = logit(1.0 - float(ev["alpha"]))
+        lo, hi = (float(ev["band_lo"]), float(ev["band_hi"])) if "band_lo" in ev else (tau - half, tau + half)
         c = np.zeros(3, np.int64)
         for name in ev["names"]:
             with np.load(os.path.join(args.z0_root, "z0_" + split, str(name))) as tr:
                 z, y = np.asarray(tr["traj"][:, 0]), np.asarray(tr["labels"]) > 0.5
-            keep = ~((z > tau - half) & (z < tau + half))
+            keep = ~((z > lo) & (z < hi))
             pred, pos = (z >= tau)[keep], y[keep]
             c += [int((pred & pos).sum()), int((pred & ~pos).sum()), int((~pred & pos).sum())]
         return c
