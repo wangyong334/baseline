@@ -15,6 +15,12 @@ gpu=${3:-}
 [ -z "$gpu" ] || [[ $gpu =~ ^[0-9]+$ ]] || { echo "gpu id must be a number"; exit 1; }
 P=run/queue/pool
 mkdir -p "$P/pending" "$P/given"
+dup=$(ls "$P"/pending/[0-9]*_"$name".sh "$P"/pending/[0-9]*_"$name"@gpu*.sh run/queue/gpu*/pending/[0-9]*_"$name".sh \
+      run/queue/gpu*/running/[0-9]*_"$name".sh 2>/dev/null | head -n 1)
+if [ -n "$dup" ] && [ "${FORCE:-0}" != 1 ]; then          # 11-08: round 4 was queued twice and the copies clobbered logs
+  echo "NOT ADDED: a job named $name is already waiting or running ($dup); FORCE=1 to add it anyway"
+  exit 1
+fi
 last=$(ls "$P/pending" "$P/given" run/queue/gpu*/pending run/queue/gpu*/running run/queue/gpu*/done \
        run/queue/gpu*/failed 2>/dev/null | sed -n 's/^\([0-9][0-9]*\)_.*/\1/p' | sort -n | tail -n 1)
 n=$(( ${last:-690} + 10 ))

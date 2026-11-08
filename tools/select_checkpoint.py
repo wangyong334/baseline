@@ -12,6 +12,9 @@ Rules:
         epochs: E1 21 (test 0.8533 vs 0.8836), E3b 24 (0.8668 vs 0.8788), V5@25 18 (val_023 0.42 vs 0.32).
     plain   (--rule plain or SELECT_RULE=plain): the epoch with the highest official pooled val IoU; on ties the first
             such epoch, i.e. the epoch of the trainer's own best_val_iou checkpoint.
+    last    (--rule last or SELECT_RULE=last; 11-08): the last epoch of the fixed schedule, no selection. For datasets
+            without an official val split (EV-Flying: our 4 held-out train recordings are too few to rank epochs;
+            they are kept for fitting the decision layer only).
 Replica of an earlier run (--reference-metrics <its metrics.jsonl>; plain rule, the reference has no per-sequence
 counts): training is deterministic, so a run stopped early that reproduces a complete earlier run bit for bit is
 selected on the earlier run's full record. Every common epoch must have the identical official val IoU, and the chosen
@@ -35,7 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.recording_groups import dense_names, group_report  # noqa: E402
 
 DELTA = 0.005
-RULES = ("plain", "guarded")
+RULES = ("plain", "guarded", "last")
 
 
 def read_records(path):
@@ -60,6 +63,13 @@ def select(table, dense=None, delta=DELTA, rule="guarded"):
     """Apply a rule. Returns a dict with the chosen epoch, the plain best-val epoch and per-epoch values."""
     if not table:
         raise ValueError("metrics.jsonl 里没有可用的轮次")
+    if rule == "last":
+        best = max(v for _, _, v in table)
+        first_best = min(e for e, _, v in table if v == best)
+        epoch, val = max((e, v) for e, _, v in table)
+        return {"rule": "last epoch of the fixed schedule (no official val split; no selection)", "epoch": epoch,
+                "best_val_epoch": first_best, "chosen": {"epoch": epoch, "val_iou": val},
+                "epochs": [{"epoch": e, "val_iou": v} for e, _, v in table]}
     if rule == "plain":
         best = max(v for _, _, v in table)
         epoch = min(e for e, _, v in table if v == best)            # first epoch reaching it = trainer's best_val_iou
@@ -184,7 +194,7 @@ def main(argv=None):
         result = select(epoch_table(records), names["val"], args.delta, rule="guarded")
         result.update(dense_rule="shot-noise regime (utils/recording_groups.py)", val_dense=names["val"])
     else:
-        result = select(epoch_table(records), rule="plain")
+        result = select(epoch_table(records), rule=args.rule)
     seed = run_seed(run, records)
     result.update(run=str(run), seed=seed)
     if args.copy:

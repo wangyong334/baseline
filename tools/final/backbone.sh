@@ -28,6 +28,10 @@ c = load_flat_config(sys.argv[1]); print(c['root'], c['height'], c['width_px'])"
   || { echo "读不出 $CFG（是否已 conda activate evuav？）"; exit 1; }
 fail() { echo "[$(date '+%m-%d %H:%M:%S')] BACKBONE $RUN seed $SEED FAILED at $1（日志 $2）"; exit 1; }
 echo "[$(date '+%m-%d %H:%M:%S')] $RUN seed $SEED 开始：配置 $CFG，GPU $CUDA_VISIBLE_DEVICES，输出 $OUT，数据 $ROOT，python $(command -v python)"
+if [ "${TRAIN:-1}" = "1" ] && { [ -e "$OUT/metrics.jsonl" ] || [ -e "$OUT/run_config_train.json" ]; }; then   # 11-08: never touch an existing run
+  echo "[$(date '+%m-%d %H:%M:%S')] BACKBONE $RUN seed $SEED FAILED at start（$OUT 里已有训练记录，不覆盖；要重训先把它挪走）"
+  exit 1
+fi
 rm -f $OUT/BACKBONE_DONE
 if [ "${TRAIN:-1}" = "1" ]; then
   python -u train_stream_v1.py --config $CFG --mode train --device ${DEVICE:-cuda:0} --seed $SEED --save-root $OUT \
