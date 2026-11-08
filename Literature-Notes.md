@@ -505,3 +505,24 @@
 | DAGr（Gehrig & Scaramuzza，Nature 629:1034，2024） | 帧 CNN + 事件异步 GNN：以 45 fps 的带宽达到 5000 fps 相机的延迟 | 检测 | 计算由事件触发、即时输出；与我们正交 |
 | Dedelayed（CVPR 2026；arXiv 2510.13714） | 远端模型预测未来帧、本地模型校正，抵消远程推理延迟 | 视频分割 | 方向与我们相反：往前猜，而不是等证据 |
 | Low-Latency Video Semantic Segmentation（Li 等，CVPR 2018） | 按预测精度逐帧分配计算的调度器 | 视频分割 | 计算时钟自适应的早期例子 |
+
+## S. PointRend 精读（11-08 下午；用户下载的 PDF `References/2026CVPR论文/事件相机与神经形态视觉方向综述/PointRend.pdf`，读了第 1～8 页）
+
+| 文献 | 问题 → 方法 | 前提 / 局限 | 对我们 |
+|---|---|---|---|
+| ★ PointRend（Kirillov、Wu、He、Girshick，CVPR 2020，arXiv 1912.08193） | 规则网格上的分割：平滑区域被过采样、边界被欠采样，输出模糊、高分辨率又太贵 → 把分割看作"渲染"，借图形学的自适应细分：先在粗网格上预测，再迭代地只在最不确定的点（概率最接近 0.5）上做细预测。三个部件：选点策略、逐点特征（细粒度特征图双线性插值 + 粗预测拼接）、共享的小 MLP 点头。训练时用"有偏随机采样 + 覆盖"（过采样 k=3、最不确定的 β=0.75 部分、其余均匀），只在采样点上算损失，和骨干一起端到端训练 | 需要的信息已经在图像里，只是分辨率不够；没有时间维；不涉及"何时下结论"。AP 提升 +1～2.8（AP 偏向内部像素、对边界不敏感），高分辨率输出时计算少 30 倍以上 | 我们是它的时间版：规则时钟在时间上欠采样难事件。区别在于我们缺的是"还没到的信息"，必须等，而它缺的是分辨率。可借：①用一个有名字的原理讲非均匀分配；②逐点特征 = 细粒度 + 粗预测（对应原始事件 + 邻居到达分）；③训练采样要保留覆盖（表 4：只采最不确定的点比均匀采样还差）；④代价表（FLOPs、激活数）；⑤接到多个骨干上证明通用 |
+
+## T. 可信度问题的跨领域机制：神经科学、昆虫视觉、计算机（11-08 晚；起因：用户问序贯决策以外还有没有可借的机制；只收 2018 年及以后；都只读了检索摘要，细节待核实）
+
+| 文献 | 问题 → 方法 | 前提 / 局限 | 对我们 |
+|---|---|---|---|
+| ★ Herzog、Drissi-Daoudi、Doerig，"All in Good Time: Long-Lasting Postdictive Effects Reveal Discrete Perception"，TiCS 24(10):826，2020 | 后发生的事能决定对几百毫秒前事件的知觉（后预测）；强制特征整合可长达约 450 ms → 两阶段模型：无意识的连续处理（存入缓冲）在前，离散的有意识判定在后 | 心理物理 + 理论；整合窗口因人而异，但不因事件而异；没有算法 | "计算和判决解耦"最直接的生物先例：连续计算 + 延后判决。我们的升级：每个事件按证据是否足够自己决定何时定案，并给误判风险上界。约 500 ms 与我们的截止接近只能当旁证 |
+| ★ Hogendoorn，"Perception in real-time: predicting the present, reconstructing the past"，TiCS 26(2):128，2022 | 神经传导有延迟，知觉无法"即时" → 知觉同时表示一条时间线：预测机制向前外推以抵消延迟，重建机制在预测失败时事后修正过去 | 综述，没有算法 | 到达分数 = 预测，判决层 = 对过去事件的重建。判决的对象是"已经发生的事件"，这一点可直接写进动机 |
+| Steinemann、Stine、Trautmann、Zylberberg、Wolpert、Shadlen，"Direct observation of the neural computations underlying a single decision"，eLife 2023（RP90859；2024 版） | 单试次的 LIP 群体活动是一个标量决策量 = 漂移 + 扩散，累积到界即定案 | 猕猴，二选一 | 序贯决策的神经实现；给"判决神经元"一个生物定义：把证据累积到界的神经元 |
+| Stone、Mattingley、Rangelov，"On second thoughts: changes of mind in decision-making"，TiCS 26(5):419，2022 | 定案后证据仍在累积，可能改主意；改主意常纠正初始错误，但有时间和代价；以"时间 × 证据来源"两维组织文献 | 行为与模型综述 | "证据够 = 截止前改主意的概率 ≤ α"有现成术语 |
+| ★ Lancer、Evans、Fabian、O'Carroll、Wiederman，J. Neurosci. 39(43):8497，2019 | 蜻蜓小目标神经元 CSTMD1：增益"聚光灯"沿目标预测轨迹前移，其余区域抑制；同一轨迹上先出现的目标即使对比度更低，也能压过突然出现的新干扰 | 电生理；机制最早见 2017 eLife（按规则不引） | "证据怎么收集"的生物依据：同源证据 = 落在预测轨迹上的后续信号，噪声没有轨迹连续性所以得不到增强 → 判决层感受野中心沿运动方向前移 + 周围抑制 |
+| "Properties of predictive gain modulation in a dragonfly visual neuron"，J. Exp. Biol.，2019（doi 10.1242/jeb.207316；作者待核实） | 预测性增益调制的空间分布：目标路径前方敏感度提高、周围抑制；不只是响应随时间慢慢累积 | 同上 | 同上；说明"沿轨迹"而不是"原地累积" |
+| Lancer 等，Commun. Biol.，2022 | 蜻蜓脑能在注意之前同时表示不止一条目标轨迹 | 同上 | 多目标时每个事件各自的轨迹证据 |
+| Wang、Zhong、Lei、Peng、Yue，"Bio-Inspired Small Target Motion Detection With Spatio-Temporal Feedback in Natural Scenes"，IEEE TIP 33:451，2024 | 仿生 STMD 模型：两个子网络 + 时空反馈回路，循环地抑制背景假阳性、增强小目标响应 | 手工滤波、帧式；只有响应，没有"何时定案" | 仿生小目标检测的最新计算模型，可作相关工作；我们是学出来的、逐事件、带截止和风险控制 |
+| Göltz 等，"Fast and energy-efficient neuromorphic deep learning with first-spike times"，Nat. Mach. Intell. 3:823，2021 | 训练 LIF 网络的首脉冲时间：证据越强越早发放，用首脉冲做分类 | 静态输入、整样本 | SNN 里"累积到阈值就发放 = 定案、发放时间 = 判决延迟"的出处；与 SEENN（停的是"算"）区分：我们停的是"等未来证据" |
+| ITST（Zhang、Feng，EMNLP 2022，arXiv 2210.12357） | 同声传译：度量每个目标词已从源端收到的信息量，累积够了才写出，按质量和延迟约束训练 | 一维、单调、一次一个输出 | 与空键权重（收集到的证据量）同类；区别：我们是密集、空间上并行的逐事件决策，共享一次骨干计算 |
