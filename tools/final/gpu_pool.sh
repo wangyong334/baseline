@@ -13,8 +13,12 @@
 # When the pool is empty the dispatcher exits and asks the runners it started on GPUs outside HOLD_GPUS to stop after
 # their current job (runners on HOLD_GPUS keep their GPU; release one with touch run/queue/gpu<id>/STOP).
 # Stop the dispatcher early: touch run/queue/pool/STOP.
+# KEEP=1 (11-08): long-running pool. The dispatcher never exits when the pool is empty and never stops runners; new
+# jobs dropped into run/queue/pool/pending/ (tools/final/pool_add.sh) start on the next free GPU. HOLD_GPUS=none: no
+# GPU keeps a placeholder (idle runners hold no GPU memory).
 # Usage (code dir, after `conda activate evuav`):
 #   GPUS="0 1 2 3" HOLD_GPUS="3" nohup bash tools/final/gpu_pool.sh >> run/queue/pool.log 2>&1 &
+#   GPUS="1 2 3" HOLD_GPUS=none KEEP=1 nohup bash tools/final/gpu_pool.sh >> run/queue/pool.log 2>&1 < /dev/null &
 #   POLL=30 FREE_POLLS=2 HOLD_GB=20 ...   poll interval (s), idle polls before taking a free GPU, placeholder size
 set -u
 cd "$(dirname "$0")/../.."
@@ -24,6 +28,7 @@ POLL=${POLL:-30}
 FREE_POLLS=${FREE_POLLS:-2}
 HOLD_GB=${HOLD_GB-20}
 HOLD_GPUS=" ${HOLD_GPUS:-3} "
+KEEP=${KEEP:-0}
 NVSMI=${NVSMI:-nvidia-smi}
 mkdir -p "$POOL/pending" "$POOL/given"
 ts() { date '+%m-%d %H:%M:%S'; }
@@ -42,7 +47,12 @@ job_for() {                            # first pool job (file-name order) that G
 
 runner_alive() {                       # our gpu_queue.sh runner for GPU $1: pid file, or its environment
   local f=run/queue/gpu$1/runner.pid p env
-  if [ -f "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null; then return 0; fi
+  if [ -f "$f" ]; then                 # the pid must still be a gpu_queue.sh process (pids get reused)
+    p=$(cat "$f")
+    if kill -0 "$p" 2>/dev/null && { tr '\0' ' ' < "/proc/$p/cmdline"; } 2>/dev/null | grep -q "gpu_queue.sh"; then
+      return 0
+    fi
+  fi
   for p in $(pgrep -f "tools/final/gpu_queue.sh" 2>/dev/null); do
     env=$( { tr '\0' '\n' < "/proc/$p/environ"; } 2>/dev/null ) || continue
     if echo "$env" | grep -qx "QNAME=gpu$1"; then return 0; fi
@@ -81,6 +91,10 @@ while true; do
     rm -f "$POOL/STOP"
     echo "[$(ts)] STOP found: dispatcher exits ($(pool_size) jobs left in the pool)"
     exit 0
+  fi
+  if [ "$(pool_size)" -eq 0 ] && [ "$KEEP" = 1 ]; then
+    sleep "$POLL"
+    continue
   fi
   if [ "$(pool_size)" -eq 0 ]; then
     for g in ${started[@]+"${started[@]}"}; do
