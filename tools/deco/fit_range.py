@@ -81,8 +81,10 @@ def fit_range(X, lt, F_, D, alpha, rows, steps=4000, seed=0):
     net.eval()
 
     def predict(Xq):
-        with torch.no_grad():
-            out = net(torch.as_tensor((Xq - mu) / sd)).numpy()
+        with torch.no_grad():                                        # in blocks of rows (all-event exports are large)
+            out = np.concatenate([net(torch.as_tensor((Xq[a:a + 65536] - mu) / sd)).numpy()
+                                  for a in range(0, len(Xq), 65536)]) if len(Xq) else np.zeros(Xq.shape[:-1] + (2,),
+                                                                                                np.float32)
         lo, hi = out[..., 0].copy(), np.maximum(out[..., 1], out[..., 0])
         lo[..., D], hi[..., D] = 0.0, 0.0                           # the deadline: nothing left to come
         return lo, hi

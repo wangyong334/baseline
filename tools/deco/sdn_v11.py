@@ -107,67 +107,100 @@ class SpikingDecisionNeuronsV11(nn.Module):
     def sigma(self):
         return torch.exp(self.log_sigma)
 
-    def forward(self, feat, ok, dw, valid, z_in, z0, p, D, dist2):
-        if D > self.dmax:
-            raise ValueError("D = %d exceeds the age table (%d)" % (D, self.dmax))
-        B, H, hd = z0.shape[0], self.heads, self.hd
-        T = feat.shape[1]
-        c0 = self.c0(torch.stack([z_in, p], 1))
-        c = c0
+    def _prepare(self, feat, dist2):
+        """Token keys / summaries / value inputs and the receptive-field prior of every token."""
+        B, T, H, hd = feat.shape[0], feat.shape[1], self.heads, self.hd
         kt = self.ln_k(self.tok(feat))                                       # [B, T, dim]
         Kt = self.wk(kt).view(B, T, H, hd)
         Et = self.we(kt).view(B, T, H, hd)
         Vt = self.v_tok(kt)
         prior = self.rf_bias[None, :, None] - dist2[:, None, :] / (2.0 * self.sigma()[None, :, None] ** 2)
+        return Kt, Et, Vt, prior
+
+    def _step(self, d, c, c0, U, z0, prep, ok, dw, m, rho_w, rho_t):
+        """One step d of the neuron: audit of the arrived tokens with the context c entering the step. Returns the new
+        membrane, the new context and (gates, attributed mass, effective count, per-head evidence).
+        d: int (all rows at the same step) or LongTensor [B] (one step per row; streaming use, V12)."""
+        Kt, Et, Vt, prior = prep
+        B, H, hd = z0.shape[0], self.heads, self.hd
+        dd = d.to(dw.dtype)[:, None] if torch.is_tensor(d) else d
+        if self.audit == "reaudit":
+            sel = ok & (dw <= dd + 0.5)
+        elif torch.is_tensor(d):
+            sel = ok & torch.where(dd < 0.5, dw <= 0.5, (dw - dd).abs() < 0.5)
+        elif d == 0:
+            sel = ok & (dw <= 0.5)
+        else:
+            sel = ok & ((dw - d).abs() < 0.5)
+        q = self.wq(self.ln_q(c + self.age.weight[d])).view(B, H, hd)
+        logit = torch.einsum("bhd,bthd->bht", q, Kt) / math.sqrt(hd) + prior          # [B, H, T]
+        selh = sel[:, None, :]
+        if self.gate == "sigmoid":
+            a = torch.sigmoid(logit) * selh.float()
+        elif self.gate == "compete":                                                     # responsibilities
+            a = torch.softmax(torch.cat([torch.zeros_like(logit[:, :1]), logit], 1), 1)[:, 1:] * selh.float()
+        else:
+            L = logit.masked_fill(~selh, float("-inf"))
+            mx = L.max(-1, keepdim=True)[0]
+            mx = torch.where(torch.isfinite(mx), mx, torch.zeros_like(mx))
+            e = torch.exp(L - mx) * selh.float()
+            a = e / e.sum(-1, keepdim=True).clamp(min=1e-12)
+        v = self.v_out(F.gelu(Vt + self.v_ctx(c)[:, None, :])).permute(0, 2, 1)       # [B, H, T]
+        if self.value == "ei":
+            v = F.softplus(v)                                   # log(1 + intensity ratio) >= 0
+        S = (a * v).sum(-1)                                                             # [B, H]
+        M = a.sum(-1)
+        if self.gate == "softmax":
+            lam_h, ne = S, M
+        else:
+            mw = a.view(B, H, -1, self.K).sum(-1)              # [B, H, windows]; V12 may pass the arrived ones only
+            lam_h, ne = redundancy_evidence(S, M, mw, rho_w, rho_t)
+        if self.value == "ei":
+            lam_h = lam_h * self.head_sign                      # target channel excites, background inhibits
+        lam = lam_h.sum(-1)
+        if self.audit == "reaudit":
+            U = torch.where(m, z0 + lam, U)
+        else:
+            U = U + m.float() * lam
+        ubar = torch.einsum("bht,bthd->bhd", a, Et) / (M[..., None] + EPS)
+        mass_in = torch.log1p(M) if self.ctx_mass else torch.zeros_like(M)
+        dc = self.wo(ubar.reshape(B, self.dim)) + self.wm(torch.cat([mass_in, lam_h], -1))
+        dc = dc + self.ff(self.ln_f(dc))
+        if self.audit == "reaudit":
+            c = torch.where(m[:, None], c0 + dc, c)
+        else:
+            c = c + m.float()[:, None] * dc
+        return U, c, (a, M, ne, lam_h)
+
+    def stream_start(self, z_in, p):
+        """Context of newly born neurons (streaming use, V12): c0 = MLP(z_in, p)."""
+        return self.c0(torch.stack([z_in, p], 1))
+
+    def stream_step(self, feat, ok, dw, dist2, z0, c0, c, U, d):
+        """Advance live neurons by one step d (streaming use, V12; d int or LongTensor [B], one step per row). Tokens
+        of windows not arrived yet may be present or absent (ok False): step d only audits tokens with dw <= d, so the
+        result equals column d of forward(). Returns the membrane U(d), the context after step d, and the attributed
+        mass and effective count summed over heads (the range head's inputs)."""
+        dmax = int(d.max()) if torch.is_tensor(d) else int(d)
+        if dmax > self.dmax:
+            raise ValueError("step %d exceeds the age table (%d)" % (dmax, self.dmax))
+        rho_w, rho_t = self.rho()
+        m = torch.ones(z0.shape[0], dtype=torch.bool, device=z0.device)
+        U, c, aux = self._step(d, c, c0, U, z0, self._prepare(feat, dist2), ok, dw, m, rho_w, rho_t)
+        return U, c, aux[1].sum(-1), aux[2].sum(-1)
+
+    def forward(self, feat, ok, dw, valid, z_in, z0, p, D, dist2):
+        if D > self.dmax:
+            raise ValueError("D = %d exceeds the age table (%d)" % (D, self.dmax))
+        c0 = self.c0(torch.stack([z_in, p], 1))
+        c = c0
+        prep = self._prepare(feat, dist2)
         rho_w, rho_t = self.rho()
         U = z0.clone()
         outs, mass, neff, lam_heads = [], [], [], []
         for d in range(D + 1):
-            if self.audit == "reaudit":
-                sel = ok & (dw <= d + 0.5)
-            elif d == 0:
-                sel = ok & (dw <= 0.5)
-            else:
-                sel = ok & ((dw - d).abs() < 0.5)
-            q = self.wq(self.ln_q(c + self.age.weight[d])).view(B, H, hd)
-            logit = torch.einsum("bhd,bthd->bht", q, Kt) / math.sqrt(hd) + prior          # [B, H, T]
-            selh = sel[:, None, :]
-            if self.gate == "sigmoid":
-                a = torch.sigmoid(logit) * selh.float()
-            elif self.gate == "compete":                                                     # responsibilities
-                a = torch.softmax(torch.cat([torch.zeros_like(logit[:, :1]), logit], 1), 1)[:, 1:] * selh.float()
-            else:
-                L = logit.masked_fill(~selh, float("-inf"))
-                mx = L.max(-1, keepdim=True)[0]
-                mx = torch.where(torch.isfinite(mx), mx, torch.zeros_like(mx))
-                e = torch.exp(L - mx) * selh.float()
-                a = e / e.sum(-1, keepdim=True).clamp(min=1e-12)
-            v = self.v_out(F.gelu(Vt + self.v_ctx(c)[:, None, :])).permute(0, 2, 1)       # [B, H, T]
-            if self.value == "ei":
-                v = F.softplus(v)                                   # log(1 + intensity ratio) >= 0
-            S = (a * v).sum(-1)                                                             # [B, H]
-            M = a.sum(-1)
-            if self.gate == "softmax":
-                lam_h, ne = S, M
-            else:
-                mw = a.view(B, H, self.n_off, self.K).sum(-1)                               # [B, H, n_off]
-                lam_h, ne = redundancy_evidence(S, M, mw, rho_w, rho_t)
-            if self.value == "ei":
-                lam_h = lam_h * self.head_sign                      # target channel excites, background inhibits
-            lam = lam_h.sum(-1)
             m = valid[:, d]
-            if self.audit == "reaudit":
-                U = torch.where(m, z0 + lam, U)
-            else:
-                U = U + m.float() * lam
-            ubar = torch.einsum("bht,bthd->bhd", a, Et) / (M[..., None] + EPS)
-            mass_in = torch.log1p(M) if self.ctx_mass else torch.zeros_like(M)
-            dc = self.wo(ubar.reshape(B, self.dim)) + self.wm(torch.cat([mass_in, lam_h], -1))
-            dc = dc + self.ff(self.ln_f(dc))
-            if self.audit == "reaudit":
-                c = torch.where(m[:, None], c0 + dc, c)
-            else:
-                c = c + m.float()[:, None] * dc
+            U, c, (a, M, ne, lam_h) = self._step(d, c, c0, U, z0, prep, ok, dw, m, rho_w, rho_t)
             outs.append(U)
             if self.keep_extras:
                 last_a = torch.where(m[:, None, None], a, last_a) if d else a      # gates at the last valid step

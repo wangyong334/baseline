@@ -116,8 +116,11 @@ def fit(X, lt, F_, tau, D, rows, steps=3000, batch=4096, seed=0):
     head.eval()
 
     def predict(Xq):
-        with torch.no_grad():
-            return torch.sigmoid(head(torch.as_tensor((Xq - mu) / sd))).numpy()
+        with torch.no_grad():                                        # in blocks of rows (all-event exports are large)
+            if not len(Xq):
+                return np.zeros(Xq.shape[:-1], np.float32)
+            return np.concatenate([torch.sigmoid(head(torch.as_tensor((Xq[a:a + 65536] - mu) / sd))).numpy()
+                                   for a in range(0, len(Xq), 65536)])
 
     return predict, {"model": head.state_dict(), "mu": mu.tolist(), "sd": sd.tolist(), "rows": int(len(y)),
                      "change_rate": float(y.mean())}
