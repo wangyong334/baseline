@@ -97,7 +97,7 @@ def build(args, device):
     big = sdn_v11.SpikingDecisionNeuronsV11(P + D + 1, K, sigma0, audit=s1.get("v11_audit", "reaudit"),
                                             rho=s1.get("v11_rho", "learn"), gate=s1.get("v11_gate", "sigmoid"),
                                             rho_init=rho_init, ctx_mass=s1.get("v11_ctx_mass", "on") == "on",
-                                            n_extra=args.report_dim)
+                                            n_extra=args.report_dim, value=s1.get("v11_value", "signed"))
     big.load_stage1(state)
     report = NV.ReportHead(small, args.report_dim)
     model = NV.NestedDeCo(small, big, report, fz["mu"], fz["sd"], fz["z_mu"], fz["z_sd"], int(ev["window_ms"])).to(device)

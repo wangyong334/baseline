@@ -23,7 +23,8 @@ Design v10 (--design v10, 11-07; DECO_PROBE_LOG 7.5-7.9), adopted after the loca
 Design v11 (--design v11, 11-08; tools/deco/sdn_v11.py, Res/v11_design/V11_DESIGN.md): spiking decision neurons from
     sequential decision theory -- membrane = prior z0 + attributed, redundancy-corrected evidence of every arrived event
     (independent sigmoid attribution gates, learned redundancy rho within / across windows, each event counted once,
-    re-audited every step); options --v11-audit / --v11-rho / --v11-gate for the ablations. Same inputs as v10. Commit
+    re-audited every step); options --v11-audit / --v11-rho / --v11-gate / --v11-value for the ablations and the
+    opponent target / background channels (11-09). Same inputs as v10. Commit
     timing: tools/deco/fit_range.py (two thresholds from the neuron's own predicted future range).
 All designs: summary.json also gets the per-step calibration slope of Lambda on val / test (1 = calibrated; a slope
     that falls with the step means evidence is being over-counted).
@@ -430,8 +431,12 @@ def main():
                     help="v11: re-audit every arrived event each step (default) or add only the new window")
     ap.add_argument("--v11-rho", choices=("learn", "sum", "mean"), default="learn",
                     help="v11: learned redundancy (default), plain sum (rho = 0) or attributed mean (rho = 1)")
-    ap.add_argument("--v11-gate", choices=("sigmoid", "softmax"), default="sigmoid",
-                    help="v11: independent attribution gates (default) or a softmax over the arrived events")
+    ap.add_argument("--v11-gate", choices=("sigmoid", "softmax", "compete"), default="sigmoid",
+                    help="v11: independent attribution gates (default), a softmax over the arrived events, or heads "
+                         "competing for every event (mixture responsibilities with an 'unrelated' option)")
+    ap.add_argument("--v11-value", choices=("signed", "ei"), default="signed",
+                    help="v11: signed evidence values (default) or opponent channels: target heads excite, background "
+                         "heads inhibit, every value log(1 + intensity ratio) >= 0")
     ap.add_argument("--v11-rho-init", type=float, nargs=2, default=(0.5, 0.12), metavar=("RHO_W", "RATIO_T"),
                     help="v11: starting rho_w and rho_t / rho_w (identifiability check: different starts should meet)")
     ap.add_argument("--v11-ctx-mass", choices=("on", "off"), default="on",
@@ -506,10 +511,10 @@ def main():
         net = sdn_v11.SpikingDecisionNeuronsV11(int(m_tr["tok"].shape[1]), int(m_tr["tok"].shape[2]), sigma0,
                                                 audit=args.v11_audit, rho=args.v11_rho, gate=args.v11_gate,
                                                 rho_init=tuple(args.v11_rho_init),
-                                                ctx_mass=args.v11_ctx_mass == "on").to(dev)
-        extra.update(sigma0=sigma0, audit=args.v11_audit, rho=args.v11_rho, gate=args.v11_gate)
-        print("v11: audit %s, redundancy %s, gate %s; receptive field starts at sigma0 = %.1f px"
-              % (args.v11_audit, args.v11_rho, args.v11_gate, sigma0), flush=True)
+                                                ctx_mass=args.v11_ctx_mass == "on", value=args.v11_value).to(dev)
+        extra.update(sigma0=sigma0, audit=args.v11_audit, rho=args.v11_rho, gate=args.v11_gate, value=args.v11_value)
+        print("v11: audit %s, redundancy %s, gate %s, values %s; receptive field starts at sigma0 = %.1f px"
+              % (args.v11_audit, args.v11_rho, args.v11_gate, args.v11_value, sigma0), flush=True)
 
         def fwd(g, idx):
             feat, ok, dw, valid, z_in, z0, p, y, dist2 = fz.batch(g, idx)

@@ -526,3 +526,36 @@
 | Wang、Zhong、Lei、Peng、Yue，"Bio-Inspired Small Target Motion Detection With Spatio-Temporal Feedback in Natural Scenes"，IEEE TIP 33:451，2024 | 仿生 STMD 模型：两个子网络 + 时空反馈回路，循环地抑制背景假阳性、增强小目标响应 | 手工滤波、帧式；只有响应，没有"何时定案" | 仿生小目标检测的最新计算模型，可作相关工作；我们是学出来的、逐事件、带截止和风险控制 |
 | Göltz 等，"Fast and energy-efficient neuromorphic deep learning with first-spike times"，Nat. Mach. Intell. 3:823，2021 | 训练 LIF 网络的首脉冲时间：证据越强越早发放，用首脉冲做分类 | 静态输入、整样本 | SNN 里"累积到阈值就发放 = 定案、发放时间 = 判决延迟"的出处；与 SEENN（停的是"算"）区分：我们停的是"等未来证据" |
 | ITST（Zhang、Feng，EMNLP 2022，arXiv 2210.12357） | 同声传译：度量每个目标词已从源端收到的信息量，累积够了才写出，按质量和延迟约束训练 | 一维、单调、一次一个输出 | 与空键权重（收集到的证据量）同类；区别：我们是密集、空间上并行的逐事件决策，共享一次骨干计算 |
+
+## U. 怎样把原理做成新颖的网络架构：方法论、部件、画法（11-09 凌晨定时任务；起因：用户担心"不会构建新颖的网络架构"，要求查文献和社区讨论、学架构图；只收 2018 年及以后；除标注"读了全文"的以外都只读了检索摘要）
+
+| 文献 | 问题 → 方法 | 前提 / 局限 | 对我们 |
+|---|---|---|---|
+| ★ Monga、Li、Eldar，"Algorithm Unrolling: Interpretable, Efficient Deep Learning for Signal and Image Processing"，IEEE SPM 38(2):18，2021（arXiv 1912.10557） | 通用网络是黑箱、要大量数据 → 把一个迭代算法按迭代展开成层，每层 = 一次迭代，算法里手设的量（步长、阈值）改成学的 | 要有一个结构确定的迭代算法；层数远少于原算法的迭代次数 | 判决神经元就是"展开的序贯检验"：一步 = 一窗；膜电位 = 后验对数几率、每个事件只记一笔、发放一次、截止，这些由算法定死，只有似然比（突触）是学的。架构图要画成"沿窗展开"，并标出哪些是学的、哪些由原理定 |
+| ★ Shlezinger、Whang、Eldar、Dimakis，"Model-Based Deep Learning"，Proc. IEEE 2023（arXiv 2012.08405） | 两类做法：①模型辅助的网络（按模型定制架构，如展开）；②网络辅助的推断（推断由模型算法完成，网络只替换其中未知的部分） | 综述 | V11 属于②：推断 = 序贯检验，网络给出未知的似然比。方法节第一句就用这个分类，审稿人有现成的框架 |
+| ★ KalmanNet（Revach、Shlezinger、Ni、López Escoriza、van Sloun、Eldar，IEEE TSP 70，2022；arXiv 2107.10043） | 动态部分已知、噪声统计未知 → 保留卡尔曼滤波的步骤，只用 RNN 学卡尔曼增益；模型失配时优于 EKF / UKF / 粒子滤波。无监督版（arXiv 2110.09005）用滤波器自己的"下一观测预测"算损失；Split-KalmanNet（IEEE TVT 2023）把两种失配分给两个网络 | 状态空间模型 | "只学模型不知道的部分"的范例。无监督版"用自己的内部预测作训练信号" = 我们无标签的自预测范围阈值（目标是自己截止时的膜电位）；Split 版"两种失配分开学" ≈ 目标 / 背景两个证据通道 |
+| ★ Slot Attention（Locatello 等，NeurIPS 2020，arXiv 2006.15055） | 无监督地把输入分给若干槽 → softmax 沿"槽"归一化（每个输入的归属在槽之间分配），槽为解释输入而竞争、从而分工；更新用加权平均而不是加权和，更稳定 | 槽数固定；迭代式 | 我们 `--v11-gate compete` 用的是同一个归一化轴（各头竞争每个邻居事件），另加一个"无关"选项；ρ = 1（平均）与它"加权平均更稳"一致，可作为固定 ρ = 1 的旁证 |
+| Evan Miller，"Attention Is Off By One"（博客，2023-07-24，evanmiller.org）；后续 Softpick（arXiv 2504.20966，2025） | softmax 的权重和恒为 1，没有可看的东西时也得看 → 分母加 1：exp(x_i) / (1 + Σ exp(x_j))，一个头可以"什么都不看"；社区里讨论很多，与"注意力汇点"有关 | 博客 + 社区实验，结论不一 | 竞争门里的"+1 = 无关"就是这个设计；V10 的空键（注意力汇点）、V11 的 sigmoid 门是同一问题（什么都没到）的另外两种答法 |
+| ★ Cornford 等，"Learning to live with Dale's principle: ANNs with separate excitatory and inhibitory units"，ICLR 2021；Li 等，"Learning better with Dale's Law: A Spectral Perspective"，NeurIPS 2023 | 生物神经元的突触要么全兴奋、要么全抑制（Dale 原理），通常认为强加它会伤训练 → 前馈抑制式的 E / I 分群网络，学得和普通网络一样好；作者自己说"持平，不超过" | 分类任务；不讲可解释性 | 两通道证据突触（目标通道兴奋、背景通道抑制、值非负）的直接依据；预期是"精度不变、可解释性由结构保证"，不能说它涨点（本地结果确实持平） |
+| Zhu 等，"Task success in trained spiking neural network models coincides with emergence of cross-stimulus-modulated inhibition"，Biol. Cybern. 2025（doi 10.1007/s00422-025-01030-4） | 按小鼠皮层连接统计搭的 E / I 脉冲网络，训练成功时会自发出现"推–拉"式（对立）抑制 | 生物建模 | 探针 4 里各头自发按"像目标 / 像背景"分工，与这里"训练会自发出现对立通道"一致；把它显式化是顺势而为 |
+| ★ Shchur 等，"Neural Temporal Point Processes: A Review"，IJCAI 2021（arXiv 2104.03528）；"Advances in Temporal Point Processes"（arXiv 2501.14291，2025） | 事件序列的对数似然 = Σ 事件处的 log 强度 − 强度的积分（补偿项 / 期望个数） | 时间点过程；积分常需数值近似 | 事件流是点过程。两个假设"邻域里有目标簇 / 有背景簇"的对数似然比 = Σ log(1 + 强度比)（每个事件一项，非负）之差 − 期望个数之差。所以 softplus(·) = log(1 + exp(·)) 正是"一个事件的点项"，两通道相减就是 LLR；补偿项（"该来没来"的反证）现在被值函数吸收，显式化可作为后续选项 |
+| ★ ConvNeXt（Liu 等，CVPR 2022，arXiv 2201.03545） | 从 ResNet-50 出发，按组（宏观设计、分组卷积、倒瓶颈、大核、微观设计）一步一步改，每一步给精度，未采纳的改动画成斜线柱；算力大致保持不变 | 只说"做了什么"，不讲原理 | 把 V10 → V11 画成同样的路线图：重新核账、ρ = 1、自预测范围阈值、两通道、嵌套联合；冻结旧账、求和、学 ρ、softmax、竞争门等画成未采纳的斜线柱。E1 表已经是这张图的数据 |
+| RegNet（Radosavovic 等，"Designing Network Design Spaces"，CVPR 2020，arXiv 2003.13678） | 比较"设计空间"（一族模型的误差分布），而不是单个最好的模型 | 需要大量采样 | 我们的"拉平器"结论（弱骨干 0.74～0.87 → 0.907～0.914）是族层面的结论，应该画成"各骨干加 / 不加判决层"的分布，而不是只报最好的骨干 |
+| ★ Google Research，"Deep Learning Tuning Playbook"（2023，developers.google.com/machine-learning/guides/deep-learning-tuning-playbook） | 超参数分三类：科学的（要研究其作用）、讨厌的（为公平比较需要调）、固定的；把讨厌的固定下来会给结论加限定，它与科学参数交互越强越糟 | 经验指南 | 常数表照此三分：科学的 = 核账方式、ρ、门、值的形式、定案规则；讨厌的 = 学习率、轮数、宽度（全部变体沿用 V10 的值、没有逐个调，结论带这个限定，且对新变体不利）；固定的（有含义）= α、截止 D、过去 P、候选 K、官方阈值 0.9 |
+| Karpathy，"A Recipe for Training Neural Networks"（博客，2019-04-25） | 先建基线、先在少量样本上过拟合、再一点点加容量和正则 | 经验 | 新部件零初始化（训练开始时 U 严格等于 z0、嵌套版严格等于分段版）就是"从能用的基线出发"，可以在实现细节里点一句 |
+| Battaglia 等，"Relational inductive biases, deep learning, and graph networks"，arXiv 1806.01261（2018） | 架构 = 关于实体和关系的归纳偏置；图网络块 = 边更新、节点更新、全局更新，对置换不变 | 框架性综述 | 判决神经元可以用图网络块的语言讲：边 = 归属门 × 证据值，节点 = 膜电位，全局 = 上下文；不同点是边的权重有概率含义、聚合按冗余折算 |
+| Bronstein、Bruna、Cohen、Veličković，"Geometric Deep Learning: Grids, Groups, Graphs, Geodesics, and Gauges"，arXiv 2104.13478（2021） | 从对称性和不变性推出架构（CNN = 平移，GNN = 置换） | 框架性 | 把我们的不变性写成设计约束：邻居事件的置换不变（集合聚合）、平移不变（只用相对的 dx、dy、dt）、因果（只看已到达的）、窗平移等变（相对窗偏移）。这也解释了 6 个 token 特征为什么都是相对量 |
+| Universal Transformers（Dehghani 等，ICLR 2019，arXiv 1807.03819）；PonderNet（Banino 等，2021，arXiv 2107.05407）；Mixture-of-Depths（Raposo 等，2024，arXiv 2404.02258） | 逐位置 / 逐 token 自适应计算：UT 用 ACT 让每个位置决定迭代几步；PonderNet 学每步的停止概率（几何先验）；MoD 用 top-k 路由决定哪些 token 进这一层 | 停的都是"在同一输入上再算几步"；停止靠计算代价项或预算 | 相关工作里要分清"多算"和"多等"：我们停的是"等未来的证据"，停止规则由风险水平 α 定、有相对截止的遗憾上界、无标签校准，不用代价系数 |
+| Net2Vis（Bäuerle 等，IEEE TVCG 2021，arXiv 1902.04394） | 分析 751 张 CVPR / ICCV 架构图：大多从左到右；图元表示层或层的组合，线表示连接；作者多半没有可视化训练，图不统一 | 针对 CNN | 架构图从左到右，事件流在左、定案脉冲在右 |
+| ★ Marshall、Freitas、Jay，"An evidence-based guidance framework for neural network system diagrams"，PLoS One 20(3):e0318800，2025（读了全文） | 12 条规范：A 用常规图形；B 信息流只用一种箭头；C 数字要谨慎（画 4 个会被当成恰好 4 个）；D 画出整个系统的输入和输出；E 全图贯穿一个具体例子；F 视觉编码要有理由；G 便于导航（层和箭头都标名、线性对齐）；H 颜色只表示分组，不为好看；I 用领域惯例；J 读者预期看到的要画，省略要在图注说明；K 要具体（写"BERT"，不写"embedding"）；L 有人只看图不读正文。用户研究：图评分高的，读者对"系统怎么工作"答得更好（p = 0.003）；单条规范的作用没有拆开测 | 10 人的研究；没有"怎么突出创新部件"的建议 | 我们的图：贯穿一个目标事件和一个闪烁噪声事件，从到达、出生、各窗的两通道电流、阈值收拢到发放；颜色只分"时钟驱动的小网络 / 事件驱动的判决神经元"和"目标 / 背景通道"；模块写具体名（BIR U-Net、判决神经元），不写"backbone / head" |
+| Reddit 机器学习板块的相关讨论（第三方镜像，个人观点）；Unlearn.AI，"How to excel at ML research"（博客） | 新架构多从"现有设计缺什么"出发（注意力针对 RNN 的上下文限制，U-Net 针对"既要全局又要细节"）；先建基线，再加复杂的东西 | 社区观点，不是共识 | 与"问题先行"的做法一致：我们的问题是"截止前每个事件的证据何时够"，结构由它推出 |
+| Ahmed、Finkbeiner、Neftci，"Efficient Event-Based Object Detection: A Hybrid Neural Network with Spatial and Temporal Attention"，CVPR 2025 | 事件检测：SNN–ANN 混合骨干 + 时空注意力，兼顾能效与精度 | 检测 | CVPR 上事件 SNN 的主流是"按层混合"；我们的嵌套是"按角色分工"（时钟驱动的先验 + 事件驱动的判决），可作对比 |
+| 开放词汇事件检测（arXiv 2510.00681，2025） | 混合 SNN–CNN；SNN 学"何时切片"，用检测结果反馈的损失调膜电位、让它在合适的时间步发放 | 切的是输入，不是逐事件定案 | "让 SNN 决定时间"的近期例子，相关工作 |
+
+**对我们的做法（归纳）**
+1. **原理 → 结构走"网络辅助的推断"**：推断算法（带截止的序贯检验）固定，网络只学模型不知道的部分（每个邻居事件的似然比）。与 KalmanNet 的位置相同，审稿人熟悉。架构图画成"沿窗展开的检验"，学的部件与原理定死的部件用不同底色。
+2. **不变性写成约束**：置换不变、平移不变、因果、窗平移等变，解释 token 为什么只用相对量。
+3. **部件的选法有名有据**：独立门 / 竞争门（Slot Attention 的归一化轴，+1 = 无关，即 softmax₁）；E / I 两通道（Dale 原理，值 = 点过程 LLR 的点项 log(1 + 强度比)）；ρ = 1（加权平均更稳，Slot Attention）。都只主张"可解释、不掉点"，不主张涨点。
+4. **呈现**：ConvNeXt 式路线图（每步一柱，采纳 / 未采纳），RegNet 式的族层面结论（多骨干、多种子），图按 Marshall 等 12 条画（贯穿一个例子、颜色只分组、写具体模块名）。
+5. **常数**按调参手册三分，写进实现细节。
+6. **相关工作分清"多算"（UT、PonderNet、MoD、CALM）和"多等"（我们）。**

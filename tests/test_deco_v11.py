@@ -7,6 +7,9 @@
        outside every receptive field change nothing, near events do; ledger mode freezes old entries; softmax ablation
        runs; rho_t <= rho_w; no NaN when nothing has arrived
     3. Calibration slope diagnostic: about 1 on calibrated logits, about 1/2 when the logits are doubled
+    4. Options of 11-09: opponent channels (value="ei") start exactly at z0 with rho = 1 and keep their signs (target
+       heads >= 0, background heads <= 0) whatever the weights; competing gates give every event a total attribution
+       below one; the channel sign is not saved, and checkpoints that saved it still load
 """
 import os
 import sys
@@ -167,6 +170,46 @@ class NeuronTests(unittest.TestCase):
         for name in ("r_w", "r_t", "log_sigma", "rf_bias"):
             self.assertIsNotNone(getattr(net, name).grad)
             self.assertTrue(bool(torch.isfinite(getattr(net, name).grad).all()))
+
+
+class OpponentAndCompeteTests(unittest.TestCase):
+    def test_opponent_channels(self):
+        x = inputs()
+        net = make(nonzero=False, value="ei", rho="mean")
+        with torch.no_grad():
+            U = net(*x)
+        torch.testing.assert_allclose(U, x[5][:, None].expand_as(U))          # target and background cancel at start
+        for rho in ("mean", "learn", "sum"):
+            net = make(value="ei", rho=rho)
+            net.keep_extras = True
+            with torch.no_grad():
+                U = net(*x)
+            lam = net.extras["lam_heads"]                                      # [B, D + 1, H]
+            self.assertTrue(bool(torch.isfinite(U).all()))
+            self.assertTrue(bool((lam[..., :2] >= 0).all()) and bool((lam[..., 2:] <= 0).all()))
+            torch.testing.assert_allclose(U, x[5][:, None] + lam.sum(-1))
+        with self.assertRaises(ValueError):
+            S.SpikingDecisionNeuronsV11(7, 4, sigma0=20.0, heads=3, value="ei")
+
+    def test_compete_gates(self):
+        x = inputs()
+        net = make(gate="compete")
+        net.keep_extras = True
+        with torch.no_grad():
+            U = net(*x)
+        a = net.extras["gates"]                                                # [B, H, T]
+        self.assertTrue(bool(torch.isfinite(U).all()))
+        self.assertTrue(bool((a.sum(1) < 1.0).all()) and bool((a >= 0).all()))
+        self.assertTrue(bool((a.sum(1)[~x[1]] == 0).all()))                    # events that never arrive get nothing
+
+    def test_sign_not_saved(self):
+        net = make(value="ei", rho="mean")
+        st = net.state_dict()
+        self.assertNotIn("head_sign", st)
+        st["head_sign"] = torch.ones(4)                                        # as saved by a few 11-09 runs
+        net2 = S.SpikingDecisionNeuronsV11(7, 4, sigma0=20.0, value="ei", rho="mean")
+        net2.load_state_dict(st)
+        self.assertEqual(net2.head_sign.tolist(), [1.0, 1.0, -1.0, -1.0])
 
 
 class BandTests(unittest.TestCase):

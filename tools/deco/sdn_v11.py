@@ -23,6 +23,15 @@ it is never added twice); the context is c = c0 + summary(audit). audit="ledger"
 window and freezes earlier entries (pure integrator, context accumulates).
 Ablations: rho="sum" / "mean" fix rho; gate="softmax" replaces the gates by a softmax over the arrived events (weighted
 mean of the values, the attention-style aggregation without evidence mass).
+Options (11-09; defaults keep the 11-08 neuron):
+    value="ei"     opponent excitatory / inhibitory channels: the first half of the heads is the target channel, the
+                   second half the background channel; every value is v = softplus(.) = log(1 + intensity ratio) >= 0,
+                   and the membrane is z0 + sum_target lambda_h - sum_background lambda_h (the log-likelihood ratio of
+                   "the event's neighbourhood holds a target cluster" vs "a background cluster" in a Poisson-cluster
+                   model, the expected-count terms absorbed in the values). With rho = 1 it starts at z0.
+    gate="compete" the heads compete for every event: a_hj = exp(l_hj) / (1 + sum_h' exp(l_h'j)) (mixture
+                   responsibilities, the extra 1 = "unrelated"), so one event is target evidence, background evidence
+                   or neither, never all at once.
 Training: stepwise BCE on U(k) (tools/deco/train_dnm.py --design v11), so every U(k) estimates the posterior and
 U(k) - U(k - 1) the conditional likelihood ratio of what arrived. Commit timing (two thresholds from the neuron's own
 predicted future range) is fitted afterwards on held-out trajectories by tools/deco/fit_range.py.
@@ -46,13 +55,18 @@ def redundancy_evidence(S, M, mw, rho_w, rho_t):
 
 class SpikingDecisionNeuronsV11(nn.Module):
     def __init__(self, n_off, K, sigma0, dim=64, heads=4, dmax=40, audit="reaudit", rho="learn", gate="sigmoid",
-                 rho_init=(0.5, 0.12), ctx_mass=True, n_extra=0):
+                 rho_init=(0.5, 0.12), ctx_mass=True, n_extra=0, value="signed"):
         super(SpikingDecisionNeuronsV11, self).__init__()
-        if audit not in ("reaudit", "ledger") or rho not in ("learn", "sum", "mean") or gate not in ("sigmoid", "softmax"):
-            raise ValueError("unknown V11 option: audit=%s rho=%s gate=%s" % (audit, rho, gate))
+        if (audit not in ("reaudit", "ledger") or rho not in ("learn", "sum", "mean")
+                or gate not in ("sigmoid", "softmax", "compete") or value not in ("signed", "ei")):
+            raise ValueError("unknown V11 option: audit=%s rho=%s gate=%s value=%s" % (audit, rho, gate, value))
+        if value == "ei" and heads % 2:
+            raise ValueError("value=ei needs an even number of heads (target / background channels)")
         self.dim, self.heads, self.hd, self.dmax = dim, heads, dim // heads, dmax
         self.n_off, self.K = n_off, K
-        self.audit, self.rho_mode, self.gate = audit, rho, gate
+        self.audit, self.rho_mode, self.gate, self.value = audit, rho, gate, value
+        sign = [1.0] * heads if value == "signed" else [1.0] * (heads // 2) + [-1.0] * (heads // 2)
+        self.register_buffer("head_sign", torch.tensor(sign), persistent=False)   # +1 target, -1 background channel
         self.ctx_mass = bool(ctx_mass)      # False: the context (and so the values) never sees the attributed mass,
                                             # so only rho decides how evidence grows with the number of related events
         self.c0 = nn.Sequential(nn.Linear(2, dim), nn.GELU(), nn.Linear(dim, dim))
@@ -120,6 +134,8 @@ class SpikingDecisionNeuronsV11(nn.Module):
             selh = sel[:, None, :]
             if self.gate == "sigmoid":
                 a = torch.sigmoid(logit) * selh.float()
+            elif self.gate == "compete":                                                     # responsibilities
+                a = torch.softmax(torch.cat([torch.zeros_like(logit[:, :1]), logit], 1), 1)[:, 1:] * selh.float()
             else:
                 L = logit.masked_fill(~selh, float("-inf"))
                 mx = L.max(-1, keepdim=True)[0]
@@ -127,6 +143,8 @@ class SpikingDecisionNeuronsV11(nn.Module):
                 e = torch.exp(L - mx) * selh.float()
                 a = e / e.sum(-1, keepdim=True).clamp(min=1e-12)
             v = self.v_out(F.gelu(Vt + self.v_ctx(c)[:, None, :])).permute(0, 2, 1)       # [B, H, T]
+            if self.value == "ei":
+                v = F.softplus(v)                                   # log(1 + intensity ratio) >= 0
             S = (a * v).sum(-1)                                                             # [B, H]
             M = a.sum(-1)
             if self.gate == "softmax":
@@ -134,6 +152,8 @@ class SpikingDecisionNeuronsV11(nn.Module):
             else:
                 mw = a.view(B, H, self.n_off, self.K).sum(-1)                               # [B, H, n_off]
                 lam_h, ne = redundancy_evidence(S, M, mw, rho_w, rho_t)
+            if self.value == "ei":
+                lam_h = lam_h * self.head_sign                      # target channel excites, background inhibits
             lam = lam_h.sum(-1)
             m = valid[:, d]
             if self.audit == "reaudit":
@@ -159,6 +179,10 @@ class SpikingDecisionNeuronsV11(nn.Module):
                            "lam_heads": torch.stack(lam_heads, 1), "gates": last_a}
         return torch.stack(outs, 1)
 
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        state_dict.pop(prefix + "head_sign", None)       # derived from `value`; a few 11-09 runs saved it
+        super(SpikingDecisionNeuronsV11, self)._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
     def load_stage1(self, state):
         """Load weights of a staged V11 run (6 token features); extra report channels start with zero weights, so the
         neuron computes exactly what the staged run computed until the reports become non-zero."""
@@ -172,4 +196,5 @@ class SpikingDecisionNeuronsV11(nn.Module):
     def learned_constants(self):
         rho_w, rho_t = self.rho()
         return {"sigma_px": self.sigma().detach().cpu().tolist(), "rf_bias": self.rf_bias.detach().cpu().tolist(),
-                "rho_w": rho_w.detach().cpu().tolist(), "rho_t": rho_t.detach().cpu().tolist()}
+                "rho_w": rho_w.detach().cpu().tolist(), "rho_t": rho_t.detach().cpu().tolist(),
+                "head_sign": self.head_sign.cpu().tolist()}

@@ -6,6 +6,8 @@
     3. The neurons with zero report columns compute exactly the staged neurons, whatever the reports are
     4. A small network + report head + neurons: the neurons' loss reaches the small network through the priors, and the
        report columns of the neurons through the reports
+    5. Control without reports (--report-dim 0, priors detached as with --prior-grad off): both networks run, and the
+       small network gets no gradient at all from the neurons (co-trained, not coupled)
 """
 import os
 import sys
@@ -144,6 +146,45 @@ class JointGradientTests(unittest.TestCase):
         self.assertGreater(g_small, 0.0)
         g_cols = float(big.tok[0].weight.grad[:, 6:].abs().sum())
         self.assertGreater(g_cols, 0.0)                    # report columns learn first (they start at zero)
+
+    def test_control_without_reports(self):
+        import train_stream_v1 as T
+        from utils.stream_common import load_flat_config
+        cfg = load_flat_config(os.path.join(ROOT, "configs", "final", "bb_v5_50.yaml"))
+        cfg.update(pad_height=32, pad_width=32, height=32, width_px=32, channels=[4, 4, 4, 4])
+        torch.manual_seed(0)
+        small = T.build_net(cfg, torch.device("cpu"))
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")               # "Initializing zero-element tensors is a no-op"
+            report = NV.ReportHead(small, 0)
+        big = S.SpikingDecisionNeuronsV11(7, 4, sigma0=10.0, n_extra=0, rho="mean", value="ei")
+        with torch.no_grad():
+            big.v_out.weight.normal_(0, 0.5)
+        model = NV.NestedDeCo(small, big, report, [0.0] * 6, [1.0] * 6, 0.0, 5.0, 50)
+        steps, n = 7, 300
+        rng = np.random.RandomState(0)
+        tt = torch.as_tensor(np.sort(rng.randint(0, steps, n))).long()
+        events = {"t": tt, "b": torch.zeros(n, dtype=torch.long), "y": torch.as_tensor(rng.randint(0, 32, n)).long(),
+                  "x": torch.as_tensor(rng.randint(0, 32, n)).long(), "p": torch.as_tensor(rng.randint(0, 2, n)).float(),
+                  "t_local": torch.as_tensor(rng.rand(n)).float()}
+        logits, _, _ = small.forward_chunk(torch.rand(steps, 1, 12, 32, 32), events, None)
+        rep = report()
+        self.assertEqual(tuple(rep.shape), (n, 0))
+        z0 = (logits - 1.0).detach()                       # --prior-grad off
+        pend = torch.nonzero(tt == 3, as_tuple=True)[0][:6]
+        offsets = list(range(-3, 4))
+        cq = tt[pend][:, None] + torch.as_tensor(offsets)[None, :]
+        xf, yf = events["x"].float(), events["y"].float()
+        pick, ok = NV.gpu_picks(xf, yf, tt, z0, pend, cq, 2, 2, -100.0)
+        t_ms = (tt.float() + events["t_local"]) * 50.0
+        raw, rtok, okT, dw, dist2 = NV.build_tokens(xf, yf, t_ms, events["p"], z0, rep, pend, pick, ok, offsets)
+        U = model.decide(raw, rtok, okT, dw, dist2, z0[pend], events["p"][pend],
+                         torch.ones(len(pend), 4, dtype=torch.bool), 3)
+        torch.nn.functional.binary_cross_entropy_with_logits(U, torch.ones_like(U)).backward()
+        self.assertTrue(bool(torch.isfinite(U).all()))
+        self.assertTrue(all(p_.grad is None or float(p_.grad.abs().sum()) == 0.0 for p_ in small.parameters()))
+        self.assertGreater(float(big.v_out.weight.grad.abs().sum()), 0.0)
 
 
 if __name__ == "__main__":
