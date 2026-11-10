@@ -21,8 +21,10 @@ mean wait over all events (ms) and over the spawned ones (windows), overturn of 
 deadline decision differs) and of early commits, recording-clustered 95% upper bounds. Interpretability: learned
 memory of the temporal BIR, predicted range / drift per context group against the realised movement, coverage, births
 by arrival margin, three example events for the figure.
-Pareto (test, pooled metrics): the gate at risk levels 0.002 ... 0.2 (the same heads, CQR at each level) against the
-distance-only gate with the same number of births and the gate without traces. Per-event test arrays for the figures:
+Pareto (test, official four metrics): the gate at risk levels 0.002 ... 0.2 (the same heads, CQR at each level)
+against the distance-only gate with the same number of births and the gate without traces. Commit risk per side (test,
+official four metrics): stopping as background at a_bg (a missed target costs Pd), as target at a_tg (a false alarm
+costs Fa), a_bg / a_tg in {alpha, 0.003, 0.001}. --fast: both sweeps with pooled metrics only. Per-event test arrays for the figures:
 <out>/vow_test_events.npz (margin, calibrated range, U(0), U(F), commit step, overturn, label, births, groups).
 Usage: python tools/deco/fit_vow.py --run <SDU run> --evidence <prefix> --z0-root <dir> --data-root <root>
        [--alpha 0.01] [--sym-alpha 0.01] [--out <run>/vow] [--steps 4000]
@@ -94,11 +96,52 @@ def fit_commit(X, lt, F_, D, rows, alpha, steps, dev, seed=0):
     return pred
 
 
-def commit_shift(pred, X, lt, F_, D, rows, alpha):
-    idx = np.nonzero(rows & (F_ == D))[0]
-    lo, _, hi = pred(X[idx])
+class Calibrated:
+    """A VoW head fitted on some recordings plus its raw ranges on held-out calibration recordings: split-conformal
+    shifts at any risk level per side (the lower quantile decides stopping as target, the upper one as background)."""
+
+    def __init__(self, pred, lo_c, hi_c, y_c):
+        self.pred, self.lo_c, self.hi_c, self.y_c = pred, lo_c, hi_c, y_c
+
+    def shifts(self, a_bg, a_tg):
+        return (VW.cqr_shift(self.lo_c, self.hi_c, self.y_c, a_tg)[0],
+                VW.cqr_shift(self.lo_c, self.hi_c, self.y_c, a_bg)[1])
+
+
+def gate_cal(tr, m0, p, y, fit_rows, cal_rows, alpha, steps, dev, traces=True):
+    g, net = fit_gate(tr, m0, p, y, fit_rows, alpha, steps, dev, traces=traces)
+    ic = np.nonzero(cal_rows)[0]
+    lo, _, hi = g(tr[ic], m0[ic], p[ic])
+    return Calibrated(g, lo, hi, y[ic]), net
+
+
+def commit_cal(X, lt, F_, D, fit_rows, cal_rows, alpha, steps, dev):
+    pc = fit_commit(X, lt, F_, D, fit_rows, alpha, steps, dev)
+    idx = np.nonzero(cal_rows & (F_ == D))[0]
+    lo, _, hi = pc(X[idx])
     mv = lt[idx, D:D + 1] - lt[idx, :D]
-    return VW.cqr_shift(lo[:, :D].reshape(-1), hi[:, :D].reshape(-1), mv.reshape(-1), alpha)
+    return Calibrated(pc, lo[:, :D].reshape(-1), hi[:, :D].reshape(-1), mv.reshape(-1))
+
+
+def gate_apply(cg, a_bg, a_tg, tr_q, m_q, p_q, z_q, tau):
+    s_lo, s_hi = cg.shifts(a_bg, a_tg)
+    lo, md, hi = cg.pred(tr_q, m_q, p_q)
+    lo, hi = lo - s_lo, hi + s_hi
+    return VW.stop_now(z_q, tau, lo, hi), lo, md, hi
+
+
+def commit_apply(cc, a_bg, a_tg, Xq, ltq, Fq, D, tau):
+    s_lo, s_hi = cc.shifts(a_bg, a_tg)
+    lo, md, hi = cc.pred(Xq)
+    lo, hi = widen(lo, hi, D, s_lo, s_hi)
+    return FR.commit_by_range(ltq, Fq, tau, lo, hi), lo, md, hi
+
+
+def split_recordings(rec, rows, frac, seed):
+    """Split the recordings of `rows` into a fit part (share `frac`) and a calibration part."""
+    r = np.random.RandomState(seed).permutation(np.unique(rec[rows]))
+    k = min(max(1, int(round(len(r) * frac))), len(r) - 1)
+    return rows & np.isin(rec, r[:k]), rows & np.isin(rec, r[k:])
 
 
 def widen(lo, hi, D, s_lo, s_hi):
@@ -198,9 +241,14 @@ def main():
     ap.add_argument("--data-root", default=None)
     ap.add_argument("--alpha", type=float, default=0.01)
     ap.add_argument("--sym-alpha", type=float, default=0.01)
+    ap.add_argument("--alpha-bg", type=float, default=None,
+                    help="risk of stopping as background (a missed target costs Pd); default --alpha")
+    ap.add_argument("--alpha-tg", type=float, default=None,
+                    help="risk of stopping as target (a false alarm costs Fa); default --alpha")
     ap.add_argument("--steps", type=int, default=4000)
     ap.add_argument("--out", default=None)
     ap.add_argument("--keep-traj", action="store_true", help="keep the exported per-policy trajectories")
+    ap.add_argument("--fast", action="store_true", help="Pareto / commit-side sweeps with pooled metrics only")
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
     out_root = args.out or os.path.join(args.run, "vow")
@@ -216,80 +264,87 @@ def main():
     d_v = lt_v[np.arange(len(F_v)), F_v] - z_v                      # gate target: movement from the prior
     d_t = lt_t[np.arange(len(F_t)), F_t] - z_t
     c_v, c_t = FH.nonpending(args, ev_v, "val", tau), FH.nonpending(args, ev_t, "test", tau)
-    recs = np.unique(ev_v["rec"])
-    A = np.isin(ev_v["rec"], np.random.RandomState(0).permutation(recs)[: len(recs) // 2])
-    print("V13 VoW: tau %.3f, D %d, val %d / test %d events in the training band (val A %d), alpha %.3g, device %s" % (
-        tau, D, len(z_v), len(z_t), int(A.sum()), args.alpha, dev), flush=True)
-    res = {"alpha": args.alpha, "sym_alpha": args.sym_alpha, "tau": tau, "D": D, "val": {}, "test": {}}
+    a_bg = args.alpha if args.alpha_bg is None else args.alpha_bg
+    a_tg = args.alpha if args.alpha_tg is None else args.alpha_tg
+    rec_v = ev_v["rec"]
+    recs = np.unique(rec_v)
+    A = np.isin(rec_v, np.random.RandomState(0).permutation(recs)[: len(recs) // 2])
+    print("V13 VoW: tau %.3f, D %d, val %d / test %d events in the training band (val A %d), heads at alpha %.3g, risk "
+          "per side: background %.3g, target %.3g, device %s" % (tau, D, len(z_v), len(z_t), int(A.sum()), args.alpha,
+                                                                 a_bg, a_tg, dev), flush=True)
+    res = {"alpha": args.alpha, "alpha_bg": a_bg, "alpha_tg": a_tg, "sym_alpha": args.sym_alpha, "tau": tau, "D": D,
+           "val": {}, "test": {}}
+    p_v, p_t = inf_v["p"], inf_t["p"]
 
-    # ---- val, two honest folds (no CQR)
+    # ---- val: two folds by recording; in each, the heads are fitted on 2/3 of the training half's recordings and
+    # calibrated (CQR) on the other 1/3, then applied to the held-out half (the same protocol as test)
     stop_v, stopz_v = np.zeros(len(z_v), bool), np.zeros(len(z_v), bool)
     L_v = F_v.copy()
-    p_v, p_t = inf_v["p"], inf_t["p"]
     for a, b in ((A, ~A), (~A, A)):
         ib = np.nonzero(b)[0]
-        g, _ = fit_gate(tr_v, m_v, p_v, d_v, a, args.alpha, args.steps, dev)
-        lo, _, hi = g(tr_v[ib], m_v[ib], p_v[ib])
-        stop_v[ib] = VW.stop_now(z_v[ib], tau, lo, hi)
-        gz, _ = fit_gate(tr_v, m_v, p_v, d_v, a, args.alpha, args.steps, dev, traces=False)
-        lo, _, hi = gz(tr_v[ib], m_v[ib], p_v[ib])
-        stopz_v[ib] = VW.stop_now(z_v[ib], tau, lo, hi)
-        pc = fit_commit(X_v, lt_v, F_v, D, a, args.alpha, args.steps, dev)
-        lo, _, hi = pc(X_v[ib])
-        L_v[ib] = FR.commit_by_range(lt_v[ib], F_v[ib], tau, lo, hi)
+        fit_r, cal_r = split_recordings(rec_v, a, 2.0 / 3.0, seed=1)
+        cgv, _ = gate_cal(tr_v, m_v, p_v, d_v, fit_r, cal_r, args.alpha, args.steps, dev)
+        stop_v[ib] = gate_apply(cgv, a_bg, a_tg, tr_v[ib], m_v[ib], p_v[ib], z_v[ib], tau)[0]
+        czv, _ = gate_cal(tr_v, m_v, p_v, d_v, fit_r, cal_r, args.alpha, args.steps, dev, traces=False)
+        stopz_v[ib] = gate_apply(czv, a_bg, a_tg, tr_v[ib], m_v[ib], p_v[ib], z_v[ib], tau)[0]
+        ccv = commit_cal(X_v, lt_v, F_v, D, fit_r, cal_r, args.alpha, args.steps, dev)
+        L_v[ib] = commit_apply(ccv, a_bg, a_tg, X_v[ib], lt_v[ib], F_v[ib], D, tau)[0]
     S_v, Ls_v = policies(z_v, tau, q, args.alpha, args.sym_alpha, F_v, stop_v, stopz_v, L_v)
     for nm in S_v:
         res["val"][nm] = evaluate(args, "val", nm, ev_v, lt_v, F_v, D, z_v, tau, S_v[nm], Ls_v[nm], c_v, inf_v,
                                   out_root)
 
-    # ---- test: heads on A, CQR on B
-    iB = np.nonzero(~A)[0]
-    g, gate_net = fit_gate(tr_v, m_v, p_v, d_v, A, args.alpha, args.steps, dev)
-    loB, _, hiB = g(tr_v[iB], m_v[iB], p_v[iB])                       # raw ranges: B (calibration), test
-    sg = VW.cqr_shift(loB, hiB, d_v[iB], args.alpha)
-    lo0r, md0, hi0r = g(tr_t, m_t, p_t)
-    lo0, hi0 = lo0r - sg[0], hi0r + sg[1]
-    stop_t = VW.stop_now(z_t, tau, lo0, hi0)
-    gz, _ = fit_gate(tr_v, m_v, p_v, d_v, A, args.alpha, args.steps, dev, traces=False)
-    lozB, _, hizB = gz(tr_v[iB], m_v[iB], p_v[iB])
-    sz = VW.cqr_shift(lozB, hizB, d_v[iB], args.alpha)
-    lozr, _, hizr = gz(tr_t, m_t, p_t)
-    stopz_t = VW.stop_now(z_t, tau, lozr - sz[0], hizr + sz[1])
-    pc = fit_commit(X_v, lt_v, F_v, D, A, args.alpha, args.steps, dev)
-    sc = commit_shift(pc, X_v, lt_v, F_v, D, ~A, args.alpha)
-    lok, mdk, hik = pc(X_t)
-    lok, hik = widen(lok, hik, D, *sc)
-    L_t = FR.commit_by_range(lt_t, F_t, tau, lok, hik)
-    res["cqr_shift"] = {"gate": sg, "gate_z0": sz, "commit": list(sc)}
+    # ---- test: heads on val A, CQR on val B
+    cg, gate_net = gate_cal(tr_v, m_v, p_v, d_v, A, ~A, args.alpha, args.steps, dev)
+    stop_t, lo0, md0, hi0 = gate_apply(cg, a_bg, a_tg, tr_t, m_t, p_t, z_t, tau)
+    cz, _ = gate_cal(tr_v, m_v, p_v, d_v, A, ~A, args.alpha, args.steps, dev, traces=False)
+    stopz_t = gate_apply(cz, a_bg, a_tg, tr_t, m_t, p_t, z_t, tau)[0]
+    cc = commit_cal(X_v, lt_v, F_v, D, A, ~A, args.alpha, args.steps, dev)
+    L_t, lok, mdk, hik = commit_apply(cc, a_bg, a_tg, X_t, lt_t, F_t, D, tau)
+    res["cqr_shift"] = {"gate": list(cg.shifts(a_bg, a_tg)), "gate_z0": list(cz.shifts(a_bg, a_tg)),
+                        "commit": list(cc.shifts(a_bg, a_tg))}
     S_t, Ls_t = policies(z_t, tau, q, args.alpha, args.sym_alpha, F_t, stop_t, stopz_t, L_t)
     for nm in S_t:
         res["test"][nm] = evaluate(args, "test", nm, ev_t, lt_t, F_t, D, z_t, tau, S_t[nm], Ls_t[nm], c_t, inf_t,
                                    out_root)
 
-    # ---- Pareto over the gate's risk level: the same heads, CQR at each level, VoW commit unchanged; distance-only
-    # gate at the same number of births; pooled metrics (no official runs)
+    # ---- Pareto over the gate's risk level (both sides, the same heads, CQR at each level, commit unchanged) against
+    # the distance-only gate with the same births and the gate without traces; official four metrics at every point
     par = []
     order_m = np.argsort(np.abs(m_t), kind="stable")
+    keys = ("iou_pooled", "births", "mean_wait_ms_all_events", "gate_overturn")
+
+    def four(r):
+        o = r.get("official", {})
+        out = {k: round(float(r[k]), 6) for k in keys}
+        out.update({k: o[k] for k in ("iou", "acc", "pd", "fa") if k in o})
+        return out
     for a2 in (0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2):
-        s1 = VW.cqr_shift(loB, hiB, d_v[iB], a2)
-        Sv = ~VW.stop_now(z_t, tau, lo0r - s1[0], hi0r + s1[1])
-        s2 = VW.cqr_shift(lozB, hizB, d_v[iB], a2)
-        Sz = ~VW.stop_now(z_t, tau, lozr - s2[0], hizr + s2[1])
+        Sv = ~gate_apply(cg, a2, a2, tr_t, m_t, p_t, z_t, tau)[0]
+        Sz = ~gate_apply(cz, a2, a2, tr_t, m_t, p_t, z_t, tau)[0]
         Sm = np.zeros(len(z_t), bool)
         Sm[order_m[:int(Sv.sum())]] = True
         row = {"alpha_gate": a2}
         for nm, Sx in (("vow", Sv), ("vow_z0", Sz), ("margin_matched", Sm)):
-            r = evaluate(args, "test", nm, ev_t, lt_t, F_t, D, z_t, tau, Sx, L_t, c_t, inf_t, out_root,
-                         official=False, quiet=True)
-            row[nm] = {k: round(float(r[k]), 6) for k in ("iou_pooled", "births", "mean_wait_ms_all_events",
-                                                          "gate_overturn")}
+            r = evaluate(args, "test", "pareto%g_%s" % (a2, nm), ev_t, lt_t, F_t, D, z_t, tau, Sx, L_t, c_t, inf_t,
+                         out_root, official=not args.fast, quiet=True)
+            row[nm] = four(r)
         par.append(row)
-        print("pareto alpha %.3f | vow IoU %.4f births %.3f%% wait %.2f ms | distance-only, same births: IoU %.4f | "
-              "vow_z0 IoU %.4f births %.3f%%" % (a2, row["vow"]["iou_pooled"], 100 * row["vow"]["births"],
-                                                 row["vow"]["mean_wait_ms_all_events"],
-                                                 row["margin_matched"]["iou_pooled"], row["vow_z0"]["iou_pooled"],
-                                                 100 * row["vow_z0"]["births"]), flush=True)
+        print("pareto alpha %.3f | births vow %.3f%% / vow_z0 %.3f%% | IoU ACC Pd Fa: vow %s | distance-only, same births "
+              "%s | vow_z0 %s" % (a2, 100 * row["vow"]["births"], 100 * row["vow_z0"]["births"],
+                                  *[" ".join(str(row[nm].get(k, "-")) for k in ("iou", "acc", "pd", "fa"))
+                                    for nm in ("vow", "margin_matched", "vow_z0")]), flush=True)
     res["pareto_test"] = par
+
+    # ---- commit risk per side (VoW gate, official four metrics): stopping as background at s_bg, as target at s_tg
+    side = []
+    for s_bg, s_tg in ((args.alpha, args.alpha), (0.003, args.alpha), (0.001, args.alpha), (args.alpha, 0.003),
+                       (0.003, 0.003), (a_bg, a_tg)):
+        L_s = commit_apply(cc, s_bg, s_tg, X_t, lt_t, F_t, D, tau)[0]
+        r = evaluate(args, "test", "commit_bg%g_tg%g" % (s_bg, s_tg), ev_t, lt_t, F_t, D, z_t, tau, S_t["vow"], L_s,
+                     c_t, inf_t, out_root, official=not args.fast)
+        side.append({"alpha_bg": s_bg, "alpha_tg": s_tg, **four(r), "commit_overturn": r["commit_overturn"]})
+    res["commit_sides_test"] = side
 
     # ---- interpretability (test)
     full = F_t == D
