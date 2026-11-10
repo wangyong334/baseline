@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Pack the results of tools/deco/queue_v12.sh: summaries (per-epoch history), runtime, range / official tables, logs,
+# Pack the results of tools/deco/queue_v12.sh (+ the EV-Flying run of run_v12_evf.sh): summaries (per-epoch history),
+# runtime, range / gated range / official tables, logs,
 # the final weights deco_v12.pt (small), job logs; no trajectories, no exports, no last.pt.
 # Usage (code dir): bash tools/deco/pack_v12.sh
 set -u
@@ -12,6 +13,9 @@ out=v12_results_$(date +%m%d_%H%M).tgz
     find "$d" -maxdepth 1 \( -name summary.json -o -name runtime.json -o -name range.log -o -name deco_v12.pt \
       -o -name 'calib*' \) -print0
     [ -d "$d/run/range" ] && find "$d/run/range" -maxdepth 1 \( -name '*.json' -o -name '*.md' -o -name '*.log' \) -print0
+    [ -d "$d/gated/run/range" ] && find "$d/gated/run/range" -maxdepth 1 \( -name '*.json' -o -name '*.md' \) -print0
+    [ -d "$d/official" ] && find "$d/official" -maxdepth 1 \( -name '*.json' -o -name '*.md' \) -print0
+    find "$d" -maxdepth 1 \( -name 'official.log' -o -name 'range_gated.log' \) -print0
   done
   find run/queue -path '*/logs/*' -name '*_v12_*' -print0 2>/dev/null
   printf 'run/queue/pool.log\0'
