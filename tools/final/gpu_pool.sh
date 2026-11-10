@@ -16,13 +16,14 @@
 # KEEP=1 (11-08): long-running pool. The dispatcher never exits when the pool is empty and never stops runners; new
 # jobs dropped into run/queue/pool/pending/ (tools/final/pool_add.sh) start on the next free GPU. HOLD_GPUS=none: no
 # GPU keeps a placeholder (idle runners hold no GPU memory).
+# 11-10: default GPUS=1 only (the user's rule: the other cards are shared, pool jobs wait for GPU 1).
 # Usage (code dir, after `conda activate evuav`):
 #   GPUS="0 1 2 3" HOLD_GPUS="3" nohup bash tools/final/gpu_pool.sh >> run/queue/pool.log 2>&1 &
 #   GPUS="1 2 3" HOLD_GPUS=none KEEP=1 nohup bash tools/final/gpu_pool.sh >> run/queue/pool.log 2>&1 < /dev/null &
 #   POLL=30 FREE_POLLS=2 HOLD_GB=20 ...   poll interval (s), idle polls before taking a free GPU, placeholder size
 set -u
 cd "$(dirname "$0")/../.."
-read -r -a GS <<< "${GPUS:-1 2 3}"
+read -r -a GS <<< "${GPUS:-1}"
 POOL=run/queue/pool
 POLL=${POLL:-30}
 FREE_POLLS=${FREE_POLLS:-2}

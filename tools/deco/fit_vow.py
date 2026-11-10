@@ -21,6 +21,9 @@ mean wait over all events (ms) and over the spawned ones (windows), overturn of 
 deadline decision differs) and of early commits, recording-clustered 95% upper bounds. Interpretability: learned
 memory of the temporal BIR, predicted range / drift per context group against the realised movement, coverage, births
 by arrival margin, three example events for the figure.
+Pareto (test, pooled metrics): the gate at risk levels 0.002 ... 0.2 (the same heads, CQR at each level) against the
+distance-only gate with the same number of births and the gate without traces. Per-event test arrays for the figures:
+<out>/vow_test_events.npz (margin, calibrated range, U(0), U(F), commit step, overturn, label, births, groups).
 Usage: python tools/deco/fit_vow.py --run <SDU run> --evidence <prefix> --z0-root <dir> --data-root <root>
        [--alpha 0.01] [--sym-alpha 0.01] [--out <run>/vow] [--steps 4000]
 Last line: "VOW FINISHED ...".
@@ -62,14 +65,19 @@ def zfit(x, rows):
 
 
 def fit_gate(tr, m0, p, y, rows, alpha, steps, dev, traces=True, seed=0):
+    """Fit on the rows of one split; returns (predict(trace, m0, p) for any split, net)."""
     mu, sd = zfit(tr, rows)
     net = VW.VoWGate(traces=traces)
-    trn = ((tr - mu) / sd).astype(np.float32)
-    VW.fit(net, [trn[rows], m0[rows], p[rows]], y[rows], alpha, steps=steps, seed=seed, device=dev)
-    return lambda idx: VW.predict(net, [((tr[idx] - mu) / sd).astype(np.float32), m0[idx], p[idx]], device=dev), net
+    trn = ((tr[rows] - mu) / sd).astype(np.float32)
+    VW.fit(net, [trn, m0[rows], p[rows]], y[rows], alpha, steps=steps, seed=seed, device=dev)
+
+    def pred(tr_q, m_q, p_q):
+        return VW.predict(net, [((tr_q - mu) / sd).astype(np.float32), m_q, p_q], device=dev)
+    return pred, net
 
 
 def fit_commit(X, lt, F_, D, rows, alpha, steps, dev, seed=0):
+    """Fit on the full-horizon rows of one split; returns predict(X) for any split."""
     sel = rows & (F_ == D)
     x = X[sel, :D].reshape(-1, X.shape[-1])
     mv = (lt[sel, D:D + 1] - lt[sel, :D]).reshape(-1)
@@ -77,18 +85,18 @@ def fit_commit(X, lt, F_, D, rows, alpha, steps, dev, seed=0):
     net = VW.VoWCommit(X.shape[-1])
     VW.fit(net, [((x - mu) / sd).astype(np.float32)], mv, alpha, steps=steps, seed=seed, device=dev)
 
-    def pred(idx):
-        xi = ((X[idx] - mu) / sd).astype(np.float32)
-        lo, md, hi = VW.predict(net, [xi.reshape(-1, X.shape[-1])], device=dev)
-        lo, md, hi = (a.reshape(len(idx), D + 1) for a in (lo, md, hi))
+    def pred(Xq):
+        xi = ((Xq - mu) / sd).astype(np.float32)
+        lo, md, hi = VW.predict(net, [xi.reshape(-1, Xq.shape[-1])], device=dev)
+        lo, md, hi = (a.reshape(len(Xq), D + 1) for a in (lo, md, hi))
         lo[:, D], md[:, D], hi[:, D] = 0.0, 0.0, 0.0                    # the deadline: nothing left to come
         return lo, md, hi
     return pred
 
 
-def commit_shift(pred, lt, F_, D, rows, alpha):
+def commit_shift(pred, X, lt, F_, D, rows, alpha):
     idx = np.nonzero(rows & (F_ == D))[0]
-    lo, _, hi = pred(idx)
+    lo, _, hi = pred(X[idx])
     mv = lt[idx, D:D + 1] - lt[idx, :D]
     return VW.cqr_shift(lo[:, :D].reshape(-1), hi[:, :D].reshape(-1), mv.reshape(-1), alpha)
 
@@ -112,7 +120,7 @@ def cluster_ucb(flag, rec, rows):
     return round(float(rate + 1.645 * np.sqrt(var)), 5)
 
 
-def evaluate(args, split, name, ev, lt, F_, D, z0, tau, S, L, c_np, info, out_root):
+def evaluate(args, split, name, ev, lt, F_, D, z0, tau, S, L, c_np, info, out_root, official=True, quiet=False):
     n = len(z0)
     i = np.arange(n)
     lt_p = lt.copy()
@@ -133,12 +141,14 @@ def evaluate(args, split, name, ev, lt, F_, D, z0, tau, S, L, c_np, info, out_ro
          "commit_overturn": float(changed[early].mean()) if early.any() else 0.0,
          "commit_overturn_ucb95": cluster_ucb(changed, ev["rec"], early),
          "changed_vs_deadline": float(changed.mean())}
-    if args.z0_root and args.data_root:
+    if official and args.z0_root and args.data_root:
         d_ = os.path.join(out_root, "%s_%s" % (name, split))
         wms = CC.export(ev, lt_p, L_p, D, args, split, d_)
         r["official"] = CC.official(args, split, d_, wms, "%s_%s" % (name, split), D)
         if not args.keep_traj:                                           # json / md / log stay next to it
             shutil.rmtree(d_, ignore_errors=True)
+    if quiet:
+        return r
     o = r.get("official", {})
     print("%-4s %-8s IoU %.4f ACC %.4f Pd %.4f Fa %.3g | births %.4f%%, wait %.2f ms/event (%.2f windows/spawned) | "
           "gate overturn %.4f (ucb %s), commit overturn %.4f (ucb %s)" % (
@@ -215,16 +225,17 @@ def main():
     # ---- val, two honest folds (no CQR)
     stop_v, stopz_v = np.zeros(len(z_v), bool), np.zeros(len(z_v), bool)
     L_v = F_v.copy()
+    p_v, p_t = inf_v["p"], inf_t["p"]
     for a, b in ((A, ~A), (~A, A)):
         ib = np.nonzero(b)[0]
-        g, _ = fit_gate(tr_v, m_v, inf_v["p"], d_v, a, args.alpha, args.steps, dev)
-        lo, _, hi = g(ib)
+        g, _ = fit_gate(tr_v, m_v, p_v, d_v, a, args.alpha, args.steps, dev)
+        lo, _, hi = g(tr_v[ib], m_v[ib], p_v[ib])
         stop_v[ib] = VW.stop_now(z_v[ib], tau, lo, hi)
-        gz, _ = fit_gate(tr_v, m_v, inf_v["p"], d_v, a, args.alpha, args.steps, dev, traces=False)
-        lo, _, hi = gz(ib)
+        gz, _ = fit_gate(tr_v, m_v, p_v, d_v, a, args.alpha, args.steps, dev, traces=False)
+        lo, _, hi = gz(tr_v[ib], m_v[ib], p_v[ib])
         stopz_v[ib] = VW.stop_now(z_v[ib], tau, lo, hi)
         pc = fit_commit(X_v, lt_v, F_v, D, a, args.alpha, args.steps, dev)
-        lo, _, hi = pc(ib)
+        lo, _, hi = pc(X_v[ib])
         L_v[ib] = FR.commit_by_range(lt_v[ib], F_v[ib], tau, lo, hi)
     S_v, Ls_v = policies(z_v, tau, q, args.alpha, args.sym_alpha, F_v, stop_v, stopz_v, L_v)
     for nm in S_v:
@@ -232,21 +243,21 @@ def main():
                                   out_root)
 
     # ---- test: heads on A, CQR on B
-    iB, iT = np.nonzero(~A)[0], np.arange(len(z_t))
-    g, gate_net = fit_gate(tr_v, m_v, inf_v["p"], d_v, A, args.alpha, args.steps, dev)
-    lo, _, hi = g(iB)
-    sg = VW.cqr_shift(lo, hi, d_v[iB], args.alpha)
-    lo0, md0, hi0 = g(iT)
-    lo0, hi0 = lo0 - sg[0], hi0 + sg[1]
+    iB = np.nonzero(~A)[0]
+    g, gate_net = fit_gate(tr_v, m_v, p_v, d_v, A, args.alpha, args.steps, dev)
+    loB, _, hiB = g(tr_v[iB], m_v[iB], p_v[iB])                       # raw ranges: B (calibration), test
+    sg = VW.cqr_shift(loB, hiB, d_v[iB], args.alpha)
+    lo0r, md0, hi0r = g(tr_t, m_t, p_t)
+    lo0, hi0 = lo0r - sg[0], hi0r + sg[1]
     stop_t = VW.stop_now(z_t, tau, lo0, hi0)
-    gz, _ = fit_gate(tr_v, m_v, inf_v["p"], d_v, A, args.alpha, args.steps, dev, traces=False)
-    lo, _, hi = gz(iB)
-    sz = VW.cqr_shift(lo, hi, d_v[iB], args.alpha)
-    loz, _, hiz = gz(iT)
-    stopz_t = VW.stop_now(z_t, tau, loz - sz[0], hiz + sz[1])
+    gz, _ = fit_gate(tr_v, m_v, p_v, d_v, A, args.alpha, args.steps, dev, traces=False)
+    lozB, _, hizB = gz(tr_v[iB], m_v[iB], p_v[iB])
+    sz = VW.cqr_shift(lozB, hizB, d_v[iB], args.alpha)
+    lozr, _, hizr = gz(tr_t, m_t, p_t)
+    stopz_t = VW.stop_now(z_t, tau, lozr - sz[0], hizr + sz[1])
     pc = fit_commit(X_v, lt_v, F_v, D, A, args.alpha, args.steps, dev)
-    sc = commit_shift(pc, lt_v, F_v, D, ~A, args.alpha)
-    lok, mdk, hik = pc(iT)
+    sc = commit_shift(pc, X_v, lt_v, F_v, D, ~A, args.alpha)
+    lok, mdk, hik = pc(X_t)
     lok, hik = widen(lok, hik, D, *sc)
     L_t = FR.commit_by_range(lt_t, F_t, tau, lok, hik)
     res["cqr_shift"] = {"gate": sg, "gate_z0": sz, "commit": list(sc)}
@@ -254,6 +265,31 @@ def main():
     for nm in S_t:
         res["test"][nm] = evaluate(args, "test", nm, ev_t, lt_t, F_t, D, z_t, tau, S_t[nm], Ls_t[nm], c_t, inf_t,
                                    out_root)
+
+    # ---- Pareto over the gate's risk level: the same heads, CQR at each level, VoW commit unchanged; distance-only
+    # gate at the same number of births; pooled metrics (no official runs)
+    par = []
+    order_m = np.argsort(np.abs(m_t), kind="stable")
+    for a2 in (0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2):
+        s1 = VW.cqr_shift(loB, hiB, d_v[iB], a2)
+        Sv = ~VW.stop_now(z_t, tau, lo0r - s1[0], hi0r + s1[1])
+        s2 = VW.cqr_shift(lozB, hizB, d_v[iB], a2)
+        Sz = ~VW.stop_now(z_t, tau, lozr - s2[0], hizr + s2[1])
+        Sm = np.zeros(len(z_t), bool)
+        Sm[order_m[:int(Sv.sum())]] = True
+        row = {"alpha_gate": a2}
+        for nm, Sx in (("vow", Sv), ("vow_z0", Sz), ("margin_matched", Sm)):
+            r = evaluate(args, "test", nm, ev_t, lt_t, F_t, D, z_t, tau, Sx, L_t, c_t, inf_t, out_root,
+                         official=False, quiet=True)
+            row[nm] = {k: round(float(r[k]), 6) for k in ("iou_pooled", "births", "mean_wait_ms_all_events",
+                                                          "gate_overturn")}
+        par.append(row)
+        print("pareto alpha %.3f | vow IoU %.4f births %.3f%% wait %.2f ms | distance-only, same births: IoU %.4f | "
+              "vow_z0 IoU %.4f births %.3f%%" % (a2, row["vow"]["iou_pooled"], 100 * row["vow"]["births"],
+                                                 row["vow"]["mean_wait_ms_all_events"],
+                                                 row["margin_matched"]["iou_pooled"], row["vow_z0"]["iou_pooled"],
+                                                 100 * row["vow_z0"]["births"]), flush=True)
+    res["pareto_test"] = par
 
     # ---- interpretability (test)
     full = F_t == D
@@ -269,7 +305,8 @@ def main():
     flip = (z_t >= tau) != (lt_t[np.arange(len(F_t)), F_t] >= tau)
     width = hi0 - lo0
     grp = {}
-    for gname, gm in groups(tr_t, z_t, tau, inf_t["past"]).items():
+    gmask = groups(tr_t, z_t, tau, inf_t["past"])
+    for gname, gm in gmask.items():
         if gm.sum() < 50:
             continue
         grp[gname] = {"n": int(gm.sum()), "pred_width": round(float(width[gm].mean()), 3),
@@ -304,6 +341,14 @@ def main():
     res["examples_test"] = ex
     torch.save({"gate": gate_net.state_dict(), "alpha": args.alpha, "cqr": res["cqr_shift"]},
                os.path.join(out_root, "vow_heads.pt"))
+    i_t = np.arange(len(F_t))                                         # per-event test arrays for the figures
+    np.savez_compressed(os.path.join(out_root, "vow_test_events.npz"), m0=m_t.astype(np.float16),
+                        q_lo=lo0.astype(np.float16), q50=md0.astype(np.float16), q_hi=hi0.astype(np.float16),
+                        U0=(lt_t[:, 0] - tau).astype(np.float16), UF=(lt_t[i_t, F_t] - tau).astype(np.float16),
+                        L=L_t.astype(np.int8), F=F_t.astype(np.int8), flip=flip, label=ev_t["label"].astype(bool),
+                        spawn_vow=S_t["vow"], spawn_sym=S_t["sym"], rec=ev_t["rec"].astype(np.int16),
+                        onset=gmask["onset (past <= 2 active, now active)"],
+                        persistent=gmask["persistent (>= 8 of 10 active)"])
     with open(os.path.join(out_root, "vow.json"), "w") as fh:
         json.dump(res, fh, indent=1)
     t = res["test"]

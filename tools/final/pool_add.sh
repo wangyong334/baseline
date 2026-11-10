@@ -31,5 +31,5 @@ if pgrep -f "tools/final/gpu_pool.sh" > /dev/null; then
   echo "dispatcher is running: the job starts on the next free GPU"
 else
   echo "NOTE: no dispatcher is running. Start it with:"
-  echo '  rm -f run/queue/pool/STOP; GPUS="1 2 3" HOLD_GPUS=none KEEP=1 nohup bash tools/final/gpu_pool.sh >> run/queue/pool.log 2>&1 < /dev/null &'
+  echo '  rm -f run/queue/pool/STOP; GPUS="1" HOLD_GPUS=none KEEP=1 nohup bash tools/final/gpu_pool.sh >> run/queue/pool.log 2>&1 < /dev/null &'
 fi

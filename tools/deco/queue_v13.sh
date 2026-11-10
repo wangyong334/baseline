@@ -3,12 +3,12 @@
 # (tools/final/gpu_pool.sh, KEEP=1), in the order of TAGS.
 # Gates: the new files are uploaded, the V11 versions of evidence.py / train_dnm.py are in place, z0 of every tag exists,
 # no V13 result dir exists yet, the pool scripts are the 11-08 version.
-# Starts the dispatcher (GPUS default "1 2 3", no placeholder, KEEP=1) if none is running.
-# Usage (code dir, after `conda activate evuav`): [GPUS="1 2 3"] [TAGS="v5s37 v5s38 v5s39"] bash tools/deco/queue_v13.sh
+# Starts the dispatcher (GPUS default "1": only GPU 1, no placeholder, KEEP=1) if none is running.
+# Usage (code dir, after `conda activate evuav`): [GPUS="1"] [TAGS="v5s37 v5s38 v5s39"] bash tools/deco/queue_v13.sh
 # Results: run/deco/<TAG>/dnm_m0.001_s0_nr_v13/{summary.json, vow/vow.json}; pack: bash tools/deco/pack_v13.sh
 set -u
 cd "$(dirname "$0")/../.."
-GPUS=${GPUS:-"1 2 3"}
+GPUS=${GPUS:-"1"}
 TAGS=${TAGS:-"v5s37 v5s38 v5s39"}
 die() { echo "QUEUE V13 NOT STARTED: $*"; exit 1; }
 grep -q 'KEEP=${KEEP:-0}' tools/final/gpu_pool.sh || die "tools/final/gpu_pool.sh is the old version (upload the 11-08 one)"
