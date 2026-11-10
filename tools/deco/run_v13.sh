@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # V13 on one backbone (11-10): BIR prior -> VoW unit (wait or not) -> spiking decision unit (SDU), design
 # Res/v13_design/V13_DESIGN.md.
-#   1. evidence of the wide training band: martingale band at ALPHA_TRAIN (default 0.001, ~7.5% of the events),
-#      no radius cap (tools/deco/evidence.py --band martingale --radius 0); a file counts as done only with its .done
-#      marker or a log ending in "EVIDENCE FINISHED" (a half-written file is rebuilt)
+#   1. evidence of the wide training band: martingale band at ALPHA_TRAIN (default 0.001 = alpha / 10 for every
+#      backbone; its share of the events depends on the backbone: 7.5% / 21% / 62% of the training events for
+#      seeds 37 / 38 / 39, see tools/deco/pick_band.py), no radius cap (tools/deco/evidence.py --band martingale
+#      --radius 0); a file counts as done only with its .done marker or a log ending in "EVIDENCE FINISHED" (a
+#      half-written file is rebuilt)
 #   2. stage 2: SDU = V11 spiking decision units, stepwise BCE on the training split (train_dnm.py --design v11
 #      $SDU_ARGS, default "--v11-rho mean" = the V11 default); skipped when <run>/summary.json exists
 #   3. stages 3-4: tools/deco/fit_vow.py: VoW gate (k = 0) + VoW commit (k >= 1), fitted on val recordings A (no labels),
@@ -17,7 +19,7 @@
 #   SDU_ARGS="--v11-rho sum" NAME=dnm_m0.001_s0_nr_v13_rhosum ...                    an SDU ablation
 #   REUSE_FROM=<other code dir> ...      copy a trained SDU of the same tag / name from there instead of training
 #   DATA_ROOT=<root> DEVICE=cpu EXTRA="--epochs 2" VOW_ARGS="--steps 200 --fast" OUT_ROOT=<dir> ...   smoke tests
-# Results: run/deco/<TAG>/dnm_m<ALPHA_TRAIN>_s<SEED>_nr_v13/{summary.json, <VOW_NAME>/vow.json, <VOW_NAME>.log}
+# Results: run/deco/<TAG>/dnm_m<alpha_train>_s<SEED>_nr_v13/{summary.json, <VOW_NAME>/vow.json, <VOW_NAME>.log}
 # Last line: "V13 <TAG> FINISHED" or "V13 <TAG> FAILED at <step> (log ...)".
 set -u
 cd "$(dirname "$0")/../.."

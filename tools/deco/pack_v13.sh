@@ -9,12 +9,12 @@ TAGS=${TAGS:-"v5s37 v5s38 v5s39"}
 out=v13_results_$(date +%m%d_%H%M).tgz
 list=$(mktemp)
 for t in $TAGS; do
-  for d in run/deco/$t/dnm_m0.001_s*_nr_v13; do
+  for d in run/deco/$t/dnm_m*_s*_nr_v13; do
     [ -d "$d" ] || continue
     find "$d" -maxdepth 2 \( -name '*.json' -o -name '*.md' -o -name '*.log' -o -name 'vow_test_events.npz' \) >> "$list"
     ls "$d.log" 2>/dev/null >> "$list"
   done
-  ls run/deco/$t/ev_m0.001_nr_*.log 2>/dev/null >> "$list"
+  ls run/deco/$t/ev_m*_nr_*.log 2>/dev/null >> "$list"
 done
 ls run/queue/gpu*/logs/*v13* 2>/dev/null >> "$list"
 tar czf "$out" -T "$list" && echo "packed $out ($(du -h "$out" | cut -f1)), $(wc -l < "$list") files"
