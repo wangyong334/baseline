@@ -1,5 +1,7 @@
 # BST-SNN：共享证据计算与逐事件贝叶斯序贯决策
 
+> 2026-11-11 后续架构迭代：当前窗口分组版本为 `configs/bst_window.json`，其完整公式、网络约束与边界见 [BST_WINDOW_METHOD.md](BST_WINDOW_METHOD.md)。本文的平坦均值式 (6) 对应保留的 `bst_shared.json` 基线；公共时间、先验、工作点、VoW 与训练协议继续适用，不把旧式 (6) 混作新窗口聚合。
+
 日期：2026-11-11。本文是新实现的方法合同与论文写作依据，不是服务器实验结论。研究标题暂定为 *Streaming Spiking Neural Networks with Bayesian Sequential Testing for Event-based Tiny Object Detection*。
 
 本轮保留 BIR 骨干，重构证据编码、SDU 与 VoW 的计算组织。旧 V11/V13 保留作对照。下文明确区分数学定义、网络近似和需要实验验证的假设；任何速度、精度、校准或创新性主张都不能仅由架构图推出。

@@ -19,6 +19,8 @@ def load_config(path):
     with open(path, encoding="utf-8") as fh:
         cfg = json.load(fh)
     BSTConfig(**cfg["model"])
+    if cfg["model"].get("normalization") == "window" and cfg["model"].get("past_windows", 10) != cfg["evidence"]["past_windows"]:
+        raise ValueError("window aggregation and evidence past horizons differ")
     if int(cfg["evidence"]["max_wait"]) != int(cfg["model"]["max_wait_steps"]):
         raise ValueError("model and evidence horizons differ")
     if not 0 < cfg["threshold"] < 1:

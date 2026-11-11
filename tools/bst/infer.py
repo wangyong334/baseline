@@ -114,8 +114,9 @@ def main(argv=None):
     ap.add_argument("--limit", type=int, default=0, help="recording limit: probe only")
     ap.add_argument("--max-windows", type=int, default=0, help="truncate each recording: probe only")
     ap.add_argument("--threads", type=int, default=4)
+    ap.add_argument("--batch-size", type=int, default=1024, help="inference query batch; independent of training batch")
     args = ap.parse_args(argv)
-    if args.limit < 0 or args.max_windows < 0 or args.threads < 1:
+    if args.limit < 0 or args.max_windows < 0 or args.threads < 1 or args.batch_size < 1:
         raise ValueError("limits must be nonnegative and threads positive")
     torch.set_num_threads(args.threads)
     device = torch.device(args.device)
@@ -195,7 +196,7 @@ def main(argv=None):
             policy = lambda features, risk, age: torch.ones_like(risk, dtype=torch.bool)
         out = run_recording(model, rec, cfg["evidence"], policy=policy, birth=birth_mode,
                             threshold=cfg["threshold"], band_alpha=pc["band_alpha"],
-                            batch_size=cfg["train"]["batch_size"], device=device,
+                            batch_size=args.batch_size, device=device,
                             wait_cost=pc["wait_cost"], birth_policy=birth_callback,
                             arrival_provider=provider, band_kind=pc.get("band_kind", "sym"))
         if not np.isfinite(provider.arrival_scores).all():
@@ -221,7 +222,8 @@ def main(argv=None):
               "split": args.split, "subset": args.subset if args.split == "val" else "all",
               "birth": birth_mode, "band_kind": pc.get("band_kind", "sym"),
               "commit": args.commit, "config": cfg,
-              "probe": bool(args.limit or args.max_windows or scope["probe"]),
+              "probe": bool(args.limit or args.max_windows or scope["probe"] or not provenance_verified
+                            or not ck.get("manifest", {}).get("prior_provenance", {}).get("complete", False)),
               "checkpoint_scope": scope, "max_windows": args.max_windows,
               "backbone_sha256": backbone_hash, "provenance_verified": provenance_verified,
               "provenance_note": "matched training prior identity" if provenance_verified else
@@ -230,6 +232,7 @@ def main(argv=None):
               "checkpoint_sha256": file_digest(args.checkpoint),
               "timing_scope": "event representation + BIR + SDU/VoW/index/cache, excluding disk load/metrics/write",
               "backbone_execution": "dense PyTorch convolutions; communication reduction is not kernel skipping",
+              "inference_batch_size": args.batch_size,
               "guaranteed_risk_bound": False}
     save_json(os.path.join(args.out, "summary.json"), report)
     print("BST ONLINE INFERENCE FINISHED %s" % report["model"], flush=True)

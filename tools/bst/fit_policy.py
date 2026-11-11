@@ -14,12 +14,18 @@ from model.bst import BirthValueHead, ContinuationValueHead, stop_risk
 from tools.bst.pipeline import (choose_queries, file_digest, get_record, load_model, paths, prior_provenance, rollout, save_json,
                                threshold_costs, validation_partition)
 from tools.bst.policy import BirthContext, policy_returns
+from tools.bst.train import require_complete_priors, validate_training_config
+from tools.bst.pipeline import checkpoint_scope
 
 
 def regress(head, x, y, weights, cfg, device, rng):
     if not len(y):
         raise ValueError("no nonterminal policy fitting examples")
     x, y, weights = np.asarray(x, np.float32), np.asarray(y, np.float32), np.asarray(weights, np.float32)
+    if (x.ndim != 2 or y.ndim != 1 or weights.shape != y.shape or len(x) != len(y)
+            or not np.isfinite(x).all() or not np.isfinite(y).all() or not np.isfinite(weights).all()
+            or (weights <= 0).any() or (y < 0).any()):
+        raise ValueError("policy regression requires finite features, nonnegative costs and positive weights")
     mean_weight = max(float(weights.mean()), 1e-12)
     optimizer = torch.optim.Adam(head.parameters(), lr=cfg["lr"])
     # A useful output scale at initialization, avoiding softplus(0) dominating
@@ -27,7 +33,9 @@ def regress(head, x, y, weights, cfg, device, rng):
     if not getattr(head, "_fitted", False):
         mean = float(np.sum(y * weights, dtype=np.float64) / max(float(weights.sum()), 1e-12))
         with torch.no_grad():
-            head.net[-1].bias.fill_(np.log(np.expm1(max(mean, 1e-6))))
+            mean = max(mean, 1e-6)
+            # Stable inverse softplus, including large finite declared costs.
+            head.net[-1].bias.fill_(mean + np.log(-np.expm1(-mean)))
         head._fitted = True
     for _ in range(cfg["fit_epochs"]):
         permutation = rng.permutation(len(y))
@@ -38,7 +46,12 @@ def regress(head, x, y, weights, cfg, device, rng):
             wb = torch.as_tensor(weights[ids], device=device)
             optimizer.zero_grad()
             loss = (wb * (head(xb) - yb).square()).sum() / (cfg["batch_size"] * mean_weight)
+            if not torch.isfinite(loss):
+                raise FloatingPointError("nonfinite VoW regression loss")
             loss.backward()
+            finite_gradients = [torch.isfinite(p.grad).all() for p in head.parameters() if p.grad is not None]
+            if finite_gradients and not torch.stack(finite_gradients).all():
+                raise FloatingPointError("nonfinite VoW gradient; refusing optimizer update")
             optimizer.step()
     error_sum = 0.0
     with torch.no_grad():
@@ -46,6 +59,8 @@ def regress(head, x, y, weights, cfg, device, rng):
             stop = start + cfg["batch_size"]
             xb = torch.as_tensor(x[start:stop], device=device)
             pred = head(xb).cpu().numpy()
+            if not np.isfinite(pred).all():
+                raise FloatingPointError("nonfinite fitted VoW prediction")
             error_sum += float(np.sum(weights[start:stop] * (pred - y[start:stop]) ** 2, dtype=np.float64))
     mse = error_sum / max(float(weights.sum()), 1e-12)
     return mse
@@ -62,7 +77,10 @@ def main(argv=None):
     ap.add_argument("--fit-epochs", type=int)
     ap.add_argument("--iterations", type=int)
     ap.add_argument("--threads", type=int, default=4)
+    ap.add_argument("--require-complete-priors", action="store_true", help="require final SDU and complete matching BIR priors")
     args = ap.parse_args(argv)
+    if args.threads < 1:
+        raise ValueError("threads must be positive")
     torch.set_num_threads(args.threads)
     model, ck = load_model(args.checkpoint, args.device)
     model.eval()
@@ -71,17 +89,24 @@ def main(argv=None):
     for arg in ("background_budget", "fit_epochs", "iterations"):
         if getattr(args, arg) is not None:
             pc[arg] = getattr(args, arg)
+    validate_training_config(cfg)
     if os.path.exists(args.out):
         raise FileExistsError("preserving existing policy checkpoint: " + args.out)
     seed = cfg["train"]["seed"]
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
     fit_names = ck["manifest"]["policy_fit"]
+    if not fit_names or set(fit_names) & set(ck["manifest"]["selection"]):
+        raise ValueError("VoW fitting and SDU selection recordings must be nonempty and disjoint")
     fit_pairs = paths(args.data_root, args.z0_root, "val", names=fit_names)
     provenance = prior_provenance(args.z0_root, ("val",))
     expected_hash = ck.get("manifest", {}).get("prior_provenance", {}).get("backbone_sha256")
     if expected_hash and provenance.get("backbone_sha256") and expected_hash != provenance["backbone_sha256"]:
         raise ValueError("policy priors came from a different BIR checkpoint")
+    if args.require_complete_priors:
+        require_complete_priors(provenance, checkpoint_scope(ck, args.data_root))
+        if not expected_hash or expected_hash != provenance["backbone_sha256"]:
+            raise ValueError("final policy requires verified matching SDU/BIR identity")
     context_config = pc.get("birth_context", {"cell": 4, "history": cfg["evidence"]["past_windows"]})
     chunks, log_weights = [], []
     t0 = time.perf_counter()

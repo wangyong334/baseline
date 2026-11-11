@@ -71,7 +71,7 @@ def explain_query(model, recording, evidence_config, event_id, threshold=0.9,
     model.to(device).eval()
     if isinstance(policy, torch.nn.Module):
         policy.to(device).eval()
-    steps, applied, applied_age = [], {}, None
+    steps, applied, applied_age, applied_windows = [], {}, None, None
     first_policy_commit = None
     try:
         with torch.no_grad():
@@ -97,8 +97,16 @@ def explain_query(model, recording, evidence_config, event_id, threshold=0.9,
                     valid = diag["mask"][0].cpu().numpy()
                     mass = gate.sum(axis=0)
                     divisor = np.ones_like(mass) if model.config.normalization == "sum" else np.maximum(mass, 1e-8)
-                    normalized = gate / divisor[None, :]
+                    normalized = diag["effective_weight"][0].cpu().numpy() if "effective_weight" in diag else gate / divisor[None, :]
                     contribution = normalized * value
+                    if "window_discount" in diag:
+                        discount = diag["window_discount"][0].cpu().numpy()
+                        window_value = diag["window_value"][0].cpu().numpy()
+                        active = diag["window_active"][0].cpu().numpy()
+                        applied_windows = [{"dw": int(g-model.config.past_windows),
+                            "discount": discount[g].tolist(), "value": window_value[g].tolist(),
+                            "contribution": (discount[g]*window_value[g]).tolist()}
+                            for g in np.flatnonzero(active)]
                     applied = {}
                     for slot in np.flatnonzero(valid):
                         source = int(indices[0, slot])
@@ -156,6 +164,7 @@ def explain_query(model, recording, evidence_config, event_id, threshold=0.9,
                               "visible_neighbors": int(diag["count"][0]),
                               "new_neighbors": len(set(applied) - set(previous)),
                               "old_evidence_change": changes, "tokens": token_rows,
+                              "window_potentials": copy.deepcopy(applied_windows),
                               "R_stop": float(risk[0]), "predicted_future_loss": future_loss,
                               "wait_cost": float(wait_cost), "Q_wait": q_wait,
                               "policy_action": chosen, "deadline": deadline,

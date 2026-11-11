@@ -115,11 +115,94 @@ def _replace_state_rows(state, rows, replacement):
         state[key][rows] = replacement[key]
 
 
+class CausalPairCache:
+    """Inference-only, bounded by peak live queries, not total stream length.
+
+    Cache ONLY immutable source/relative encodings. Gate weights, evidence
+    values, posterior corrections and context are recomputed by reaudit.
+    Stable reusable slots avoid copying all old pairs when the queue changes.
+    """
+
+    def __init__(self, model, source_cache, slots, batch_size):
+        self.model, self.source = model, source_cache
+        self.slots, self.batch_size = int(slots), int(batch_size)
+        self.capacity, self.free, self.storage = 0, [], {}
+        self.prepared_pairs = 0
+        self.prepared_slots = 0
+        c = self.model.config
+        self.layout, offset = {}, 0
+        for name, tail in (("key", (c.heads, c.relation_dim)), ("value", (c.heads, c.relation_dim)),
+                           ("context", (c.state_dim,)), ("bias", (c.heads,)), ("dw", ()), ("relative", (4,))):
+            width = int(np.prod(tail)) if tail else 1
+            self.layout[name] = (offset, offset + width, tail)
+            offset += width
+        self.width = offset
+
+    def allocate(self, count):
+        if len(self.free) < count:
+            old = self.capacity
+            capacity = max(old * 2, old + count - len(self.free), min(256, self.batch_size))
+            device = self.source.device
+            shapes = {"packed": (self.width,), "indices": ()}
+            dtype = next(self.model.parameters()).dtype
+            for name, tail in shapes.items():
+                kind = torch.long if name == "indices" else dtype
+                data = torch.full((capacity, self.slots) + tail, -1 if name == "indices" else 0, dtype=kind, device=device)
+                if old:
+                    data[:old].copy_(self.storage[name])
+                self.storage[name] = data
+            self.free.extend(range(capacity - 1, old - 1, -1))
+            self.capacity = capacity
+        ids = np.asarray([self.free.pop() for _ in range(count)], np.int64)
+        if len(ids):
+            rows = torch.as_tensor(ids, device=self.source.device)
+            # Invalid slots must be clean when a committed query's slot is reused.
+            self.storage["packed"][rows] = 0
+            self.storage["indices"][rows] = -1
+        return ids
+
+    def append(self, pool_rows, global_indices, relative, starts):
+        """Encode an observed append, preserving the exact original slot order."""
+        width = global_indices.shape[1]
+        starts = np.broadcast_to(np.asarray(starts, np.int64), (len(pool_rows),)).copy()
+        useful = (global_indices >= 0).any(axis=1)
+        pool_rows, global_indices, relative, starts = (value[useful] for value in
+                                                      (pool_rows, global_indices, relative, starts))
+        for begin in range(0, len(pool_rows), self.batch_size):
+            sl = slice(begin, begin + self.batch_size)
+            ids = global_indices[sl]
+            local = torch.as_tensor(self.source.local_indices(ids), device=self.source.device)
+            rel = torch.as_tensor(relative[sl], device=self.source.device)
+            pairs = self.model.prepare_pairs(self.source.encoded, local, rel)
+            rows = torch.as_tensor(pool_rows[sl], device=self.source.device)[:, None]
+            cols = torch.as_tensor(starts[sl], device=self.source.device)[:, None] + torch.arange(width, device=self.source.device)
+            # One contiguous transfer/scatter instead of a kernel per field.
+            values = dict(pairs, relative=rel)
+            packed = torch.cat([values[name].reshape(len(ids), width, -1) for name in self.layout], dim=-1)
+            self.storage["packed"][rows, cols] = packed
+            self.storage["indices"][rows, cols] = torch.as_tensor(ids, device=self.source.device)
+            self.prepared_pairs += int((ids >= 0).sum())
+            self.prepared_slots += int(ids.size)
+
+    def read(self, pool_rows, end):
+        rows = torch.as_tensor(pool_rows, device=self.source.device)
+        # Slice before gathering: do not move impossible future slots.
+        packed = self.storage["packed"][:, :end][rows]
+        indices = self.storage["indices"][:, :end][rows]
+        result = {name: packed[..., start:stop].reshape((len(pool_rows), end) + tail)
+                  for name, (start, stop, tail) in self.layout.items()}
+        result.update(indices=indices, present=indices >= 0)
+        return result
+
+    def release(self, rows):
+        self.free.extend(np.asarray(rows, np.int64).tolist())
+
+
 def run_recording(model, rec, evidence_config=None, policy=None, birth="band", threshold=0.9,
                   band_alpha=0.01, batch_size=256, device="cpu", wait_cost=0.0,
                   fp_cost=None, fn_cost=None, birth_policy=None, band_kind="sym",
                   return_traces=False, prior_logits=None, source_features=None,
-                  arrival_provider=None):
+                  arrival_provider=None, source_batch_size=4096):
     """Run chronological inference and return ``logits``, ``lags`` and ``stats``.
 
     ``logits`` use the repository's z0 scale. Official reporting applies
@@ -151,6 +234,8 @@ def run_recording(model, rec, evidence_config=None, policy=None, birth="band", t
         raise ValueError("learned birth requires a pre-SDU birth_policy")
     if int(batch_size) != batch_size or int(batch_size) < 1:
         raise ValueError("batch_size must be positive")
+    if int(source_batch_size) != source_batch_size or int(source_batch_size) < 1:
+        raise ValueError("source_batch_size must be positive")
     if not np.isfinite(wait_cost) or wait_cost < 0:
         raise ValueError("wait_cost must be finite and nonnegative")
     if arrival_provider is not None:
@@ -192,8 +277,8 @@ def run_recording(model, rec, evidence_config=None, policy=None, birth="band", t
     lags = np.zeros(len(rec), np.int64)
     reasons = np.full(len(rec), "birth", dtype="<U8")
     active = np.empty(0, np.int64)
-    neighbors = np.full((0, index.slots_per_query), -1, np.int64)
-    relative = np.zeros((0, index.slots_per_query, 4), np.float32)
+    pair_rows = np.empty(0, np.int64)
+    counts = np.empty(0, np.int64)
     state = None
     traces = []
     stats = {"events": len(rec), "births": 0, "queries_updated": 0, "decision_checks": 0,
@@ -203,7 +288,10 @@ def run_recording(model, rec, evidence_config=None, policy=None, birth="band", t
     started = time.perf_counter()
     try:
         with torch.no_grad():
-            cache = CausalSourceCache(model, rec, device, batch_size, source_features)
+            # Source MLPs are small and per-row: larger encoding batches reduce
+            # launches without changing evidence budgets or SDU query batches.
+            cache = CausalSourceCache(model, rec, device, source_batch_size, source_features)
+            pairs_cache = CausalPairCache(model, cache, index.slots_per_query, batch_size)
             for window, arrived in rec.iter_windows(include_empty=True):
                 if arrival_provider is not None:
                     arrival = arrival_provider(window, arrived.copy())
@@ -231,13 +319,14 @@ def run_recording(model, rec, evidence_config=None, policy=None, birth="band", t
                 earliest = window - index.past_windows - index.max_wait
                 cache.evict_before(earliest)
                 index.evict_before(earliest)
+                appends = []
+                previous_counts = counts.copy()
                 # Every live query retains exactly its old candidate identities.
                 if len(active):
                     state["previous_score"] = state["score"].clone()
-                    new = index.query(active, current_window=window, new_only=True)
-                    present = new["mask"]
-                    neighbors[present] = new["idx"][present]
-                    relative[present] = new["relative"][present]
+                    new = index.query_arriving(active, current_window=window)
+                    counts += new["mask"].sum(axis=1)
+                    appends.append((pair_rows, new["idx"], new["relative"], new["slot"]))
                 if birth == "all":
                     admit = np.ones(len(arrived), bool)
                 elif birth == "band":
@@ -258,8 +347,12 @@ def run_recording(model, rec, evidence_config=None, policy=None, birth="band", t
                     born_state = model.make_state(p0, polarity)
                     state = born_state if state is None else concat_states([state, born_state])
                     active = np.concatenate([active, born])
-                    neighbors = np.concatenate([neighbors, initial["idx"]], axis=0)
-                    relative = np.concatenate([relative, initial["relative"]], axis=0)
+                    new_rows = pairs_cache.allocate(len(born))
+                    pair_rows = np.concatenate([pair_rows, new_rows])
+                    counts = np.concatenate([counts, initial["mask"].sum(axis=1)])
+                    previous_counts = np.concatenate([previous_counts, np.full(len(born), -1, np.int64)])
+                    end = (index.past_windows + 1) * index.K
+                    appends.append((new_rows, initial["idx"][:, :end], initial["relative"][:, :end], 0))
                     stats["births"] += len(born)
                 stats["max_active"] = max(stats["max_active"], len(active))
                 if not len(active):
@@ -272,25 +365,25 @@ def run_recording(model, rec, evidence_config=None, policy=None, birth="band", t
                 ages = window - rec.window[active]
                 age_tensor = torch.as_tensor(ages, dtype=state["score"].dtype, device=device)
                 state["age"] = age_tensor
-                counts = (neighbors >= 0).sum(axis=1)
-                old_count = state["count"].cpu().numpy()
-                changed = (counts > old_count) & (counts > 0)
+                changed = (counts > previous_counts) & (counts > 0)
                 stats["empty_prefix_checks"] += int((counts == 0).sum())
                 rows_to_update = np.flatnonzero(changed)
                 # Only actually updated queries cause source encoding and SDU work.
-                if len(rows_to_update):
-                    needed = neighbors[rows_to_update]
-                    cache.ensure(needed[needed >= 0], window)
+                if appends:
+                    # Old sources were encoded already; never rescan the old prefix.
+                    needed = np.concatenate([ids[ids >= 0] for _, ids, _, _ in appends])
+                    cache.ensure(needed, window)
+                    for pool, ids, rel, starts in appends:
+                        pairs_cache.append(pool, ids, rel, starts)
                 for begin in range(0, len(rows_to_update), batch_size):
                     rows_np = rows_to_update[begin:begin + batch_size]
                     rows = torch.as_tensor(rows_np, dtype=torch.long, device=device)
                     substate = take_state(state, rows)
                     # Fixed queue storage, but no kernels over impossible future slots.
                     last_slot = (index.past_windows + int(ages[rows_np].max()) + 1) * index.K
-                    local = torch.as_tensor(cache.local_indices(neighbors[rows_np, :last_slot]), dtype=torch.long, device=device)
-                    rel = torch.as_tensor(relative[rows_np, :last_slot], device=device)
-                    _, updated, _ = model.reaudit(cache.encoded, local, rel, substate,
-                                                  substate["prior"], substate["polarity"], age_tensor[rows])
+                    pairs = pairs_cache.read(pair_rows[rows_np], last_slot)
+                    _, updated, _ = model.reaudit(cache.encoded, pairs["indices"], pairs["relative"], substate,
+                                                  substate["prior"], substate["polarity"], age_tensor[rows], pair_cache=pairs)
                     _replace_state_rows(state, rows, updated)
                     stats["queries_updated"] += len(rows_np)
                     stats["pair_visits"] += int(counts[rows_np].sum())
@@ -299,6 +392,7 @@ def run_recording(model, rec, evidence_config=None, policy=None, birth="band", t
                 stop = deadline.copy()
                 if policy is not None:
                     candidates = np.flatnonzero(~deadline)
+                    decisions, invalid_predictions = [], []
                     for begin in range(0, len(candidates), batch_size):
                         rows_np = candidates[begin:begin + batch_size]
                         rows = torch.as_tensor(rows_np, dtype=torch.long, device=device)
@@ -306,16 +400,23 @@ def run_recording(model, rec, evidence_config=None, policy=None, birth="band", t
                         features = model.value_features(substate, age=age_tensor[rows])
                         if isinstance(policy, nn.Module):
                             prediction = policy(features)
-                            if (prediction.shape != risks[rows].shape or not torch.isfinite(prediction).all()
-                                    or (prediction < 0).any()):
+                            if prediction.shape != risks[rows].shape:
                                 raise ValueError("continuation head must return finite nonnegative loss[B]")
+                            invalid_predictions.append((~torch.isfinite(prediction) | (prediction < 0)).any().reshape(1))
                             decision = risks[rows] <= float(wait_cost) + prediction
                         else:
                             decision = policy(features, risks[rows], age_tensor[rows])
                         decision = torch.as_tensor(decision, device=device)
                         if decision.shape != risks[rows].shape or decision.dtype != torch.bool:
                             raise ValueError("policy callable must return bool[B], True means commit")
-                        stop[rows_np] = decision.cpu().numpy()
+                        decisions.append(decision)
+                    if decisions:
+                        # One D2H synchronization per window, not per minibatch
+                        # and per validity check. Invalid outputs still fail.
+                        checked = torch.cat(decisions + invalid_predictions).cpu().numpy()
+                        if checked[len(candidates):].any():
+                            raise ValueError("continuation head must return finite nonnegative loss[B]")
+                        stop[candidates] = checked[:len(candidates)]
                 stats["decision_checks"] += len(active)
                 if return_traces:
                     traces.append({"window": window, "ids": active.copy(),
@@ -331,13 +432,18 @@ def run_recording(model, rec, evidence_config=None, policy=None, birth="band", t
                 stats["deadline_commits"] += int(deadline[emit].sum())
                 stats["policy_commits"] += int((~deadline[emit]).sum())
                 keep = np.flatnonzero(~stop)
-                active, neighbors, relative = active[keep], neighbors[keep], relative[keep]
+                pairs_cache.release(pair_rows[emit])
+                active, pair_rows, counts = active[keep], pair_rows[keep], counts[keep]
                 state = take_state(state, torch.as_tensor(keep, dtype=torch.long, device=device)) if len(keep) else None
             stats["source_encoded"] = cache.encoded_total
             stats["cache_peak_sources"] = cache.peak_sources
             stats["cache_peak_bytes"] = cache.peak_bytes
             stats["trees_built"] = index.trees_built
             stats["remaining_active"] = len(active)
+            stats["pair_cache_capacity"] = pairs_cache.capacity
+            stats["pair_cache_bytes"] = sum(v.numel() * v.element_size() for v in pairs_cache.storage.values())
+            stats["pairs_prepared"] = pairs_cache.prepared_pairs
+            stats["pair_slots_prepared"] = pairs_cache.prepared_slots
     finally:
         model.train(model_training)
         if isinstance(policy, nn.Module):

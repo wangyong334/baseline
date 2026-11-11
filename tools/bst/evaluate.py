@@ -54,7 +54,10 @@ def main(argv=None):
     ap.add_argument("--commit", choices=("fixed", "learned", "arrival"), default="learned")
     ap.add_argument("--limit", type=int, default=0, help="recording limit for a PROBE, not a full benchmark")
     ap.add_argument("--threads", type=int, default=4)
+    ap.add_argument("--batch-size", type=int, default=1024, help="inference query batch; independent of training batch")
     args = ap.parse_args(argv)
+    if args.batch_size < 1:
+        raise ValueError("inference batch_size must be positive")
     torch.set_num_threads(args.threads)
     model, ck = load_model(args.checkpoint, args.device)
     model.eval()
@@ -101,7 +104,7 @@ def main(argv=None):
         out = run_recording(model, rec, cfg["evidence"], policy=policy, birth=birth_mode,
                             threshold=cfg["threshold"], band_alpha=pc["band_alpha"],
                             band_kind=pc.get("band_kind", "sym"),
-                            batch_size=cfg["train"]["batch_size"], device=args.device,
+                            batch_size=args.batch_size, device=args.device,
                             wait_cost=pc["wait_cost"], birth_policy=birth_callback)
         mr = metric_record(rec)
         ref = references(mr, 0, rec.window_ms)
@@ -119,8 +122,11 @@ def main(argv=None):
               "split": args.split, "subset": args.subset if args.split == "val" else "all",
               "birth": birth_mode, "commit": args.commit, "config": cfg,
               "band_kind": pc.get("band_kind", "sym"), "prior_provenance": provenance,
-              "probe": bool(args.limit) or scope["probe"], "checkpoint_scope": scope,
+              "probe": bool(args.limit) or scope["probe"] or not provenance.get("complete", False)
+                  or not ck.get("manifest", {}).get("prior_provenance", {}).get("complete", False),
+              "checkpoint_scope": scope,
               "evaluation_limit": args.limit, "checkpoint_sha256": file_digest(args.checkpoint),
+              "inference_batch_size": args.batch_size,
               "timing_scope": "SDU/VoW/index/cache on precomputed BIR priors; excludes BIR and file load",
               "guaranteed_risk_bound": False}
     save_json(os.path.join(args.out, "summary.json"), report)

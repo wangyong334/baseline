@@ -92,10 +92,14 @@ def policy_returns(logits, labels, valid, wait_actions, tau, fp_cost, fn_cost, w
     """
     logits, labels = np.asarray(logits), np.asarray(labels)
     valid, wait_actions = np.asarray(valid, bool), np.asarray(wait_actions, bool)
-    if logits.shape != valid.shape or logits.shape != wait_actions.shape or labels.shape != logits.shape[:1]:
+    if logits.ndim != 2 or logits.shape[1] < 1 or logits.shape != valid.shape or logits.shape != wait_actions.shape or labels.shape != logits.shape[:1]:
         raise ValueError("incompatible trajectory shapes")
-    if wait_cost < 0 or fp_cost <= 0 or fn_cost <= 0:
+    if not all(math.isfinite(float(value)) for value in (tau, fp_cost, fn_cost, wait_cost)) or wait_cost < 0 or fp_cost <= 0 or fn_cost <= 0:
         raise ValueError("costs must be nonnegative with positive classification costs")
+    if not np.isfinite(logits).all() or not np.isin(labels, [0, 1]).all():
+        raise ValueError("trajectories must be finite with binary labels")
+    if not valid[:, 0].all() or ((~valid[:, :-1]) & valid[:, 1:]).any():
+        raise ValueError("valid trajectory ages must form a nonempty causal prefix")
     action = logits >= tau
     loss = np.where(action, fp_cost * (1 - labels[:, None]), fn_cost * labels[:, None])
     target = np.zeros_like(logits, dtype=np.float32)

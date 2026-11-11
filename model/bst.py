@@ -11,6 +11,12 @@ Local equation S3: L_i = L_i^prior + sum_h sum_j(a_ijh v_ijh) / sum_j(a_ijh).
 Local equation S4: c_i = c_i^0 + Context(weighted_source_summary, evidence_statistics).
 See docs/BST_METHOD.md, equations (4)-(6), for the paper-level notation.
 
+S3 above describes the retained legacy mean baseline. normalization='window'
+instead normalizes within each source window, then SUMS discounted window
+potentials; bounded signed values and window-balanced context/VoW statistics
+make this an architectural constraint, not merely a reinterpretation of S3.
+See model/bst_window.py and docs/BST_WINDOW_METHOD.md (W1-W7).
+
 Old evidence is retained and both its weight and its value can be revised when
 new evidence arrives.  Equation S3 REPLACES the total correction; it does not add
 the old evidence again.  Its residual is a learned total evidence correction,
@@ -28,6 +34,7 @@ from typing import Dict, Optional
 import torch
 from torch import nn
 from torch.nn import functional as F
+from model.bst_window import WindowEvidence
 
 
 @dataclass
@@ -43,6 +50,9 @@ class BSTConfig:
     normalization: str = "mean"
     revalue: bool = True
     reweight: bool = True
+    past_windows: int = 10
+    window_gate: bool = True
+    bounded_values: bool = True
 
     def __post_init__(self):
         for name in ("source_features", "source_dim", "state_dim", "relation_dim", "heads"):
@@ -56,8 +66,10 @@ class BSTConfig:
             raise ValueError("spatial_scale must be positive and finite")
         if self.max_wait_steps < 0 or int(self.max_wait_steps) != self.max_wait_steps:
             raise ValueError("max_wait_steps must be a nonnegative integer")
-        if self.normalization not in ("mean", "sum", "softmax"):
-            raise ValueError("normalization must be mean, sum or softmax")
+        if self.normalization not in ("mean", "sum", "softmax", "window"):
+            raise ValueError("normalization must be mean, sum, softmax or window")
+        if int(self.past_windows) != self.past_windows or self.past_windows < 0:
+            raise ValueError("past_windows must be a nonnegative integer")
 
     def to_dict(self):
         return asdict(self)
@@ -189,6 +201,38 @@ class SharedSequentialModel(nn.Module):
         self.context_update = nn.Sequential(
             nn.Linear(c.state_dim + 2 * h, c.state_dim), nn.SiLU(),
             nn.Linear(c.state_dim, c.state_dim), nn.Tanh())
+        if c.normalization == "window":
+            self.window_evidence = WindowEvidence(c.state_dim, h, c.past_windows,
+                                                   c.max_wait_steps, c.window_gate, c.bounded_values)
+        # Runtime-only grouping of parallel affine projections. State-dict names,
+        # training gradients and learned architecture remain unchanged.
+        self.fused_inference = True
+        self._inference_projection_cache = {}
+
+    def train(self, mode=True):
+        self._inference_projection_cache.clear()
+        return super().train(mode)
+
+    def _project_many(self, x, names):
+        layers = [getattr(self, name) for name in names]
+        # Diagnostic Linear hooks need their original call sites. Their MAC sum
+        # is identical to the grouped GEMM; benchmark timing never enables hooks.
+        if self.training or torch.is_grad_enabled() or not self.fused_inference or any(layer._forward_hooks for layer in layers):
+            return [layer(x) for layer in layers]
+        parameters = [p for layer in layers for p in (layer.weight, layer.bias) if p is not None]
+        stamp = tuple((id(p), p.data_ptr(), p._version, p.device, p.dtype) for p in parameters)
+        entry = self._inference_projection_cache.get(names)
+        if entry is None or entry[0] != stamp:
+            weight = torch.cat([layer.weight for layer in layers], dim=0)
+            if all(layer.bias is None for layer in layers):
+                bias = None
+            else:
+                bias = torch.cat([layer.bias if layer.bias is not None else
+                                  layer.weight.new_zeros(layer.out_features) for layer in layers])
+            entry = (stamp, weight, bias)
+            self._inference_projection_cache[names] = entry
+        joined = F.linear(x, entry[1], entry[2])
+        return joined.split([layer.out_features for layer in layers], dim=-1)
 
     @property
     def value_feature_dim(self):
@@ -205,9 +249,8 @@ class SharedSequentialModel(nn.Module):
         x = torch.cat([torch.asinh(source_features[:, :1]), source_features[:, 1:]], dim=1)
         z = self.source_encoder(x)
         h, r = self.config.heads, self.config.relation_dim
-        return {"key": self.source_key(z).reshape(-1, h, r),
-                "value": self.source_value(z).reshape(-1, h, r),
-                "context": self.source_context(z)}
+        key, value, context = self._project_many(z, ("source_key", "source_value", "source_context"))
+        return {"key": key.reshape(-1, h, r), "value": value.reshape(-1, h, r), "context": context}
 
     def make_state(self, prior_logit, p):
         if prior_logit.ndim != 1 or p.shape != prior_logit.shape:
@@ -217,11 +260,14 @@ class SharedSequentialModel(nn.Module):
         # The streaming executor scatters updates into fields in place.  Each
         # field therefore needs independent storage, including initial zeros.
         # clone preserves the differentiable connection to the arrival score.
-        return {"context": context, "anchor": context.clone(),
+        state = {"context": context, "anchor": context.clone(),
                 "score": prior_logit.clone(), "previous_score": prior_logit.clone(),
                 "prior": prior_logit.clone(), "polarity": p.clone(), "correction": zero.clone(),
                 "count": torch.full_like(prior_logit, -1.0), "mass": zero.clone(),
                 "neff": zero.clone(), "age": zero.clone()}
+        if self.config.normalization == "window":
+            state["units"] = zero.clone()
+        return state
 
     @staticmethod
     def _ages(age, ref):
@@ -235,12 +281,14 @@ class SharedSequentialModel(nn.Module):
         return age
 
     def prepare_pairs(self, encoded_source, neighbor_indices, relative):
-        """Cache query-state-independent reads for one offline minibatch.
+        """Cache query-state-independent source and relative projections.
 
         This retains gradients and is invalid after an optimizer update.  Its
         memory scales with query-neighbor pairs, so it is NOT an unbounded
-        persistent online cache.  The causal mask is still applied at EVERY
-        re-audit; no future token enters a prefix summary or decision.
+        persistent online cache. The online executor retains only arrived pairs
+        for live queries and releases their slots on commit. The causal mask is
+        still applied at EVERY re-audit; no future token enters a prefix summary
+        or decision, and no context-dependent weight/value is cached here.
         """
         c = self.config
         if neighbor_indices.ndim != 2 or relative.shape != tuple(neighbor_indices.shape) + (4,):
@@ -250,10 +298,15 @@ class SharedSequentialModel(nn.Module):
         indices = neighbor_indices.long()
         present = (indices >= 0) & (indices < n)
         safe_relative = torch.where(present[..., None], relative, torch.zeros_like(relative))
+        if c.normalization == "window":
+            dw = safe_relative[..., 3]
+            valid_window = torch.isfinite(dw) & (dw == dw.round()) & (dw >= -c.past_windows) & (dw <= c.max_wait_steps)
+            if not bool(valid_window.all()):
+                raise ValueError("window aggregation requires integer offsets in the declared past/wait horizon")
         rel = self.relation(torch.asinh(safe_relative / self.relation_scale.to(relative.dtype)))
-        rk = self.relation_key(rel).reshape(b, t, c.heads, c.relation_dim)
-        rv = self.relation_value(rel).reshape(b, t, c.heads, c.relation_dim)
-        rb = self.relation_bias(rel)
+        rk, rv, rb = self._project_many(rel, ("relation_key", "relation_value", "relation_bias"))
+        rk = rk.reshape(b, t, c.heads, c.relation_dim)
+        rv = rv.reshape(b, t, c.heads, c.relation_dim)
         gather = indices.clamp(min=0, max=max(n - 1, 0))
         def read(name):
             x = encoded_source[name]
@@ -272,8 +325,9 @@ class SharedSequentialModel(nn.Module):
         are -1; future neighbors are additionally suppressed by their dw.
         `force_update` is only for controlled ablations or replaced source caches.
         Default repeated calls on the same prefix are exact no-ops for beliefs.
-        `pair_cache` can be prepared once per offline training minibatch with
-        prepare_pairs; it does not cache any context-dependent gate or value.
+        `pair_cache` can be prepared once per offline training minibatch or
+        appended causally by the bounded online executor with prepare_pairs;
+        it does not cache any context-dependent gate or value.
         """
         c = self.config
         if neighbor_indices.ndim != 2 or relative.shape != tuple(neighbor_indices.shape) + (4,):
@@ -305,15 +359,25 @@ class SharedSequentialModel(nn.Module):
         # New observations must affect the reinterpretation of old neighbors in
         # this call, not only in a later call that might never receive evidence.
         visible_count = mask.sum(-1).to(prior_logit.dtype)
-        visible_summary = source_context.sum(1)
-        visible_summary = visible_summary / visible_count[:, None].clamp(min=1.0)
+        grouping = None
+        if c.normalization == "window":
+            grouping = self.window_evidence.summarize_visible(source_context, mask, pairs["dw"])
+            visible_summary = grouping["balanced"]
+        else:
+            visible_summary = source_context.sum(1)
+            visible_summary = visible_summary / visible_count[:, None].clamp(min=1.0)
         qctx = self.query_norm(context + self.evidence_query(visible_summary)
                                + self.age_query((age / max(c.max_wait_steps, 1))[:, None]))
         if not c.reweight:
             qkey_ctx = self.query_norm(a0)
         else:
             qkey_ctx = qctx
-        qkey = self.query_key(qkey_ctx).reshape(b, c.heads, c.relation_dim)
+        vctx = qctx if c.revalue else self.query_norm(a0)
+        if c.reweight == c.revalue:
+            qkey, qvalue = self._project_many(qkey_ctx, ("query_key", "query_value"))
+        else:
+            qkey, qvalue = self.query_key(qkey_ctx), self.query_value(vctx)
+        qkey = qkey.reshape(b, c.heads, c.relation_dim)
         gate_logit = (key * qkey[:, None]).sum(-1) / math.sqrt(c.relation_dim) + rb
         if c.normalization == "softmax":
             if t:
@@ -326,22 +390,28 @@ class SharedSequentialModel(nn.Module):
                 weights = gate_logit
         else:
             weights = torch.sigmoid(gate_logit) * mask[..., None].to(gate_logit.dtype)
-        vctx = qctx if c.revalue else self.query_norm(a0)
-        qvalue = self.query_value(vctx).reshape(b, c.heads, c.relation_dim)
+        qvalue = qvalue.reshape(b, c.heads, c.relation_dim)
         hidden = F.silu(value + qvalue[:, None])
         values = (hidden * self.value_weight[None, None]).sum(-1) + self.value_bias[None, None]
         values = torch.where(mask[..., None], values, torch.zeros_like(values))
-        mass_h = weights.sum(1)
-        numerator = (weights * values).sum(1)
-        if c.normalization == "sum":
-            head_correction = numerator
+        window_result = None
+        if c.normalization == "window":
+            values = self.window_evidence.bound_values(values)
+            window_result = self.window_evidence(weights, values, source_context, qkey_ctx, grouping)
+            weights = window_result["gate"]
+            head_correction = window_result["head_correction"]
+            mass_h, summary = window_result["mass_h"], window_result["summary"]
+            neff = window_result["neff"]
         else:
-            head_correction = numerator / mass_h.clamp(min=1e-8)
+            mass_h = weights.sum(1)
+            numerator = (weights * values).sum(1)
+            head_correction = numerator if c.normalization == "sum" else numerator / mass_h.clamp(min=1e-8)
+            summary_weight = weights.mean(-1)
+            summary_mass = summary_weight.sum(-1)
+            summary = torch.bmm(summary_weight[:, None], source_context).squeeze(1)
+            summary = summary / summary_mass[:, None].clamp(min=1e-8)
+            neff = (mass_h.square() / weights.square().sum(1).clamp(min=1e-8)).mean(-1)
         correction = head_correction.sum(-1)
-        summary_weight = weights.mean(-1)
-        summary_mass = summary_weight.sum(-1)
-        summary = torch.bmm(summary_weight[:, None], source_context).squeeze(1)
-        summary = summary / summary_mass[:, None].clamp(min=1e-8)
         new_context = a0 + self.context_update(torch.cat([summary, head_correction, torch.log1p(mass_h)], -1))
         count = visible_count
         has_evidence = count > 0
@@ -350,9 +420,8 @@ class SharedSequentialModel(nn.Module):
         candidate_score = prior_logit + correction
         score = torch.where(update, candidate_score, state["score"])
         mass = mass_h.sum(-1)
-        # Kish effective size of attention weights, not independent evidence count.
-        neff_h = mass_h.square() / weights.square().sum(1).clamp(min=1e-8)
-        neff = neff_h.mean(-1)
+        # Kish size uses tokens in legacy modes and discounted windows in window
+        # mode. Neither measures statistical independence.
         def choose(candidate, old):
             sel = update.reshape((b,) + (1,) * (candidate.ndim - 1))
             return torch.where(sel, candidate, old)
@@ -365,11 +434,16 @@ class SharedSequentialModel(nn.Module):
                   "count": torch.where(valid, count, state["count"]),
                   "mass": choose(mass, state["mass"]), "neff": choose(neff, state["neff"]),
                   "age": torch.where(valid, age, state["age"])}
+        if window_result is not None:
+            result["units"] = choose(window_result["units"], state["units"])
         diag = {"correction": result["correction"], "delta": score - state["score"],
                 "mass": result["mass"], "neff": result["neff"], "count": result["count"],
                 "updated": update, "head_correction": head_correction}
         if return_tokens:
             diag.update({"gate": weights, "value": values, "mask": mask})
+            if window_result is not None:
+                diag.update({key: window_result[key] for key in ("effective_weight", "window_discount",
+                              "window_value", "window_active", "units")})
         return score, result, diag
 
     def value_features(self, state, prior_logit=None, age=None):
@@ -380,7 +454,7 @@ class SharedSequentialModel(nn.Module):
         horizon = max(self.config.max_wait_steps, 1)
         scalars = [torch.asinh(score), torch.asinh(prior), state["polarity"],
                    torch.asinh(state["correction"]), torch.asinh(score - state["previous_score"]),
-                   torch.log1p(state["count"].clamp(min=0)), torch.log1p(state["mass"]),
+                   torch.log1p(state.get("units", state["count"]).clamp(min=0)), torch.log1p(state["mass"]),
                    torch.log1p(state["neff"]), elapsed / horizon,
                    (self.config.max_wait_steps - elapsed).clamp(min=0) / horizon]
         return torch.cat([state["context"], torch.stack(scalars, dim=-1)], dim=-1)

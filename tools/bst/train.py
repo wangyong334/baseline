@@ -1,5 +1,6 @@
 """Train the shared SDU on frozen BIR scores; select only on held-out recordings."""
 import argparse
+import math
 import os
 import sys
 import time
@@ -14,6 +15,37 @@ from tools.bst.pipeline import (checkpoint_scope, choose_queries, evaluate_sampl
                                 paths, rollout, save_json, validation_partition, weighted_event_loss)
 
 
+def validate_training_config(cfg):
+    """Reject silent empty fits and invalid cost/optimizer settings before work."""
+    for group, positive, nonnegative in (
+            ("train", ("epochs", "batch_size"), ("background_budget", "validation_background_budget")),
+            ("policy", ("iterations", "fit_epochs", "batch_size", "hidden"), ("background_budget",))):
+        for name in positive + nonnegative:
+            value = cfg[group][name]
+            if not isinstance(value, (int, float)) or not math.isfinite(value) or int(value) != value:
+                raise ValueError("%s.%s must be an integer" % (group, name))
+            if value < (1 if name in positive else 0):
+                raise ValueError("invalid %s.%s" % (group, name))
+    seed = cfg["train"]["seed"]
+    if not isinstance(seed, int) or not 0 <= seed < 2**32:
+        raise ValueError("train.seed must be an integer in [0, 2**32)")
+    for group, name, positive in (("train", "lr", True), ("train", "grad_clip", True),
+                                  ("train", "weight_decay", False), ("policy", "lr", True),
+                                  ("policy", "wait_cost", False), ("policy", "init_cost", False)):
+        value = float(cfg[group][name])
+        if not math.isfinite(value) or (value <= 0 if positive else value < 0):
+            raise ValueError("invalid %s.%s" % (group, name))
+    if not 0 < float(cfg["policy"]["band_alpha"]) < .5:
+        raise ValueError("policy.band_alpha must lie in (0, 0.5)")
+
+
+def require_complete_priors(provenance, scope):
+    if not provenance.get("verified") or not provenance.get("complete") or not provenance.get("backbone_sha256"):
+        raise ValueError("final training requires complete, verified BIR prior manifests")
+    if scope["probe"]:
+        raise ValueError("final training requires all raw train/validation recordings")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--config", default="configs/bst_shared.json")
@@ -22,17 +54,24 @@ def main(argv=None):
     ap.add_argument("--out", required=True)
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--epochs", type=int)
+    ap.add_argument("--seed", type=int, help="override SDU/VoW seed; backbone identity is checked separately")
+    ap.add_argument("--require-complete-priors", action="store_true", help="reject incomplete/legacy caches for final runs")
     ap.add_argument("--background-budget", type=int)
     ap.add_argument("--limit-train", type=int, default=0)
     ap.add_argument("--limit-val", type=int, default=0)
     ap.add_argument("--threads", type=int, default=4)
     args = ap.parse_args(argv)
+    if args.threads < 1 or args.limit_train < 0 or args.limit_val < 0:
+        raise ValueError("threads must be positive and recording limits nonnegative")
     torch.set_num_threads(args.threads)
     cfg = load_config(args.config)
     if args.epochs is not None:
         cfg["train"]["epochs"] = args.epochs
     if args.background_budget is not None:
         cfg["train"]["background_budget"] = args.background_budget
+    if args.seed is not None:
+        cfg["train"]["seed"] = args.seed
+    validate_training_config(cfg)
     seed = cfg["train"]["seed"]
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -52,6 +91,8 @@ def main(argv=None):
                 "config": cfg, "stage": "frozen_BIR_shared_SDU", "test_used": False}
     manifest["prior_provenance"] = prior_provenance(args.z0_root)
     manifest["scope"] = checkpoint_scope(manifest, args.data_root)
+    if args.require_complete_priors:
+        require_complete_priors(manifest["prior_provenance"], manifest["scope"])
     save_json(os.path.join(args.out, "manifest.json"), manifest)
     model = SharedSequentialModel(BSTConfig(**cfg["model"])).to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["train"]["lr"],
@@ -95,7 +136,9 @@ def main(argv=None):
                 if not torch.isfinite(loss):
                     raise FloatingPointError("nonfinite loss in %s" % rec.name)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["train"]["grad_clip"])
+                gradient_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["train"]["grad_clip"])
+                if not torch.isfinite(gradient_norm):
+                    raise FloatingPointError("nonfinite gradient in %s; refusing optimizer update" % rec.name)
                 optimizer.step()
                 train_loss += float(loss_sum.detach())
                 query_count += len(ids)
@@ -104,6 +147,9 @@ def main(argv=None):
         schedule.step()
         validation = evaluate_sampled(model, select, cfg, args.device,
                                       cfg["train"]["validation_background_budget"], seed)
+        candidate = validation[selection_metric]
+        if not math.isfinite(candidate):
+            raise FloatingPointError("nonfinite validation selection metric; refusing checkpoint save")
         row = {"epoch": epoch + 1, "train_prefix_bce": train_loss / max(population, 1),
                "queries": query_count, "encoded_source_rows": encoded_count,
                "validation": validation, "seconds": time.perf_counter() - start_time}
@@ -112,7 +158,6 @@ def main(argv=None):
                       "manifest": manifest, "validation": validation, "format": "bst_shared_v1",
                       "log_w": expected_log_w, "selection_metric": selection_metric}
         torch.save(checkpoint, os.path.join(args.out, "last.pt"))
-        candidate = validation[selection_metric]
         improved = (candidate < best) if minimize else (candidate > best)
         if improved:
             best = candidate

@@ -1,0 +1,25 @@
+{
+  "backbones": [
+    {
+      "id": "bir",
+      "architecture_family": "EvSpSegNetStream",
+      "adapter": "evspsegnet_stream",
+      "neuron": "tif",
+      "checkpoints": {"37": null, "38": null}
+    },
+    {
+      "id": "lif",
+      "architecture_family": "EvSpSegNetStream",
+      "adapter": "evspsegnet_stream",
+      "neuron": "lif",
+      "checkpoints": {"37": null, "38": null}
+    },
+    {
+      "id": "relu",
+      "architecture_family": "EvSpSegNetStream",
+      "adapter": "evspsegnet_stream",
+      "neuron": "relu",
+      "checkpoints": {"37": null, "38": null}
+    }
+  ]
+}

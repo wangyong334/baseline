@@ -279,6 +279,48 @@ class NeighborIndex:
             result[:, :take.shape[1]] = take
         return result
 
+    def _select_window(self, q, xy, window):
+        """Identical KNN/self-exclusion/tie order for a batch in one window."""
+        tree, ids, etree, evid = self._window_tree(int(window))
+        near = self._knn(tree, ids, xy, self.k_near + 1) if self.k_near else np.empty((len(q), 0), np.int64)
+        near[near == q[:, None]] = -1
+        near = self._first(near, self.k_near)
+        selected = self._knn(etree, evid, xy, self.k_evidence + self.k_near + 1) if self.k_evidence else np.empty((len(q), 0), np.int64)
+        if selected.shape[1]:
+            selected[selected == q[:, None]] = -1
+            selected[(selected[:, :, None] == near[:, None, :]).any(axis=2)] = -1
+        return np.concatenate([near, self._first(selected, self.k_evidence)], axis=1)
+
+    def query_arriving(self, query_ids, current_window):
+        """Compact [B,K] append for live queries, one KNN call per source tree.
+
+        All ages share the same arriving source window. Search them together
+        rather than once per age, and leave the old prefix untouched. ``slot``
+        locates these K slots in the original fixed neighborhood layout.
+        """
+        q = _integer_vector(query_ids, "query_ids")
+        r = self.recording
+        if ((q < 0) | (q >= len(r))).any():
+            raise IndexError("query id outside the recording")
+        window = int(current_window)
+        if window != current_window or not 0 <= window < r.n_windows:
+            raise ValueError("invalid arriving window")
+        ages = window - r.window[q]
+        if ((ages < 0) | (ages > self.max_wait)).any():
+            raise ValueError("query age must lie in [0, max_wait]")
+        xy = np.stack([r.x[q], r.y[q]], axis=1).astype(np.float64)
+        idx = self._select_window(q, xy, window) if len(q) else np.empty((0, self.K), np.int64)
+        mask = idx >= 0
+        relative = np.zeros(idx.shape + (4,), np.float32)
+        rows, cols = np.nonzero(mask)
+        src, dest = idx[rows, cols], q[rows]
+        relative[rows, cols, 0] = r.x[src] - r.x[dest]
+        relative[rows, cols, 1] = r.y[src] - r.y[dest]
+        relative[rows, cols, 2] = r.t[src] - r.t[dest]
+        relative[rows, cols, 3] = r.window[src] - r.window[dest]
+        return {"idx": idx, "relative": relative, "mask": mask,
+                "slot": (self.past_windows + ages) * self.K, "query_ids": q}
+
     def query(self, query_ids, age=None, current_window=None, new_only=False):
         """Return ``idx``, ``relative``, ``mask``, ``age`` and ``max_age``.
 
@@ -313,17 +355,7 @@ class NeighborIndex:
                 available &= dw == ages
             for w in np.unique(target[available]):
                 rows = np.flatnonzero(available & (target == w))
-                tree, ids, etree, evid = self._window_tree(int(w))
-                near = self._knn(tree, ids, xy[rows], self.k_near + 1) if self.k_near else np.empty((len(rows), 0), np.int64)
-                near[near == q[rows, None]] = -1
-                near = self._first(near, self.k_near)
-                selected = self._knn(etree, evid, xy[rows], self.k_evidence + self.k_near + 1) if self.k_evidence else np.empty((len(rows), 0), np.int64)
-                if selected.shape[1]:
-                    selected[selected == q[rows, None]] = -1
-                    repeated = (selected[:, :, None] == near[:, None, :]).any(axis=2)
-                    selected[repeated] = -1
-                selected = self._first(selected, self.k_evidence)
-                picks[rows, oi] = np.concatenate([near, selected], axis=1)
+                picks[rows, oi] = self._select_window(q[rows], xy[rows], w)
         idx = picks.reshape(len(q), self.slots_per_query)
         mask = idx >= 0
         relative = np.zeros(idx.shape + (4,), dtype=np.float32)
