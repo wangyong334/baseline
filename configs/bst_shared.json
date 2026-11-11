@@ -1,0 +1,49 @@
+{
+  "threshold": 0.9,
+  "recording_n_windows": 160,
+  "model": {
+    "source_features": 2,
+    "source_dim": 32,
+    "state_dim": 16,
+    "relation_dim": 8,
+    "heads": 2,
+    "window_ms": 50.0,
+    "spatial_scale": 16.0,
+    "max_wait_steps": 10,
+    "normalization": "mean",
+    "reweight": true,
+    "revalue": true
+  },
+  "evidence": {
+    "past_windows": 10,
+    "max_wait": 10,
+    "k_near": 8,
+    "k_evidence": 8,
+    "radius": 0,
+    "filter_logit": -5.8
+  },
+  "train": {
+    "seed": 37,
+    "epochs": 12,
+    "batch_size": 256,
+    "background_budget": 32768,
+    "validation_background_budget": 8192,
+    "selection_metric": "weighted_band_iou",
+    "lr": 0.001,
+    "weight_decay": 0.0001,
+    "grad_clip": 1.0
+  },
+  "policy": {
+    "iterations": 3,
+    "fit_epochs": 20,
+    "batch_size": 4096,
+    "hidden": 32,
+    "lr": 0.001,
+    "background_budget": 32768,
+    "wait_cost": 0.0001,
+    "init_cost": 0.0001,
+    "birth": "band",
+    "band_kind": "martingale",
+    "band_alpha": 0.01
+  }
+}

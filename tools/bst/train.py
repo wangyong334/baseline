@@ -1,0 +1,126 @@
+"""Train the shared SDU on frozen BIR scores; select only on held-out recordings."""
+import argparse
+import os
+import sys
+import time
+
+import numpy as np
+import torch
+
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, ROOT)
+from model.bst import BSTConfig, SharedSequentialModel
+from tools.bst.pipeline import (checkpoint_scope, choose_queries, evaluate_sampled, get_record, load_config, prior_provenance,
+                                paths, rollout, save_json, validation_partition, weighted_event_loss)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--config", default="configs/bst_shared.json")
+    ap.add_argument("--data-root", required=True)
+    ap.add_argument("--z0-root", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--epochs", type=int)
+    ap.add_argument("--background-budget", type=int)
+    ap.add_argument("--limit-train", type=int, default=0)
+    ap.add_argument("--limit-val", type=int, default=0)
+    ap.add_argument("--threads", type=int, default=4)
+    args = ap.parse_args(argv)
+    torch.set_num_threads(args.threads)
+    cfg = load_config(args.config)
+    if args.epochs is not None:
+        cfg["train"]["epochs"] = args.epochs
+    if args.background_budget is not None:
+        cfg["train"]["background_budget"] = args.background_budget
+    seed = cfg["train"]["seed"]
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    rng = np.random.default_rng(seed)
+    train = paths(args.data_root, args.z0_root, "train", limit=args.limit_train)
+    fit, select = validation_partition(paths(args.data_root, args.z0_root, "val", limit=args.limit_val))
+    os.makedirs(args.out, exist_ok=True)
+    target = os.path.join(args.out, "model.pt")
+    if os.path.exists(target):
+        raise FileExistsError("choose a new output directory; preserving %s" % target)
+    manifest = {"train": [os.path.basename(p[0]) for p in train],
+                "policy_fit": [os.path.basename(p[0]) for p in fit],
+                "selection": [os.path.basename(p[0]) for p in select],
+                "data_root": os.path.abspath(args.data_root), "z0_root": os.path.abspath(args.z0_root),
+                "config": cfg, "stage": "frozen_BIR_shared_SDU", "test_used": False}
+    manifest["prior_provenance"] = prior_provenance(args.z0_root)
+    manifest["scope"] = checkpoint_scope(manifest, args.data_root)
+    save_json(os.path.join(args.out, "manifest.json"), manifest)
+    model = SharedSequentialModel(BSTConfig(**cfg["model"])).to(args.device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["train"]["lr"],
+                                 weight_decay=cfg["train"]["weight_decay"])
+    schedule = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, cfg["train"]["epochs"])
+    selection_metric = cfg["train"].get("selection_metric", "weighted_prefix_bce")
+    if selection_metric not in ("weighted_prefix_bce", "weighted_band_iou", "weighted_deadline_iou"):
+        raise ValueError("unknown selection metric")
+    minimize = selection_metric == "weighted_prefix_bce"
+    best = float("inf") if minimize else -float("inf")
+    expected_log_w = None
+    history = []
+    for epoch in range(cfg["train"]["epochs"]):
+        start_time = time.perf_counter()
+        model.train()
+        train_loss, population, query_count, encoded_count = 0.0, 0, 0, 0
+        order = rng.permutation(len(train))
+        for ri in order:
+            rec, index = get_record(train[ri], cfg)
+            if expected_log_w is None:
+                expected_log_w = rec.log_w
+            elif not np.isclose(rec.log_w, expected_log_w, atol=1e-6, rtol=0):
+                raise ValueError("mixed backbone score scales in training")
+            qs = choose_queries(rec, cfg["train"]["background_budget"], rng)
+            permutation = rng.permutation(len(qs.ids))
+            population += len(rec)
+            for start in range(0, len(permutation), cfg["train"]["batch_size"]):
+                rows = permutation[start:start + cfg["train"]["batch_size"]]
+                ids = qs.ids[rows]
+                if not len(ids):
+                    continue
+                optimizer.zero_grad()
+                result = rollout(model, rec, index, ids, args.device)
+                labels = torch.as_tensor(rec.label[ids], dtype=torch.float32, device=args.device)
+                weights = torch.as_tensor(qs.weights[rows], dtype=torch.float32, device=args.device)
+                loss_sum = weighted_event_loss(result["logits"], result["valid"], labels, weights)
+                # Fixed denominator across recordings and partial minibatches:
+                # summing all sampled minibatch objectives is proportional to
+                # the global Horvitz-Thompson event loss, not an equal-record loss.
+                loss = loss_sum / float(cfg["train"]["batch_size"])
+                if not torch.isfinite(loss):
+                    raise FloatingPointError("nonfinite loss in %s" % rec.name)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["train"]["grad_clip"])
+                optimizer.step()
+                train_loss += float(loss_sum.detach())
+                query_count += len(ids)
+                encoded_count += result["source_count"]
+            print("epoch %d record %s queries %d / %d" % (epoch + 1, rec.name, len(qs.ids), len(rec)), flush=True)
+        schedule.step()
+        validation = evaluate_sampled(model, select, cfg, args.device,
+                                      cfg["train"]["validation_background_budget"], seed)
+        row = {"epoch": epoch + 1, "train_prefix_bce": train_loss / max(population, 1),
+               "queries": query_count, "encoded_source_rows": encoded_count,
+               "validation": validation, "seconds": time.perf_counter() - start_time}
+        history.append(row)
+        checkpoint = {"model": model.state_dict(), "config": cfg, "epoch": epoch + 1,
+                      "manifest": manifest, "validation": validation, "format": "bst_shared_v1",
+                      "log_w": expected_log_w, "selection_metric": selection_metric}
+        torch.save(checkpoint, os.path.join(args.out, "last.pt"))
+        candidate = validation[selection_metric]
+        improved = (candidate < best) if minimize else (candidate > best)
+        if improved:
+            best = candidate
+            torch.save(checkpoint, target)
+        save_json(os.path.join(args.out, "training.json"), history)
+        print(row, flush=True)
+    print("BST TRAIN FINISHED: " + target, flush=True)
+
+
+if __name__ == "__main__":
+    main()
