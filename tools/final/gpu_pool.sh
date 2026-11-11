@@ -17,6 +17,10 @@
 # jobs dropped into run/queue/pool/pending/ (tools/final/pool_add.sh) start on the next free GPU. HOLD_GPUS=none: no
 # GPU keeps a placeholder (idle runners hold no GPU memory).
 # 11-10: default GPUS=1 only (the user's rule: the other cards are shared, pool jobs wait for GPU 1).
+# 11-10 evening (SHELVED by the user, opt-in only): HOLD_GB=elastic makes runners on HOLD_GPUS keep the card with tools/final/gpu_hold.py, also during
+# jobs. Our own processes (placeholder, anything whose cwd is this code dir) never count as "another program". A GPU
+# with our runner also gets its next job while another program is on it, provided the memory not used by others is at
+# least NEED_GB (unset by default = old rule; our jobs use about 5 GB), because the elastic placeholder makes room.
 # Usage (code dir, after `conda activate evuav`):
 #   GPUS="0 1 2 3" HOLD_GPUS="3" nohup bash tools/final/gpu_pool.sh >> run/queue/pool.log 2>&1 &
 #   GPUS="1 2 3" HOLD_GPUS=none KEEP=1 nohup bash tools/final/gpu_pool.sh >> run/queue/pool.log 2>&1 < /dev/null &
@@ -28,6 +32,8 @@ POOL=run/queue/pool
 POLL=${POLL:-30}
 FREE_POLLS=${FREE_POLLS:-2}
 HOLD_GB=${HOLD_GB-20}
+NEED_GB=${NEED_GB:-}
+HERE=$(pwd -P)
 HOLD_GPUS=" ${HOLD_GPUS:-3} "
 KEEP=${KEEP:-0}
 NVSMI=${NVSMI:-nvidia-smi}
@@ -62,14 +68,30 @@ runner_alive() {                       # our gpu_queue.sh runner for GPU $1: pid
   return 1
 }
 
-others_on() {                          # PIDs on GPU $1 other than a gpu_queue.sh placeholder; "ERR" if unreadable
-  local bus apps p
+foreign_apps() {                       # "pid MiB" of programs on GPU $1 that are not ours; "ERR" if unreadable
+  local bus apps p m cwd                # ours = a placeholder (fixed or elastic) or a process whose cwd is this dir
   bus=$($NVSMI --query-gpu=pci.bus_id --format=csv,noheader -i "$1" 2>/dev/null | tr -d ' ')
   [ -n "$bus" ] || { echo ERR; return; }
-  apps=$($NVSMI --query-compute-apps=gpu_bus_id,pid --format=csv,noheader 2>/dev/null | tr -d ' ') || { echo ERR; return; }
-  for p in $(echo "$apps" | awk -F, -v b="$bus" '$1 == b {print $2}'); do
-    { tr '\0' ' ' < "/proc/$p/cmdline"; } 2>/dev/null | grep -q "print('holding'" || echo "$p"
+  apps=$($NVSMI --query-compute-apps=gpu_bus_id,pid,used_memory --format=csv,noheader,nounits 2>/dev/null \
+         | tr -d ' ') || { echo ERR; return; }
+  echo "$apps" | awk -F, -v b="$bus" '$1 == b {print $2, $3}' | while read -r p m; do
+    { tr '\0' ' ' < "/proc/$p/cmdline"; } 2>/dev/null | grep -q "print('holding'\|gpu_hold.py" && continue
+    cwd=$(readlink -f "/proc/$p/cwd" 2>/dev/null)
+    case "$cwd" in "$HERE"|"$HERE"/*) continue ;; esac
+    echo "$p $m"
   done
+}
+
+others_on() {                          # PIDs of programs on GPU $1 that are not ours; "ERR" if unreadable
+  foreign_apps "$1" | awk '{print $1}'
+}
+
+room_for_job() {                       # memory on GPU $1 not used by other programs >= NEED_GB
+  local total used
+  total=$($NVSMI --query-gpu=memory.total --format=csv,noheader,nounits -i "$1" 2>/dev/null | tr -d ' ')
+  [ -n "$total" ] || return 1
+  used=$(foreign_apps "$1" | awk '$1 == "ERR" {e = 1} {s += $2} END {if (e) print "ERR"; else print s + 0}')
+  [ "$used" != ERR ] && [ $(( total - used )) -ge $(( NEED_GB * 1024 )) ]
 }
 
 give() {                               # move the next pool job for GPU $1 into its queue (tag dropped)
@@ -86,7 +108,8 @@ give() {                               # move the next pool job for GPU $1 into 
 declare -A idle
 started=()
 echo "[$(ts)] pool started: GPUs ${GS[*]}, poll ${POLL} s, take a free GPU after ${FREE_POLLS} idle polls," \
-     "GPUs${HOLD_GPUS% } keep ${HOLD_GB:-no} GB when idle, the others hold nothing; $(pool_size) jobs"
+     "GPUs${HOLD_GPUS% } hold: ${HOLD_GB:-none} (GB when idle, or elastic), the others hold nothing;" \
+     "a GPU with our runner takes jobs beside other programs if ${NEED_GB} GB are not theirs; $(pool_size) jobs"
 while true; do
   if [ -f "$POOL/STOP" ]; then
     rm -f "$POOL/STOP"
@@ -111,7 +134,7 @@ while true; do
     if runner_alive "$g"; then
       idle[$g]=0
       if [ -z "$(ls "$q"/pending/*.sh 2>/dev/null)" ] && [ -z "$(ls "$q"/running/*.sh 2>/dev/null)" ] \
-         && [ -z "$others" ]; then
+         && { [ -z "$others" ] || { [ -n "$NEED_GB" ] && room_for_job "$g"; }; }; then
         give "$g"
       fi
     elif [ -z "$others" ]; then
