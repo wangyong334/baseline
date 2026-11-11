@@ -17,6 +17,16 @@ potentials; bounded signed values and window-balanced context/VoW statistics
 make this an architectural constraint, not merely a reinterpretation of S3.
 See model/bst_window.py and docs/BST_WINDOW_METHOD.md (W1-W7).
 
+With innovation=True, the reported logit is instead z0 + F_d - F_birth,
+where F_birth is the differentiable potential of the age-zero prefix and is
+frozen for the lifetime of that query. Age zero therefore preserves the BIR
+prior exactly; later observations can still revise old tokens in F_d. This
+birth reference does not establish calibrated Bayesian likelihood ratios.
+With null_evidence=True, a zero-valued competitor permits the raw potential
+to vanish with its affinities. It does not force the final innovation logit
+back to z0: rejecting all later evidence leaves z0 - F_birth. Visible source
+context can influence the re-audit before learned affinity gates are applied.
+
 Old evidence is retained and both its weight and its value can be revised when
 new evidence arrives.  Equation S3 REPLACES the total correction; it does not add
 the old evidence again.  Its residual is a learned total evidence correction,
@@ -53,6 +63,8 @@ class BSTConfig:
     past_windows: int = 10
     window_gate: bool = True
     bounded_values: bool = True
+    null_evidence: bool = False
+    innovation: bool = False
 
     def __post_init__(self):
         for name in ("source_features", "source_dim", "state_dim", "relation_dim", "heads"):
@@ -70,6 +82,8 @@ class BSTConfig:
             raise ValueError("normalization must be mean, sum, softmax or window")
         if int(self.past_windows) != self.past_windows or self.past_windows < 0:
             raise ValueError("past_windows must be a nonnegative integer")
+        if self.null_evidence and self.normalization != "window":
+            raise ValueError("null evidence requires window aggregation")
 
     def to_dict(self):
         return asdict(self)
@@ -203,7 +217,8 @@ class SharedSequentialModel(nn.Module):
             nn.Linear(c.state_dim, c.state_dim), nn.Tanh())
         if c.normalization == "window":
             self.window_evidence = WindowEvidence(c.state_dim, h, c.past_windows,
-                                                   c.max_wait_steps, c.window_gate, c.bounded_values)
+                                                   c.max_wait_steps, c.window_gate, c.bounded_values,
+                                                   null_evidence=c.null_evidence)
         # Runtime-only grouping of parallel affine projections. State-dict names,
         # training gradients and learned architecture remain unchanged.
         self.fused_inference = True
@@ -267,6 +282,11 @@ class SharedSequentialModel(nn.Module):
                 "neff": zero.clone(), "age": zero.clone()}
         if self.config.normalization == "window":
             state["units"] = zero.clone()
+        if self.config.innovation:
+            # Birth evidence is a differentiable reference, never a detached
+            # learned-feature cache. Keep it even after old sources are revalued.
+            state["birth_potential"] = zero.clone()
+            state["birth_initialized"] = torch.zeros_like(prior_logit, dtype=torch.bool)
         return state
 
     @staticmethod
@@ -318,7 +338,8 @@ class SharedSequentialModel(nn.Module):
                 "present": present, "dw": safe_relative[..., 3]}
 
     def reaudit(self, encoded_source, neighbor_indices, relative, state, prior_logit, p,
-                age, valid=None, return_tokens=False, force_update=False, pair_cache=None):
+                age, valid=None, return_tokens=False, force_update=False, pair_cache=None,
+                validate_birth=True):
         """Return (logits[B], new_state, diagnostics).
 
         `valid[B]` suppresses changes for padded queries.  Invalid neighbor IDs
@@ -328,6 +349,12 @@ class SharedSequentialModel(nn.Module):
         `pair_cache` can be prepared once per offline training minibatch or
         appended causally by the bounded online executor with prepare_pairs;
         it does not cache any context-dependent gate or value.
+        Innovation queries must observe their age-zero prefix first. A late
+        first call is allowed only when that birth prefix contains no selected
+        evidence, as in the streaming executor's skipped empty births.
+        ``validate_birth=False`` is reserved for internal executors that prove
+        this ordering themselves; the public forward wrapper always validates.
+        Validation of tensor ages can require a device-to-host synchronization.
         """
         c = self.config
         if neighbor_indices.ndim != 2 or relative.shape != tuple(neighbor_indices.shape) + (4,):
@@ -337,6 +364,7 @@ class SharedSequentialModel(nn.Module):
             raise ValueError("query metadata must have shape [B]")
         if state is None:
             state = self.make_state(prior_logit, p)
+        scalar_birth = isinstance(age, (int, float)) and age == 0
         age = self._ages(age, prior_logit)
         if valid is None:
             valid = torch.ones_like(prior_logit, dtype=torch.bool)
@@ -347,6 +375,11 @@ class SharedSequentialModel(nn.Module):
         pairs = self.prepare_pairs(encoded_source, neighbor_indices, relative) if pair_cache is None else pair_cache
         if pairs["present"].shape != neighbor_indices.shape:
             raise ValueError("pair cache shape does not match this query batch")
+        if c.innovation and validate_birth and not scalar_birth:
+            has_birth_tokens = (pairs["present"] & (pairs["dw"] <= 0)).any(-1)
+            missing_birth = valid & ~state["birth_initialized"] & (age > 0) & has_birth_tokens
+            if bool(missing_birth.any()):
+                raise ValueError("innovation requires an age-zero birth reference before a later prefix with birth evidence")
         mask = pairs["present"] & (pairs["dw"] <= age[:, None]) & valid[:, None]
         key = torch.where(mask[..., None, None], pairs["key"], torch.zeros_like(pairs["key"]))
         value = torch.where(mask[..., None, None], pairs["value"], torch.zeros_like(pairs["value"]))
@@ -411,12 +444,24 @@ class SharedSequentialModel(nn.Module):
             summary = torch.bmm(summary_weight[:, None], source_context).squeeze(1)
             summary = summary / summary_mass[:, None].clamp(min=1e-8)
             neff = (mass_h.square() / weights.square().sum(1).clamp(min=1e-8)).mean(-1)
-        correction = head_correction.sum(-1)
-        new_context = a0 + self.context_update(torch.cat([summary, head_correction, torch.log1p(mass_h)], -1))
+        potential = head_correction.sum(-1)
+        context_delta = self.context_update(torch.cat([summary, head_correction, torch.log1p(mass_h)], -1))
+        if window_result is not None and "context_support" in window_result:
+            context_delta = context_delta * window_result["context_support"][:, None]
+        new_context = a0 + context_delta
         count = visible_count
         has_evidence = count > 0
         changed = (count > state["count"]) | bool(force_update)
         update = valid & has_evidence & changed
+        birth_potential = None
+        correction = potential
+        if c.innovation:
+            # S1: ell_d = z0 + F(E_<=d, q_d) - F(E_<=0, q_0).
+            # Empty births may be skipped online and have zero potential.
+            # Otherwise the caller must initialize age zero explicitly.
+            birth_potential = torch.where(update & (age == 0) & ~state["birth_initialized"],
+                                          potential, state["birth_potential"])
+            correction = potential - birth_potential
         candidate_score = prior_logit + correction
         score = torch.where(update, candidate_score, state["score"])
         mass = mass_h.sum(-1)
@@ -436,14 +481,21 @@ class SharedSequentialModel(nn.Module):
                   "age": torch.where(valid, age, state["age"])}
         if window_result is not None:
             result["units"] = choose(window_result["units"], state["units"])
+        if birth_potential is not None:
+            result["birth_potential"] = birth_potential
+            result["birth_initialized"] = state["birth_initialized"] | valid
         diag = {"correction": result["correction"], "delta": score - state["score"],
                 "mass": result["mass"], "neff": result["neff"], "count": result["count"],
                 "updated": update, "head_correction": head_correction}
+        if birth_potential is not None:
+            diag["birth_potential"] = birth_potential
         if return_tokens:
             diag.update({"gate": weights, "value": values, "mask": mask})
             if window_result is not None:
                 diag.update({key: window_result[key] for key in ("effective_weight", "window_discount",
                               "window_value", "window_active", "units")})
+                diag.update({key: window_result[key] for key in ("window_support", "null_mass", "effective_window_mass")
+                             if key in window_result})
         return score, result, diag
 
     def value_features(self, state, prior_logit=None, age=None):

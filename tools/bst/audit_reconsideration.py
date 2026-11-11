@@ -70,8 +70,9 @@ def audit_query(model, recording, config, event_id, device="cpu"):
                 # updated. They are not applied again: check committed belief.
                 frozen_score, frozen, diag = original(encoded, indices, relative, updated,
                                                        prior, polarity, age, **kwargs)
-                differences = {key: float((updated[key]-frozen[key]).abs().max()) for key in BELIEF_FIELDS}
-                exact = torch.equal(score, frozen_score) and all(torch.equal(updated[k], frozen[k]) for k in BELIEF_FIELDS)
+                fields = BELIEF_FIELDS + tuple(k for k in ("birth_potential", "units") if k in updated)
+                differences = {key: float((updated[key]-frozen[key]).abs().max()) for key in fields}
+                exact = torch.equal(score, frozen_score) and all(torch.equal(updated[k], frozen[k]) for k in fields)
                 checks.append({"age": int(age), "exact_belief_no_op": bool(exact),
                                "updated_again": bool(diag["updated"].any()),
                                "max_absolute_belief_change": max(differences.values())})

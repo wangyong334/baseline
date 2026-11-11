@@ -166,7 +166,9 @@ def main():
               "mac_scope": "Conv2d/Linear subtotal only; not all ops/FLOPs; dense kernels, not spike-skipped hardware",
               "policy_protocol": "five_policy_with_age0_v2", "default_policy_set": list(POLICIES),
               "selection": "Predeclared policies in args.policies; test results do not select weights or thresholds",
-              "age0_control": "band_arrival runs SDU once at admission, commits before later windows; separates arrival refinement from waiting for new evidence",
+              "age0_control": ("band_arrival runs SDU once; birth-referenced innovation must equal BIR at age zero, validating the zero-innovation boundary"
+                               if model.config.innovation else
+                               "band_arrival runs SDU once at admission, commits before later windows; separates arrival refinement from waiting for new evidence"),
               "policies": {}}
     for name in names:
         started = time.perf_counter()

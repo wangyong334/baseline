@@ -1,0 +1,422 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
+  "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg xmlns:xlink="http://www.w3.org/1999/xlink" width="1277.28pt" height="718.56pt" viewBox="0 0 1277.28 718.56" xmlns="http://www.w3.org/2000/svg" version="1.1">
+ <metadata>
+  <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+   <cc:Work>
+    <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
+    <dc:date>2026-11-11T19:05:43.287279</dc:date>
+    <dc:format>image/svg+xml</dc:format>
+    <dc:creator>
+     <cc:Agent>
+      <dc:title>Matplotlib v3.7.5, https://matplotlib.org/</dc:title>
+     </cc:Agent>
+    </dc:creator>
+   </cc:Work>
+  </rdf:RDF>
+ </metadata>
+ <defs>
+  <style type="text/css">*{stroke-linejoin: round; stroke-linecap: butt}</style>
+ </defs>
+ <g id="figure_1">
+  <g id="patch_1">
+   <path d="M 0 718.56 
+L 1277.28 718.56 
+L 1277.28 0 
+L 0 0 
+z
+" style="fill: #ffffff"/>
+  </g>
+  <g id="axes_1">
+   <g id="line2d_1">
+    <path d="M 292.932 240.552 
+L 324.36 240.552 
+" clip-path="url(#pef5e5491ee)" style="fill: none; stroke: #203447; stroke-width: 1.5; stroke-linecap: square"/>
+   </g>
+   <g id="line2d_2">
+    <path d="M 324.36 240.552 
+L 324.36 207.0288 
+" clip-path="url(#pef5e5491ee)" style="fill: none; stroke: #203447; stroke-width: 1.5; stroke-linecap: square"/>
+   </g>
+   <g id="patch_2">
+    <path d="M 326.358778 207.0288 
+Q 340.072896 207.0288 352.109963 207.0288 
+" clip-path="url(#pef5e5491ee)" style="fill: none; stroke: #203447; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 346.109963 204.0288 
+L 352.109963 207.0288 
+L 346.109963 210.0288 
+z
+" clip-path="url(#pef5e5491ee)" style="fill: #203447; stroke: #203447; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="line2d_3">
+    <path d="M 292.932 320.868 
+L 324.36 320.868 
+" clip-path="url(#pef5e5491ee)" style="fill: none; stroke: #203447; stroke-width: 1.5; stroke-linecap: square"/>
+   </g>
+   <g id="line2d_4">
+    <path d="M 324.36 320.868 
+L 324.36 390.708 
+" clip-path="url(#pef5e5491ee)" style="fill: none; stroke: #203447; stroke-width: 1.5; stroke-linecap: square"/>
+   </g>
+   <g id="patch_3">
+    <path d="M 326.358778 390.708 
+Q 340.072896 390.708 352.109963 390.708 
+" clip-path="url(#pef5e5491ee)" style="fill: none; stroke: #203447; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 346.109963 387.708 
+L 352.109963 390.708 
+L 346.109963 393.708 
+z
+" clip-path="url(#pef5e5491ee)" style="fill: #203447; stroke: #203447; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="line2d_5">
+    <path d="M 704.988 207.0288 
+L 736.416 207.0288 
+" clip-path="url(#pef5e5491ee)" style="fill: none; stroke: #203447; stroke-width: 1.5; stroke-linecap: square"/>
+   </g>
+   <g id="line2d_6">
+    <path d="M 736.416 207.0288 
+L 736.416 264.996 
+" clip-path="url(#pef5e5491ee)" style="fill: none; stroke: #203447; stroke-width: 1.5; stroke-linecap: square"/>
+   </g>
+   <g id="patch_4">
+    <path d="M 738.414778 264.996 
+Q 752.128896 264.996 764.165963 264.996 
+" clip-path="url(#pef5e5491ee)" style="fill: none; stroke: #203447; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 758.165963 261.996 
+L 764.165963 264.996 
+L 758.165963 267.996 
+z
+" clip-path="url(#pef5e5491ee)" style="fill: #203447; stroke: #203447; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="line2d_7">
+    <path d="M 704.988 390.708 
+L 736.416 390.708 
+" clip-path="url(#pef5e5491ee)" style="fill: none; stroke: #203447; stroke-width: 1.5; stroke-linecap: square"/>
+   </g>
+   <g id="line2d_8">
+    <path d="M 736.416 390.708 
+L 736.416 327.852 
+" clip-path="url(#pef5e5491ee)" style="fill: none; stroke: #203447; stroke-width: 1.5; stroke-linecap: square"/>
+   </g>
+   <g id="patch_5">
+    <path d="M 738.414778 327.852 
+Q 752.128896 327.852 764.165963 327.852 
+" clip-path="url(#pef5e5491ee)" style="fill: none; stroke: #203447; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 758.165963 324.852 
+L 764.165963 327.852 
+L 758.165963 330.852 
+z
+" clip-path="url(#pef5e5491ee)" style="fill: #203447; stroke: #203447; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="line2d_9">
+    <path d="M 959.904 264.996 
+L 994.824 264.996 
+" clip-path="url(#pef5e5491ee)" style="fill: none; stroke: #2d8580; stroke-width: 1.5; stroke-linecap: square"/>
+   </g>
+   <g id="line2d_10">
+    <path d="M 994.824 264.996 
+L 994.824 210.5208 
+" clip-path="url(#pef5e5491ee)" style="fill: none; stroke: #2d8580; stroke-width: 1.5; stroke-linecap: square"/>
+   </g>
+   <g id="patch_6">
+    <path d="M 996.823204 210.5208 
+Q 1012.284967 210.5208 1026.069679 210.5208 
+" clip-path="url(#pef5e5491ee)" style="fill: none; stroke: #2d8580; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 1020.069679 207.5208 
+L 1026.069679 210.5208 
+L 1020.069679 213.5208 
+z
+" clip-path="url(#pef5e5491ee)" style="fill: #2d8580; stroke: #2d8580; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="line2d_11">
+    <path d="M 959.904 327.852 
+L 994.824 327.852 
+" clip-path="url(#pef5e5491ee)" style="fill: none; stroke: #bd7a24; stroke-width: 1.5; stroke-linecap: square"/>
+   </g>
+   <g id="line2d_12">
+    <path d="M 994.824 327.852 
+L 994.824 395.5968 
+" clip-path="url(#pef5e5491ee)" style="fill: none; stroke: #bd7a24; stroke-width: 1.5; stroke-linecap: square"/>
+   </g>
+   <g id="patch_7">
+    <path d="M 996.823204 395.5968 
+Q 1012.284967 395.5968 1026.069679 395.5968 
+" clip-path="url(#pef5e5491ee)" style="fill: none; stroke: #bd7a24; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 1020.069679 392.5968 
+L 1026.069679 395.5968 
+L 1020.069679 398.5968 
+z
+" clip-path="url(#pef5e5491ee)" style="fill: #bd7a24; stroke: #bd7a24; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="patch_8">
+    <path d="M 530.388 521.404796 
+Q 530.388 488.484371 530.388 457.240996 
+" clip-path="url(#pef5e5491ee)" style="fill: none; stroke-dasharray: 5.55,2.4; stroke-dashoffset: 0; stroke: #8964ac; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 527.388 463.240996 
+L 530.388 457.240996 
+L 533.388 463.240996 
+z
+" clip-path="url(#pef5e5491ee)" style="fill: #8964ac; stroke-dasharray: 5.55,2.4; stroke-dashoffset: 0; stroke: #8964ac; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="line2d_13">
+    <path d="M 41.508 660.2904 
+L 1235.772 660.2904 
+" clip-path="url(#pef5e5491ee)" style="fill: none; stroke: #d9e1e8; stroke-width: 0.9; stroke-linecap: square"/>
+   </g>
+   <g id="text_1">
+    <text style="fill: #203447; font: 700 21px 'DejaVu Sans'; text-anchor: start" x="41.508" y="50.572594" transform="rotate(-0 41.508 50.572594)">VoW  |  Compare stopping risk with conditional continuation cost</text>
+   </g>
+   <g id="text_2">
+    <text style="fill: #586c7d; font: 11.4px 'DejaVu Sans'; text-anchor: start" x="41.508" y="85.090219" transform="rotate(-0 41.508 85.090219)">Learn the cost of a deployable future policy first, then compare actions using only the current causal state.</text>
+   </g>
+   <g id="patch_9">
+    <path d="M 50.9364 371.502 
+L 286.9956 371.502 
+Q 294.678 371.502 294.678 363.8196 
+L 294.678 187.1244 
+Q 294.678 179.442 286.9956 179.442 
+L 50.9364 179.442 
+Q 43.254 179.442 43.254 187.1244 
+L 43.254 363.8196 
+Q 43.254 371.502 50.9364 371.502 
+z
+" clip-path="url(#pef5e5491ee)" style="fill: #fff1df; stroke: #bd7a24; stroke-width: 1.5; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_10">
+    <path d="M 361.7244 263.25 
+L 699.0516 263.25 
+Q 706.734 263.25 706.734 255.5676 
+L 706.734 159.1884 
+Q 706.734 151.506 699.0516 151.506 
+L 361.7244 151.506 
+Q 354.042 151.506 354.042 159.1884 
+L 354.042 255.5676 
+Q 354.042 263.25 361.7244 263.25 
+z
+" clip-path="url(#pef5e5491ee)" style="fill: #f2ecfa; stroke: #8964ac; stroke-width: 1.5; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_11">
+    <path d="M 361.7244 455.31 
+L 699.0516 455.31 
+Q 706.734 455.31 706.734 447.6276 
+L 706.734 333.7884 
+Q 706.734 326.106 699.0516 326.106 
+L 361.7244 326.106 
+Q 354.042 326.106 354.042 333.7884 
+L 354.042 447.6276 
+Q 354.042 455.31 361.7244 455.31 
+z
+" clip-path="url(#pef5e5491ee)" style="fill: #f2ecfa; stroke: #8964ac; stroke-width: 1.5; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_12">
+    <path d="M 773.7804 371.502 
+L 953.9676 371.502 
+Q 961.65 371.502 961.65 363.8196 
+L 961.65 229.0284 
+Q 961.65 221.346 953.9676 221.346 
+L 773.7804 221.346 
+Q 766.098 221.346 766.098 229.0284 
+L 766.098 363.8196 
+Q 766.098 371.502 773.7804 371.502 
+z
+" clip-path="url(#pef5e5491ee)" style="fill: #f2ecfa; stroke: #8964ac; stroke-width: 1.5; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_13">
+    <path d="M 1035.6804 256.266 
+L 1222.8516 256.266 
+Q 1230.534 256.266 1230.534 248.5836 
+L 1230.534 173.1564 
+Q 1230.534 165.474 1222.8516 165.474 
+L 1035.6804 165.474 
+Q 1027.998 165.474 1027.998 173.1564 
+L 1027.998 248.5836 
+Q 1027.998 256.266 1035.6804 256.266 
+z
+" clip-path="url(#pef5e5491ee)" style="fill: #e6f5f3; stroke: #2d8580; stroke-width: 1.5; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_14">
+    <path d="M 1035.6804 441.342 
+L 1222.8516 441.342 
+Q 1230.534 441.342 1230.534 433.6596 
+L 1230.534 358.2324 
+Q 1230.534 350.55 1222.8516 350.55 
+L 1035.6804 350.55 
+Q 1027.998 350.55 1027.998 358.2324 
+L 1027.998 433.6596 
+Q 1027.998 441.342 1035.6804 441.342 
+z
+" clip-path="url(#pef5e5491ee)" style="fill: #fff1df; stroke: #bd7a24; stroke-width: 1.5; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_15">
+    <path d="M 50.9364 626.418 
+L 699.0516 626.418 
+Q 706.734 626.418 706.734 618.7356 
+L 706.734 529.3404 
+Q 706.734 521.658 699.0516 521.658 
+L 50.9364 521.658 
+Q 43.254 521.658 43.254 529.3404 
+L 43.254 618.7356 
+Q 43.254 626.418 50.9364 626.418 
+z
+" clip-path="url(#pef5e5491ee)" style="fill: #f3f6f9; stroke: #8495a4; stroke-width: 1.5; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_16">
+    <path d="M 773.7804 626.418 
+L 1222.8516 626.418 
+Q 1230.534 626.418 1230.534 618.7356 
+L 1230.534 529.3404 
+Q 1230.534 521.658 1222.8516 521.658 
+L 773.7804 521.658 
+Q 766.098 521.658 766.098 529.3404 
+L 766.098 618.7356 
+Q 766.098 626.418 773.7804 626.418 
+z
+" clip-path="url(#pef5e5491ee)" style="fill: #f3f6f9; stroke: #8495a4; stroke-width: 1.5; stroke-linejoin: miter"/>
+   </g>
+   <g id="text_3">
+    <!-- The stop branch depends on estimated belief quality; it is not a certified error bound. Current-step costs are added once; later policy costs belong inside $J^{\pi}$. -->
+    <g style="fill: #586c7d" transform="translate(41.508 684.0536)">
+     <text>
+      <tspan style="font: 10px 'DejaVu Sans'" x="0 6.108398 12.446289 18.598633 21.777344 26.987305 30.908203 37.026367 43.374023 46.552734 52.900391 57.011719 63.139648 69.477539 74.975586 81.313477 84.492188 90.839844 96.992188 103.339844 109.492188 115.830078 122.177734 127.387695 130.566406 136.68457 143.022461 146.201172 152.353516 157.563477 161.484375 164.262695 174.003906 180.131836 184.052734 190.205078 196.552734 199.731445 206.079102 212.231445 215.009766 217.788086 223.94043 227.460938 230.639648 236.987305 243.325195 249.453125 252.231445 255.009766 258.930664 264.848633 268.217773 271.396484 274.174805 278.095703 281.274414 284.052734 289.262695 292.441406 298.779297 304.897461 308.818359 311.99707 318.125 321.303711 326.801758 332.954102 337.06543 340.986328 343.764648 347.285156 350.063477 356.21582 362.563477 365.742188 371.894531 376.005859 380.117188 386.235352 390.34668 393.525391 399.873047 405.991211 412.329102 418.666992 425.014648 428.193359 431.37207 438.354492 444.692383 448.803711 452.915039 459.067383 465.405273 469.326172 472.93457 478.144531 482.06543 488.217773 494.56543 497.744141 503.242188 509.360352 514.570312 518.491211 523.701172 526.879883 533.007812 537.119141 543.271484 546.450195 552.578125 558.925781 565.273438 571.425781 577.773438 580.952148 587.070312 593.408203 598.90625 605.058594 608.427734 611.606445 614.384766 620.512695 624.433594 630.585938 634.697266 637.875977 644.223633 650.341797 653.120117 655.898438 661.396484 667.314453 670.493164 675.991211 682.109375 687.319336 691.240234 696.450195 699.628906 705.976562 712.128906 714.907227 721.025391 727.363281 733.710938 736.889648 739.667969 746.005859 751.21582 753.994141 760.341797 766.494141 777.812415" y="-0.3437500000000009">The stop branch depends on estimated belief quality; it is not a certified error bound. Current-step costs are added once; later policy costs belong inside .</tspan>
+      <tspan style="font: oblique 10px 'DejaVu Sans'" x="769.672852" y="-0.3437500000000009">J</tspan>
+      <tspan style="font: oblique 7px 'DejaVu Sans'" x="773.324622" y="-4.171875">π</tspan>
+     </text>
+    </g>
+   </g>
+   <g id="text_4">
+    <!-- Current causal state $S_d$ -->
+    <g style="fill: #203447" transform="translate(96.446 205.06305)">
+     <text>
+      <tspan style="font: 700 11.2px 'DejaVu Sans'" x="0 8.256226 16.265259 21.813354 27.36145 34.991455 43.000488 48.378296 52.294922 58.963623 66.555176 74.564209 81.260376 88.851929 92.70813 96.624756 103.320923 108.69873 116.290283 121.668091 129.298096" y="-0.640625">Current causal state </tspan>
+      <tspan style="font: oblique 11.2px 'DejaVu Sans'" x="133.214722" y="-0.640625">S</tspan>
+      <tspan style="font: oblique 7.84px 'DejaVu Sans'" x="140.355835" y="1.1640625">d</tspan>
+     </text>
+    </g>
+   </g>
+   <g id="text_5">
+    <text style="fill: #203447; font: 10.7px 'DejaVu Sans'" transform="translate(88.882352 275.38962)">Revised belief / change / prior</text>
+    <text style="fill: #203447; font: 10.7px 'DejaVu Sans'" transform="translate(96.55375 290.216894)">Null-aware context + mass</text>
+    <text style="fill: #203447; font: 10.7px 'DejaVu Sans'" transform="translate(88.824672 305.044168)">Window count / concentration</text>
+    <text style="fill: #203447; font: 10.7px 'DejaVu Sans'" transform="translate(79.865094 319.871443)">Elapsed age + remaining horizon</text>
+   </g>
+   <g id="text_6">
+    <text style="fill: #203447; font: 700 11.4px 'DejaVu Sans'; text-anchor: middle" x="530.388" y="177.279019" transform="rotate(-0 530.388 177.279019)">Stop branch: model-based risk</text>
+   </g>
+   <g id="text_7">
+    <!-- $R_s=\min[c_{FN}\widehat{p}_d,\ c_{FP}(1-\widehat{p}_d)]$ -->
+    <g style="fill: #203447" transform="translate(456.268 222.41079)">
+     <text>
+      <tspan style="font: oblique 10.9px 'DejaVu Sans'" x="0 49.922748 66.275836 87.523836 127.284193" y="-0.9968749999999993">Rcpcp</tspan>
+      <tspan style="font: oblique 7.63px 'DejaVu Sans'" x="7.556213 55.901874 60.280548 73.284186 93.502962 97.881636 134.292543" y="0.8078125000000007">sFNdFPd</tspan>
+      <tspan style="font: 10.9px 'DejaVu Sans'" x="13.941791 25.172565 35.766132 38.787555 45.680011 78.41712 102.772963 107.0157 116.053419 139.425477 143.668214" y="-0.9968749999999993">=min[,(1−)]</tspan>
+      <tspan style="font: 7.071345px 'STIXSizeTwoSym'" x="75.189105 136.197462" y="-4.5625">̂̂</tspan>
+     </text>
+    </g>
+    <text style="fill: #203447; font: 10.9px 'DejaVu Sans'" transform="translate(431.59057 237.53735)">Costs match the reporting threshold</text>
+   </g>
+   <g id="text_8">
+    <text style="fill: #203447; font: 700 11.7px 'DejaVu Sans'; text-anchor: middle" x="530.388" y="352.106972" transform="rotate(-0 530.388 352.106972)">Wait branch: conditional return</text>
+   </g>
+   <g id="text_9">
+    <text style="fill: #203447; font: 11.2px 'DejaVu Sans'" transform="translate(444.162 396.2773)">Linear - SiLU - Linear - Softplus</text>
+    <!-- $f_\theta(S_d)\approx\mathbb{E}[J_{d+1}^{\pi}\mid S_d]$ -->
+    <g style="fill: #203447" transform="translate(477.692 412.14735)">
+     <text>
+      <tspan style="font: oblique 11.2px 'DejaVu Sans'" x="0 13.468445 55.685745 88.988907" y="-0.4031249999999993">fSJS</tspan>
+      <tspan style="font: oblique 7.84px 'DejaVu Sans'" x="3.960571 20.609558 59.003616 59.774892 96.13002" y="1.4015625000000007 1.4015625000000007 2.6046875000000007 -4.7890625 1.4015625000000007">θddπd</tspan>
+      <tspan style="font: 11.2px 'DejaVu Sans'" x="9.079407 25.909119 32.489929 51.296707 81.172134 101.429581" y="-0.4031249999999993">()≈[∣]</tspan>
+      <tspan style="font: italic 11.2px 'STIXNonUnicode'" x="44.107971" y="-0.4031249999999993"></tspan>
+      <tspan style="font: 7.84px 'DejaVu Sans'" x="65.536636 73.669266" y="2.6046875000000007">+1</tspan>
+     </text>
+    </g>
+    <!-- $Q_w=c_{step}+f_\theta(S_d)$ -->
+    <g style="fill: #203447" transform="translate(482.06 428.58895)">
+     <text>
+      <tspan style="font: oblique 11.2px 'DejaVu Sans'" x="0 29.406311 66.736511 80.204956" y="-0.640625">QcfS</tspan>
+      <tspan style="font: oblique 7.84px 'DejaVu Sans'" x="8.85498 35.591614 39.694458 42.782166 47.627136 70.697083 87.346069" y="1.1640625">wstepθd</tspan>
+      <tspan style="font: 11.2px 'DejaVu Sans'" x="17.788269 55.118469 75.815918 92.64563" y="-0.640625">=+()</tspan>
+     </text>
+    </g>
+   </g>
+   <g id="text_10">
+    <text style="fill: #203447; font: 700 12.4px 'DejaVu Sans'; text-anchor: middle" x="863.874" y="247.878863" transform="rotate(-0 863.874 247.878863)">Compare</text>
+   </g>
+   <g id="text_11">
+    <!-- $Q_w&lt;R_s$ ? -->
+    <g style="fill: #203447" transform="translate(836.8015 310.668583)">
+     <text>
+      <tspan style="font: oblique 11.9px 'DejaVu Sans'" x="0 31.050629" y="-0.09375">QR</tspan>
+      <tspan style="font: oblique 8.33px 'DejaVu Sans'" x="9.346924 39.301666" y="1.875">ws</tspan>
+      <tspan style="font: 11.9px 'DejaVu Sans'" x="18.78714 43.960571 47.735291" y="-0.09375">&lt; ?</tspan>
+     </text>
+    </g>
+    <text style="fill: #203447; font: 11.9px 'DejaVu Sans'" transform="translate(807.776656 327.158729)">Deadline overrides</text>
+   </g>
+   <g id="text_12">
+    <text style="fill: #203447; font: 700 11.4px 'DejaVu Sans'; text-anchor: middle" x="1129.266" y="191.247019" transform="rotate(-0 1129.266 191.247019)">Commit</text>
+   </g>
+   <g id="text_13">
+    <text style="fill: #203447; font: 10.9px 'DejaVu Sans'; text-anchor: middle" x="1129.266" y="233.083719" transform="rotate(-0 1129.266 233.083719)">Finalize event + time</text>
+   </g>
+   <g id="text_14">
+    <text style="fill: #203447; font: 700 10.9px 'DejaVu Sans'; text-anchor: middle" x="1129.266" y="375.943097" transform="rotate(-0 1129.266 375.943097)">Wait</text>
+   </g>
+   <g id="text_15">
+    <text style="fill: #203447; font: 10.4px 'DejaVu Sans'; text-anchor: middle" x="1129.266" y="418.02175" transform="rotate(-0 1129.266 418.02175)">Next window + re-audit</text>
+   </g>
+   <g id="text_16">
+    <text style="fill: #203447; font: 700 10.9px 'DejaVu Sans'; text-anchor: middle" x="374.994" y="547.051097" transform="rotate(-0 374.994 547.051097)">Training: policy evaluation, then improvement</text>
+   </g>
+   <g id="text_17">
+    <text style="fill: #203447; font: 10.4px 'DejaVu Sans'" transform="translate(158.962437 588.907972)">Frozen-policy rollouts produce realized costs; regress their conditional expectation.</text>
+    <text style="fill: #203447; font: 10.4px 'DejaVu Sans'" transform="translate(147.921375 603.319528)">Labels supervise training targets only; never choose the per-event hindsight minimum.</text>
+   </g>
+   <g id="text_18">
+    <text style="fill: #203447; font: 700 10.8px 'DejaVu Sans'; text-anchor: middle" x="998.316" y="546.975113" transform="rotate(-0 998.316 546.975113)">Admission precedes costly SDU work</text>
+   </g>
+   <g id="text_19">
+    <text style="fill: #203447; font: 10.3px 'DejaVu Sans'" transform="translate(849.630672 588.949664)">Default: a declared fixed band. Optional cheap birth head</text>
+    <text style="fill: #203447; font: 10.3px 'DejaVu Sans'" transform="translate(846.432039 603.222648)">predicts opening cost from own/shared backbone features.</text>
+   </g>
+   <g id="text_20">
+    <g id="patch_17">
+     <path d="M 985.499075 195.409462 
+L 1001.355325 195.409462 
+L 1001.355325 182.331337 
+L 985.499075 182.331337 
+z
+" style="fill: #ffffff"/>
+    </g>
+    <text style="fill: #2d8580; font: 10px 'DejaVu Sans'; text-anchor: middle" x="993.4272" y="191.629775" transform="rotate(-0 993.4272 191.629775)">no</text>
+   </g>
+   <g id="text_21">
+    <g id="patch_18">
+     <path d="M 981.689775 425.183063 
+L 1002.371025 425.183063 
+L 1002.371025 412.104938 
+L 981.689775 412.104938 
+z
+" style="fill: #ffffff"/>
+    </g>
+    <text style="fill: #bd7a24; font: 10px 'DejaVu Sans'; text-anchor: middle" x="992.0304" y="421.403375" transform="rotate(-0 992.0304 421.403375)">yes</text>
+   </g>
+   <g id="text_22">
+    <g id="patch_19">
+     <path d="M 459.721594 496.419863 
+L 601.054406 496.419863 
+L 601.054406 483.341738 
+L 459.721594 483.341738 
+z
+" style="fill: #ffffff"/>
+    </g>
+    <text style="fill: #8964ac; font: 10px 'DejaVu Sans'; text-anchor: middle" x="530.388" y="492.640175" transform="rotate(-0 530.388 492.640175)">supervise continuation cost</text>
+   </g>
+  </g>
+ </g>
+ <defs>
+  <clipPath id="pef5e5491ee">
+   <rect x="10.08" y="10.08" width="1257.12" height="698.4"/>
+  </clipPath>
+ </defs>
+</svg>

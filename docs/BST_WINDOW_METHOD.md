@@ -1,5 +1,7 @@
 # 最终窗口分组模型：原理、结构与可检验性质
 
+> 本页描述保留的 R2 模型。R3 的零值竞争、出生参考公式与限制见 [R3 方法合同](BST_FINAL_R3_METHOD.md)，其改变不是旧权重的无损替换。
+
 2026-11-11。当前新模型配置为 `configs/bst_window.json`，旧 `bst_shared.json` 保留为平坦均值基线。新模型需要重新训练 SDU 和拟合 VoW；不能把旧权重、旧等待策略换一个名称作为新结果。本文是实际实现的方法合同，配套图与论文组织见 [BST_PAPER_BLUEPRINT.md](BST_PAPER_BLUEPRINT.md)。
 
 ## 1. 先明确问题，而非先选择网络层

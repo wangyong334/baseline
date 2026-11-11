@@ -345,11 +345,17 @@ def run_recording(model, rec, evidence_config=None, policy=None, birth="band", t
                     p0 = torch.as_tensor(prior[born], device=device)
                     polarity = torch.as_tensor(rec.p[born], device=device)
                     born_state = model.make_state(p0, polarity)
+                    birth_counts = initial["mask"].sum(axis=1)
+                    if model.config.innovation:
+                        # Empty births skip the SDU below, but their known
+                        # zero reference must still be registered. Nonempty
+                        # births are always processed at age zero this window.
+                        born_state["birth_initialized"] = torch.as_tensor(birth_counts == 0, device=device)
                     state = born_state if state is None else concat_states([state, born_state])
                     active = np.concatenate([active, born])
                     new_rows = pairs_cache.allocate(len(born))
                     pair_rows = np.concatenate([pair_rows, new_rows])
-                    counts = np.concatenate([counts, initial["mask"].sum(axis=1)])
+                    counts = np.concatenate([counts, birth_counts])
                     previous_counts = np.concatenate([previous_counts, np.full(len(born), -1, np.int64)])
                     end = (index.past_windows + 1) * index.K
                     appends.append((new_rows, initial["idx"][:, :end], initial["relative"][:, :end], 0))
@@ -382,8 +388,12 @@ def run_recording(model, rec, evidence_config=None, policy=None, birth="band", t
                     # Fixed queue storage, but no kernels over impossible future slots.
                     last_slot = (index.past_windows + int(ages[rows_np].max()) + 1) * index.K
                     pairs = pairs_cache.read(pair_rows[rows_np], last_slot)
+                    # Queue-owned states have either been processed at birth
+                    # or explicitly registered as empty above. Arbitrary late
+                    # public calls must retain reaudit's birth validation.
                     _, updated, _ = model.reaudit(cache.encoded, pairs["indices"], pairs["relative"], substate,
-                                                  substate["prior"], substate["polarity"], age_tensor[rows], pair_cache=pairs)
+                                                  substate["prior"], substate["polarity"], age_tensor[rows], pair_cache=pairs,
+                                                  validate_birth=False)
                     _replace_state_rows(state, rows, updated)
                     stats["queries_updated"] += len(rows_np)
                     stats["pair_visits"] += int(counts[rows_np].sum())

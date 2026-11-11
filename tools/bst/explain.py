@@ -72,6 +72,7 @@ def explain_query(model, recording, evidence_config, event_id, threshold=0.9,
     if isinstance(policy, torch.nn.Module):
         policy.to(device).eval()
     steps, applied, applied_age, applied_windows = [], {}, None, None
+    birth_tokens, birth_windows = {}, {}
     first_policy_commit = None
     try:
         with torch.no_grad():
@@ -119,6 +120,23 @@ def explain_query(model, recording, evidence_config, event_id, threshold=0.9,
                                            "normalized_weight": normalized[slot].tolist(),
                                            "contribution_per_head": contribution[slot].tolist(),
                                            "total_contribution": float(contribution[slot].sum())}
+                    if model.config.innovation:
+                        if age == 0:
+                            birth_tokens = copy.deepcopy(applied)
+                            birth_windows = {item["dw"]: copy.deepcopy(item) for item in (applied_windows or [])}
+                        for source, item in applied.items():
+                            raw = np.asarray(item["contribution_per_head"])
+                            reference = np.asarray(birth_tokens.get(source, {}).get("contribution_per_head", np.zeros_like(raw)))
+                            item["raw_contribution_per_head"] = raw.tolist()
+                            item["birth_reference_contribution_per_head"] = reference.tolist()
+                            item["contribution_per_head"] = (raw-reference).tolist()
+                            item["total_contribution"] = float((raw-reference).sum())
+                        for item in applied_windows or []:
+                            raw = np.asarray(item["contribution"])
+                            reference = np.asarray(birth_windows.get(item["dw"], {}).get("contribution", np.zeros_like(raw)))
+                            item["raw_contribution"] = raw.tolist()
+                            item["birth_reference_contribution"] = reference.tolist()
+                            item["contribution"] = (raw-reference).tolist()
                     applied_age = age
                 # No new evidence means the core freezes its belief. Its
                 # candidate diagnostic gates are NOT used for attribution.
@@ -159,6 +177,7 @@ def explain_query(model, recording, evidence_config, event_id, threshold=0.9,
                               "posterior_probability_estimate": _probability(current_score),
                               "report_probability": _probability(current_score + r.log_w),
                               "correction": correction, "contribution_sum": contribution_sum,
+                              "birth_potential": float(state["birth_potential"][0]) if model.config.innovation else 0.,
                               "reconstruction_error": error, "score_updated": updated,
                               "attribution_carried_from_age": applied_age,
                               "visible_neighbors": int(diag["count"][0]),
@@ -182,7 +201,8 @@ def explain_query(model, recording, evidence_config, event_id, threshold=0.9,
             "source_encoded": cache.encoded_total, "steps": steps,
             "interpretation": "Algebraic contributions in a fitted model; not causal effects, calibrated "
                 "association probabilities, or verified token log-likelihood ratios.",
-            "update_rule": "logit = prior + replacement full-prefix correction; never accumulate old corrections",
+            "update_rule": ("logit = prior + current prefix potential - frozen differentiable birth potential"
+                            if model.config.innovation else "logit = prior + replacement full-prefix correction; never accumulate old corrections"),
             "after_commit": "Later prefixes are counterfactual diagnostic continuations, not online compute",
             "birth": "The requested query is explicitly admitted for this diagnostic; birth gate is not applied",
             "max_reconstruction_error": max(x["reconstruction_error"] for x in steps)}

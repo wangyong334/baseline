@@ -1,0 +1,523 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
+  "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg xmlns:xlink="http://www.w3.org/1999/xlink" width="1277.28pt" height="718.56pt" viewBox="0 0 1277.28 718.56" xmlns="http://www.w3.org/2000/svg" version="1.1">
+ <metadata>
+  <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+   <cc:Work>
+    <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
+    <dc:date>2026-11-11T19:05:42.023421</dc:date>
+    <dc:format>image/svg+xml</dc:format>
+    <dc:creator>
+     <cc:Agent>
+      <dc:title>Matplotlib v3.7.5, https://matplotlib.org/</dc:title>
+     </cc:Agent>
+    </dc:creator>
+   </cc:Work>
+  </rdf:RDF>
+ </metadata>
+ <defs>
+  <style type="text/css">*{stroke-linejoin: round; stroke-linecap: butt}</style>
+ </defs>
+ <g id="figure_1">
+  <g id="patch_1">
+   <path d="M 0 718.56 
+L 1277.28 718.56 
+L 1277.28 0 
+L 0 0 
+z
+" style="fill: #ffffff"/>
+  </g>
+  <g id="axes_1">
+   <g id="patch_2">
+    <path d="M 249.538188 207.0288 
+Q 271.980936 207.0288 292.746633 207.0288 
+" clip-path="url(#p9dde832df2)" style="fill: none; stroke: #203447; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 286.746633 204.0288 
+L 292.746633 207.0288 
+L 286.746633 210.0288 
+z
+" clip-path="url(#p9dde832df2)" style="fill: #203447; stroke: #203447; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="patch_3">
+    <path d="M 249.538188 388.6128 
+Q 271.980936 388.6128 292.746633 388.6128 
+" clip-path="url(#p9dde832df2)" style="fill: none; stroke: #203447; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 286.746633 385.6128 
+L 292.746633 388.6128 
+L 286.746633 391.6128 
+z
+" clip-path="url(#p9dde832df2)" style="fill: #203447; stroke: #203447; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="line2d_1">
+    <path d="M 247.536 251.028 
+L 269.8848 251.028 
+" clip-path="url(#p9dde832df2)" style="fill: none; stroke: #bd7a24; stroke-width: 1.5; stroke-linecap: square"/>
+   </g>
+   <g id="line2d_2">
+    <path d="M 269.8848 251.028 
+L 269.8848 299.2176 
+" clip-path="url(#p9dde832df2)" style="fill: none; stroke: #bd7a24; stroke-width: 1.5; stroke-linecap: square"/>
+   </g>
+   <g id="line2d_3">
+    <path d="M 269.8848 299.2176 
+L 406.7712 299.2176 
+" clip-path="url(#p9dde832df2)" style="fill: none; stroke: #bd7a24; stroke-width: 1.5; stroke-linecap: square"/>
+   </g>
+   <g id="patch_4">
+    <path d="M 406.7712 301.213735 
+Q 406.7712 315.280288 406.7712 327.669789 
+" clip-path="url(#p9dde832df2)" style="fill: none; stroke: #bd7a24; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 409.7712 321.669789 
+L 406.7712 327.669789 
+L 403.7712 321.669789 
+z
+" clip-path="url(#p9dde832df2)" style="fill: #bd7a24; stroke: #bd7a24; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="line2d_4">
+    <path d="M 146.268 331.344 
+L 146.268 304.8048 
+" clip-path="url(#p9dde832df2)" style="fill: none; stroke: #3a8360; stroke-width: 1.5; stroke-linecap: square"/>
+   </g>
+   <g id="line2d_5">
+    <path d="M 146.268 304.8048 
+L 327.852 304.8048 
+" clip-path="url(#p9dde832df2)" style="fill: none; stroke: #3a8360; stroke-width: 1.5; stroke-linecap: square"/>
+   </g>
+   <g id="patch_5">
+    <path d="M 327.852 302.807557 
+Q 327.852 284.901071 327.852 268.671635 
+" clip-path="url(#p9dde832df2)" style="fill: none; stroke: #3a8360; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 324.852 274.671635 
+L 327.852 268.671635 
+L 330.852 274.671635 
+z
+" clip-path="url(#p9dde832df2)" style="fill: #3a8360; stroke: #3a8360; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="patch_6">
+    <path d="M 518.418138 207.0288 
+Q 542.608136 207.0288 565.121082 207.0288 
+" clip-path="url(#p9dde832df2)" style="fill: none; stroke: #203447; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 559.121082 204.0288 
+L 565.121082 207.0288 
+L 559.121082 210.0288 
+z
+" clip-path="url(#p9dde832df2)" style="fill: #203447; stroke: #203447; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="patch_7">
+    <path d="M 518.418138 388.6128 
+Q 542.608136 388.6128 565.121082 388.6128 
+" clip-path="url(#p9dde832df2)" style="fill: none; stroke: #203447; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 559.121082 385.6128 
+L 565.121082 388.6128 
+L 559.121082 391.6128 
+z
+" clip-path="url(#p9dde832df2)" style="fill: #203447; stroke: #203447; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="patch_8">
+    <path d="M 717.5592 514.420796 
+Q 717.5592 481.500371 717.5592 450.256996 
+" clip-path="url(#p9dde832df2)" style="fill: none; stroke: #203447; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 714.5592 456.256996 
+L 717.5592 450.256996 
+L 720.5592 456.256996 
+z
+" clip-path="url(#p9dde832df2)" style="fill: #203447; stroke: #203447; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="patch_9">
+    <path d="M 867.618138 227.9808 
+Q 891.808136 227.9808 914.321082 227.9808 
+" clip-path="url(#p9dde832df2)" style="fill: none; stroke: #203447; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 908.321082 224.9808 
+L 914.321082 227.9808 
+L 908.321082 230.9808 
+z
+" clip-path="url(#p9dde832df2)" style="fill: #203447; stroke: #203447; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="patch_10">
+    <path d="M 867.618138 402.5808 
+Q 891.808136 402.5808 914.321082 402.5808 
+" clip-path="url(#p9dde832df2)" style="fill: none; stroke: #203447; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 908.321082 399.5808 
+L 914.321082 402.5808 
+L 908.321082 405.5808 
+z
+" clip-path="url(#p9dde832df2)" style="fill: #203447; stroke: #203447; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="patch_11">
+    <path d="M 1073.7432 448.579204 
+Q 1073.7432 481.499629 1073.7432 512.743004 
+" clip-path="url(#p9dde832df2)" style="fill: none; stroke: #2d8580; stroke-width: 1.5; stroke-linecap: round"/>
+    <path d="M 1076.7432 506.743004 
+L 1073.7432 512.743004 
+L 1070.7432 506.743004 
+z
+" clip-path="url(#p9dde832df2)" style="fill: #2d8580; stroke: #2d8580; stroke-width: 1.5; stroke-linecap: round"/>
+   </g>
+   <g id="line2d_6">
+    <path d="M 41.508 660.2904 
+L 1235.772 660.2904 
+" clip-path="url(#p9dde832df2)" style="fill: none; stroke: #d9e1e8; stroke-width: 0.9; stroke-linecap: square"/>
+   </g>
+   <g id="text_1">
+    <text style="fill: #203447; font: 700 21px 'DejaVu Sans'; text-anchor: start" x="41.508" y="50.572594" transform="rotate(-0 41.508 50.572594)">SDU  |  Null-competitive evidence within revisable windows</text>
+   </g>
+   <g id="text_2">
+    <text style="fill: #586c7d; font: 11.4px 'DejaVu Sans'; text-anchor: start" x="41.508" y="85.090219" transform="rotate(-0 41.508 85.090219)">A learned zero-valued competitor lets a window contribute little evidence without forcing its remaining tokens to sum to one.</text>
+   </g>
+   <g id="patch_12">
+    <path d="M 50.9364 266.742 
+L 241.5996 266.742 
+Q 249.282 266.742 249.282 259.0596 
+L 249.282 155.6964 
+Q 249.282 148.014 241.5996 148.014 
+L 50.9364 148.014 
+Q 43.254 148.014 43.254 155.6964 
+L 43.254 259.0596 
+Q 43.254 266.742 50.9364 266.742 
+z
+" clip-path="url(#p9dde832df2)" style="fill: #fff1df; stroke: #bd7a24; stroke-width: 1.5; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_13">
+    <path d="M 50.9364 448.326 
+L 241.5996 448.326 
+Q 249.282 448.326 249.282 440.6436 
+L 249.282 337.2804 
+Q 249.282 329.598 241.5996 329.598 
+L 50.9364 329.598 
+Q 43.254 329.598 43.254 337.2804 
+L 43.254 440.6436 
+Q 43.254 448.326 50.9364 448.326 
+z
+" clip-path="url(#p9dde832df2)" style="fill: #eaf5ee; stroke: #3a8360; stroke-width: 1.5; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_14">
+    <path d="M 302.3604 266.742 
+L 510.4836 266.742 
+Q 518.166 266.742 518.166 259.0596 
+L 518.166 155.6964 
+Q 518.166 148.014 510.4836 148.014 
+L 302.3604 148.014 
+Q 294.678 148.014 294.678 155.6964 
+L 294.678 259.0596 
+Q 294.678 266.742 302.3604 266.742 
+z
+" clip-path="url(#p9dde832df2)" style="fill: #fff1df; stroke: #bd7a24; stroke-width: 1.5; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_15">
+    <path d="M 302.3604 448.326 
+L 510.4836 448.326 
+Q 518.166 448.326 518.166 440.6436 
+L 518.166 337.2804 
+Q 518.166 329.598 510.4836 329.598 
+L 302.3604 329.598 
+Q 294.678 329.598 294.678 337.2804 
+L 294.678 440.6436 
+Q 294.678 448.326 302.3604 448.326 
+z
+" clip-path="url(#p9dde832df2)" style="fill: #fff1df; stroke: #bd7a24; stroke-width: 1.5; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_16">
+    <path d="M 574.7364 448.326 
+L 859.6836 448.326 
+Q 867.366 448.326 867.366 440.6436 
+L 867.366 155.6964 
+Q 867.366 148.014 859.6836 148.014 
+L 574.7364 148.014 
+Q 567.054 148.014 567.054 155.6964 
+L 567.054 440.6436 
+Q 567.054 448.326 574.7364 448.326 
+z
+" clip-path="url(#p9dde832df2)" style="fill: #fff1df; stroke: #bd7a24; stroke-width: 1.5; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_17">
+    <path d="M 923.9364 308.646 
+L 1222.8516 308.646 
+Q 1230.534 308.646 1230.534 300.9636 
+L 1230.534 155.6964 
+Q 1230.534 148.014 1222.8516 148.014 
+L 923.9364 148.014 
+Q 916.254 148.014 916.254 155.6964 
+L 916.254 300.9636 
+Q 916.254 308.646 923.9364 308.646 
+z
+" clip-path="url(#p9dde832df2)" style="fill: #fff1df; stroke: #bd7a24; stroke-width: 1.5; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_18">
+    <path d="M 923.9364 448.326 
+L 1222.8516 448.326 
+Q 1230.534 448.326 1230.534 440.6436 
+L 1230.534 365.2164 
+Q 1230.534 357.534 1222.8516 357.534 
+L 923.9364 357.534 
+Q 916.254 357.534 916.254 365.2164 
+L 916.254 440.6436 
+Q 916.254 448.326 923.9364 448.326 
+z
+" clip-path="url(#p9dde832df2)" style="fill: #e6f5f3; stroke: #2d8580; stroke-width: 1.5; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_19">
+    <path d="M 574.7364 619.434 
+L 859.6836 619.434 
+Q 867.366 619.434 867.366 611.7516 
+L 867.366 522.3564 
+Q 867.366 514.674 859.6836 514.674 
+L 574.7364 514.674 
+Q 567.054 514.674 567.054 522.3564 
+L 567.054 611.7516 
+Q 567.054 619.434 574.7364 619.434 
+z
+" clip-path="url(#p9dde832df2)" style="fill: #f3f6f9; stroke: #8495a4; stroke-width: 1.5; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_20">
+    <path d="M 50.9364 619.434 
+L 510.4836 619.434 
+Q 518.166 619.434 518.166 611.7516 
+L 518.166 522.3564 
+Q 518.166 514.674 510.4836 514.674 
+L 50.9364 514.674 
+Q 43.254 514.674 43.254 522.3564 
+L 43.254 611.7516 
+Q 43.254 619.434 50.9364 619.434 
+z
+" clip-path="url(#p9dde832df2)" style="fill: #f3f6f9; stroke: #8495a4; stroke-width: 1.5; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_21">
+    <path d="M 923.9364 619.434 
+L 1222.8516 619.434 
+Q 1230.534 619.434 1230.534 611.7516 
+L 1230.534 522.3564 
+Q 1230.534 514.674 1222.8516 514.674 
+L 923.9364 514.674 
+Q 916.254 514.674 916.254 522.3564 
+L 916.254 611.7516 
+Q 916.254 619.434 923.9364 619.434 
+z
+" clip-path="url(#p9dde832df2)" style="fill: #e6f5f3; stroke: #2d8580; stroke-width: 1.5; stroke-linejoin: miter"/>
+   </g>
+   <g id="text_3">
+    <text style="fill: #586c7d; font: 10px 'DejaVu Sans'" transform="translate(41.508 683.952038)">At fixed query/content, replicating a complete window leaves its aggregate unchanged; all affinities zero implies zero raw potential.</text>
+    <text style="fill: #586c7d; font: 10px 'DejaVu Sans'" transform="translate(41.508 697.049459)">Null support and window discounts are learned aggregation coefficients, not calibrated association or reliability probabilities.</text>
+   </g>
+   <g id="text_4">
+    <!-- Current query $q_d$ -->
+    <g style="fill: #203447" transform="translate(96.66 173.0748)">
+     <text>
+      <tspan style="font: 700 10.6px 'DejaVu Sans'" x="0 7.797546 15.361633 20.601501 25.84137 33.047485 40.611572 45.690613 49.389648 56.995239 64.559326 71.765442 77.00531 83.931274" y="-0.828125">Current query </tspan>
+      <tspan style="font: oblique 10.6px 'DejaVu Sans'" x="87.63031" y="-0.828125">q</tspan>
+      <tspan style="font: oblique 7.42px 'DejaVu Sans'" x="94.374695" y="0.9765625">d</tspan>
+     </text>
+    </g>
+   </g>
+   <g id="text_5">
+    <text style="fill: #203447; font: 10.1px 'DejaVu Sans'" transform="translate(95.131227 215.37513)">Prior-anchored state</text>
+    <text style="fill: #203447; font: 10.1px 'DejaVu Sans'" transform="translate(65.819133 229.370969)">+ visible-window context + age</text>
+    <text style="fill: #203447; font: 10.1px 'DejaVu Sans'" transform="translate(81.326578 243.366807)">LayerNorm over channels</text>
+   </g>
+   <g id="text_6">
+    <text style="fill: #203447; font: 700 10.6px 'DejaVu Sans'; text-anchor: middle" x="146.268" y="354.763144" transform="rotate(-0 146.268 354.763144)">All retained tokens</text>
+   </g>
+   <g id="text_7">
+    <text style="fill: #203447; font: 10.1px 'DejaVu Sans'" transform="translate(70.570078 396.95913)">Source keys / values / context</text>
+    <text style="fill: #203447; font: 10.1px 'DejaVu Sans'" transform="translate(99.822992 410.954969)">Relative geometry</text>
+    <text style="fill: #203447; font: 10.1px 'DejaVu Sans'" transform="translate(111.513742 424.950807)">Causal masks</text>
+   </g>
+   <g id="text_8">
+    <text style="fill: #203447; font: 700 10.8px 'DejaVu Sans'; text-anchor: middle" x="406.422" y="173.331112" transform="rotate(-0 406.422 173.331112)">Reweight old + new</text>
+   </g>
+   <g id="text_9">
+    <text style="fill: #203447; font: 10.3px 'DejaVu Sans'" transform="translate(350.501047 214.626464)">Query-key interaction</text>
+    <!-- $a_{jh}=\sigma(u_{jh})$ -->
+    <g style="fill: #203447" transform="translate(379.539 228.901943)">
+     <text>
+      <tspan style="font: oblique 10.3px 'DejaVu Sans'" x="0 25.677722 36.172961" y="-0.40625">aσu</tspan>
+      <tspan style="font: oblique 7.21px 'DejaVu Sans'" x="6.281128 8.274573 42.669299 44.662744" y="1.234375">jhjh</tspan>
+      <tspan style="font: 10.3px 'DejaVu Sans'" x="15.092395 32.17406 49.483618" y="-0.40625">=()</tspan>
+     </text>
+    </g>
+    <text style="fill: #203447; font: 10.3px 'DejaVu Sans'" transform="translate(322.253297 244.225848)">Masked tokens have zero weight</text>
+   </g>
+   <g id="text_10">
+    <text style="fill: #203447; font: 700 10.4px 'DejaVu Sans'; text-anchor: middle" x="406.422" y="354.611175" transform="rotate(-0 406.422 354.611175)">Revalue old + new</text>
+   </g>
+   <g id="text_11">
+    <text style="fill: #203447; font: 9.9px 'DejaVu Sans'" transform="translate(327.734789 396.168581)">SiLU(source + relation + query)</text>
+    <!-- Head readout $r_{jh}$ -->
+    <g style="fill: #203447" transform="translate(365.634 409.889672)">
+     <text>
+      <tspan style="font: 9.9px 'DejaVu Sans'" x="0 7.425537 13.500977 19.552307 25.820618 28.959595 33.019531 39.094971 45.146301 51.414612 57.456299 63.714966 67.586853" y="-0.40625">Head readout </tspan>
+      <tspan style="font: oblique 9.9px 'DejaVu Sans'" x="70.72583" y="-0.40625">r</tspan>
+      <tspan style="font: oblique 6.93px 'DejaVu Sans'" x="74.785767 76.706281" y="1.234375">jh</tspan>
+     </text>
+    </g>
+    <!-- $v_{jh}=s_h\tanh(r_{jh}),\ s_h&gt;0$ -->
+    <g style="fill: #203447" transform="translate(350.487 424.620872)">
+     <text>
+      <tspan style="font: oblique 9.9px 'DejaVu Sans'" x="0 24.540961 60.633453 83.390324" y="-0.40625">vsrs</tspan>
+      <tspan style="font: oblique 6.93px 'DejaVu Sans'" x="5.843994 7.764508 29.685797 64.69339 66.613904 88.535161" y="1.234375">jhhjhh</tspan>
+      <tspan style="font: 9.9px 'DejaVu Sans'" x="14.342902 34.340302 38.212189 44.263519 50.522186 56.780853 71.268408 75.121008 95.113554 105.311613" y="-0.40625">=tanh(),&gt;0</tspan>
+     </text>
+    </g>
+   </g>
+   <g id="text_12">
+    <!-- Within source window $g$ -->
+    <g style="fill: #203447" transform="translate(637.242 174.1688)">
+     <text>
+      <tspan style="font: 700 11.9px 'DejaVu Sans'" x="0 13.09845 17.168884 22.845459 31.299438 35.369873 43.823853 47.958069 55.026245 63.184509 71.638489 77.494812 84.533997 92.587891 96.722107 107.692566 111.763 120.21698 128.717346 136.87561 147.846069" y="-0.875">Within source window </tspan>
+      <tspan style="font: oblique 11.9px 'DejaVu Sans'" x="151.980286" y="-0.875">g</tspan>
+     </text>
+    </g>
+   </g>
+   <g id="text_13">
+    <!-- $w_{jh}=\dfrac{a_{jh}}{\sum_{k\in g}a_{kh}+n_g\nu_h}$ -->
+    <g style="fill: #203447" transform="translate(663.516 243.046976)">
+     <text>
+      <tspan style="font: oblique 11.4px 'DejaVu Sans'" x="0 50.530182 60.826105 81.422382 93.986835" y="-0.5718749999999986 9.307812499999997 -8.84375 9.307812499999997 9.307812499999997">waanν</tspan>
+      <tspan style="font: oblique 7.98px 'DejaVu Sans'" x="9.303284 11.515521 30.826105 45.475861 57.500702 62.111798 67.796625 70.008862 88.631732 100.340839" y="1.2328125000000014 1.2328125000000014 20.28125 20.28125 11.112499999999997 11.112499999999997 -7.0390625 -7.0390625 11.112499999999997 11.112499999999997">jhkgkhjhgh</tspan>
+      <tspan style="font: 11.4px 'DejaVu Sans'" x="19.078973 69.67525" y="-0.5718749999999986 9.307812499999997">=+</tspan>
+      <tspan style="font: 11.4px 'DejaVu Sans Display'" x="35.826105" y="9.3078125">∑</tspan>
+      <tspan style="font: 7.98px 'DejaVu Sans'" x="36.988489" y="20.28125">∈</tspan>
+     </text>
+     <rect x="30.826105" y="-3.592187" width="74.862061" height="0.7125"/>
+    </g>
+    <text style="fill: #203447; font: 11.4px 'DejaVu Sans'" transform="translate(717.21 279.615415)"/>
+    <!-- $m_{gh}=\sum_{j\in g}w_{jh}v_{jh}$ -->
+    <g style="fill: #203447" transform="translate(675.144 300.009659)">
+     <text>
+      <tspan style="font: oblique 11.4px 'DejaVu Sans'" x="0 52.750751 69.613599" y="-0.8125">mwv</tspan>
+      <tspan style="font: oblique 7.98px 'DejaVu Sans'" x="11.080627 16.134949 35.445532 47.696429 62.054034 64.266272 76.345288 78.557526" y="0.9921875 0.9921875 10.1609375 10.1609375 0.9921875 0.9921875 0.9921875 0.9921875">ghjgjhjh</tspan>
+      <tspan style="font: 11.4px 'DejaVu Sans'" x="23.698401" y="-0.8125">=</tspan>
+      <tspan style="font: 11.4px 'DejaVu Sans Display'" x="38.445532" y="-0.8125">∑</tspan>
+      <tspan style="font: 7.98px 'DejaVu Sans'" x="39.209058" y="10.1609375">∈</tspan>
+     </text>
+    </g>
+    <!-- $c_g=\sum_{j\in g}\overline{w}_{j}u_j$ -->
+    <g style="fill: #203447" transform="translate(684.834 331.029059)">
+     <text>
+      <tspan style="font: oblique 11.4px 'DejaVu Sans'" x="0 42.877606 54.799182" y="-0.8125 -0.9214999999999982 -0.8125">cwu</tspan>
+      <tspan style="font: oblique 7.98px 'DejaVu Sans'" x="6.254028 25.572388 37.823285 52.286163 62.008533" y="0.9921875 10.1609375 10.1609375 0.9921875 0.9921875">gjgjj</tspan>
+      <tspan style="font: 11.4px 'DejaVu Sans'" x="13.825256" y="-0.8125">=</tspan>
+      <tspan style="font: 11.4px 'DejaVu Sans Display'" x="28.572388" y="-0.8125">∑</tspan>
+      <tspan style="font: 7.98px 'DejaVu Sans'" x="29.335913" y="10.1609375">∈</tspan>
+     </text>
+     <rect x="42.877606" y="-9.224625" width="9.303284" height="0.7125"/>
+    </g>
+    <!-- $\alpha_{gh}=\sum_{j\in g}w_{jh}\leq 1$ -->
+    <g style="fill: #203447" transform="translate(673.434 362.048459)">
+     <text>
+      <tspan style="font: oblique 11.4px 'DejaVu Sans'" x="0 49.168292" y="-0.8125">αw</tspan>
+      <tspan style="font: oblique 7.98px 'DejaVu Sans'" x="7.498169 12.55249 31.863074 44.113971 58.471576 60.683813" y="0.9921875 0.9921875 10.1609375 10.1609375 0.9921875 0.9921875">ghjgjh</tspan>
+      <tspan style="font: 11.4px 'DejaVu Sans'" x="20.115942 68.247266 79.994397" y="-0.8125">=≤1</tspan>
+      <tspan style="font: 11.4px 'DejaVu Sans Display'" x="34.863074" y="-0.8125">∑</tspan>
+      <tspan style="font: 7.98px 'DejaVu Sans'" x="35.626599" y="10.1609375">∈</tspan>
+     </text>
+    </g>
+    <text style="fill: #203447; font: 11.4px 'DejaVu Sans'" transform="translate(717.21 388.470898)"/>
+    <text style="fill: #203447; font: 11.4px 'DejaVu Sans'" transform="translate(627.913266 404.26818)">Null value and context are zero</text>
+   </g>
+   <g id="text_14">
+    <text style="fill: #203447; font: 700 11.4px 'DejaVu Sans'; text-anchor: middle" x="1073.394" y="173.787019" transform="rotate(-0 1073.394 173.787019)">Across arrived windows</text>
+   </g>
+   <g id="text_15">
+    <!-- $\rho_{gh}=\sigma(\mathrm{MLP}[q_d,c_g,\Delta w_g])$ -->
+    <g style="fill: #203447" transform="translate(1007.2855 221.8556)">
+     <text>
+      <tspan style="font: oblique 10.9px 'DejaVu Sans'" x="0 30.210217 67.58772 85.199292 109.326306" y="-0.640625">ρσqcw</tspan>
+      <tspan style="font: oblique 7.63px 'DejaVu Sans'" x="6.903076 11.735229 74.490796 91.178418 118.220654" y="1.1640625">ghdgg</tspan>
+      <tspan style="font: 10.9px 'DejaVu Sans'" x="18.979443 37.102673 41.34541 50.728284 56.787061 63.344983 79.62373 96.311353 101.886914 123.353589 127.596326" y="-0.640625">=(MLP[,,Δ])</tspan>
+     </text>
+    </g>
+    <!-- $F_{dh}=\sum_g\rho_{gh}m_{gh}$ -->
+    <g style="fill: #203447" transform="translate(1034.8625 242.4675)">
+     <text>
+      <tspan style="font: oblique 10.9px 'DejaVu Sans'" x="0 39.421765 56.282495" y="-0.8125">Fρm</tspan>
+      <tspan style="font: oblique 7.63px 'DejaVu Sans'" x="6.255249 11.087402 32.56239 46.324841 51.156995 66.876062 71.708215" y="0.9921875 0.9921875 8.524999999999999 0.9921875 0.9921875 0.9921875 0.9921875">dhgghgh</tspan>
+      <tspan style="font: 10.9px 'DejaVu Sans'" x="18.331616" y="-0.8125">=</tspan>
+      <tspan style="font: 10.9px 'DejaVu Sans Display'" x="29.56239" y="-0.8125">∑</tspan>
+     </text>
+    </g>
+    <!-- $F_d=\sum_hF_{dh}$ -->
+    <g style="fill: #203447" transform="translate(1047.888 270.6004)">
+     <text>
+      <tspan style="font: oblique 10.9px 'DejaVu Sans'" x="0 34.597046" y="-0.8125">FF</tspan>
+      <tspan style="font: oblique 7.63px 'DejaVu Sans'" x="6.255249 27.737671 40.852295 45.684448" y="0.9921875 10.0671875 0.9921875 0.9921875">dhdh</tspan>
+      <tspan style="font: 10.9px 'DejaVu Sans'" x="13.506897" y="-0.8125">=</tspan>
+      <tspan style="font: 10.9px 'DejaVu Sans Display'" x="24.737671" y="-0.8125">∑</tspan>
+     </text>
+    </g>
+   </g>
+   <g id="text_16">
+    <text style="fill: #203447; font: 700 11.9px 'DejaVu Sans'; text-anchor: middle" x="1073.394" y="383.686941" transform="rotate(-0 1073.394 383.686941)">Effective evidence mass</text>
+   </g>
+   <g id="text_17">
+    <!-- $M_{dh}=\sum_g\rho_{gh}\alpha_{gh}$ -->
+    <g style="fill: #203447" transform="translate(1033.266 422.25)">
+     <text>
+      <tspan style="font: oblique 11.4px 'DejaVu Sans'" x="0 44.491675 62.113782" y="-0.8125">Mρα</tspan>
+      <tspan style="font: oblique 7.98px 'DejaVu Sans'" x="9.81427 14.868591 37.179175 51.712134 56.766455 69.611951 74.666272" y="0.9921875 0.9921875 8.618749999999999 0.9921875 0.9921875 0.9921875 0.9921875">dhgghgh</tspan>
+      <tspan style="font: 11.4px 'DejaVu Sans'" x="22.432043" y="-0.8125">=</tspan>
+      <tspan style="font: 11.4px 'DejaVu Sans Display'" x="34.179175" y="-0.8125">∑</tspan>
+     </text>
+    </g>
+   </g>
+   <g id="text_18">
+    <text style="fill: #203447; font: 700 11px 'DejaVu Sans'; text-anchor: middle" x="717.21" y="540.143081" transform="rotate(-0 717.21 540.143081)">Learned null competitor</text>
+   </g>
+   <g id="text_19">
+    <!-- $\nu_h=\mathrm{softplus}(\eta_h)+\epsilon&gt;0$ -->
+    <g style="fill: #203447" transform="translate(655.68 581.3355)">
+     <text>
+      <tspan style="font: oblique 10.5px 'DejaVu Sans'" x="0 69.225488 97.825" y="-0.640625">νηε</tspan>
+      <tspan style="font: oblique 7.35px 'DejaVu Sans'" x="5.865234 75.880273" y="1.1640625">hh</tspan>
+      <tspan style="font: 10.5px 'DejaVu Sans'" x="12.87002 23.713525 29.183984 35.608057 39.30459 43.421533 50.086572 53.003809 59.658594 65.129053 80.839404 86.981494 105.546191 116.389697" y="-0.640625">=softplus()+&gt;0</tspan>
+     </text>
+    </g>
+    <!-- $n_g$ = valid token count in window $g$ -->
+    <g style="fill: #203447" transform="translate(625.02 595.9095)">
+     <text>
+      <tspan style="font: oblique 10.5px 'DejaVu Sans'" x="0 177.698486" y="-0.640625">ng</tspan>
+      <tspan style="font: oblique 7.35px 'DejaVu Sans'" x="6.654785" y="1.1640625">g</tspan>
+      <tspan style="font: 10.5px 'DejaVu Sans'" x="11.621094 14.95874 23.756592 27.094238 33.308105 39.742432 42.659668 45.576904 52.241943 55.57959 59.696533 66.120605 72.201172 78.661133 85.315918 88.653564 94.426514 100.850586 107.505371 114.160156 118.2771 121.614746 124.531982 131.186768 134.524414 143.112061 146.029297 152.684082 159.349121 165.773193 174.36084" y="-0.640625"> = valid token count in window </tspan>
+     </text>
+    </g>
+   </g>
+   <g id="text_20">
+    <text style="fill: #203447; font: 700 11.1px 'DejaVu Sans'; text-anchor: middle" x="280.71" y="540.219066" transform="rotate(-0 280.71 540.219066)">A new window changes the interpretation of old tokens</text>
+   </g>
+   <g id="text_21">
+    <!-- Current $q_d$ drives every retained gate and signed value. -->
+    <g style="fill: #203447" transform="translate(132.204 581.830649)">
+     <text>
+      <tspan style="font: 10.6px 'DejaVu Sans'" x="0 7.418823 14.152832 18.521118 22.889404 29.42627 36.160278 40.326233 55.469849 58.847229 65.591614 69.9599 72.911865 79.199707 85.736572 91.272156 94.649536 101.186401 107.474243 114.011108 118.379395 124.667236 128.044617 132.412903 138.949768 143.115723 149.626648 152.578613 159.312622 165.849487 172.593872 175.971252 182.715637 189.226562 193.392517 199.929382 203.306763 209.817688 216.551697 223.296082 226.673462 232.209045 235.161011 241.905396 248.639404 255.17627 261.920654 265.298035 271.585876 278.096802 281.048767 287.782776 294.319641" y="-0.640625">Current  drives every retained gate and signed value.</tspan>
+      <tspan style="font: oblique 10.6px 'DejaVu Sans'" x="43.703613" y="-0.640625">q</tspan>
+      <tspan style="font: oblique 7.42px 'DejaVu Sans'" x="50.447998" y="1.1640625">d</tspan>
+     </text>
+    </g>
+    <text style="fill: #203447; font: 10.6px 'DejaVu Sans'" transform="translate(110.494703 596.540882)">The full prefix potential is recomputed, never repeatedly added.</text>
+   </g>
+   <g id="text_22">
+    <text style="fill: #203447; font: 700 11px 'DejaVu Sans'; text-anchor: middle" x="1073.394" y="540.143081" transform="rotate(-0 1073.394 540.143081)">To birth-referenced readout</text>
+   </g>
+   <g id="text_23">
+    <text style="fill: #203447; font: 10.5px 'DejaVu Sans'" transform="translate(993.456188 581.882279)">Current potential + null-aware</text>
+    <text style="fill: #203447; font: 10.5px 'DejaVu Sans'" transform="translate(1009.630289 596.432408)">context / mass statistics</text>
+   </g>
+   <g id="text_24">
+    <g id="patch_22">
+     <path d="M 659.086122 492.098681 
+L 776.032278 492.098681 
+L 776.032278 479.282119 
+L 659.086122 479.282119 
+z
+" style="fill: #ffffff"/>
+    </g>
+    <text style="fill: #203447; font: 9.8px 'DejaVu Sans'; text-anchor: middle" x="717.5592" y="488.394588" transform="rotate(-0 717.5592 488.394588)">zero-valued alternative</text>
+   </g>
+  </g>
+ </g>
+ <defs>
+  <clipPath id="p9dde832df2">
+   <rect x="10.08" y="10.08" width="1257.12" height="698.4"/>
+  </clipPath>
+ </defs>
+</svg>

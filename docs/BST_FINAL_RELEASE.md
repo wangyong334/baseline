@@ -1,6 +1,6 @@
 # 最终实验版本：BST 共享证据模型（2026-11-11）
 
-> 本页记录旧平坦均值 r1 基线。后续窗口分组重审版本、最终复测结果及新配置入口见 [BST_WINDOW_RELEASE.md](BST_WINDOW_RELEASE.md)；新版本必须显式使用 `configs/bst_window.json`。
+> 本页保留旧平坦均值 r1 基线记录。当前 R3 入口为 `configs/bst_final.json`，见 [R3 交付与验证](BST_FINAL_R3_RELEASE.md) 和 [服务器切换步骤](BST_SERVER_R3.md)。下文旧重启恢复命令不适用于仍在运行的池子。
 
 这是用于服务器种子 37、38 正式实验的代码版本，不是已经获得最终精度的模型权重。服务器结果返回前，不宣称 VoW 优于 V11、达到 SOTA、满足严格贝叶斯风险界或保证 CVPR 录用。CLAUDE.md 按用户约定留待单独的阶段总结。
 

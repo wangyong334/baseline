@@ -11,6 +11,7 @@ import torch
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, ROOT)
 from model.bst import BirthValueHead, ContinuationValueHead, stop_risk
+from tools.bst.training_geometry import GeometryBatches
 from tools.bst.pipeline import (choose_queries, file_digest, get_record, load_model, paths, prior_provenance, rollout, save_json,
                                threshold_costs, validation_partition)
 from tools.bst.policy import BirthContext, policy_returns
@@ -118,9 +119,12 @@ def main(argv=None):
             qs = choose_queries(rec, pc["background_budget"], rng)
             context = BirthContext(rec, retain_all=True, **context_config)
             log_weights.append(rec.log_w)
-            for start in range(0, len(qs.ids), cfg["train"]["batch_size"]):
-                ids = qs.ids[start:start + cfg["train"]["batch_size"]]
-                result = rollout(model, rec, index, ids, args.device, collect_features=True)
+            geometry = GeometryBatches(index, qs.ids, cfg["train"]["batch_size"],
+                                       cfg["train"].get("geometry_cache_mb", 64))
+            for start, stop, prepared in geometry:
+                ids = qs.ids[start:stop]
+                result = rollout(model, rec, index, ids, args.device, collect_features=True,
+                                 prepared_batch=prepared)
                 chunks.append({"features": result["features"].cpu().numpy(),
                                "logits": result["logits"].cpu().numpy(),
                                "valid": result["valid"].cpu().numpy(),

@@ -1,6 +1,6 @@
 # 最终两种子任务：GPU 1 池子
 
-> 后续窗口分组模型请使用 [BST_WINDOW_RELEASE.md](../../docs/BST_WINDOW_RELEASE.md) 的 `window_20261111_r2` 命令，并显式传入 `--config configs/bst_window.json`。本页的 r1 命令保留为原平坦均值基线和重启恢复说明；已经运行的池子无需再次恢复。
+> 当前 R3 使用 [BST_SERVER_R3.md](../../docs/BST_SERVER_R3.md)：先结束旧训练，再上传更新，以 `final_20261111_r3` 和显式 `--config configs/bst_final.json` 加入已有 GPU 1 池子。本页 r1 命令仅保留作历史记录；已经运行的池子无需再次恢复或重建。
 
 先通过 SFTP 上传本次代码；服务器项目仍是 `/media/stephen/nvme0n1/wy_data/EV-UAV-v13`。下面命令只管理这个目录的队列，不连接其他机器、不结束其他用户进程。
 

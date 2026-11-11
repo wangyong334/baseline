@@ -1,5 +1,7 @@
 # 窗口分组重审模型：本轮交付与运行入口
 
+> 本页保留 R2 记录及其负面探针结果。当前出生参考/null 版本为 [R3](BST_FINAL_R3_RELEASE.md)，配置 `configs/bst_final.json`；R2 继续作为重训消融。
+
 2026-11-11。配置为 `configs/bst_window.json`，建议新发布标签 `window_20261111_r2`。这是可训练、可评估的最终候选架构，正式训练权重和性能结论仍需服务器两种子实验。旧 `bst_shared.json` 与已有 r1 冻结快照保留为平坦均值基线；没有改写 CLAUDE.md。
 
 ## 模块与主张

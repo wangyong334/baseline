@@ -37,11 +37,21 @@ def variants(base):
                "no_revalue": {"revalue": False},
                "no_reaudit": {"reweight": False, "revalue": False}}
     if base["model"]["normalization"] != "mean":
-        patches["legacy_flat_mean"] = {"normalization": "mean", "window_gate": False, "bounded_values": False}
+        # The legacy model has neither a null competitor nor the admission
+        # potential subtraction. Leaving either enabled changes the reference.
+        patches["legacy_flat_mean"] = {"normalization": "mean", "window_gate": False,
+                                       "bounded_values": False, "null_evidence": False,
+                                       "innovation": False}
     if base["model"].get("window_gate"):
         patches["no_window_gate"] = {"window_gate": False}
     if base["model"].get("bounded_values"):
         patches["unbounded_values"] = {"bounded_values": False}
+    if base["model"].get("null_evidence"):
+        patches["no_null_evidence"] = {"null_evidence": False}
+    if base["model"].get("innovation"):
+        patches["no_innovation"] = {"innovation": False}
+    if base["model"].get("null_evidence") and base["model"].get("innovation"):
+        patches["window_r2"] = {"null_evidence": False, "innovation": False}
     output = {}
     for name, patch in patches.items():
         config = copy.deepcopy(base)

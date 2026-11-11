@@ -6,7 +6,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from tools.bst.experiment_matrix import build_plan, inspect_backbone, variants, write_plan
+from tools.bst.experiment_matrix import POLICIES, build_plan, inspect_backbone, variants, write_plan
 
 
 class ExperimentMatrixTests(unittest.TestCase):
@@ -101,6 +101,44 @@ class ExperimentMatrixTests(unittest.TestCase):
         self.assertEqual(saved["mode"], "plan_only_no_training_or_queue_submission")
         with self.assertRaises(FileExistsError):
             write_plan(plan)
+
+    def test_final_config_has_null_innovation_factorial_and_preserves_all_budgets(self):
+        from model.bst import BSTConfig, SharedSequentialModel
+        root = Path(__file__).resolve().parents[1]
+        base = json.loads((root/"configs/bst_final.json").read_text(encoding="utf-8"))
+        before = copy.deepcopy(base)
+        options = variants(base)
+        self.assertEqual(len(options), 10)
+        expected = {"full": (True, True), "no_null_evidence": (False, True),
+                    "no_innovation": (True, False), "window_r2": (False, False)}
+        for name, pair in expected.items():
+            model = options[name]["model"]
+            self.assertEqual((model["null_evidence"], model["innovation"]), pair)
+        for config in options.values():
+            BSTConfig(**config["model"])
+            for section in ("train", "policy", "evidence"):
+                self.assertEqual(config[section], base[section])
+            self.assertEqual(config["train"]["geometry_cache_mb"], 64)
+        legacy = options["legacy_flat_mean"]["model"]
+        self.assertFalse(legacy["null_evidence"])
+        self.assertFalse(legacy["innovation"])
+        legacy_net = SharedSequentialModel(BSTConfig(**legacy))
+        self.assertFalse(hasattr(legacy_net, "window_evidence"))
+        self.assertEqual(base, before)
+        self.assertEqual(POLICIES, (("band", "arrival"), ("band", "fixed"),
+                                    ("band", "learned"), ("learned", "learned")))
+
+    def test_real_window_r2_config_retains_its_original_seven_variants(self):
+        from model.bst import BSTConfig
+        root = Path(__file__).resolve().parents[1]
+        base = json.loads((root/"configs/bst_window.json").read_text(encoding="utf-8"))
+        options = variants(base)
+        self.assertEqual(set(options), {"full", "no_reweight", "no_revalue", "no_reaudit",
+                                        "legacy_flat_mean", "no_window_gate", "unbounded_values"})
+        for config in options.values():
+            BSTConfig(**config["model"])
+            self.assertEqual(config["train"], base["train"])
+            self.assertEqual(config["policy"], base["policy"])
 
     def test_actual_neuron_variants_share_event_output_contract_but_seed_is_checked(self):
         import numpy as np

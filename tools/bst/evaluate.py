@@ -127,7 +127,7 @@ def main(argv=None):
               "checkpoint_scope": scope,
               "evaluation_limit": args.limit, "checkpoint_sha256": file_digest(args.checkpoint),
               "inference_batch_size": args.batch_size,
-              "timing_scope": "SDU/VoW/index/cache on precomputed BIR priors; excludes BIR and file load",
+              "timing_scope": "Streaming loop on precomputed BIR priors: per-window neighbor lookup, SDU/VoW, caches and output transfer; excludes BIR, recording/index initialization and file load. Use final_metrics.py for complete raw-stream timing.",
               "guaranteed_risk_bound": False}
     save_json(os.path.join(args.out, "summary.json"), report)
     print("BST EVALUATE FINISHED %s" % report["model"], flush=True)

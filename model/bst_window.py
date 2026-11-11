@@ -4,6 +4,14 @@ The grouping is an acquisition unit, NOT an independence assertion. Replicating
 an entire selected window's fixed tokens leaves normalized summaries unchanged;
 adding a distinct window may add evidence. Across-window discount coefficients
 are learned, not calibrated reliability probabilities. No token is discarded.
+
+With null_evidence enabled, each observed window also has a zero-valued null
+competitor: w_jh = a_jh / (sum_j a_jh + n_window * nu_h), nu_h > 0.
+The accepted mass can fall to zero, whereas ordinary normalized attention
+cancels uniform attenuation of every affinity. Null normalization keeps the
+complete-group replication property by scaling null mass with valid n_window.
+Context is a subprobability mixture with the same zero-valued null branch;
+neither value nor context is renormalized by accepted mass afterward.
 """
 import math
 
@@ -13,17 +21,23 @@ from torch.nn import functional as F
 
 
 class WindowEvidence(nn.Module):
-    def __init__(self, state_dim, heads, past_windows, max_wait, gate=True, bounded=True):
+    def __init__(self, state_dim, heads, past_windows, max_wait, gate=True, bounded=True,
+                 null_evidence=False):
         super().__init__()
         self.groups = int(past_windows + max_wait + 1)
         self.past_windows = int(past_windows)
         self.gated, self.bounded = bool(gate), bool(bounded)
+        self.null_evidence = bool(null_evidence)
         if gate:
             self.discount = nn.Sequential(nn.Linear(2 * state_dim + 1, state_dim), nn.SiLU(),
                                           nn.Linear(state_dim, heads))
         if bounded:
             # Unit initial potential scale, learned jointly by the prefix loss.
             self.raw_scale = nn.Parameter(torch.full((heads,), math.log(math.expm1(1.))))
+        if self.null_evidence:
+            # A learned zero-valued competitor per head. Multiplying its mass
+            # by the valid token count preserves complete-group replication.
+            self.raw_null = nn.Parameter(torch.full((heads,), math.log(math.expm1(1.))))
         self.register_buffer("window_age", (torch.arange(self.groups).float() - past_windows)
                              / max(max_wait, 1), persistent=False)
 
@@ -53,14 +67,22 @@ class WindowEvidence(nn.Module):
 
     def forward(self, weights, values, source_context, query_context, grouping):
         index, active = grouping["index"], grouping["active"]
-        # Stabilize each valid affinity BEFORE normalization. A floor on the
-        # group denominator would break complete-group replication invariance.
-        # Extreme underflow falls back to uniform within-window affinities;
-        # invalid tokens remain exactly zero and never become fake evidence.
+        # Legacy normalization stabilizes affinities before group division;
+        # flooring the group denominator would break replication invariance.
+        # The null path instead keeps a zero affinity exactly zero.
         epsilon = max(1e-12, torch.finfo(weights.dtype).tiny)
-        weights = torch.where(grouping["mask"][..., None], weights.clamp(min=epsilon), torch.zeros_like(weights))
+        # The null denominator is already positive for an observed group:
+        # zero affinities must stay zero rather than create uniform evidence.
+        affinities = weights if self.null_evidence else weights.clamp(min=epsilon)
+        weights = torch.where(grouping["mask"][..., None], affinities, torch.zeros_like(weights))
         mass = self.group_sum(weights, index)
-        divisor = self.token_read(mass, index)
+        if self.null_evidence:
+            counts = self.group_sum(grouping["mask"].to(weights.dtype)[..., None], index)
+            null = F.softplus(self.raw_null).to(weights) + epsilon
+            denominator = mass + counts * null[None, None]
+        else:
+            denominator = mass
+        divisor = self.token_read(denominator, index)
         within = weights / torch.where(divisor > 0, divisor, torch.ones_like(divisor))
         window_value = self.group_sum(within * values, index)
         window_context = self.group_sum(within.mean(-1)[..., None] * source_context, index)
@@ -73,6 +95,23 @@ class WindowEvidence(nn.Module):
         discount = discount * active[..., None].to(discount.dtype)
         effective = within * self.token_read(discount, index)
         correction = (discount * window_value).sum(1)
+        if self.null_evidence:
+            # window_value and window_context already include non-null
+            # support. Apply rho once; do not multiply their values by support
+            # a second time, or renormalize away the missing/null mass.
+            support = mass / torch.where(denominator > 0, denominator, torch.ones_like(denominator))
+            effective_mass = discount * support
+            mass_h = effective_mass.sum(1)
+            units = grouping["units"].clamp(min=1.)
+            summary = (effective.mean(-1)[..., None] * source_context).sum(1) / units[:, None]
+            neff = (mass_h.square() / effective_mass.square().sum(1).clamp(min=1e-8)).mean(-1)
+            null_mass = (1. - support) * active[..., None].to(support.dtype)
+            return {"gate": weights, "head_correction": correction, "mass_h": mass_h, "summary": summary,
+                    "neff": neff, "effective_weight": effective, "window_discount": discount,
+                    "window_value": window_value, "window_active": active, "units": grouping["units"],
+                    "window_support": support, "null_mass": null_mass,
+                    "effective_window_mass": effective_mass,
+                    "context_support": mass_h.mean(-1) / units}
         mass_h = discount.sum(1)
         summary_weight = discount.mean(-1)
         summary = (window_context * summary_weight[..., None]).sum(1)

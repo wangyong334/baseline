@@ -4,6 +4,7 @@ import math
 import os
 import sys
 import time
+import uuid
 
 import numpy as np
 import torch
@@ -13,6 +14,7 @@ sys.path.insert(0, ROOT)
 from model.bst import BSTConfig, SharedSequentialModel
 from tools.bst.pipeline import (checkpoint_scope, choose_queries, evaluate_sampled, get_record, load_config, prior_provenance,
                                 paths, rollout, save_json, validation_partition, weighted_event_loss)
+from tools.bst.training_geometry import GeometryBatches
 
 
 def validate_training_config(cfg):
@@ -37,6 +39,20 @@ def validate_training_config(cfg):
             raise ValueError("invalid %s.%s" % (group, name))
     if not 0 < float(cfg["policy"]["band_alpha"]) < .5:
         raise ValueError("policy.band_alpha must lie in (0, 0.5)")
+    budget = float(cfg["train"].get("geometry_cache_mb", 64))
+    if not math.isfinite(budget) or budget < 0:
+        raise ValueError("train.geometry_cache_mb must be finite and nonnegative")
+
+
+def save_checkpoint(checkpoint, path):
+    """Readers see a complete old or new checkpoint, never a partial write."""
+    temporary = str(path) + "." + uuid.uuid4().hex[:8] + ".tmp"
+    try:
+        torch.save(checkpoint, temporary)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def require_complete_priors(provenance, scope):
@@ -60,6 +76,7 @@ def main(argv=None):
     ap.add_argument("--limit-train", type=int, default=0)
     ap.add_argument("--limit-val", type=int, default=0)
     ap.add_argument("--threads", type=int, default=4)
+    ap.add_argument("--geometry-cache-mb", type=float, help="bounded CPU neighbor-ID cache; 0 disables")
     args = ap.parse_args(argv)
     if args.threads < 1 or args.limit_train < 0 or args.limit_val < 0:
         raise ValueError("threads must be positive and recording limits nonnegative")
@@ -71,6 +88,8 @@ def main(argv=None):
         cfg["train"]["background_budget"] = args.background_budget
     if args.seed is not None:
         cfg["train"]["seed"] = args.seed
+    if args.geometry_cache_mb is not None:
+        cfg["train"]["geometry_cache_mb"] = args.geometry_cache_mb
     validate_training_config(cfg)
     seed = cfg["train"]["seed"]
     torch.manual_seed(seed)
@@ -110,8 +129,11 @@ def main(argv=None):
         model.train()
         train_loss, population, query_count, encoded_count = 0.0, 0, 0, 0
         order = rng.permutation(len(train))
-        for ri in order:
+        recording_stats = []
+        for ordinal, ri in enumerate(order, 1):
+            record_started = time.perf_counter()
             rec, index = get_record(train[ri], cfg)
+            load_seconds = time.perf_counter() - record_started
             if expected_log_w is None:
                 expected_log_w = rec.log_w
             elif not np.isclose(rec.log_w, expected_log_w, atol=1e-6, rtol=0):
@@ -119,13 +141,18 @@ def main(argv=None):
             qs = choose_queries(rec, cfg["train"]["background_budget"], rng)
             permutation = rng.permutation(len(qs.ids))
             population += len(rec)
-            for start in range(0, len(permutation), cfg["train"]["batch_size"]):
-                rows = permutation[start:start + cfg["train"]["batch_size"]]
+            geometry = GeometryBatches(index, qs.ids[permutation], cfg["train"]["batch_size"],
+                                       cfg["train"].get("geometry_cache_mb", 64))
+            next_progress = time.perf_counter() + 30.0
+            update_seconds = 0.0
+            for start, stop, prepared in geometry:
+                update_started = time.perf_counter()
+                rows = permutation[start:stop]
                 ids = qs.ids[rows]
                 if not len(ids):
                     continue
                 optimizer.zero_grad()
-                result = rollout(model, rec, index, ids, args.device)
+                result = rollout(model, rec, index, ids, args.device, prepared_batch=prepared)
                 labels = torch.as_tensor(rec.label[ids], dtype=torch.float32, device=args.device)
                 weights = torch.as_tensor(qs.weights[rows], dtype=torch.float32, device=args.device)
                 loss_sum = weighted_event_loss(result["logits"], result["valid"], labels, weights)
@@ -143,8 +170,29 @@ def main(argv=None):
                 train_loss += float(loss_sum.detach())
                 query_count += len(ids)
                 encoded_count += result["source_count"]
+                update_seconds += time.perf_counter() - update_started
+                if time.perf_counter() >= next_progress:
+                    progress = {"epoch": epoch + 1, "stage": "train", "recording": rec.name,
+                        "recordings_completed": ordinal - 1, "recordings_total": len(train),
+                        "queries_completed_in_recording": stop, "queries_total_in_recording": len(qs.ids),
+                        "elapsed_epoch_seconds": time.perf_counter() - start_time}
+                    save_json(os.path.join(args.out, "progress.json"), progress)
+                    print("TRAIN PROGRESS " + str(progress), flush=True)
+                    next_progress = time.perf_counter() + 30.0
             print("epoch %d record %s queries %d / %d" % (epoch + 1, rec.name, len(qs.ids), len(rec)), flush=True)
+            stats = {"recording": rec.name, "ordinal": ordinal, "queries": len(qs.ids),
+                     "load_seconds": load_seconds, "update_seconds": update_seconds,
+                     "recording_seconds": time.perf_counter() - record_started, "geometry": dict(geometry.stats)}
+            recording_stats.append(stats)
+            progress = {"epoch": epoch + 1, "stage": "train", "recording": rec.name,
+                        "recordings_completed": ordinal, "recordings_total": len(train),
+                        "elapsed_epoch_seconds": time.perf_counter() - start_time, "last_recording": stats}
+            save_json(os.path.join(args.out, "progress.json"), progress)
+            print("RECORD TIMING " + str(stats), flush=True)
         schedule.step()
+        save_json(os.path.join(args.out, "progress.json"), {"epoch": epoch + 1, "stage": "validation",
+                  "recordings_completed": len(train), "recordings_total": len(train)})
+        validation_started = time.perf_counter()
         validation = evaluate_sampled(model, select, cfg, args.device,
                                       cfg["train"]["validation_background_budget"], seed)
         candidate = validation[selection_metric]
@@ -152,18 +200,21 @@ def main(argv=None):
             raise FloatingPointError("nonfinite validation selection metric; refusing checkpoint save")
         row = {"epoch": epoch + 1, "train_prefix_bce": train_loss / max(population, 1),
                "queries": query_count, "encoded_source_rows": encoded_count,
-               "validation": validation, "seconds": time.perf_counter() - start_time}
+               "validation": validation, "seconds": time.perf_counter() - start_time,
+               "validation_seconds": time.perf_counter() - validation_started, "recordings": recording_stats}
         history.append(row)
         checkpoint = {"model": model.state_dict(), "config": cfg, "epoch": epoch + 1,
                       "manifest": manifest, "validation": validation, "format": "bst_shared_v1",
                       "log_w": expected_log_w, "selection_metric": selection_metric}
-        torch.save(checkpoint, os.path.join(args.out, "last.pt"))
+        save_checkpoint(checkpoint, os.path.join(args.out, "last.pt"))
         improved = (candidate < best) if minimize else (candidate > best)
         if improved:
             best = candidate
-            torch.save(checkpoint, target)
+            save_checkpoint(checkpoint, target)
         save_json(os.path.join(args.out, "training.json"), history)
-        print(row, flush=True)
+        print({key: value for key, value in row.items() if key != "recordings"}, flush=True)
+        save_json(os.path.join(args.out, "progress.json"), {"epoch": epoch + 1, "stage": "epoch_complete",
+                  "checkpoint": "last.pt", "validation": validation, "seconds": row["seconds"]})
     print("BST TRAIN FINISHED: " + target, flush=True)
 
 

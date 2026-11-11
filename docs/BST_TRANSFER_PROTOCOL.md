@@ -29,7 +29,7 @@ LIF、连续状态 graded、无状态 ReLU、TIF/BIR 四种变体共用同一 U-
 
 ## 正式矩阵
 
-`tools/bst/experiment_matrix.py` 根据 `configs/bst_window.json` 生成以下重训对照。它只生成配置、校验结果和命令，不启动任务，也不加入池子。
+`tools/bst/experiment_matrix.py` 根据配置生成重训对照。旧 `configs/bst_window.json` 保留以下七项；最终候选 `configs/bst_final.json` 在此基础上增加三个变体，形成“空证据竞争 × 出生势扣除”的 2×2。工具只生成配置、校验结果和命令，不启动任务，也不加入池子。
 
 | 配置 | 改动 | 能回答的问题 |
 |---|---|---|
@@ -37,9 +37,22 @@ LIF、连续状态 graded、无状态 ReLU、TIF/BIR 四种变体共用同一 U-
 | no_reweight | 来源 affinity 与窗口可靠性门使用固定查询锚点 | 对旧证据重新判定相关性是否有贡献 |
 | no_revalue | 旧来源的有符号值不再依赖当前查询上下文 | 对旧证据重新解释支持/反对方向是否有贡献 |
 | no_reaudit | 同时关闭两条重审路径 | 重新审查是否超出新证据集合变大的作用 |
-| legacy_flat_mean | 平坦均值；关闭窗口门与值有界化 | 与原平坦方案比较；这是组合参考，不能声称只改变一个因素 |
+| legacy_flat_mean | 平坦均值；关闭窗口门、值有界化、空证据竞争和出生势扣除 | 与原平坦方案比较；这是组合参考，不能声称只改变一个因素 |
 | no_window_gate | 只关闭窗口级门 | 学到的窗口可靠性是否有独立作用 |
 | unbounded_values | 只关闭有界化 | 单条/单窗证据幅度约束是否有作用 |
+
+`bst_final.json` 中额外声明：
+
+| 变体 | null_evidence | innovation | 对照含义 |
+|---|---|---|---|
+| full | 开 | 开 | 空证据竞争与出生势扣除同时启用 |
+| no_null_evidence | 关 | 开 | 保留出生势扣除，检查允许“本窗不提供支持”的必要性 |
+| no_innovation | 开 | 关 | 保留空证据竞争，检查重新使用出生时历史势的影响 |
+| window_r2 | 关 | 关 | 回到原窗口分组机制，作为 2×2 的共同参考 |
+
+每个变体完整复制父配置的采样预算、batch、训练轮数、64 MiB 几何 ID 缓存、证据预算、等待代价及策略集合。只修改表中模型开关；所有结构均使用相同的新训练执行优化，避免把训练提速误归因于机制变化。`window_r2` 指重训原 r2 数学结构，不是重新使用旧探针权重；实际缓存预算以父配置为准。
+
+空证据竞争给每头加入学习的零值选项，允许有效证据质量趋零而不被组内归一化抵消；它不是额外的真值过滤。`innovation` 使用 `z0 + F(prefix_d) - F(prefix_0)`，出生势留在计算图中并随权重一起训练。该形式不意味着后续窗口独立，也不保证新增观测只能改善判断。两个开关必须分别检验，不能只将整套 r3 与 r2 的差异归给其中一个。
 
 每个结构变体都重新训练自己的 SDU、拟合自己的 VoW，不能共享另一变体的 policy 权重。`no_reaudit` 仍能汇聚新到达的证据，并非 BIR-only，也不等于物理上移除整个 SDU。关闭机制开关不保证 GPU 实现自动免去所有相应算子；效率按实际执行测量。
 
@@ -47,7 +60,7 @@ LIF、连续状态 graded、无状态 ReLU、TIF/BIR 四种变体共用同一 U-
 
 骨干/种子之间的先验路径按 `backbone_id/seed/SHA256` 分开；同骨干同种子的各 SDU 变体可以共用同一份冻结先验。每个变体在 val/test 上预声明固定出生+age0立即停止、固定出生+固定截止、固定出生+学习停止、学习出生+学习停止；最终原始流评估同时含 BIR-only。
 
-`--birth band --commit arrival` 会打开符合出生规则的 SDU，在年龄 0 读取已经可用的历史与当前窗口证据，完成一次精化后立即提交，不额外等待后续窗口。它与完全不运行 SDU 的 BIR-only 是两个不同对照。BIR-only → age0 回答“历史精化是否有效”；age0 → 固定截止/学习停止回答“后来到达的观测与等待是否有额外收益”。这项对照使用同一已训练 SDU，不在测试集选模型，也不把离线预计算先验的评估时间当作完整骨干推理时间。
+`--birth band --commit arrival` 会打开符合出生规则的 SDU，在年龄 0 读取已经可用的历史与当前窗口证据，随后立即提交，不额外等待后续窗口。对于旧 r2 或 `no_innovation`，BIR-only → age0 回答“历史精化是否有效”；age0 → 固定截止/学习停止回答“后来到达的观测与等待是否有额外收益”。对于启用 `innovation` 的 r3，出生势相减使 age0 分数严格等于初始分数，因此该对照是零新增信息边界检查；它仍运行了一次 SDU，实际计算量不会自动等于 BIR-only。各结构的该项对照均使用同一已训练 SDU，不在测试集选模型，也不把离线预计算先验的评估时间当作完整骨干推理时间。
 
 结构消融优先看相同出生规则和固定截止的对照，避免将等待长度改变误归因于证据模块。VoW 另用验证集确定的相同等待/计算预算对比；测试只报告预先确定的策略。逐录像变化、两种子变异、目标误伤和能耗均保留，不能只给最好 IoU。
 
@@ -60,13 +73,13 @@ conda activate evuav
 cd /media/stephen/nvme0n1/wy_data/EV-UAV-v13
 python tools/bst/experiment_matrix.py \
   --backbones configs/bst_backbones.actual.json \
-  --config configs/bst_window.json \
+  --config configs/bst_final.json \
   --data-root /media/stephen/nvme0n1/wy_data/datasets/EV-UAV-dataset \
-  --out run/bst_matrix/window_transfer_20261111_r2
+  --out run/bst_matrix/final_transfer_20261111_r3
 ```
 
 输出 `matrix.json`、`COMMANDS.md` 和逐实验配置。缺少权重、内部种子不符、骨干/SDU 时域不同、未校准层增益、重复使用同一权重等会明确阻塞对应条目，不产生该条目的可执行命令。`--require-ready` 要求所有声明项通过后才写出计划。
 
-矩阵不包含骨干训练命令；所需骨干权重必须来自各自公平的训练协议。矩阵生成也不冻结代码，正式执行前沿用发布流程冻结源码和配置，使用新 release 标签。已有 `final_20261111_r1` 的冻结任务不修改；新的主模型用 `window_20261111_r2` 与旧实验隔离。
+矩阵不包含骨干训练命令；所需骨干权重必须来自各自公平的训练协议。矩阵生成也不冻结代码，正式执行前沿用发布流程冻结源码和配置，使用新 release 标签。已有 `final_20261111_r1` 与 `window_20261111_r2` 的冻结任务不修改；新的主模型用 `final_20261111_r3` 和显式 `--config configs/bst_final.json` 隔离。`queue_final.py` 的兼容默认值仍是 `bst_shared.json`，不可省略新配置参数。若需生成旧七项矩阵，显式改回 `--config configs/bst_window.json` 并使用另一个输出目录。
 
 当前已通过四种实际网络类的两窗事件接口测试（随机小网络，只验证接口，不是性能实验）和真实本地 BIR seed37 的 checkpoint 检查。尚无正式训练后跨独立架构的性能结果。

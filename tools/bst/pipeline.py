@@ -6,12 +6,14 @@ import json
 import math
 import os
 import warnings
+import uuid
 
 import numpy as np
 import torch
 
 from model.bst import BSTConfig, SharedSequentialModel
 from tools.bst.data import NeighborIndex, compact_neighbors, load_recording, sample_queries
+from tools.bst.training_geometry import GeometryBatches
 from tools.deco.evidence import band_bounds
 
 
@@ -40,8 +42,14 @@ def save_json(path, value):
             return finite_json(item.item())
         return None if isinstance(item, float) and not math.isfinite(item) else item
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(finite_json(value), fh, indent=2, ensure_ascii=False, allow_nan=False)
+    temporary = str(path) + "." + uuid.uuid4().hex[:8] + ".tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8") as fh:
+            json.dump(finite_json(value), fh, indent=2, ensure_ascii=False, allow_nan=False)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def file_digest(path):
@@ -156,7 +164,8 @@ def threshold_costs(threshold, log_w):
     return tau, cost_fp, 1.0 - cost_fp
 
 
-def rollout(model, rec, index, ids, device="cpu", collect_features=False):
+def rollout(model, rec, index, ids, device="cpu", collect_features=False,
+            prepared_batch=None, trim_prefix=True):
     """Full causal prefixes for TRAINING; not an early-exit timing benchmark.
 
     Only selected queries construct neighbours. Each unique source is encoded
@@ -164,7 +173,9 @@ def rollout(model, rec, index, ids, device="cpu", collect_features=False):
     the model. LayerNorm is per source, so future rows cannot affect past rows.
     """
     D = model.config.max_wait_steps
-    batch = index.query(ids, age=D)
+    batch = index.query(ids, age=D) if prepared_batch is None else prepared_batch
+    if prepared_batch is not None and not np.array_equal(batch["query_ids"], ids):
+        raise ValueError("prepared geometry must preserve query identity and order")
     sources, local = compact_neighbors(batch)
     source = torch.as_tensor(rec.source_features[sources], device=device)
     encoded = model.encode_sources(source)
@@ -178,8 +189,14 @@ def rollout(model, rec, index, ids, device="cpu", collect_features=False):
     scores, features, masks = [], [], []
     for age in range(D + 1):
         valid = maximum >= age
-        score, state, _ = model.reaudit(encoded, neighbors, relative, state, prior, polarity, age,
-                                        valid=valid, pair_cache=pair_cache)
+        # Future slots are identically masked. Do not run their dynamic heads
+        # before they arrive; retain every old slot for re-audit and gradients.
+        end = min(neighbors.shape[1], (index.past_windows + age + 1) * index.K) if trim_prefix else neighbors.shape[1]
+        visible_pairs = {key: value[:, :end] for key, value in pair_cache.items()}
+        # This owned state is initialized at age zero above and never reordered;
+        # no per-age host synchronization is needed for the public API guard.
+        score, state, _ = model.reaudit(encoded, neighbors[:, :end], relative[:, :end], state, prior, polarity, age,
+                                        valid=valid, pair_cache=visible_pairs, validate_birth=False)
         scores.append(score)
         masks.append(valid)
         if collect_features:
@@ -216,11 +233,13 @@ def evaluate_sampled(model, pairs, config, device, background_budget=0, seed=37)
             qs = choose_queries(rec, background_budget, rng)
             population += len(rec)
             tau, _, _ = threshold_costs(config["threshold"], rec.log_w)
-            for start in range(0, len(qs.ids), config["train"]["batch_size"]):
-                ids = qs.ids[start:start + config["train"]["batch_size"]]
+            geometry = GeometryBatches(idx, qs.ids, config["train"]["batch_size"],
+                                       config["train"].get("geometry_cache_mb", 64))
+            for start, stop, prepared in geometry:
+                ids = qs.ids[start:stop]
                 weights = torch.as_tensor(qs.weights[start:start + len(ids)], dtype=torch.float32, device=device)
                 y = torch.as_tensor(rec.label[ids], dtype=torch.float32, device=device)
-                result = rollout(model, rec, idx, ids, device)
+                result = rollout(model, rec, idx, ids, device, prepared_batch=prepared)
                 total_loss += float(weighted_event_loss(result["logits"], result["valid"], y, weights))
                 z = result["logits"].gather(1, result["max_age"][:, None]).squeeze(1)
                 pred, pos = z >= tau, y > 0.5

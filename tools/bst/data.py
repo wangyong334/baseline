@@ -321,16 +321,7 @@ class NeighborIndex:
         return {"idx": idx, "relative": relative, "mask": mask,
                 "slot": (self.past_windows + ages) * self.K, "query_ids": q}
 
-    def query(self, query_ids, age=None, current_window=None, new_only=False):
-        """Return ``idx``, ``relative``, ``mask``, ``age`` and ``max_age``.
-
-        ``age`` and ``current_window`` are exclusive scalar or [B] arguments.
-        Future slots are -1 and their relative features are zero. Calling with
-        a larger age exposes extra windows without changing earlier picks.
-        End-of-recording ages are clamped to the final observed window.
-        ``new_only`` returns only the currently arriving window. A live queue
-        can append these slots to its saved prefix, avoiding repeated searches.
-        """
+    def _query_metadata(self, query_ids, age, current_window):
         q = _integer_vector(query_ids, "query_ids")
         r = self.recording
         if ((q < 0) | (q >= len(r))).any():
@@ -346,6 +337,47 @@ class NeighborIndex:
             raise ValueError("query age must lie in [0, max_wait]")
         maximum = np.minimum(self.max_wait, r.n_windows - 1 - r.window[q])
         ages = np.minimum(ages, maximum)
+        return q, ages, maximum
+
+    def query(self, query_ids, age=None, current_window=None, new_only=False):
+        """Return the fixed-slot neighborhood using one batch per source tree.
+
+        ``age`` and ``current_window`` are exclusive scalar or [B] arguments.
+        Future slots are -1 and their relative features are zero. Calling with
+        a larger age exposes extra windows without changing earlier picks.
+        End-of-recording ages are clamped to the final observed window.
+        ``new_only`` returns only the currently arriving window.
+
+        Query rows in a random training minibatch span many birth windows. The
+        reference offset-first loop queries the SAME source tree separately for
+        each offset. Here the selected query/source-window pairs are identical,
+        but all pairs sharing a source tree are searched together and scattered
+        back to their original rows/offsets. Source selection, tie ordering,
+        optimizer minibatches and the causal prefix layout do not change.
+        """
+        q, ages, maximum = self._query_metadata(query_ids, age, current_window)
+        r = self.recording
+        picks = np.full((len(q), len(self.offsets), self.K), -1, dtype=np.int64)
+        target = r.window[q, None] + self.offsets[None, :]
+        available = (self.offsets[None, :] <= ages[:, None]) & (target >= 0) & (target < r.n_windows)
+        if new_only:
+            available &= self.offsets[None, :] == ages[:, None]
+        rows, offsets = np.nonzero(available)
+        if len(rows):
+            windows = target[rows, offsets]
+            order = np.argsort(windows, kind="stable")
+            windows, rows, offsets = windows[order], rows[order], offsets[order]
+            boundaries = np.r_[0, np.flatnonzero(windows[1:] != windows[:-1]) + 1, len(windows)]
+            xy = np.stack([r.x[q], r.y[q]], axis=1).astype(np.float64)
+            for start, end in zip(boundaries[:-1], boundaries[1:]):
+                group = rows[start:end]
+                picks[group, offsets[start:end]] = self._select_window(q[group], xy[group], windows[start])
+        return self._query_result(q, picks, ages, maximum)
+
+    def query_reference(self, query_ids, age=None, current_window=None, new_only=False):
+        """Offset-first oracle retained for exact execution-equivalence checks."""
+        q, ages, maximum = self._query_metadata(query_ids, age, current_window)
+        r = self.recording
         picks = np.full((len(q), len(self.offsets), self.K), -1, dtype=np.int64)
         xy = np.stack([r.x[q], r.y[q]], axis=1).astype(np.float64)
         for oi, dw in enumerate(self.offsets):
@@ -356,6 +388,10 @@ class NeighborIndex:
             for w in np.unique(target[available]):
                 rows = np.flatnonzero(available & (target == w))
                 picks[rows, oi] = self._select_window(q[rows], xy[rows], w)
+        return self._query_result(q, picks, ages, maximum)
+
+    def _query_result(self, q, picks, ages, maximum):
+        r = self.recording
         idx = picks.reshape(len(q), self.slots_per_query)
         mask = idx >= 0
         relative = np.zeros(idx.shape + (4,), dtype=np.float32)
