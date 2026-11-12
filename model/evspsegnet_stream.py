@@ -580,7 +580,8 @@ class EvSpSegNetStream(nn.Module):
         for name in selected:
             getattr(self, name).neuron.memory_read_enabled = bool(enabled)
 
-    def forward(self, x, events, states, state_mode=None, collect=False):
+    def forward(self, x, events, states, state_mode=None, collect=False,
+                return_features=False, skip_readout=False):
         mode = self.state_mode if state_mode is None else state_mode
         if mode not in ("carry", "reset_each_window"):
             raise ValueError("state_mode 必须是 carry 或 reset_each_window")
@@ -609,9 +610,15 @@ class EvSpSegNetStream(nn.Module):
             s6, n6, u6, i6 = self.dec2(torch.cat([self.up2(s5), s2], 1), prev[5])
             deep1 = self.up1(s6)
             s7, n7, u7, i7 = self.dec1(torch.cat([deep1, s1], 1), prev[6])
-        feat, residual_gate, residual_correction = self._event_features(
-            u7, residual1, deep1, events)
-        logits = self._readout(feat, events)
+        if return_features and (self.has_subthreshold_residual or self.has_dual_memory):
+            raise ValueError("Dense feature interface supports the V5 base backbone only")
+        residual_gate, residual_correction = None, None
+        if skip_readout:
+            logits = u7.new_empty((0,))
+        else:
+            feat, residual_gate, residual_correction = self._event_features(
+                u7, residual1, deep1, events)
+            logits = self._readout(feat, events)
         info = None
         if collect:
             info = {"spikes": [s1, s2, s3, s4, s5, s6, s7],
@@ -626,9 +633,13 @@ class EvSpSegNetStream(nn.Module):
                 info["memory"] = {name: state[1].detach()
                                   for name, state in zip(LAYER_NAMES, [n1, n2, n3, n4, n5, n6, n7])
                                   if name in self.dual_memory_layers}
+        if return_features:
+            info = {} if info is None else info
+            info["features"] = u7
         return logits, [n1, n2, n3, n4, n5, n6, n7], info
 
-    def forward_chunk(self, x, events, states, state_mode=None, collect=False, keep=None):
+    def forward_chunk(self, x, events, states, state_mode=None, collect=False, keep=None,
+                      return_features=False, skip_readout=False):
         """逐层时间并行：一次处理一个片段的 T 个连续窗口，与按时间顺序调用 forward T 次数学等价。
 
         本网络层与层之间没有时间反馈，每层的输出序列只取决于它的输入序列，
@@ -699,9 +710,15 @@ class EvSpSegNetStream(nn.Module):
             deep1 = unflat(self.up1(flat(s6)))
             s7, n7, u7 = run_layer("dec1", torch.cat([deep1, s1], 2),
                                    keep_u_pre=True)
-        feat, residual_gate, residual_correction = self._event_features(
-            u7, residual1, deep1, events)
-        logits = self._readout(feat, events)
+        if return_features and (self.has_subthreshold_residual or self.has_dual_memory):
+            raise ValueError("Dense feature interface supports the V5 base backbone only")
+        residual_gate, residual_correction = None, None
+        if skip_readout:
+            logits = u7.new_empty((0,))
+        else:
+            feat, residual_gate, residual_correction = self._event_features(
+                u7, residual1, deep1, events)
+            logits = self._readout(feat, events)
         info = None
         if collect:
             info = {"spikes": [s1, s2, s3, s4, s5, s6, s7],
@@ -714,6 +731,9 @@ class EvSpSegNetStream(nn.Module):
                             event_residual_correction=residual_correction)
             if self.has_dual_memory:
                 info["memory"] = memories
+        if return_features:
+            info = {} if info is None else info
+            info["features"] = u7
         return logits, [n1, n2, n3, n4, n5, n6, n7], info
 
     def _readout(self, feat, events):
