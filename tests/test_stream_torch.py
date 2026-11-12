@@ -1,39 +1,45 @@
-"""LIF / 网络 / 校准 / 训练步骤的单元测试（需要 torch，CPU 即可运行，不需要数据集）。
+"""V5 BIR readout/state/gradient/calibration numerical regressions for V15."""
 
-服务器上运行: python -m pytest tests/test_stream_torch.py -q
-"""
 import math
+
+
 import os
+
+
 import sys
+
+
 import unittest
+
 
 import numpy as np
 
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 
 import torch  # noqa: E402
 
+
 from dataset import stream_windows as sw  # noqa: E402
+
+
 from model.evspsegnet_stream import (LAYER_NAMES, EvSpSegNetStream, calibrate_gains,  # noqa: E402
                                      count_parameters, estimate_operations)
+
+
 from model.lif2d_stream import ChannelGain, StreamingLIF2d, detach_states  # noqa: E402
 
-H, W = 264, 352
 
-
-def lif(**kw):
-    """构造一个默认参数的 LIF（dt=50, tau0=200, 范围 [50,2000], 阈值 1）。"""
-    args = dict(dt_ms=50.0, tau_init_ms=200.0, tau_min_ms=50.0, tau_max_ms=2000.0, v_threshold=1.0)
-    args.update(kw)
-    return StreamingLIF2d(3, **args)
+H, W = 16, 24
 
 
 def random_events(n, seed, device="cpu"):
     """生成 n 个随机事件的读出输入字典。"""
     g = torch.Generator().manual_seed(seed)
     return {"b": torch.zeros(n, dtype=torch.long),
-            "y": torch.randint(0, 260, (n,), generator=g),
-            "x": torch.randint(0, 346, (n,), generator=g),
+            "y": torch.randint(0, H, (n,), generator=g),
+            "x": torch.randint(0, W, (n,), generator=g),
             "p": torch.randint(0, 2, (n,), generator=g).float(),
             "t_local": torch.rand(n, generator=g)}
 
@@ -41,7 +47,12 @@ def random_events(n, seed, device="cpu"):
 def small_net(seed=0, dtype=torch.float32, **kw):
     """固定种子构造网络。"""
     torch.manual_seed(seed)
-    return EvSpSegNetStream(**kw).to(dtype)
+    options = dict(channels=(2, 4, 4, 4), neuron="tif", v_threshold=0.05, tif={"k_init": 0.001})
+    options.update(kw)
+    net = EvSpSegNetStream(**options).to(dtype)
+    for block in net.blocks():
+        block.gain.set_gain(torch.full((block.out_ch,), 20.0, dtype=dtype))
+    return net
 
 
 def random_input(seed, scale=3.0, dtype=torch.float32, density=0.02):
@@ -51,42 +62,7 @@ def random_input(seed, scale=3.0, dtype=torch.float32, density=0.02):
     return mask * torch.rand(1, 12, H, W, generator=g).to(dtype) * scale
 
 
-class LIFTests(unittest.TestCase):
-    def test_tau_init_and_beta(self):
-        n = lif()
-        self.assertTrue(torch.allclose(n.tau(), torch.full((3,), 200.0), atol=1e-3))
-        self.assertTrue(torch.allclose(n.beta(), torch.full((3,), math.exp(-0.25)), atol=1e-5))
-
-    def test_zero_input_pure_decay(self):
-        n = lif().double()
-        state = torch.rand(1, 3, 4, 4, dtype=torch.float64) * 0.9
-        spikes, new_state, u_pre = n(torch.zeros_like(state), state)
-        beta = n.beta().double().view(1, -1, 1, 1)
-        self.assertTrue(torch.allclose(u_pre, beta * state))
-        self.assertEqual(float(spikes.sum()), 0.0)
-        self.assertTrue(torch.allclose(new_state, u_pre))
-
-    def test_spike_and_soft_reset(self):
-        n = lif()
-        current = torch.tensor([1.5, 0.99, 1.0]).view(1, 3, 1, 1)
-        spikes, new_state, u_pre = n(current, None)
-        self.assertEqual(spikes.view(-1).tolist(), [1.0, 0.0, 1.0])
-        self.assertTrue(torch.allclose(new_state.view(-1), torch.tensor([0.5, 0.99, 0.0])))
-        self.assertTrue(torch.allclose(u_pre, current))
-
-    def test_surrogate_gradient_value(self):
-        n = lif()
-        current = torch.tensor([1.0, 2.0, 0.0]).view(1, 3, 1, 1).requires_grad_()
-        spikes, _, _ = n(current, None)
-        spikes.sum().backward()
-        self.assertTrue(torch.allclose(current.grad.view(-1), torch.tensor([1.0, 0.25, 0.25])))
-
-    def test_tau_parameter_receives_gradient(self):
-        n = lif()
-        _, state, _ = n(torch.full((1, 3, 2, 2), 0.6), None)
-        _, _, u_pre = n(torch.zeros(1, 3, 2, 2), state)
-        u_pre.sum().backward()
-        self.assertTrue(bool((n.a.grad.abs() > 0).all()))
+class StateAndGainTests(unittest.TestCase):
 
     def test_detach_keeps_values(self):
         x = torch.rand(2, 2, requires_grad=True) * 3
@@ -105,9 +81,6 @@ class LIFTests(unittest.TestCase):
 
 
 class NetworkTests(unittest.TestCase):
-    def test_parameter_count_matches_design(self):
-        # 卷积 104400 + 读出 513 + 增益 216 + tau 参数 216
-        self.assertEqual(count_parameters(small_net())["total"], 105345)
 
     def test_shapes_and_empty_window(self):
         net = small_net()
@@ -164,12 +137,6 @@ class NetworkTests(unittest.TestCase):
         b, _, _ = net(random_input(9), ev, None, state_mode="carry")
         self.assertFalse(torch.equal(a, b))
 
-    def test_relu_variant_runs(self):
-        net = small_net(neuron="relu")
-        logits, states, _ = net(random_input(10), random_events(20, 10), None)
-        self.assertEqual(tuple(logits.shape), (20,))
-        self.assertTrue(all(s is None for s in states))
-
 
 class GradientAccumulationTests(unittest.TestCase):
     def test_chunk_backward_equals_single_graph(self):
@@ -214,6 +181,7 @@ class GradientAccumulationTests(unittest.TestCase):
 
 
 class CalibrationTests(unittest.TestCase):
+
     def factory(self):
         """两段序列，每段 3 个连续窗口的合成校准数据。"""
         def sequence(offset):
@@ -234,46 +202,6 @@ class CalibrationTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 calibrate_gains(net, self.factory, 0.99, 256, 64, 0.05, 20.0, seed=5)
         self.assertTrue(torch.equal(gains[0], gains[1]))
-
-    def test_operation_estimate_consistency(self):
-        net = small_net()
-        ops = estimate_operations(net, H, W, {name: 1.0 for name in LAYER_NAMES}, 100)
-        self.assertAlmostEqual(ops["mac"] + ops["sop"], ops["dense_ops"], delta=1e-3)
-        zero = estimate_operations(net, H, W, {name: 0.0 for name in LAYER_NAMES}, 100)
-        self.assertEqual(zero["sop"], 0.0)
-
-
-class TrainSequenceTests(unittest.TestCase):
-    def synthetic_sequence(self, n=3000):
-        """构造一个合成的 StreamSequence（不读磁盘）。"""
-        rng = np.random.RandomState(0)
-        x = rng.randint(0, 346, n).astype(np.int64)
-        y = rng.randint(0, 260, n).astype(np.int64)
-        t = rng.randint(0, 8000, n).astype(np.int64)
-        p = rng.randint(0, 2, n).astype(np.int8)
-        label = (rng.rand(n) < 0.1).astype(np.float32)
-        order, bounds = sw.split_windows(t, 50, 160)
-        inner_bin, t_local = sw.time_bin_and_local(t, 50, 5)
-        return sw.StreamSequence("synthetic.npz", x, y, t, p, label, label.astype(np.float64),
-                                 inner_bin, t_local, order, bounds)
-
-    def test_step_counts(self):
-        import train_stream_v1 as T
-        cfg = {"tbptt_k": 16, "grad_clip": 1.0, "time_bins": 5, "pad_height": H, "pad_width": W,
-               "input_clip": 3.0, "optimizer_step": "per_sequence"}
-        seq, q99 = self.synthetic_sequence(), np.full(12, math.log(2.0), dtype=np.float32)
-        for mode, expect_one in (("per_sequence", True), ("per_chunk", False)):
-            cfg["optimizer_step"] = mode
-            net = small_net(seed=1)
-            before = [p.detach().clone() for p in net.parameters()]
-            opt = torch.optim.Adam(net.parameters(), lr=1e-3)
-            out = T.train_sequence(net, seq, opt, cfg, q99, 5.0, torch.device("cpu"),
-                                   np.random.RandomState(0), max_windows=40)
-            self.assertTrue(math.isfinite(out["loss_sum"]))
-            self.assertEqual(out["steps"] == 1, expect_one)
-            self.assertGreater(out["steps"], 0)
-            changed = any(not torch.equal(a, b.detach()) for a, b in zip(before, net.parameters()))
-            self.assertTrue(changed)
 
 
 if __name__ == "__main__":

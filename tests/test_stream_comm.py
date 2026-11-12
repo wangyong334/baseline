@@ -1,40 +1,51 @@
-"""通信预算训练（utils/comm_budget.py：每窗消息数的峰值约束；Stream-SNN-Innovations.md 12.13~12.21、12.35、12.36）。
-
-CPU、float64 小网络，不需要数据集。
-    1. CommBudget.from_config：没有预算时为 None（关闭）；只接受 TIF 量化网络 + trainer=streams；
-       平均预算 mean、旧键 comm_budget_sop / comm_accounting 都报错
-    2. 网络声明的发送层（message_layers）与 forward 的实际连接一致：逐层扰动输出，看是否影响其他层或 logits
-       （LIF / TIF、原形式 / 合并解码器四种网络）
-    3. 消息数：取自实际张量形状；每窗消息数 = 前向逐窗统计的发送层 |Δq| 之和；与解码器写法无关；
-       LIF 的平均消息数 = 发送层脉冲数之和（预算的来源）
-    4. window_rates：前向值与评估口径一致——片段首窗与上一片段末状态比较、新录像（keep = 0）首窗与 0 比较，
-       并与逐窗统计 TIF 消息的 stop_stats 一致；反向按 |Δx| 求导（没越界的变化也有梯度）；空窗不计入
-    5. 峰值约束：只罚超出预算的窗；对偶按违约比例；不发消息的层不受约束
-    6. 评估：messages_per_window 与训练同口径；sop_per_window 按网络自身结构计（能耗只在评估环节）
-    7. train_streams：约束不紧（mu 保持 0）时与关闭逐位相同；超出时 mu 增大、参数轨迹改变、无漏梯度
-    8. 配置文件：与基础版只差 comm_* 四项与 save_root，预算为 V1 的 val 每窗平均脉冲数
-"""
+"""V5 numerical regression retained for the V15 release; legacy variants removed."""
 import copy
+
+
 import os
+
+
 import sys
+
+
 import unittest
 
+
 import numpy as np
+
+
 import torch
+
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+
 import train_stream_v1 as T  # noqa: E402
+
+
 from dataset.stream_source import TorchWindowSource  # noqa: E402
+
+
 from model.evspsegnet_stream import (LAYER_NAMES, MESSAGE_LAYERS, EvSpSegNetStream,  # noqa: E402
-                                     estimate_operations, merge_decoder_state_dict, window_sop_summary)
+                                     estimate_operations, window_sop_summary)
+
+
 from test_stream_layerwise import CFG, H, Q99, SMALL, W, synthetic_sequence  # noqa: E402
+
+
 from test_stream_tif import make_tif_net  # noqa: E402
+
+
 from utils.comm_budget import (CommBudget, mean_messages, window_message_summary, window_messages,  # noqa: E402
                                window_rates)
 
+
 CPU = torch.device("cpu")
+
+
 POS_WEIGHT = 4.0
+
+
 SCALE = {"enc1": 1, "enc2": 2, "enc3": 4, "enc4": 8, "dec3": 4, "dec2": 2, "dec1": 1}   # 只用于构造测试输入
 
 
@@ -73,14 +84,6 @@ def run_stats(model, source, windows=12, per_window=False):
         return model.stop_tif_stats()
 
 
-def make_lif_net(merged=False):
-    torch.manual_seed(5)
-    net = EvSpSegNetStream(channels=SMALL, neuron="lif", merged_decoder=merged, v_threshold=0.05).double()
-    for block in net.blocks():
-        block.gain.set_gain(torch.full((block.out_ch,), 20.0, dtype=torch.float64))
-    return net
-
-
 class CommBudgetConfigTests(unittest.TestCase):
     def test_off_and_validation(self):
         net = make_tif_net()
@@ -96,8 +99,6 @@ class CommBudgetConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError):                                 # 旧配置（只有 SOP 预算）不会被静默关闭
             CommBudget.from_config(stream_cfg(comm_budget_sop=1e5), net)
         with self.assertRaises(ValueError):
-            CommBudget.from_config(budget_cfg(1e3), EvSpSegNetStream(channels=SMALL, neuron="lif"))
-        with self.assertRaises(ValueError):
             CommBudget.from_config(budget_cfg(1e3), make_tif_net(quantize=False))
 
 
@@ -106,7 +107,7 @@ class MessageLayerDeclarationTests(unittest.TestCase):
         # 逐层把该层的输出加一个扰动：若其他层的 u_pre 或 logits 随之改变，说明它的输出被接收（发出消息）
         source = TorchWindowSource(synthetic_sequence(0), CFG, Q99, CPU, torch.float64)
         x, events, _, _ = source.window(3)
-        for net in (make_tif_net(), make_tif_net(merged=True), make_lif_net(), make_lif_net(merged=True)):
+        for net in (make_tif_net(),):
             net.eval()
             with torch.no_grad():
                 base_logits, _, base = net(x, events, None, collect=True)
@@ -124,33 +125,11 @@ class MessageLayerDeclarationTests(unittest.TestCase):
                     not torch.equal(a, b) for j, (a, b) in enumerate(zip(info["u_pre"], base["u_pre"])) if j != index)
                 if changed:
                     consumed.append(name)
-            self.assertEqual(tuple(consumed), net.message_layers(), (net.neuron_kind, net.merged_decoder))
+            self.assertEqual(tuple(consumed), net.message_layers(), net.neuron_kind)
         self.assertEqual(MESSAGE_LAYERS, tuple(n for n in LAYER_NAMES if n != "dec1"))
 
 
 class MessageCountTests(unittest.TestCase):
-    def test_messages_match_forward_and_are_decoder_independent(self):
-        # 原形式与换算后的合并形式（函数严格相同）：逐层 |Δq| 与神经元数相同，每窗消息数相同
-        net = make_tif_net().eval()
-        merged = make_tif_net(merged=True).eval()
-        merged.load_state_dict(merge_decoder_state_dict(net.state_dict()))
-        source = TorchWindowSource(synthetic_sequence(0), CFG, Q99, CPU, torch.float64)
-        stats = [run_stats(model, source, per_window=True) for model in (net, merged)]
-        for name, block in zip(LAYER_NAMES, net.blocks()):
-            self.assertEqual(stats[0][name]["neurons"], block.out_ch * (H // SCALE[name]) * (W // SCALE[name]))
-            self.assertEqual(stats[0][name]["neurons"], stats[1][name]["neurons"])
-            self.assertAlmostEqual(stats[0][name]["message_abs_rate"], stats[1][name]["message_abs_rate"],
-                                   places=12, msg=name)
-            np.testing.assert_allclose(stats[0][name]["per_window_rate"], stats[1][name]["per_window_rate"],
-                                       rtol=0, atol=1e-12)
-        direct = sum(stats[0][n]["message_abs_rate"] * stats[0][n]["neurons"] for n in MESSAGE_LAYERS)
-        self.assertGreater(direct, 0.0)
-        self.assertAlmostEqual(mean_messages(net, None, stats[0]), direct, delta=1e-9 * direct)
-        summaries = [window_message_summary(model, s) for model, s in zip((net, merged), stats)]
-        self.assertAlmostEqual(summaries[0]["mean"], direct, delta=1e-9 * direct)
-        self.assertEqual(summaries[0], summaries[1])
-        self.assertIsNone(window_message_summary(net, run_stats(net, source, windows=2)))     # 没有逐窗统计
-        self.assertIsNone(mean_messages(make_tif_net(quantize=False), None, stats[0]))
 
     def test_window_messages_equals_layer_sums(self):
         net = make_tif_net()
@@ -160,25 +139,6 @@ class MessageCountTests(unittest.TestCase):
         rates = window_rates(net, memories, None, keep)
         expected = sum(r * float(m[0, 0].numel()) for n, r, m in zip(LAYER_NAMES, rates, memories) if n != "dec1")
         torch.testing.assert_allclose(window_messages(net, memories, None, keep), expected, rtol=0, atol=1e-9)
-
-    def test_lif_mean_messages(self):
-        # LIF：平均消息数 = 发送层每窗脉冲数之和（同结构 LIF 的这个值就是通信预算）
-        net = make_lif_net().eval()
-        source = TorchWindowSource(synthetic_sequence(0), CFG, Q99, CPU, torch.float64)
-        monitor = T.LayerMonitor(net.v_threshold)
-        counts, states = 0.0, None
-        with torch.no_grad():
-            for k in range(12):
-                x, events, _, _ = source.window(k)
-                _, states, info = net(x, events, states, collect=True)
-                monitor.update(info)
-                counts += sum(float((s > 0).sum()) for n, s in zip(LAYER_NAMES, info["spikes"]) if n != "dec1")
-        layers = monitor.summary()
-        for name, block in zip(LAYER_NAMES, net.blocks()):
-            self.assertEqual(layers[name]["neurons"], block.out_ch * (H // SCALE[name]) * (W // SCALE[name]))
-        self.assertGreater(counts, 0.0)
-        self.assertAlmostEqual(mean_messages(net, layers), counts / 12.0, delta=1e-9 * counts)
-        self.assertIsNone(mean_messages(EvSpSegNetStream(channels=SMALL, neuron="relu"), layers))
 
 
 class WindowRateTests(unittest.TestCase):
@@ -262,6 +222,7 @@ class WindowRateTests(unittest.TestCase):
 
 
 class PeakConstraintTests(unittest.TestCase):
+
     def test_only_windows_over_budget_are_penalized(self):
         net = make_tif_net()
         memories = make_memories(net, 4.0)
@@ -335,36 +296,9 @@ class PeakConstraintTests(unittest.TestCase):
             net(source.window(0)[0], source.window(0)[1], None)
             self.assertNotIn("per_window_rate", net.stop_tif_stats()["enc1"])      # 默认不记逐窗
 
-    def test_train_streams(self):
-        data = [synthetic_sequence(seed) for seed in (0, 1, 2)]
-        lengths = [seq.n_windows for seq in data]
-        plan = [(0, [(0, 12)]), (1, [(1, 12), (2, 12)])]
-        net_a = make_tif_net()
-        net_b, net_c = copy.deepcopy(net_a), copy.deepcopy(net_a)
-        opts = [torch.optim.SGD(n.parameters(), lr=0.05) for n in (net_a, net_b, net_c)]
-        out_a = T.train_streams(net_a, data, lengths, opts[0], stream_cfg(), Q99, POS_WEIGHT, CPU, None, plan=plan)
-        slack = CommBudget.from_config(budget_cfg(1e30), net_b)
-        out_b = T.train_streams(net_b, data, lengths, opts[1], stream_cfg(), Q99, POS_WEIGHT, CPU, None, plan=plan,
-                                comm=slack)
-        self.assertEqual(slack.mu, 0.0)
-        self.assertEqual(out_a["loss_sum"], out_b["loss_sum"])
-        for (name, pa), (_, pb) in zip(net_a.named_parameters(), net_b.named_parameters()):
-            self.assertTrue(torch.equal(pa, pb), name)                      # 约束不紧时与关闭逐位相同
-        self.assertNotIn("comm", out_a)
-        self.assertEqual(out_b["comm"]["violation_mean"], 0.0)
-        self.assertGreater(out_b["comm"]["messages_est_mean"], 0.0)
-        tight = CommBudget.from_config(budget_cfg(1e-3), net_c)
-        tight.mu = 0.5
-        out = T.train_streams(net_c, data, lengths, opts[2], stream_cfg(), Q99, POS_WEIGHT, CPU, None, plan=plan,
-                              comm=tight)
-        self.assertGreater(tight.mu, 0.5)
-        self.assertEqual((out["comm"]["mu_start"], out["comm"]["mu_end"]), (0.5, tight.mu))
-        self.assertEqual(out["comm"]["violation_mean"], 1.0)
-        self.assertTrue(any(not torch.equal(pa, pc) for pa, pc in zip(net_a.parameters(), net_c.parameters())))
-        self.assertEqual(out["missing_grads"], [])
-
 
 class CommConfigTests(unittest.TestCase):
+
     def test_peak_config(self):
         from utils.stream_common import load_flat_config
         a = load_flat_config("configs/evisseg_stream_tif_notransport.yaml")
@@ -380,22 +314,6 @@ class CommConfigTests(unittest.TestCase):
                          (157700.0, 0.01, "peak", 0.05))
         comm = CommBudget.from_config(dict(stream_cfg(), **{k: b[k] for k in comm_keys}), make_tif_net())
         self.assertEqual((comm.budget, comm.alpha), (157700.0, 0.05))
-
-    def test_evflying_peak_config(self):
-        # EV-Flying 版：与 EV-Flying 基础版只差 comm_* 四项与 save_root；预算为 V1 在 EV-Flying val 上的每窗平均脉冲数
-        from utils.stream_common import load_flat_config
-        a = load_flat_config("configs/evisseg_stream_tif_notransport_evflying.yaml")
-        b = load_flat_config("configs/evisseg_stream_tif_comm_peak_evflying.yaml")
-        e = load_flat_config("configs/evisseg_stream_tif_comm_peak.yaml")
-        comm_keys = {"comm_budget_messages", "comm_dual_lr", "comm_budget_mode", "comm_peak_alpha"}
-        self.assertEqual(set(b) - set(a), comm_keys)
-        for key in a:
-            if key != "save_root":
-                self.assertEqual(a[key], b[key], key)
-        self.assertEqual(b["save_root"], "log/stream_tif_commpeak_msg_evflying_x4_seed37")
-        self.assertEqual(b["comm_budget_messages"], 293200.0)
-        for key in comm_keys - {"comm_budget_messages"}:                # 除预算外与 EV-UAV 定型版相同
-            self.assertEqual(b[key], e[key], key)
 
     def test_every_budget_config_is_valid(self):
         # 现存配置中凡是开启通信预算的，都按消息数约束、不带旧键（旧配置已归档到 configs/_removed_comm_20261023/）

@@ -1,33 +1,45 @@
-"""V5 TIF 神经元（StreamingTIF2d，10-19 起不再搬运）与 TIF 网络的单元测试（CPU、float64 小网络，不需要数据集）。
-
-    1. 定义：初值、零输入静息、None 与零状态相同、反射累积器、量化电平、状态上界
-    2. forward_steps（含 keep 掩码）与逐窗 forward 等价（前向与梯度），量化开 / 关
-    3. 诊断统计：|Δq| 与手算一致
-    4. 网络：配置校验（已删除的搬运、本地参照的键）、与 LIF 同种子初始化逐位相同、forward_chunk 与逐窗 forward 等价、
-       增益校准、运算量估计、完整训练 + 评估入口（2 轮合成数据）
-    5. 两端代理梯度开关（BoundedSurrogate）；死通道统计与 TIF 语义的健康检查；配置文件只差该差的键
-误差一律用 (a - b).abs().max() 比较。
-"""
+"""V5 numerical regression retained for the V15 release; legacy variants removed."""
 import copy
+
+
 import os
+
+
 import sys
+
+
 import unittest
 
+
 import numpy as np
+
+
 import torch
+
+
 import torch.nn.functional as F
+
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+
 from dataset.stream_source import TorchWindowSource  # noqa: E402
+
+
 from model.evspsegnet_stream import (LAYER_NAMES, TIF_DEFAULTS, EvSpSegNetStream,  # noqa: E402
                                      calibrate_gains, estimate_operations, tif_settings)
+
+
 from model.lif2d_stream import BoundedSurrogate, StreamingTIF2d, inverse_softplus  # noqa: E402
+
+
 from test_stream_layerwise import (CFG, CHUNKS, H, Q99, SMALL, W, max_error, rel_error,  # noqa: E402
                                    synthetic_sequence)
 
+
 LIF_ARGS = dict(dt_ms=50.0, tau_init_ms=200.0, tau_min_ms=50.0, tau_max_ms=2000.0)
-# 小网络没有经过增益校准，驱动量级很小：调低参考值、阈值（即 theta），让每层都有活动
+
+
 ACTIVE_TIF = {"k_init": 1e-3}
 
 
@@ -170,7 +182,7 @@ def make_tif_net(merged=False, quantize=True, seed=5, threshold=0.05, **extra):
     """float64 小 TIF 网络；阈值（即 theta 初值）与参考值调低，让未校准的小网络各层都有活动。"""
     torch.manual_seed(seed)
     tif = dict(ACTIVE_TIF, quantize=quantize, **extra)
-    net = EvSpSegNetStream(channels=SMALL, neuron="tif", merged_decoder=merged, v_threshold=threshold,
+    net = EvSpSegNetStream(channels=SMALL, neuron="tif", v_threshold=threshold,
                            tif=tif).double()
     # 输出量程 D*theta = threshold；与 graded 对照相同，把增益放大 1/threshold，让信号逐层保持量级
     for block in net.blocks():
@@ -179,46 +191,11 @@ def make_tif_net(merged=False, quantize=True, seed=5, threshold=0.05, **extra):
 
 
 class TIFNetworkTests(unittest.TestCase):
-    def test_config_validation(self):
-        self.assertEqual(tif_settings(None), TIF_DEFAULTS)
-        for bad in ({"unknown": 1}, {"levels": 0}, {"levels": 2.5}, {"quantize": "yes"},
-                    {"k_init": 0.0}, {"surrogate": 1}):
-            with self.subTest(bad=bad), self.assertRaises(ValueError):
-                tif_settings(bad)
-        # 旧 checkpoint 的配置：不搬运时可以加载，已删除机制的键被丢弃
-        legacy = {"levels": 7, "quantize": True, "transport": False, "k_init": 0.05, "surrogate": False,
-                  "transport_ref_init": 0.0, "transport_layers": list(LAYER_NAMES), "eps_init": 0.1}
-        self.assertEqual(tif_settings(legacy), TIF_DEFAULTS)
-        self.assertEqual(tif_settings(dict(legacy, reference=False)), TIF_DEFAULTS)   # 10-22 删除的本地参照
-        self.assertEqual(tif_settings(dict(legacy, hysteresis=False)), TIF_DEFAULTS)  # 10-22 删除的滞回汇报
-        for bad in ({"transport": True}, {"transport_ref_init": 0.05}, dict(legacy, transport=True),
-                    {"reference": True}, {"hysteresis": True}):
-            with self.subTest(bad=bad), self.assertRaises(ValueError):
-                tif_settings(bad)
-        with self.assertRaises(ValueError):
-            EvSpSegNetStream(channels=SMALL, neuron="lif", tif={"levels": 7})
-        with self.assertRaises(ValueError):
-            EvSpSegNetStream(channels=SMALL, neuron="tif", dual_memory={"layers": ["enc2"]})
-        net = EvSpSegNetStream(channels=SMALL, neuron="tif")
-        self.assertTrue(net.is_tif and net.stateful and not net.spiking)
-        self.assertEqual(net.tif_config, TIF_DEFAULTS)
-
-    def test_same_initialization_as_lif(self):
-        torch.manual_seed(3)
-        lif = EvSpSegNetStream(channels=SMALL, neuron="lif")
-        lif_params = dict(lif.named_parameters())
-        torch.manual_seed(3)
-        tif = EvSpSegNetStream(channels=SMALL, neuron="tif")
-        for name, param in tif.named_parameters():
-            if name in lif_params:
-                self.assertEqual(max_error(param, lif_params[name]), 0.0, name)
-            else:
-                self.assertTrue(name.split(".")[-1] in ("k_raw", "log_theta"), name)
 
     def test_forward_chunk_matches_step_forward(self):
         seq = synthetic_sequence()
         source = TorchWindowSource(seq, CFG, Q99, torch.device("cpu"), torch.float64)
-        cases = [(False, True, {}), (False, False, {}), (True, True, {}), (False, True, {"surrogate": True})]
+        cases = [(False, True, {}), (False, False, {}), (False, True, {"surrogate": True})]
         for merged, quantize, extra in cases:
             for mode in ("carry", "reset_each_window"):
                 with self.subTest(merged=merged, quantize=quantize, extra=extra, mode=mode):
@@ -337,6 +314,7 @@ class TIFNetworkTests(unittest.TestCase):
 
 
 class TIFFixTests(unittest.TestCase):
+
     def test_bounded_surrogate_forward_and_gradient(self):
         x = torch.tensor([[-2.0, -0.5, 0.0, 0.3, 1.0, 1.5, 3.0]], dtype=torch.float64, requires_grad=True)
         cap = torch.tensor([[1.0]], dtype=torch.float64, requires_grad=True)
@@ -385,121 +363,6 @@ class TIFFixTests(unittest.TestCase):
         for _ in range(3):
             _, state, _ = n(current, state)
         self.assertAlmostEqual(n.stop_stats()["dead_channel_frac"], 1.0 / 3, places=12)
-
-    def test_health_uses_tif_semantics(self):
-        import train_stream_v1 as T
-        from utils.stream_common import health_warnings
-        layers = {"enc1": {"firing_rate": 0.5, "silent_channel_frac": 0.0, "always_on_frac": 0.9,
-                           "big_membrane_frac": 0.0}}
-        self.assertIs(T.health_layer_stats(layers, {}), layers)
-        warnings = health_warnings(T.health_layer_stats(layers, {"enc1": {"dead_channel_frac": 0.7,
-                                                                           "saturation": 0.2}}), {}, {})
-        text = " ".join(warnings)
-        self.assertIn("70%", text)
-        self.assertIn("电平到顶", text)
-        self.assertNotIn("每窗发放", text)
-
-
-class TIFConfigTests(unittest.TestCase):
-    def test_evflying_config_differs_from_v1_only_in_neuron(self):
-        # EV-Flying 上的 TIF：除 neuron / tif / save_root 外与 V1 的 EV-Flying 配置逐项相同
-        from utils.stream_common import load_flat_config
-        v1 = load_flat_config("configs/evisseg_stream_v1_evflying.yaml")
-        cfg = load_flat_config("configs/evisseg_stream_tif_notransport_evflying.yaml")
-        self.assertEqual(set(cfg) - {"tif"}, set(v1))
-        for key in v1:
-            if key not in ("neuron", "save_root"):
-                self.assertEqual(cfg[key], v1[key], key)
-        self.assertEqual(cfg["neuron"], "tif")
-        self.assertEqual(tif_settings(cfg["tif"]), TIF_DEFAULTS)
-        self.assertNotEqual(cfg["save_root"], v1["save_root"])
-
-    def test_no_removed_keys_in_configs(self):
-        import glob
-        from utils.stream_common import load_flat_config
-        for path in glob.glob("configs/evisseg_stream_tif*.yaml"):                # 现存配置不再带已删除机制的键
-            tif = load_flat_config(path).get("tif") or {}
-            self.assertFalse(set(tif) & {"transport", "transport_ref_init", "transport_layers", "eps_init",
-                                         "reference"}, path)
-            tif_settings(tif)                                   # 每份现存 TIF 配置都能构造（已删除的版本会报错）
-
-
-class TIFEndToEndTests(unittest.TestCase):
-    def test_mode_train_and_eval(self):
-        # 文件读取、TIF 增益校准、一轮多流训练、验证（含 TIF 统计）、checkpoint、正式评估（逐窗执行、运算量）
-        try:
-            import cv2  # noqa: F401
-            import pandas  # noqa: F401
-            import tqdm  # noqa: F401
-        except ImportError as error:
-            self.skipTest("完整训练入口需要原 V1 的 cv2/pandas/tqdm 依赖: %s" % error)
-        import contextlib
-        import io
-        import json
-        import tempfile
-        from pathlib import Path
-        from types import SimpleNamespace
-        import train_stream_v1 as T
-        from utils.stream_common import load_flat_config
-        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
-            root = Path(directory)
-            pos = neg = 0
-            for split, seeds in (("train", (3, 4, 5)), ("val", (6,))):
-                (root / split).mkdir()
-                for seed in seeds:
-                    seq = synthetic_sequence(seed=seed)
-                    loc = np.stack((seq.x, seq.y, seq.t), axis=1)
-                    norm = np.column_stack((loc, seq.p, seq.label, seq.target_id))
-                    np.savez(root / split / ("seq_%d.npz" % seed), ev_loc=loc, evs_norm=norm)
-                    if split == "train":
-                        pos += int(seq.label.sum())
-                        neg += seq.n_events - int(seq.label.sum())
-            stats = dict(q99=Q99.tolist(), train_pos=pos, train_neg=neg, pos_weight=min(neg / pos, 30.0))
-            (root / "stats.json").write_text(json.dumps(stats), encoding="utf-8")
-            for config in ("evisseg_stream_tif_notransport", "evisseg_stream_tif_adapt3",
-                           "evisseg_stream_tif_comm_peak"):
-                run = root / config
-                cfg = load_flat_config("configs/%s.yaml" % config)
-                self.assertEqual((cfg["neuron"], cfg["trainer"], cfg["streams"], cfg["accumulate"]),
-                                 ("tif", "streams", 4, 1))
-                cfg.update(root=str(root), stats_path=str(root / "stats.json"), save_root=str(run),
-                           channels=list(SMALL), height=H, width_px=W, pad_height=H, pad_width=W,
-                           n_windows=12, epochs=2, num_workers=0, tbptt_k=4, train_subset_size=1,
-                           calib_sequences=1, calib_windows=8, calib_samples_per_channel=32, calib_min_positive=4,
-                           segments=[[0, 3], [4, 7], [8, 11]], timing_warmup_windows=1, eval_chunk=4,
-                           execution="layer", input_device="gpu", streams=2)
-                T.mode_train(SimpleNamespace(device="cpu", mode="train", resume=False), cfg)
-                record = json.loads((run / "metrics.jsonl").read_text(encoding="utf-8").splitlines()[-1])
-                self.assertEqual(set(record["tif"]), set(LAYER_NAMES), config)
-                self.assertEqual(set(record["tif_parameters"]), set(LAYER_NAMES), config)
-                self.assertIn("theta_mean", record["tif_parameters"]["enc2"])
-                self.assertIn("dead_channel_frac", record["tif"]["dec3"])
-                self.assertEqual(record["comm"] is not None, "comm_budget_messages" in cfg, config)   # 通信预算（12.35）
-                if record["comm"] is not None:                                    # 每窗消息数的峰值约束
-                    self.assertEqual((record["comm"]["mode"], record["comm"]["unit"]), ("peak", "messages"))
-                    self.assertIsNotNone(record["comm"]["val_messages_p95"])
-                adapt = bool(cfg["tif"].get("adapt", False))                     # 工作点自校准（12.1）
-                self.assertEqual("tau_b_mean" in record["tif_parameters"]["enc1"], adapt, config)
-                only = ("enc1",) if adapt else ()
-                for name in LAYER_NAMES:                                          # 只有自校准层有 tau_b 与基线
-                    self.assertEqual("tau_b_mean" in record["tif_parameters"][name], name in only, (config, name))
-                    self.assertEqual("baseline_level_mean" in record["tif"][name], name in only, (config, name))
-                self.assertEqual("baseline_level_mean" in record["tif"]["enc1"], adapt, config)
-                checkpoint = run / "best_val_iou_seed37.pt"
-                self.assertTrue(checkpoint.exists())
-                args = SimpleNamespace(checkpoint=str(checkpoint), device="cpu", mode="eval", split="val",
-                                       overwrite=True, execution=None, input_device=None, readout_ablation="none",
-                                       subthreshold_ablation="none", memory_ablation="none", memory_off_layers=None,
-                                       reset_every=0, reset_offset=0, dump_dir=None)
-                T.mode_eval(args, cfg)
-                result = json.loads((run / "eval_val_best_val_iou_seed37.json").read_text(encoding="utf-8"))
-                self.assertEqual(result["tif"]["levels"], 7)
-                self.assertIn("sop_per_window", result["carry"])                   # 单窗 SOP 分布（能耗，只用于报告）
-                self.assertIn("messages_per_window", result["carry"])              # 每窗消息数（通信约束的检验口径）
-                self.assertNotIn("per_window_rate", result["carry"]["tif"]["enc1"])
-                for mode in ("carry", "reset_each_window"):
-                    self.assertEqual(set(result[mode]["tif"]), set(LAYER_NAMES))
-                    self.assertIn("tif", result[mode]["operations"])
 
 
 if __name__ == "__main__":

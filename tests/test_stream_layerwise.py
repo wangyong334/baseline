@@ -1,32 +1,47 @@
-"""训练加速选项的等价性测试：逐层时间并行（execution=layer）与设备端输入构造（input_device=gpu）。
-
-全部在 CPU 上用 float64 小网络运行，不需要数据集：
-    1. 查找表归一化与 normalize_counts 逐位相同；torch 输入构造与 numpy 输入构造逐位相同
-    2. LIF.forward_steps 与逐窗 forward 等价（前向与梯度）
-    3. forward_chunk 与逐窗 forward 等价：两种解码器 × LIF/graded/ReLU × carry/reset，跨片段传递状态，含梯度
-    4. train_sequence / run_sequence 在四种选项组合下结果一致（更新后参数、概率、每窗混淆矩阵、发放统计）
-误差一律用 (a - b).abs().max() 比较，不用 torch.testing.assert_close（torch 1.9 默认比较步长）。
-"""
+"""V5 numerical regression retained for the V15 release; legacy variants removed."""
 import copy
+
+
 import math
+
+
 import unittest
+
+
 from types import SimpleNamespace
 
+
 import numpy as np
+
+
 import torch
 
+
 from dataset import stream_windows as sw
+
+
 from dataset.stream_source import NumpyWindowSource, TorchWindowSource, make_window_source
+
+
 from model.evspsegnet_stream import LAYER_NAMES, EvSpSegNetStream
-from model.lif2d_stream import StreamingLIF2d
-from utils.stream_common import subset_due
+
 
 H, W, WINDOWS = 16, 24, 12
+
+
 SMALL = (2, 4, 4, 4)
+
+
 TOL = 1e-10
+
+
 Q99 = np.linspace(0.5, 1.5, 12).astype(np.float32)
+
+
 CFG = dict(time_bins=5, pad_height=H, pad_width=W, input_clip=3.0, tbptt_k=4, optimizer_step="per_sequence",
            grad_clip=1.0, threshold=0.5, eval_chunk=5, state_mode="carry")
+
+
 CHUNKS = ((0, 3), (3, 8), (8, 12))
 
 
@@ -55,22 +70,6 @@ def synthetic_sequence(seed=0, n=900):
     order, bounds = sw.split_windows(t, 50, WINDOWS)
     bins, local = sw.time_bin_and_local(t, 50, 5)
     return sw.StreamSequence("synthetic.npz", x, y, t, p, label, label.astype(np.float64), bins, local, order, bounds)
-
-
-def make_net(merged=False, neuron="lif", seed=5, threshold=0.05):
-    """float64 小网络；调低阈值让各层都有发放，核对才不是在沉默网络上做的。"""
-    torch.manual_seed(seed)
-    net = EvSpSegNetStream(channels=SMALL, neuron=neuron, merged_decoder=merged).double()
-    for block in net.blocks():
-        if hasattr(block.neuron, "v_threshold"):
-            block.neuron.v_threshold = threshold
-    if neuron == "graded":
-        # graded 的发放幅值就是膜电位（约等于阈值）。这里把阈值调低到 0.05 是为了让小网络有活动，
-        # 但那样幅值也只有 0.05，信号会逐层缩小。放大增益让幅值回到 1 附近，与 LIF 的二值输出同量级。
-        # 真实网络阈值为 1、增益经过校准，本来就是同量级，不需要这一步。
-        for block in net.blocks():
-            block.gain.set_gain(torch.full((block.out_ch,), 1.0 / threshold, dtype=torch.float64))
-    return net
 
 
 class InputSourceTests(unittest.TestCase):
@@ -121,220 +120,6 @@ class InputSourceTests(unittest.TestCase):
                          (torch.float64, torch.float64, torch.float64, torch.long))
         with self.assertRaises(ValueError):
             make_window_source(seq, dict(CFG, input_device="npu"), Q99, torch.device("cpu"))
-
-
-class LIFStepsTests(unittest.TestCase):
-    def test_forward_steps_matches_repeated_forward(self):
-        for carry in (True, False):
-            with self.subTest(carry=carry):
-                torch.manual_seed(0)
-                neuron = StreamingLIF2d(3, 50.0, 200.0, 50.0, 2000.0, 1.0).double()
-                neuron.a.data.uniform_(-3, 3)
-                current = (torch.rand(6, 2, 3, 4, 5, dtype=torch.float64) * 2).requires_grad_()
-                start = torch.rand(2, 3, 4, 5, dtype=torch.float64)
-                weights = torch.rand(6, 2, 3, 4, 5, dtype=torch.float64)
-
-                state, spikes, u_pres = start, [], []
-                for t in range(6):
-                    s, state, u = neuron(current[t], state if carry else None)
-                    spikes.append(s)
-                    u_pres.append(u)
-                loss_a = (torch.stack(u_pres) * weights).sum() + (torch.stack(spikes) * weights).sum() + state.sum()
-                grad_a = torch.autograd.grad(loss_a, [current, neuron.a], allow_unused=True)
-
-                s, final, u = neuron.forward_steps(current, start, carry=carry)
-                self.assertEqual(max_error(s, torch.stack(spikes)), 0.0)
-                self.assertLess(max_error(u, torch.stack(u_pres)), TOL)
-                self.assertLess(max_error(final, state), TOL)
-                loss_b = (u * weights).sum() + (s * weights).sum() + final.sum()
-                grad_b = torch.autograd.grad(loss_b, [current, neuron.a], allow_unused=True)
-                self.assertLess(max_error(grad_a[0], grad_b[0]), TOL)
-                if carry:
-                    self.assertLess(max_error(grad_a[1], grad_b[1]), TOL)
-                    self.assertGreater(float(grad_b[1].abs().sum()), 0.0)
-                else:
-                    self.assertIsNone(grad_b[1])                        # reset 模式不使用 beta
-                self.assertIsNone(neuron.forward_steps(current, start, carry, keep_u_pre=False)[2])
-
-
-class ForwardChunkTests(unittest.TestCase):
-    def test_forward_chunk_matches_step_forward(self):
-        seq = synthetic_sequence()
-        source = TorchWindowSource(seq, CFG, Q99, torch.device("cpu"), torch.float64)
-        for merged in (False, True):
-            for neuron in ("lif", "graded", "relu"):
-                for mode in ("carry", "reset_each_window"):
-                    with self.subTest(merged=merged, neuron=neuron, mode=mode):
-                        self.check_pair(source, merged, neuron, mode)
-
-    def check_pair(self, source, merged, neuron, mode):
-        net_a = make_net(merged, neuron)
-        net_b = copy.deepcopy(net_a)
-        g = torch.Generator().manual_seed(3)
-
-        states, logits_a, loss_a, info_a = None, [], 0.0, {"spikes": [], "u_pre": []}
-        chunk_states_a = []
-        for start, end in CHUNKS:
-            for k in range(start, end):
-                x, events, _, _ = source.window(k)
-                logits, states, info = net_a(x, events, states, state_mode=mode, collect=True)
-                logits_a.append(logits)
-                info_a["spikes"].append(info["spikes"])
-                info_a["u_pre"].append(info["u_pre"])
-            chunk_states_a.append(states)
-        weights = torch.rand(sum(int(l.numel()) for l in logits_a), generator=g, dtype=torch.float64)
-        logits_a = torch.cat(logits_a)
-        (logits_a * weights).sum().backward()
-
-        states, logits_b, active = None, [], [0] * 7
-        for i, (start, end) in enumerate(CHUNKS):
-            x, events, _, _ = source.chunk(start, end)
-            logits, states, info = net_b.forward_chunk(x, events, states, state_mode=mode, collect=True)
-            logits_b.append(logits)
-            for layer in range(7):
-                spikes_a = torch.stack([w[layer] for w in info_a["spikes"][start:end]])
-                u_pre_a = torch.stack([w[layer] for w in info_a["u_pre"][start:end]])
-                self.assertEqual(int(((spikes_a > 0) != (info["spikes"][layer] > 0)).sum()), 0, LAYER_NAMES[layer])
-                self.assertLess(rel_error(u_pre_a, info["u_pre"][layer]), TOL, LAYER_NAMES[layer])
-                active[layer] += int((info["spikes"][layer] > 0).sum())
-            for a, b in zip(chunk_states_a[i], states):
-                if a is None:
-                    self.assertIsNone(b)
-                else:
-                    self.assertLess(rel_error(a, b), TOL)
-        logits_b = torch.cat(logits_b)
-        self.assertLess(rel_error(logits_a, logits_b), TOL)
-        (logits_b * weights).sum().backward()
-        self.assertTrue(all(n > 0 for n in active), active)             # 每层都有发放
-        for (name, pa), (_, pb) in zip(net_a.named_parameters(), net_b.named_parameters()):
-            if pa.grad is None:
-                self.assertIsNone(pb.grad, name)
-                continue
-            scale = max(float(pa.grad.abs().max()), 1.0)
-            self.assertLess(max_error(pa.grad, pb.grad) / scale, 1e-9, name)
-
-    def test_rejects_wrong_input_rank(self):
-        net = make_net()
-        x, events, _, _ = TorchWindowSource(synthetic_sequence(), CFG, Q99, torch.device("cpu"),
-                                            torch.float64).window(0)
-        with self.assertRaises(ValueError):
-            net.forward_chunk(x, events, None)
-
-
-class TrainingLoopTests(unittest.TestCase):
-    def test_train_sequence_equivalent_across_options(self):
-        import train_stream_v1 as T
-        seq = synthetic_sequence(seed=2)
-        for optimizer_step in ("per_sequence", "per_chunk"):
-            results = {}
-            for execution in ("step", "layer"):
-                for input_device in ("cpu", "gpu"):
-                    cfg = dict(CFG, optimizer_step=optimizer_step, execution=execution, input_device=input_device)
-                    net = make_net(merged=True, seed=9)
-                    optimizer = torch.optim.Adam(net.parameters(), lr=1e-2)
-                    out = T.train_sequence(net, seq, optimizer, cfg, Q99, 3.0, torch.device("cpu"),
-                                           np.random.RandomState(4))
-                    results[(execution, input_device)] = (net, out)
-            ref_net, ref = results[("step", "cpu")]
-            self.assertGreater(ref["steps"], 0)
-            self.assertEqual(ref["missing_grads"], [])
-            for key, (net, out) in results.items():
-                with self.subTest(optimizer_step=optimizer_step, option=key):
-                    self.assertEqual(out["steps"], ref["steps"])
-                    self.assertEqual(out["events"], ref["events"])
-                    self.assertLess(abs(out["loss_sum"] - ref["loss_sum"]), 1e-9 * max(ref["loss_sum"], 1.0))
-                    for (name, pa), (_, pb) in zip(ref_net.named_parameters(), net.named_parameters()):
-                        self.assertLess(max_error(pa.detach(), pb.detach()), 1e-9, name)
-
-    def test_run_sequence_layer_matches_step(self):
-        import train_stream_v1 as T
-        seq = synthetic_sequence(seed=3)
-        net = make_net(seed=11).eval()
-        for mode in ("carry", "reset_each_window"):
-            outputs = {}
-            for execution, input_device in (("step", "cpu"), ("layer", "gpu"), ("layer", "cpu")):
-                cfg = dict(CFG, execution=execution, input_device=input_device)
-                monitor = T.LayerMonitor(net.v_threshold)
-                with torch.no_grad():
-                    probs, confusion = T.run_sequence(net, seq, cfg, Q99, torch.device("cpu"), mode, monitor)
-                outputs[execution, input_device] = (probs, confusion, monitor.summary())
-            ref_probs, ref_confusion, ref_layers = outputs["step", "cpu"]
-            self.assertGreater(int(ref_confusion[:, 3].sum()), 0)
-            for key, (probs, confusion, layers) in outputs.items():
-                with self.subTest(mode=mode, option=key):
-                    self.assertLess(float(np.abs(probs - ref_probs).max()), 1e-6)
-                    self.assertTrue(np.array_equal(confusion, ref_confusion))
-                    for name in LAYER_NAMES:
-                        for stat, value in ref_layers[name].items():
-                            self.assertAlmostEqual(layers[name][stat], value, delta=1e-9, msg=(name, stat))
-        with self.assertRaises(ValueError):
-            T.run_sequence(net, seq, dict(CFG, execution="layer"), Q99, torch.device("cpu"), "carry",
-                           timer=T.WindowTimer(0, torch.device("cpu")))
-
-    def test_run_sequence_periodic_reset(self):
-        """周期清零（记忆长度诊断）：M=1 等于 reset_each_window，M>=窗数等于 carry，中间值与逐窗手写参考一致。"""
-        import train_stream_v1 as T
-        seq = synthetic_sequence(seed=4)
-        net = make_net(seed=13).eval()
-        cfg = dict(CFG, execution="step", input_device="cpu")
-        device = torch.device("cpu")
-        with torch.no_grad():
-            carry = T.run_sequence(net, seq, cfg, Q99, device, "carry")
-            reset = T.run_sequence(net, seq, cfg, Q99, device, "reset_each_window")
-            every1 = T.run_sequence(net, seq, cfg, Q99, device, "carry", reset_every=1)
-            every_all = T.run_sequence(net, seq, cfg, Q99, device, "carry", reset_every=WINDOWS)
-            periodic = T.run_sequence(net, seq, cfg, Q99, device, "carry", reset_every=5, reset_offset=2)
-            # 手写参考：在窗 2、7 前清零（k=0 本来就是零状态）
-            source = make_window_source(seq, cfg, Q99, device, torch.float64)
-            states, parts, prob_parts = None, [], []
-            for k in range(seq.n_windows):
-                if k in (2, 7):
-                    states = None
-                x, events, _, idx = source.window(k)
-                logits, states, _ = net(x, events, states, state_mode="carry")
-                parts.append(idx)
-                prob_parts.append(torch.sigmoid(logits).float().numpy())
-            reference = sw.refill_by_index(seq.n_events, parts, prob_parts)
-        self.assertTrue(np.array_equal(every1[0], reset[0]) and np.array_equal(every1[1], reset[1]))
-        self.assertTrue(np.array_equal(every_all[0], carry[0]) and np.array_equal(every_all[1], carry[1]))
-        self.assertLess(float(np.abs(periodic[0] - reference).max()), 1e-6)
-        first = seq.order[seq.bounds[0]:seq.bounds[2]]
-        self.assertTrue(np.array_equal(periodic[0][first], carry[0][first]))   # 第一次清零之前与 carry 相同
-        self.assertGreater(float(np.abs(periodic[0] - carry[0]).max()), 0.0)   # 清零之后确实改变了结果
-        for every, offset in ((-1, 0), (0, 1), (5, 5), (5, -1)):
-            with self.assertRaises(ValueError):
-                T.check_periodic_reset(every, offset)
-        with self.assertRaises(ValueError):
-            T.run_sequence(net, seq, dict(CFG, execution="layer"), Q99, device, "carry", reset_every=4)
-        base = dict(config="configs/evisseg_stream_v1.yaml", seed=None, state_mode=None, neuron=None,
-                    save_root=None, execution=None, input_device=None, train_subset_every=None, tbptt_k=None)
-        with self.assertRaises(ValueError):
-            T.build_config(SimpleNamespace(mode="train", reset_every=8, reset_offset=0, **base))
-        self.assertIn("seed", T.build_config(SimpleNamespace(mode="eval", reset_every=8, reset_offset=3, **base)))
-
-    def test_options_validation_and_subset_schedule(self):
-        import train_stream_v1 as T
-        self.assertEqual(T.speed_options({}), ("step", "cpu"))
-        for bad in ({"execution": "fast"}, {"input_device": "npu"}, {"train_subset_every": 0}, {"eval_chunk": 0}):
-            with self.assertRaises(ValueError):
-                T.speed_options(bad)
-        self.assertEqual([e for e in range(50) if subset_due(e, 50, 1)], list(range(50)))
-        self.assertEqual([e for e in range(12) if subset_due(e, 12, 5)], [4, 9, 11])
-        args = SimpleNamespace(config="configs/evisseg_stream_v1.yaml", seed=None, state_mode=None, neuron=None,
-                               save_root=None, execution="layer", input_device="gpu", train_subset_every=5,
-                               tbptt_k=32)
-        cfg = T.build_config(args)
-        self.assertEqual((cfg["execution"], cfg["input_device"], cfg["train_subset_every"], cfg["tbptt_k"]),
-                         ("layer", "gpu", 5, 32))
-        # 代码级缺省（配置里没有这些键时）仍是原实现，保证旧配置与旧 checkpoint 行为不变
-        self.assertEqual(T.speed_options({}), ("step", "cpu"))
-        # 随仓库发布的 YAML 则默认走加速路径（09-18 起），复现原实现要显式加命令行参数
-        shipped = T.build_config(SimpleNamespace(**dict(
-            vars(args), execution=None, input_device=None, train_subset_every=None, tbptt_k=None)))
-        self.assertEqual(T.speed_options(shipped), ("layer", "gpu"))
-        self.assertEqual((shipped["train_subset_every"], shipped["tbptt_k"]), (5, 16))
-        with self.assertRaises(ValueError):
-            T.build_config(SimpleNamespace(**dict(vars(args), tbptt_k=0)))
 
 
 if __name__ == "__main__":

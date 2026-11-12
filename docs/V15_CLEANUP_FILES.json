@@ -1,0 +1,3375 @@
+{
+  "schema_version": 1,
+  "purpose": "V15 dependency-driven removal of unused historical code; no research artifacts removed",
+  "base_git_head": "6cc480ff3bc50bf27c1f28e3f850aa500ec171c4",
+  "counts": {
+    "configs": 122,
+    "dataset": 3,
+    "model": 11,
+    "(root)": 5,
+    "tests": 34,
+    "tools": 109,
+    "utils": 5,
+    "lib": 42
+  },
+  "deleted_files": [
+    {
+      "path": "configs/_removed_comm_20261023/evisseg_stream_tif_comm.yaml",
+      "sha256": "03851d6d53d6e45ce9bbb8607f1439f1c1b3fc817648b9821c9f5b0b41979579",
+      "bytes": 2609,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/_removed_comm_20261023/evisseg_stream_tif_comm_acc2.yaml",
+      "sha256": "c874fe09797a0d8b15de8190c04e3a31d7343c228b18241c11c09a7fb759ca30",
+      "bytes": 2650,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/_removed_comm_20261023/evisseg_stream_tif_comm_dlr001.yaml",
+      "sha256": "35cd32008858d697d4de35b616f4cea27fed9286a7d9d0e569d65c99251bac11",
+      "bytes": 2585,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/_removed_comm_20261023/evisseg_stream_tif_comm_peak_dlr001.yaml",
+      "sha256": "abd80f59d691ca5061a0f099b1a2e8ab889f8252db054862543fb51cb1855870",
+      "bytes": 2830,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/_removed_comm_20261023/evisseg_stream_tif_comm_peak_merged.yaml",
+      "sha256": "923e0ae125218d1dd62957be1a49efc67b3e61c69c4a2594c43aef070db6e2d9",
+      "bytes": 3060,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/_removed_comm_20261023/evisseg_stream_tif_comm_peak_unmerged.yaml",
+      "sha256": "152a373d00dbff0dcb90a8f389a53b9d957aed1e29e14b16ffbb968db16fec25",
+      "bytes": 2778,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/_removed_comm_20261023/evisseg_stream_tif_notransport_acc2.yaml",
+      "sha256": "e6b66907645cd3e813c8844d45da2da7712fc24721b3436898b7deac8e6bcc9f",
+      "bytes": 2380,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/changepoint_v1.yaml",
+      "sha256": "61a313384d0af80f69cffa7cd1914286a3b312b3c17203cb50bcd3a2800147d9",
+      "bytes": 2700,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/changepoint_v2.yaml",
+      "sha256": "5913635848ccad157616e288e453de1365b7d5f6c2c8535008dc5a8cf0b675dc",
+      "bytes": 3455,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/changepoint_v3.yaml",
+      "sha256": "3a486f542e1d707f0c66624c9d295b2381bbf91d52fa52e926194e56a638cc79",
+      "bytes": 4309,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/changepoint_v4.yaml",
+      "sha256": "116424490e779277dd807ec8f8172bdc131f00fa0ebab246f44b6e733326b6da",
+      "bytes": 5551,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/changepoint_v41.yaml",
+      "sha256": "e806b77b551440dfce8907a2116e2c2c1c926643997145c0f9fd30c1b4f7ea4e",
+      "bytes": 5348,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/changepoint_v41_adaptive.yaml",
+      "sha256": "465c567d40be3284530e78d5944f3409aeddc72843253fff5e750efbcec42e0e",
+      "bytes": 4083,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/changepoint_v41_evflying.yaml",
+      "sha256": "73dd84d25eb3c6a2f4b8711e13cd023e733e931e8c9087e0e3e83dfab8e7bb72",
+      "bytes": 4076,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/changepoint_v41_evflying_adaptive.yaml",
+      "sha256": "f555e7ee2faf38ed872005858953c63fd4f421096d7e39d79208c72772c724ac",
+      "bytes": 3599,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/changepoint_v41_evflying_feature.yaml",
+      "sha256": "506501786202f6de5954ad3f4cf31aa2cefa28f79fca606047e60e86a0841ad7",
+      "bytes": 3664,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/changepoint_v41_evflying_feature_adaptive.yaml",
+      "sha256": "b623578b5a102c293c6e190946461eee65244f4a8219beb915c95cd37ff6a177",
+      "bytes": 3632,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/changepoint_v41_insample.yaml",
+      "sha256": "48f1f125871906c751fdf2af83b1b534af9b2f3645cbb542d2258cf946bc95b6",
+      "bytes": 3578,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/changepoint_v41_insample_adaptive.yaml",
+      "sha256": "c8a09d3d4168f50f1630528fdc8718b14bcf234576098b12e25fbfddcae512b9",
+      "bytes": 3706,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/changepoint_v41_insample_feature.yaml",
+      "sha256": "e253b56ceb9734635cf1e0ad0aa47701ccf3c6f9cdb0734ebd3ae8d95ebf8e0d",
+      "bytes": 3988,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/changepoint_v41_insample_feature_adaptive.yaml",
+      "sha256": "365993c1eae4a1e77432a2d69e1315a0b0693ffbfc263294a4c42b2a5dd373f3",
+      "bytes": 3774,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/changepoint_v41_insample_feature_causal.yaml",
+      "sha256": "af60e3522ac8807266d195b21a84410dc9d7e395d6132476b1a2a1d2059e0c28",
+      "bytes": 4129,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/changepoint_v4_adaptive.yaml",
+      "sha256": "f050a02a6c181a1ae9be9c71a4008bfb84279883d74949b1deeeb9ff1df03784",
+      "bytes": 3901,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/changepoint_v4_evflying.yaml",
+      "sha256": "bd35907e6f480af6803ec6212bc5b4c01b0a21d9d1be0a85d932adfd1e7f67f4",
+      "bytes": 4577,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/changepoint_v4_evflying_adaptive.yaml",
+      "sha256": "3a32501e688f84bcf26f5e398c0c6c334b79f1a8cb82f05597bacf57e24f5a3b",
+      "bytes": 3772,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/configs.py",
+      "sha256": "5bba47e167a4eb557e23fc5702091e60b2b8265f4efc345893dbaa5d634800d4",
+      "bytes": 607,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_evflying_x4_k3orig.yaml",
+      "sha256": "cb4a20c20b471b53052b47645ebd75a12ddf21bf5ff5c1fa9d70b6743dd87ee2",
+      "bytes": 1040,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_evflying_x4_k5.yaml",
+      "sha256": "492e7986d74c3b3a4bbb6cfaa7db30ee6ff7fa7c3e6aa696bb0eb227753b4abb",
+      "bytes": 1194,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_evuav.yaml",
+      "sha256": "bb6ce0cc69978120bd2ef6b8eaa84736cd70b144ec0267931b0752eee9b5379f",
+      "bytes": 651,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_evuav_baseline_v2.yaml",
+      "sha256": "0cccfee26c8c1ab1895119c1aacfc97056e51a9498b7c11e3cc4821f1efa220a",
+      "bytes": 1029,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_evuav_baseline_v2_repolr.yaml",
+      "sha256": "418588c757c642f1ebcd7b278d5ae4560ed3bf439104685091aa65c67a062322",
+      "bytes": 1126,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_evuav_mp.yaml",
+      "sha256": "eb5db3b137a362009e01da30df5e169101a9d44b1c54fe07b58175e8bbe1ddff",
+      "bytes": 640,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_evuav_mp_linear.yaml",
+      "sha256": "6579a9df06ea2c4ed33b6912cb915e6db9e30193f6142b1c66bf2da3c52194bb",
+      "bytes": 681,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_stream_dual_dec2.yaml",
+      "sha256": "7d3b9a551ddf7ad4f9a5e3087d9afdc71cf1cfaa1045d583fd6a59a36fc4c6bb",
+      "bytes": 3131,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_stream_dual_dec3.yaml",
+      "sha256": "e12c50197fb07993966212dabf23806320cc692e9bc500ea714313ce377eae69",
+      "bytes": 3131,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_stream_dual_enc2.yaml",
+      "sha256": "1022cb2343800f89f9b3a76ce5c08f299403456dbaa9e13153d7bfeeebc9657e",
+      "bytes": 3131,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_stream_dual_enc234.yaml",
+      "sha256": "f688380f9f0fdca287371bb22649eae75c92ccfc4207862096058dee5645644c",
+      "bytes": 3179,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_stream_dual_enc234_dec32.yaml",
+      "sha256": "33408b6c0332975a6f1528827fa6053c75e5e2ef2af2f7c93971a869c8dd04e8",
+      "bytes": 3209,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_stream_dual_enc234_dec321.yaml",
+      "sha256": "b81c624e9bf382fa282408546c95590b90336b8f6372d9c063ca8f5ebeeee290",
+      "bytes": 3222,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_stream_dual_enc234_ebssa.yaml",
+      "sha256": "223b639adc0ea8646081b3474971bb0977dcd1232e1dbce59aac9f114fc14d40",
+      "bytes": 1482,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_stream_dual_enc234_ebssa_bf.yaml",
+      "sha256": "bc78664ee7e631c4427c03c2c32bee08ec217143ed21fee9d0ce77e955d2147a",
+      "bytes": 1897,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_stream_dual_enc234_evflying.yaml",
+      "sha256": "9d04c43175f611783074c3d915ec8a452b3d9f7ff49c6c6c4608ed6b5f36b268",
+      "bytes": 1490,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_stream_dual_enc234_evflying_e32.yaml",
+      "sha256": "57bc7e6101c7c7d884e4ce5dca13286e45a2056db8ec1e4ea0034e0f259a48ff",
+      "bytes": 1853,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_stream_dual_enc234_residual_competitive_dualpath.yaml",
+      "sha256": "ec5c20d5e52c5b85f668c9047c4e1013f4fac84c6e737c43054cb4921ac20f5d",
+      "bytes": 3855,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_stream_dual_enc234_residual_competitive_vertical.yaml",
+      "sha256": "610342fde8459a365115a7d25e4eb34857ccd284d9f3f11abe14615fa2d500b9",
+      "bytes": 3766,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_stream_dual_enc234_residual_dualpath.yaml",
+      "sha256": "b98e233b88e49e744f8e59c76b7e18271cc3d850994f284524ff194a8ac84027",
+      "bytes": 3410,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_stream_dual_enc234_residual_horizontal.yaml",
+      "sha256": "7967f59bfe96f5635ea1678cabbb016ab82e71da2540c1592dbced91e0cd93fc",
+      "bytes": 3417,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_stream_dual_enc234_residual_selective_dualpath.yaml",
+      "sha256": "7a8dbbf659b44ca564e8f27b4b74c4eda07bf9115f32330a41e90a0d1cd066a1",
+      "bytes": 4000,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_stream_dual_enc234_residual_vertical.yaml",
+      "sha256": "77473a024dbf3e58c46dc524e62145186f66fd81e60e1d53b3ec155da28ff0bd",
+      "bytes": 3385,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_stream_dual_enc3.yaml",
+      "sha256": "714838706fca57170e689e03da6b3ce3304e9a3a810cf1a21dc735f75defd142",
+      "bytes": 3131,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_stream_dual_enc34.yaml",
+      "sha256": "78e33a146df8a9cb689756bcd5302b7193d0515841e77fdfff040766fb8bbaad",
+      "bytes": 3166,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_stream_dual_enc4.yaml",
+      "sha256": "5d7d4b2e01d903fa58117796f9cd9375285422b69f9f33ac0961b6db65ce8df3",
+      "bytes": 3153,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_stream_merged_decoder.yaml",
+      "sha256": "907a35a0009142252a1152b440b0acdbd424c4db0a0b781fe9ddb73cb56da0ac",
+      "bytes": 3285,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_stream_tif_adapt3.yaml",
+      "sha256": "6fe93b5d6f0f4582a42b73d33e6ccb73433e79f29e712ce33a54e24476855643",
+      "bytes": 2884,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_stream_tif_adapt3_evflying.yaml",
+      "sha256": "68e690e727164415aaab14d16889cd16b87db46b2c3f7cf49bbdfd725ce86f24",
+      "bytes": 2866,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_stream_tif_comm_peak_evflying.yaml",
+      "sha256": "c801d8a565bdb02fdf192be7b26c9705482c521bb032c529716db31361963c95",
+      "bytes": 2861,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_stream_tif_comm_peak_invariant.yaml",
+      "sha256": "248dd46099bd72f3e543ae9e35082fa160779d7d01ce2ee7f49ad0e558bba1ea",
+      "bytes": 2943,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_stream_tif_comm_peak_invariant_noiseaug.yaml",
+      "sha256": "0e30fc2e880e19a8fa835ef21f467cebc053ae2d507a9c107ac1b4c1410b254a",
+      "bytes": 3192,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_stream_tif_comm_peak_invariant_noiseaug_evflying.yaml",
+      "sha256": "f02241daf061a4fdb00d6b5f8cda8d74d53feff7a2218a312c288452df371a2f",
+      "bytes": 4125,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_stream_tif_comm_peak_invariant_noiseaug_wide.yaml",
+      "sha256": "74ce44b3b2e853aa08b6a928b8a8d9e5b09f1f272dcb7a83356c5022d982f54d",
+      "bytes": 3144,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_stream_tif_comm_peak_invariant_pconv.yaml",
+      "sha256": "93d2c6b330eadf46fceffc41195ec0a70be69797adbbbb9556c4d389e0be84da",
+      "bytes": 3195,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_stream_tif_comm_peak_noiseaug.yaml",
+      "sha256": "4bff65c6d7d38865a51d33c281fc616dd789afd20e50bf06534fe71af19fb98e",
+      "bytes": 3140,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_stream_tif_comm_peak_noiseaug_wide.yaml",
+      "sha256": "b389763850c8e4d0414517fa2ae185207657f66e87285af75002667d2e3fd43a",
+      "bytes": 3073,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_stream_tif_notransport_evflying.yaml",
+      "sha256": "28010e32cca199a3da1d09f2ee136db00046cb38854501b92d01a637cf7f0572",
+      "bytes": 2355,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_stream_tif_sg_notransport.yaml",
+      "sha256": "8a0cfb6d234f57be049c733dfcddb1fd56fb9ca3955797af3c93556c6907b134",
+      "bytes": 2333,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_stream_v1_ebssa.yaml",
+      "sha256": "c99722f8526e09abe52cdb36e473d9f9e394cd147df80c0c706efd536dfb66f5",
+      "bytes": 2205,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_stream_v1_ebssa_bf.yaml",
+      "sha256": "ae4b21360fefa3ae3189911d9b06db0e05485a1b0115e52011f60c5ab94917bc",
+      "bytes": 2505,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_stream_v1_evflying.yaml",
+      "sha256": "b10497e3c073a46ff3d9bf3f2ec5800d2cc32cbbace6e6fbcdb3df815dace8a6",
+      "bytes": 2245,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/evisseg_stream_v1_evflying_e32.yaml",
+      "sha256": "37e474a2c036bd04bef28cce918a269bdb750ef93ffe3d995e8869009c410a10",
+      "bytes": 2599,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/final/b2_lookahead_25.yaml",
+      "sha256": "3010e10b256991c2f5bf29dae5d3f55caa0e2e20771bfec155190fb4679af8ad",
+      "bytes": 2035,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/final/b2_lookahead_50.yaml",
+      "sha256": "8ac58852b14aa19352565b79075ee1fe28e78edfb1004027df686160220fcb64",
+      "bytes": 2321,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/final/b2_lookahead_occ_50.yaml",
+      "sha256": "d99f9e9451a00591f1fd0b6b7ed04c09a8c7f8ed8bcaf79bbe025cdac8c0bfaa",
+      "bytes": 2645,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/final/bb_e1_50.yaml",
+      "sha256": "5c9216951bd634d63ff0ae5e0e7cbcd5326cbb8719f0ccc1094b80ed72f234ff",
+      "bytes": 3390,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/final/bb_e3a_50.yaml",
+      "sha256": "e93dde9cd413511cd5fd882c541482ba7d11e1965260d308d068d8860002c99a",
+      "bytes": 3186,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/final/bb_e3b_25.yaml",
+      "sha256": "bd72b68589dd97d20cf27b4a9e1a9d6051a49367244ffe378794f5beaf4f577f",
+      "bytes": 3752,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/final/bb_e3b_50.yaml",
+      "sha256": "c2cd7cd436c6def7cc4ef8ac3008722ffa47179744d756db486b582b1637451b",
+      "bytes": 3456,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/final/bb_e3b_evf.yaml",
+      "sha256": "98c5f48477bc343e0137f8edc48455b4b036ba8c4fd089e63dac554d74c35e9c",
+      "bytes": 4480,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/final/bb_v5_100.yaml",
+      "sha256": "d20e24abec83396ed5bd32b91c3e42bd657eff8f41f9706ae6c64f3ea5efd68d",
+      "bytes": 3323,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/final/bb_v5_200.yaml",
+      "sha256": "81d579ed899acda17963c6543b7f115f8279d990d1b45361dc1361d270c6e60d",
+      "bytes": 3396,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/final/bb_v5_25.yaml",
+      "sha256": "44508a52050a44ccdcf88575fc931978461eb044389c05407fbd3496784d276b",
+      "bytes": 3787,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/final/bb_v5_400.yaml",
+      "sha256": "044aaaedd197665350b176855a77bba1345199f3f060017880e8b2e21cf057ed",
+      "bytes": 3512,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/final/bb_v5_50.yaml",
+      "sha256": "ff8b2e2ab0e8c49943a1effe753c332ada2de7197922e367c388cb079ee7682f",
+      "bytes": 3138,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/final/bb_v5_evf.yaml",
+      "sha256": "8af699abff5dddfdc338c6840a4a4a3172c5fba8667ba68250b42b74a2484aee",
+      "bytes": 3073,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/final/bb_v5lif_100.yaml",
+      "sha256": "e8ec85c9f803c39897af6e09d1f214bf5f4c8deba4b5db08bc34a157f7b5c362",
+      "bytes": 2011,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/final/bb_v5lif_200.yaml",
+      "sha256": "2e93cd668d3d04b8010c0e0eb9f426403362a0866ce7c82045076c9d3cd32bef",
+      "bytes": 2008,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/final/bb_v5lif_25.yaml",
+      "sha256": "e3bf03a3dc8921d7675ba3e91d33193e5c341dd91e0f75aea496fa23e9108e63",
+      "bytes": 2304,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/final/bb_v5lif_400.yaml",
+      "sha256": "336d0ed910d863ea29e42d10c1e62938b7a7fedbaf001d7ba3549a87c4b0549f",
+      "bytes": 2020,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/final/bb_v5lif_50.yaml",
+      "sha256": "32f1dcb42b0b28c61146d0282dc7afc4037d0d81622b738993b5ff30049bf643",
+      "bytes": 2353,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/final/bb_v5lifn4_400.yaml",
+      "sha256": "e48bf571e56534d9e1c6f28bf85b5cf882d93ffd1282b04d4e5b400eb666196c",
+      "bytes": 2171,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/final/bb_v5n4_400.yaml",
+      "sha256": "4c39688789cf15d86d7f8a12e53c566714b2c00a11f1979387dd8b03152fa994",
+      "bytes": 3782,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/final/bb_v5nb_400.yaml",
+      "sha256": "fef40cadcb8f7852bf22b9c3acfcccaf747b0b9671f54182a86d86fa8ac493ca",
+      "bytes": 3304,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/final/bb_v5nb_50.yaml",
+      "sha256": "ee73f17fdda18177ae6bec18b0ab460ccd7a82770226fa47957f5c8d0a67c694",
+      "bytes": 2978,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/final/rcl_feature_25.yaml",
+      "sha256": "1595fc8779865806ed881afcc8705cb8af936038ebbe04e1f1f52c6396e452f5",
+      "bytes": 2115,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/final/rcl_feature_50.yaml",
+      "sha256": "b31e77197533d7e3c8426727f7ac2ab9d948e68c0b175d10d273d05c7bdf5c2d",
+      "bytes": 4333,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/final/rcl_feature_causal_50.yaml",
+      "sha256": "ab7958b6caf813aea641c09789030f9477d6ec04ec97dcb2253bce183eeb29ae",
+      "bytes": 4502,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/final/rcl_feature_evf.yaml",
+      "sha256": "fd3cc390fffae6b10f555c4332ede8d4b18f09f31914dfc8934fa9cd48d4d5c2",
+      "bytes": 3974,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/final/rcl_score_50.yaml",
+      "sha256": "bd66e8c8357dd018010dddf3998f2346d5ad10a2260276b0181978b16b2bc9d5",
+      "bytes": 3900,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/full_model_v2.yaml",
+      "sha256": "43fc096c28ffa35aa64dd0dd9b218e4db3948ed985eaeba083d492a145c3a35d",
+      "bytes": 4025,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/object_layer_v1.yaml",
+      "sha256": "f5f41c7935b2e9e538da2a59a47ac1ca9eae300867dc322c4429eaa824c114ff",
+      "bytes": 3347,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/object_layer_v2.yaml",
+      "sha256": "d3bb17c1e293844594dc6ca323ba2a5abaefd316e75d95f6aaf34ca991553f48",
+      "bytes": 1497,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/object_layer_v2_fixed.yaml",
+      "sha256": "22f5f361e0fcfd6965b3d9e9f8bf63df1f9a79ff911f38fc5ed68c56739b99e3",
+      "bytes": 1609,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/object_layer_v2_noctx.yaml",
+      "sha256": "bc5a9c0c61eae8929f74dc62beee1606530db6ceadfe1f2d4aa87a4cb005e588",
+      "bytes": 1541,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/object_tokens_v1.yaml",
+      "sha256": "e0f467db137e16f49d5145106ab5be53f897bf16afbe1b6ea4a26a2bf00aa568",
+      "bytes": 1970,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/sprint_full.yaml",
+      "sha256": "9e7d809e02986c2b10791f69730d5fde454480503806ab2137042ed326ac7a4e",
+      "bytes": 3567,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/sprint_tokens.yaml",
+      "sha256": "f4cc95653c59b4fc552da34b0ee429709a2c462678fda787907ce8ca74a654d8",
+      "bytes": 2262,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/track_head_v2.yaml",
+      "sha256": "41450992190d7da9046c65f852ed9638f4c11a88254f9d19ddafd8d32c111d31",
+      "bytes": 3480,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/track_head_v2_lag1.yaml",
+      "sha256": "1f3c310f1e41c0c22ca839b9818b965a727f4e1ac5d3a7d0f47bf4a0908a862f",
+      "bytes": 3532,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/track_head_v2_notrack.yaml",
+      "sha256": "ee42cd65bc92946beecd13c53abb9bf2e2a55ef0cc8e1b4adfeb8abcc38c7d4e",
+      "bytes": 3533,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/track_head_v3.yaml",
+      "sha256": "64cdfc1e5715b40ba854662ab74832054147313c73d7eadcdb898a500f9e1448",
+      "bytes": 4097,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/track_head_v3_lag1.yaml",
+      "sha256": "142aca73247c5feff9d36ea7ac9811940dd4fb7e8f5381f9897736bf084539ca",
+      "bytes": 4117,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/track_head_v4.yaml",
+      "sha256": "849aea32be6e5d970c1ba1050efd483be4f16c4d534ce52e96448427a6db902e",
+      "bytes": 4338,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/track_head_v4_fixed.yaml",
+      "sha256": "754533d034b301ae3726aefd5747c4887e49ee1c2e9f7345410d10c1150a9740",
+      "bytes": 4361,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/track_head_v4b.yaml",
+      "sha256": "0a272655da996912c3b2f93cbeb4548fc89e21d66855864ef3862d6b16af358d",
+      "bytes": 4704,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/track_head_v4bT.yaml",
+      "sha256": "766c6a7b3d002c9c88fee6d2326c6894dea2a350c5c895285e30348dabb030bb",
+      "bytes": 5038,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/track_head_v4c.yaml",
+      "sha256": "ff99d7d20cd92305694b23fa073aefca5731b1abe358e10d1cc765ace55223ce",
+      "bytes": 4968,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/track_head_v4cT.yaml",
+      "sha256": "8f63c2a05e800bc15128c8a4e02ed4a7d49defd54e67daae15d8fdf8144b6849",
+      "bytes": 5302,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/track_head_v4d.yaml",
+      "sha256": "d62cb8795399de65ed958334cd1016866100b80f6cb488eadd2bb6a4c6623717",
+      "bytes": 5532,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/track_head_v4d_fixed.yaml",
+      "sha256": "565f99d3320b43c0947ff7cb5a3256543f40c05e6f5ffdcd5fff3702e20e3690",
+      "bytes": 5555,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/track_head_v4e.yaml",
+      "sha256": "f0f9f7c275908983dd5c2c70a288c894862c6a7a13de4a8b70ea83981195e354",
+      "bytes": 6113,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/track_head_v4f.yaml",
+      "sha256": "6169e9e3e7d0ecfda7cd113d4ef773db5025a48d0939ec4d9d11fabf6fec4ab0",
+      "bytes": 6819,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/v14/bir_carry.yaml",
+      "sha256": "5f0ff8f28038a5e89c2dd16f0704dda1493aee3943366e987335ef12a7b92387",
+      "bytes": 2405,
+      "git_tracked": true
+    },
+    {
+      "path": "configs/v14/bir_reset.yaml",
+      "sha256": "767efa7a9759500d494e2bd3aa832398933a189ea459b30be66b02a5224a9ed5",
+      "bytes": 2417,
+      "git_tracked": true
+    },
+    {
+      "path": "dataset/basedataset.py",
+      "sha256": "6a330e7d40fd8accb46fdc868aa33cd522fdefc499baf5ab28f9ea5d8770a49f",
+      "bytes": 4223,
+      "git_tracked": true
+    },
+    {
+      "path": "dataset/ev_uav.py",
+      "sha256": "9790565df790e438daa4f2b399c8bf0cc469538ae704ef915b5d56728afc5884",
+      "bytes": 1262,
+      "git_tracked": true
+    },
+    {
+      "path": "model/basemodel.py",
+      "sha256": "674f0d88fe1fe6100a1ed437d9657eee3f14207c6a9cb0e6160f3f301639b2d0",
+      "bytes": 4467,
+      "git_tracked": true
+    },
+    {
+      "path": "model/changepoint_layer.py",
+      "sha256": "0d1e02f9951cc3634e115e89dec0363bd4cb30287e93828fee0e2dcaca90d163",
+      "bytes": 59746,
+      "git_tracked": true
+    },
+    {
+      "path": "model/clutter_field.py",
+      "sha256": "4a84ebc517f845d8ef9ba7e92a41f9401ec38e7e5fae3d6c44ae103c0e5ca9a5",
+      "bytes": 9378,
+      "git_tracked": true
+    },
+    {
+      "path": "model/evspsegnet.py",
+      "sha256": "f26ef249077b3b538a83230e555fcf093f7c1d5873aa1252304fe124d957c752",
+      "bytes": 10859,
+      "git_tracked": true
+    },
+    {
+      "path": "model/evspsegnet_mp.py",
+      "sha256": "cb399112beda23550dc61f0e0ed23c2b7e6ccf9d3720ce69788400f87b32d3b8",
+      "bytes": 3732,
+      "git_tracked": true
+    },
+    {
+      "path": "model/lookahead_head.py",
+      "sha256": "2d59499e2905a3a449d7c459f56dfa6a2adee6e79376c9524781484b7c74b92b",
+      "bytes": 16710,
+      "git_tracked": true
+    },
+    {
+      "path": "model/object_layer.py",
+      "sha256": "3816d69fc9761e92ffc628e90081a640c057377bdcabaecce3ae0e32984ef207",
+      "bytes": 44242,
+      "git_tracked": true
+    },
+    {
+      "path": "model/object_tokens.py",
+      "sha256": "573ed75dfc80e41de10bc7af02b2a81da43fd9c9b67f0044c6eac2eedaa21a64",
+      "bytes": 37504,
+      "git_tracked": true
+    },
+    {
+      "path": "model/track_head.py",
+      "sha256": "6e88ea2e60557b6bf97a134f51d109cbd12371528248aa594270fc71a91c2253",
+      "bytes": 61119,
+      "git_tracked": true
+    },
+    {
+      "path": "test.py",
+      "sha256": "2fff4687125face4f1b260594789b22dfe8934b4c1b8f93dd92a0ccdcace5862",
+      "bytes": 1842,
+      "git_tracked": true
+    },
+    {
+      "path": "tests/test_changepoint_layer.py",
+      "sha256": "9674c5e46a1190fc744efda5945f9a3275fc4ed80a76d2121c550b6cf716e1dc",
+      "bytes": 102855,
+      "git_tracked": true
+    },
+    {
+      "path": "tests/test_clutter_field.py",
+      "sha256": "a2140a2fd135c0c2ed1240c8142b0530b10f98168866eb0565c934cebb0e365c",
+      "bytes": 6240,
+      "git_tracked": true
+    },
+    {
+      "path": "tests/test_convert_ebssa.py",
+      "sha256": "f6df00995068ca16ac6380dab8e39b933e3ff9bb5ea201c2b233d1ed6d3ba279",
+      "bytes": 6520,
+      "git_tracked": true
+    },
+    {
+      "path": "tests/test_convert_evflying_x4.py",
+      "sha256": "f5d96dc7f1959b76ffc7982b0bf7bb72d6e64a7165e79998bcedb0a27e65d10d",
+      "bytes": 3247,
+      "git_tracked": true
+    },
+    {
+      "path": "tests/test_crossfit.py",
+      "sha256": "10efccd0eaca36bbf65103d9754e2bd93dfc6a08ab0dacd4b5349a8b659e61b1",
+      "bytes": 7822,
+      "git_tracked": true
+    },
+    {
+      "path": "tests/test_deco_v10.py",
+      "sha256": "1d47594eaba64107d8ce74192e8479b619b70f2ad762e74105c1b90a29a04aab",
+      "bytes": 11194,
+      "git_tracked": true
+    },
+    {
+      "path": "tests/test_deco_v11.py",
+      "sha256": "dbd425f2905ae1422be7e13b74f17611ee4de4d081859e4c3e9582932de7e426",
+      "bytes": 11748,
+      "git_tracked": true
+    },
+    {
+      "path": "tests/test_end2end.py",
+      "sha256": "79f9c281f133c802e8d93d8c469bbb6c86900b742b0777000dddb476bdad4368",
+      "bytes": 15021,
+      "git_tracked": true
+    },
+    {
+      "path": "tests/test_final_v9.py",
+      "sha256": "e43c20d51ceafd84230cac7c08eb1b1e0da83891cdc8e600264ed15d23a67463",
+      "bytes": 49448,
+      "git_tracked": true
+    },
+    {
+      "path": "tests/test_make_blocks.py",
+      "sha256": "66d08e00ff8abc17dfe24930871e51f06b8d5c5f5197c25b253d8d1644ac9d92",
+      "bytes": 3389,
+      "git_tracked": true
+    },
+    {
+      "path": "tests/test_mp_lr.py",
+      "sha256": "e7ca75cb91dc7f669cab84402a231371bb2f96fc38d3c9af349830853bef3078",
+      "bytes": 2503,
+      "git_tracked": true
+    },
+    {
+      "path": "tests/test_mp_routing.py",
+      "sha256": "63a8f2c740a666a66e1bae0891a28d52be1c20472636aed4bf906c7c7a4b4f5d",
+      "bytes": 5566,
+      "git_tracked": true
+    },
+    {
+      "path": "tests/test_nested_v11.py",
+      "sha256": "8d597318501fe430b42587864d77799435e7ab63536e0603f73a6a595da1617e",
+      "bytes": 10568,
+      "git_tracked": true
+    },
+    {
+      "path": "tests/test_object_layer.py",
+      "sha256": "b76a2a3089a231a870b926ad5867aec4526cb5ac100972bad898ad28f10f37de",
+      "bytes": 20525,
+      "git_tracked": true
+    },
+    {
+      "path": "tests/test_object_tokens.py",
+      "sha256": "511b77b5b87c24131315152632dc102929b1c09f4136936ed093fbcc08675930",
+      "bytes": 24528,
+      "git_tracked": true
+    },
+    {
+      "path": "tests/test_stream_border.py",
+      "sha256": "0808f4015c8f14f9383a6ed9933857aee244c8dc6ee4c333b53f19e0d9bb2767",
+      "bytes": 11963,
+      "git_tracked": true
+    },
+    {
+      "path": "tests/test_stream_comod.py",
+      "sha256": "842e536ccdc96d465d5a79d3cbf44c530659fa41fb2cd4d3d095abf05bf73e48",
+      "bytes": 12694,
+      "git_tracked": true
+    },
+    {
+      "path": "tests/test_stream_dual_memory.py",
+      "sha256": "480fed7902bc6825a001f6a8a68bcaf4fb97e7a8bba21143a8f67546c5b5f6f1",
+      "bytes": 17994,
+      "git_tracked": true
+    },
+    {
+      "path": "tests/test_stream_invariant.py",
+      "sha256": "b53140c459c014fe165216916bfeb873ef29fe4cfaafc1222e8b421b7a28a287",
+      "bytes": 21822,
+      "git_tracked": true
+    },
+    {
+      "path": "tests/test_stream_memory_diagnostics.py",
+      "sha256": "e5c211f55ffa4d21bf86630e13e4c2400a283a748b5c358601e3c4b935c16881",
+      "bytes": 2814,
+      "git_tracked": true
+    },
+    {
+      "path": "tests/test_stream_merged_decoder.py",
+      "sha256": "2ca6e24af96054fd962ecd9fc2fadd2c82a0bf1dfd08ea71b6772caab7f00ae7",
+      "bytes": 15973,
+      "git_tracked": true
+    },
+    {
+      "path": "tests/test_stream_noise_aug.py",
+      "sha256": "a643aa374670d8495e7468b8084a11071781db561510ce5936e208a0ff45db3a",
+      "bytes": 7183,
+      "git_tracked": true
+    },
+    {
+      "path": "tests/test_stream_noise_profile.py",
+      "sha256": "23d3abd4d1bbf1d5cd723b4e5f1de55a1d490ceb8fa2c0df7ad2c341931b873d",
+      "bytes": 6719,
+      "git_tracked": true
+    },
+    {
+      "path": "tests/test_stream_speed_tools.py",
+      "sha256": "f129839c71f07299c3761ec20e9f38ed8ecf2d5ef3768b890ba26576fa872c27",
+      "bytes": 17015,
+      "git_tracked": true
+    },
+    {
+      "path": "tests/test_stream_subthreshold_residual.py",
+      "sha256": "d9771460da9c43e259c45b0240acbba464629b7bfdb2a6051232112a17580142",
+      "bytes": 16350,
+      "git_tracked": true
+    },
+    {
+      "path": "tests/test_stream_tbptt_probe.py",
+      "sha256": "a16d39384095a53948df1f5f18d0c66d953bc4b598128713f074606115701f5a",
+      "bytes": 6775,
+      "git_tracked": true
+    },
+    {
+      "path": "tests/test_stream_tif_adapt.py",
+      "sha256": "56af1063ce335460e2e99b8bd335166cb74fb8e1f0a714755533cdbcdbb20dcf",
+      "bytes": 14662,
+      "git_tracked": true
+    },
+    {
+      "path": "tests/test_stream_tif_diagnose.py",
+      "sha256": "bcfcdd5fb2392fb125d02a6ca7f815e1214b211d2493d23efef9ed3e6c7b059a",
+      "bytes": 15394,
+      "git_tracked": true
+    },
+    {
+      "path": "tests/test_track_head.py",
+      "sha256": "d2a9649eb23b44b2fa8c94e45b79bc7198d0675e89174a04f1960d3e727cdfce",
+      "bytes": 57461,
+      "git_tracked": true
+    },
+    {
+      "path": "tests/test_train_numerics.py",
+      "sha256": "2dbee6c49dcab5b51674bcc9706772079d56a85b15ba6835c884fba7ded509cf",
+      "bytes": 4616,
+      "git_tracked": true
+    },
+    {
+      "path": "tests/test_v14_experiment.py",
+      "sha256": "e696285cd13a9f91190545357926651bd01389c291cea3d1f8eb331c73deb959",
+      "bytes": 6898,
+      "git_tracked": true
+    },
+    {
+      "path": "tests/test_v14_queue.py",
+      "sha256": "bea12c5c2efc2c3cd9769d7d7e05ce494a1a9fa74104b529775abccd23e0de66",
+      "bytes": 7933,
+      "git_tracked": true
+    },
+    {
+      "path": "tests/test_v9_opt.py",
+      "sha256": "19a5e9d4512a896bf1aafd37e449ea01f49b1e51a1160406295d8d4881b21bf7",
+      "bytes": 15496,
+      "git_tracked": true
+    },
+    {
+      "path": "tests/test_vow.py",
+      "sha256": "7afe7e38e009cbe8b91e4d1e214683b97b315e6ea529a4b0eb757b4472205b2f",
+      "bytes": 6275,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/b1_delayed_confirm.py",
+      "sha256": "ca13a5bea53af641ea6783a2a94128d98224e7b2eebe681463380efc7fabfbab",
+      "bytes": 6707,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/baseline_energy.py",
+      "sha256": "b314d363eafd414e1ee1e963c34a1f1f13bc1d4102a06db317e2e5a2f8c10885",
+      "bytes": 11937,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/bench_stream_batches.py",
+      "sha256": "4dfd032ca58d1a88ebbb2ab571f8049c8ade92414bbe40e4e002e44c628f3ca1",
+      "bytes": 8172,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/bench_stream_speed.py",
+      "sha256": "88926a172879a4494be35320392d3d3987c2e8a0cae91fe881e2221274191bfd",
+      "bytes": 19080,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/check_stream_execution.py",
+      "sha256": "06f76dba55b2c2156e26683626f92bd0963943a2c893372f31c6ac2c50a62da6",
+      "bytes": 21076,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/commit_calibration.py",
+      "sha256": "b33f8f6f8ca561b7bbdf0e5fc980df556110b2304e7679986fd3f6b04f998ad6",
+      "bytes": 9243,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/comod_synthetic.py",
+      "sha256": "bf0b6a9f01f695a56492c60287ab54482fad4d8d4f197079f85c2883b71f126a",
+      "bytes": 26744,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/convert_ebssa.py",
+      "sha256": "c807a73e8b97c9da165000a060e73a6ffc56566112bd87ba98fb94fe25b8dfb2",
+      "bytes": 20598,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/convert_evflying_x4.py",
+      "sha256": "f370227a9c5d5d63e2d10a8e651bf619a18b6c1a40b1eb51b8cc64d15f8ee4aa",
+      "bytes": 9885,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/convert_to_merged_decoder.py",
+      "sha256": "316be31abdac68e23dea4622b3da4eb37a22aaee2fecbb06aafca0c03e8ef44b",
+      "bytes": 14140,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/band_probe.py",
+      "sha256": "1bc37728f9d48dcf9ca2f62c8d6a0fea4559478947aa251198306cc2dc0ae2c0",
+      "bytes": 3496,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/calibrate_commit.py",
+      "sha256": "8710ae24c494275a66943f57bcf7381442588cf09efd796328bae85bb40d014b",
+      "bytes": 8647,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/check_v13_deps.sh",
+      "sha256": "4ed1b399209dc551939c3ec7fbd69abe8547b02c5d83f4d8b6b5e1f71b9d06f9",
+      "bytes": 1430,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/diag_split_shift.py",
+      "sha256": "5ffce9f3e0ea1833fddfc032ee681802677a7c5e4c0cb33eaf7f29b226974965",
+      "bytes": 6099,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/dump_z0.py",
+      "sha256": "b07381329e637d61ff78deb540c74821046a097962f86efca5e10f754feb4d47",
+      "bytes": 4046,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/evidence.py",
+      "sha256": "1f7d8d7a5d780e8eb3790d4bf246a39d71297e2b45e08b6be1ac4caff2db03f4",
+      "bytes": 12092,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/fit_head.py",
+      "sha256": "deb66ab6bb4025bd939a4ec1accd97ae721b20a18a0426fb01232151e1b427ef",
+      "bytes": 11700,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/fit_range.py",
+      "sha256": "1262f2d70bf2250db554bfe42dc12553a71e0d0ba491fac801375c510d4dd9ef",
+      "bytes": 13922,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/fit_vow.py",
+      "sha256": "0b23e9cdd170aa9e987bc3dd499e4d47c37b24322aeb163561a513568d39ddf4",
+      "bytes": 24370,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/mil_groups.py",
+      "sha256": "887a61de85bccdb9111949d179bd221d6fec46689f2970fe36168497c9696fed",
+      "bytes": 2706,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/nested_v11.py",
+      "sha256": "eb2df50c7aa78fb5f3b709b8afb229bd162e7d5de001aaa00dae32a7be48edb1",
+      "bytes": 7583,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/offset_probe.py",
+      "sha256": "9d30999dfba8ac1a873c9a1058990e67c7ba5168a79ed22029888e0d9255c965",
+      "bytes": 3653,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/pack_round2.sh",
+      "sha256": "3da4f49a407f625868d2af8717ff096264f7e9b5e38d85b3fcf98ad2f110911a",
+      "bytes": 1344,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/pack_round3.sh",
+      "sha256": "a2692bbad5ce95d668d305e3c6688c4ba74c54ea9b337c34386c16a5ff9de371",
+      "bytes": 1312,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/pack_round4.sh",
+      "sha256": "b6d6c6123f7e464cd2425eb5f9eb6bcdeb97b124aee3a8d1f35f808a1c45b6a0",
+      "bytes": 1379,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/pack_v13.sh",
+      "sha256": "824367c5e701b2e64666d9728a4d7fe0f3442974598f773026852ce50d4c433e",
+      "bytes": 1018,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/phase_window_probe.py",
+      "sha256": "e33a01f52ed1b71baa57cbf8fb24bd16a11e327e071c19f3aae34468eb03f93a",
+      "bytes": 4966,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/pick_band.py",
+      "sha256": "64a6c13912fb2202b118fc412adfe487a8db9536684ee2de7a03881333dbc4ed",
+      "bytes": 2714,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/pool_round23.sh",
+      "sha256": "e146fbd1449dfddc076885d7324ebc87fa279c42f3a6336d0292016ca2fa79b2",
+      "bytes": 3334,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/queue_round2.sh",
+      "sha256": "cf42aa977d87931e8f0f9380e6340bf7bb78c82d29cee35f4ce4d82110a5a962",
+      "bytes": 6452,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/queue_round3.sh",
+      "sha256": "247e1778016e2c4ddc5162547ebf1023fe163e66fae30e057d80cf375978164a",
+      "bytes": 4450,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/queue_round4.sh",
+      "sha256": "ce8724450c6ff96f13c7fdc472f8973df0cad2d549e22095037287b139497ef2",
+      "bytes": 2931,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/queue_v10.sh",
+      "sha256": "63ba48c2989a99ceb7d6799cfc3e420bcfec8c6c45a2cfaae6e82141028283e3",
+      "bytes": 2675,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/queue_v13.sh",
+      "sha256": "16da67221b896a7ffbf653d12c6b207c25ba9ae8b8eb6dedd3e1d3e3e48213b6",
+      "bytes": 2355,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/queue_v13best.sh",
+      "sha256": "ff4e607eb0a05d15b76eaf459e37127fc09b99ab6536fb08263bd905969a1042",
+      "bytes": 2987,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/run_deco.sh",
+      "sha256": "8446207c382c69656c82de192676c1129ce79cf725bc5e60dffdbf0f1eda353d",
+      "bytes": 3790,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/run_dnm.sh",
+      "sha256": "9beb21de7d1b3ecf6e60c14d95ab9d17c2f2778b4c3539f1fa68dc7f5cb64ce3",
+      "bytes": 5475,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/run_nested.sh",
+      "sha256": "fd767ef2c60d46b579fb3e2cf75f4c088df5438b8ec6cce9387535000e696c1a",
+      "bytes": 4291,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/run_nested_ctrl.sh",
+      "sha256": "b98c05a5efdce94cece35baedcbd805178b8932b90bb80ca2ea4eabc3a390dc7",
+      "bytes": 3048,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/run_v11_staged.sh",
+      "sha256": "31ba971b3d15566eb0869a369e987bf955d80497dd6a3d562ddf7a62c167ed93",
+      "bytes": 1919,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/run_v13.sh",
+      "sha256": "7a3a701e4081fe030d92d8cc7fa85b65cecab34c3cc61b7c56c20694c671712b",
+      "bytes": 5207,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/sdn_v11.py",
+      "sha256": "e7574925f4a5d24b4f537bd85b9fd5c65501843c6314f175c86854d8b0aff0e5",
+      "bytes": 12610,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/setup_v13_dir.sh",
+      "sha256": "f2b9f3bf9a1c682468d4d8bb5b0527832b6845be9d5092b908163ec512eeb0a8",
+      "bytes": 1778,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/smoke_dnm_w400.sh",
+      "sha256": "ebb0d84d51399e174793a1a406aff2ad9f78f4d284f3d0e041745ab527593244",
+      "bytes": 1496,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/smoke_v13.sh",
+      "sha256": "acecf4077bde4c6e4ec7c8ba80c09505bdfc394654e96af5c9ebd7891bf0e009",
+      "bytes": 1089,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/tokens.py",
+      "sha256": "dee8fe934f30478f2ad3bc0d22459b5cf1b3f8d83f598fd79caeb6b660c6ffa3",
+      "bytes": 9124,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/train_dnm.py",
+      "sha256": "166b14f82cc9a1ef508e56c26f2c4a99e5e0ca7814737b009ca77f0699b16e8e",
+      "bytes": 35132,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/train_nested.py",
+      "sha256": "9496c39333f8b5585036360b4f4ca75d0eef1f285cc0c6e3a75e9473081ea399",
+      "bytes": 26530,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/train_probe.py",
+      "sha256": "f2777f8c10c6c84a8070351896d33ecb6abd0bbf351c6d71660658834d4175ee",
+      "bytes": 13826,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/vow.py",
+      "sha256": "ae133788e9b4709de5ef35b1d86a75c05f85ad53f27a03e9ed62951660868a3f",
+      "bytes": 8694,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/deco/wait_smoke.sh",
+      "sha256": "009817352814a71faf53c5759b614d8f2069d28c71727a832a8db342bbccbee9",
+      "bytes": 512,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/diagnose_gap.py",
+      "sha256": "fdaae6c49ed8c2c81de7a19f284b2005f64ccb13f0de8708292f65e158775e4f",
+      "bytes": 14702,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/diagnose_stream_memory.py",
+      "sha256": "2dc14a466d8d26dfb2b75e649d09aef117c99b12c45374b253bf008fc851f4e9",
+      "bytes": 8527,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/diagnose_tif.py",
+      "sha256": "7f264ccb5d6764dc3edb21d5df4ca2a3a742e9768a6322d8ff97bc664ccc8af7",
+      "bytes": 38789,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/dump_baseline_predictions.py",
+      "sha256": "eed55a0ad61c25971e85a1a0d0e07ba8acadc6263961cf3c50af7d5d9b5069e2",
+      "bytes": 4091,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/error_budget.py",
+      "sha256": "6c17275ff849f15092bcbc0c5d3d35caae66f74101fb7e10823df57a6370a37d",
+      "bytes": 10892,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/eval_baseline_stitched.py",
+      "sha256": "d85415ada5c776defda0ab13aead4d7b5bc8878af1207f6bcfb1f7c3603d231b",
+      "bytes": 9295,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/eval_module2.sh",
+      "sha256": "68f94667b82795755ab41149ef9a2b3ff0aff735e4c8f04ea4d52dd199e3bcb2",
+      "bytes": 3991,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/export_oof_outputs.py",
+      "sha256": "ccdab3e9e566cf65b535606183a8f3949d306dbd8c85fb9f881219e8349d5fbf",
+      "bytes": 4746,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/final/backbone.sh",
+      "sha256": "489e6634a7f0d97ed5fefcec0ac296455c2bd8e5a68788e4f16e8c1e7973ed26",
+      "bytes": 3671,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/final/bg_ablation.sh",
+      "sha256": "20ced60d95a75acd0cdb1784740397242b33721e917c87e789d4f88c39976984",
+      "bytes": 2310,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/final/cal_analysis.sh",
+      "sha256": "aeddf9dc86a9f4ec741a9d0b59bdcc18a28a3ea113e61c8fc97f84676ca10acd",
+      "bytes": 2602,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/final/chains.sh",
+      "sha256": "2d446b78c117924178f5e557f22dfa70623e49ef52a844bacade312d3518fa28",
+      "bytes": 2982,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/final/commit_cal.sh",
+      "sha256": "8ff08d6b5a7aa6c678ef7cba343c1ed49c46fbe2c1a628fa9ba0a42b195194be",
+      "bytes": 2179,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/final/compare_heads.py",
+      "sha256": "a578891decff2388ce2de57d5943ed417743e7322fb419da38a55e1bf87ab890",
+      "bytes": 5269,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/final/head.sh",
+      "sha256": "35a7772037f0ebeafbde1a1a88efb53b4ccc1dd9368b83caab7c79fa8567d697",
+      "bytes": 4778,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/final/pack.sh",
+      "sha256": "36c22107b5b51d9ba7800dfa0824f16485bed4dd754a680851b0f7d11450c447",
+      "bytes": 867,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/final/plan_a.sh",
+      "sha256": "1a7911dd968596a26354ce53b1e6c881e714f18024561d59b3c4cb7944ec2bbd",
+      "bytes": 10626,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/final/pool_add.sh",
+      "sha256": "e5e3a801741283ac83253b850cd53ffda1b776e18e98f5aa32d54bc841ac7b2a",
+      "bytes": 2039,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/final/queue_25ms.sh",
+      "sha256": "647db1d1c769f567a2ead946c4e63518f3962848cfa3bafc74bb5117fa3dcb8b",
+      "bytes": 1022,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/final/queue_25ms_full.sh",
+      "sha256": "92fd667a752e1a07a9634b2adc1193fb2c0e96789f79544892fcc24df0db0141",
+      "bytes": 1648,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/final/queue_b2_evf.sh",
+      "sha256": "f4261f26d41d3c42bcee98ce48c0e137258042226d11e1a16ed11565affa64ca",
+      "bytes": 1743,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/final/queue_basic_e1.sh",
+      "sha256": "c60c49a7b2a8eb5d3d92ec8302187325be068a432aadb31826700342a9f8c7a9",
+      "bytes": 769,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/final/queue_basic_e3b.sh",
+      "sha256": "2dd19b675ffc2b59a4742c6dc8fd678755af32358b22e5b765a2c4f8e5100d26",
+      "bytes": 780,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/final/queue_basic_v5.sh",
+      "sha256": "3b0b9a322d2b38224561813d6a9ff0f81e8ba45f6a5f7479dc21ec1daa91e7f4",
+      "bytes": 4835,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/final/queue_evf.sh",
+      "sha256": "d6e748a8ae8dedd4c3efe3d54b8c3b541daaca225702970eb743f2595343b029",
+      "bytes": 1353,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/final/queue_seed.sh",
+      "sha256": "52281406822de6392833bd8366bab672f44037e82370b145933ec17dbb870351",
+      "bytes": 2030,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/final/queue_window_sweep.sh",
+      "sha256": "2990931891405119af09f0e7917387c10849e77c47b0262eea19353c8fe2f6b4",
+      "bytes": 1375,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/final_analysis.py",
+      "sha256": "7e908dc67c1f0fbcab0f70affa98c30aa8f4f8b43b9a34e70eae813313a7957b",
+      "bytes": 25651,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/final_summary.py",
+      "sha256": "d79685a4bde476d7f2d51ea0dbc70c9cdfbfc66000117ffcf1675649bcd53aee",
+      "bytes": 8980,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/fp_cluster_analysis.py",
+      "sha256": "cdce9e185daf0141fb2e01427f758ff49068d7f36a47e75a154367a7453e0fa5",
+      "bytes": 12149,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/fp_source.py",
+      "sha256": "47a1ead6444d8c718eb349af22f8d52029a37f7331f47463eddfbf4385887087",
+      "bytes": 4132,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/make_blocks.py",
+      "sha256": "68eb894b3d45abac10cc37a53e40103de6af7c0869fb9d64211b7fa2563c6549",
+      "bytes": 5400,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/noise_profile.py",
+      "sha256": "6669759c5432318d56dc3428afa2a650198dee6c98daedba977904fc7309cb3f",
+      "bytes": 15350,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/paper_tables.py",
+      "sha256": "c73994f02fe025c80bfb5c60ff898472b4becd0e98ad8f320dfacd7b4d29be09",
+      "bytes": 29332,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/partition_probe.py",
+      "sha256": "9f927c592a6f49e87a47ebc3813fe4268df6ee01b47e503f33ca2dbaf7062915",
+      "bytes": 33261,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/path_integration_ceiling.py",
+      "sha256": "5124241daf3098cf4f8a870dbc9ddba14b095b23d77243862bbd0ed56cb77def",
+      "bytes": 8229,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/per_sequence_metrics.py",
+      "sha256": "ce796bab6532f59a11d85998354564f41e1e35c50d71f3af1900a62a2ec87ef7",
+      "bytes": 5185,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/phase0_step_size.py",
+      "sha256": "6c7621a9d236c51a884000712657ccc960ceb40da5b8a2f21ea42c8f5d3f43ff",
+      "bytes": 24910,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/queue_track_head_v2.sh",
+      "sha256": "21a54ab0233244d3bb236d209b01a50e1aaf97baadb816617676b19ad3653713",
+      "bytes": 3492,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/rcl_stage1_check.py",
+      "sha256": "26a6c358c712f98ffd337f1a3bc09a893c5087765db6175d22a9c8e9eac37846",
+      "bytes": 8531,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/run_crossfit_queue.sh",
+      "sha256": "ebe279f02520ba128f053a42fe66b8bbcd1db6a8d5db6ba307f7612b693963c9",
+      "bytes": 2318,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/run_end2end.sh",
+      "sha256": "8ff535b1b97d5be4b0c561195786bf6e377dbe2e2838b61a6e8320683338442b",
+      "bytes": 1639,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/run_full_model.sh",
+      "sha256": "cf39c6f7519dc43eb6c0c26028d4290b30d14b8888ba4bebba54cdd98ed9c028",
+      "bytes": 6283,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/run_memory_diagnostics.sh",
+      "sha256": "ac65bb3a755cae4402a0d25327220570b4caaf2765e0b20d5499b6362974d280",
+      "bytes": 1040,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/run_rcl_crossfit.sh",
+      "sha256": "ff3a1b52e852fbc88eef7972adafd393583ce2e0d39c78c50028520eb2b9689c",
+      "bytes": 3220,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/run_track_head.sh",
+      "sha256": "90ac5eb77d67519f974a5fa16b1457e999843ab5040c37b018ed46cc4d23737c",
+      "bytes": 1869,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/run_variant.sh",
+      "sha256": "ced2161a1d5be18e6c054e4e8c113d95a062afdd5aaefbd463109d557171636a",
+      "bytes": 1561,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/select_backbone.py",
+      "sha256": "2c56b865ae67e40b3854a38a28c99d414a48a32d3eac00aea6c2eb41da051210",
+      "bytes": 7924,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/select_checkpoint.py",
+      "sha256": "b409f4cd14e43534405b4934d52f73e72fd20c0c2c07fe29d4abeca3c30318c7",
+      "bytes": 13830,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/setup_rented_server.sh",
+      "sha256": "582153f159f5029b997af775bebd92215c48494ee9c533a71d4a9b81619db870",
+      "bytes": 6206,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/stream_energy.py",
+      "sha256": "83bc9c6b52f8753d60826bf0d7ade44ccfb6263d552ba86a265175b55e38920d",
+      "bytes": 9101,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/summarize_runs.py",
+      "sha256": "346c576633fd6ce3c13d0a180cd80b3e3b861cdbf9694d75077c0d17439113c9",
+      "bytes": 9011,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/summarize_training.py",
+      "sha256": "d0132ad34fc3759725f542f2b4c1b3411c28901ec29862973fe76a5ce764d4e3",
+      "bytes": 4914,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/sweep_threshold.py",
+      "sha256": "683c73def0c01eec7cffbb580c087ec81a845bc9e98ec99d637fec9dda714d85",
+      "bytes": 8580,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/tbptt_grad_probe.py",
+      "sha256": "d5d028e3474bf6eff118b60fd0d928101f5207bebdc0b0d666c589bd084f55e2",
+      "bytes": 10987,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/v14/queue.py",
+      "sha256": "eec135877d882859aff40330570cc6e7d8c91a5ba2394be43ff8e0036acab23d",
+      "bytes": 15417,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/v14/run_experiment.py",
+      "sha256": "cda962c4f1415855b9b3997d9867a37ea926f67674051a163cfe70e9ca4ee0de",
+      "bytes": 15492,
+      "git_tracked": true
+    },
+    {
+      "path": "tools/verify_predictions.py",
+      "sha256": "f1b5f28796d63e8ad82a99b5d3804670f336eb624447b0ed0ea812724ec126ec",
+      "bytes": 20323,
+      "git_tracked": true
+    },
+    {
+      "path": "train.py",
+      "sha256": "b729be24d13b6911bed47508017f88cad5fee5802228ac42e2bc6a09acddda06",
+      "bytes": 3958,
+      "git_tracked": true
+    },
+    {
+      "path": "train_end2end.py",
+      "sha256": "cd1396906c81479702b2be70b264b4f96b38f6262b9b56fe0986bef0989f5805",
+      "bytes": 28324,
+      "git_tracked": true
+    },
+    {
+      "path": "train_mp.py",
+      "sha256": "77ba7f581f986c41ab7266fa879634e31f345cfa82ffbde1c84bdf3acf8d7fe7",
+      "bytes": 22519,
+      "git_tracked": true
+    },
+    {
+      "path": "train_track_head.py",
+      "sha256": "c71b45a9328348ba9a89d989a31b5f796fc983aa6277badfe4edff964a6df157",
+      "bytes": 63858,
+      "git_tracked": true
+    },
+    {
+      "path": "utils/aggregate.py",
+      "sha256": "1e7f994fb8826dcb4a6f62826d5cd58cdbdc186f2a55a126689a72d6b3012eb5",
+      "bytes": 4986,
+      "git_tracked": true
+    },
+    {
+      "path": "utils/recording_groups.py",
+      "sha256": "ac53564caf3b38d488e72c4eefe879e3fb7ad65ac4717b7fc713b5f98c6a40c6",
+      "bytes": 3574,
+      "git_tracked": true
+    },
+    {
+      "path": "utils/stcloss.py",
+      "sha256": "079c107f3da0602138df24927fab51d111f52b6d5d375ceb80c43a50a6cd6062",
+      "bytes": 2253,
+      "git_tracked": true
+    },
+    {
+      "path": "utils/train_numerics.py",
+      "sha256": "fdb3c5045d6170767b2d9d381544919dac3ec88f4703a62777914722d638e287",
+      "bytes": 1391,
+      "git_tracked": true
+    },
+    {
+      "path": "utils/vis.py",
+      "sha256": "e066a5454f41f789bfd8275ac7161b1ce5d828cbe16737c462e6eee2e062e2da",
+      "bytes": 1214,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/HAIS_OP.egg-info/PKG-INFO",
+      "sha256": "4f21b40a0e19cd47dfec891c9fae136c244f13b22fb37982704897a358191826",
+      "bytes": 54,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/HAIS_OP.egg-info/SOURCES.txt",
+      "sha256": "b01e8ec341e2479ddef581eca5132818324ca5e9402c4ff007160352839a6837",
+      "bytes": 189,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/HAIS_OP.egg-info/dependency_links.txt",
+      "sha256": "7eb70257593da06f682a3ddda54a9d260d4fc514f645237f5ca74b08f8da61a6",
+      "bytes": 2,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/HAIS_OP.egg-info/top_level.txt",
+      "sha256": "37662715a5ffc02b25375d922b2ed127085511268a50b26633176c85f3aa199e",
+      "bytes": 9,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/build/lib.linux-x86_64-cpython-39/HAIS_OP.cpython-39-x86_64-linux-gnu.so",
+      "sha256": "90622aed9bbab5ef8767aab18c43e698ba408bd7e14b2be050ec7a979a79d96e",
+      "bytes": 12985440,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/build/temp.linux-x86_64-cpython-39/.ninja_deps",
+      "sha256": "397c32fe206ff9fe14c7cfd71e48397f7a0d65af1542c52d57ef42d807396829",
+      "bytes": 71156,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/build/temp.linux-x86_64-cpython-39/.ninja_log",
+      "sha256": "97a13f79a7f0e44631d9ca2bc27797d5634f6ddc590c2ce35256282e8db21d94",
+      "bytes": 427,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/build/temp.linux-x86_64-cpython-39/build.ninja",
+      "sha256": "eee9b2f12a971aa05dc18373d81086a7e1ec1cd4f312fbe96fba1ec44871d466",
+      "bytes": 2681,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/build/temp.linux-x86_64-cpython-39/src/cuda.o",
+      "sha256": "b06232fb8cbf55eee96fc99ff41817980209f78c5ac68b55fc7873e549211b44",
+      "bytes": 124760,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/build/temp.linux-x86_64-cpython-39/src/hais_ops.o",
+      "sha256": "6e8f61b8cd470f501a3522074bd04b5d10c1531be4f70ca806bd21413c8e11b3",
+      "bytes": 11119408,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/build/temp.linux-x86_64-cpython-39/src/hais_ops_api.o",
+      "sha256": "353df6c98fa776219c45af24a9316980db595f1278603c10ab5be45d5f9ed144",
+      "bytes": 16342488,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/functions/__pycache__/hais_ops.cpython-38.pyc",
+      "sha256": "89f0fba5938c93c6a35a66fbf9e5f0481f3fbb4f79ab86a374728e97de9dbca1",
+      "bytes": 11959,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/functions/hais_ops.py",
+      "sha256": "0c5739a478a430e30b7feee392c5c9baacbe785de9615dce6c5157c774b4a031",
+      "bytes": 14485,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/setup.py",
+      "sha256": "7ba35e77c4e62067bc1aed0317af972d26227a6639c0e17927e7324d77b25349",
+      "bytes": 402,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/src/bfs_cluster/bfs_cluster.cpp",
+      "sha256": "eaeb7eae59518a317df6d718faf016dc2ca4f36ae6442e8223cd2f4b305bf279",
+      "bytes": 4394,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/src/bfs_cluster/bfs_cluster.cu",
+      "sha256": "b9b0ab3187c6b2ac01ffac98024004ad6ab69f83459a55272bea18cb307d03bc",
+      "bytes": 2781,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/src/bfs_cluster/bfs_cluster.h",
+      "sha256": "63b43697947949f6036160a614a4c11744d7c4fa9050aa0f699f2083639115c1",
+      "bytes": 904,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/src/cal_iou_and_masklabel/cal_iou_and_masklabel.cpp",
+      "sha256": "cca80997b6eb8b599a3462fc74360d646f26948700fe24b6b825296abc280005",
+      "bytes": 1553,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/src/cal_iou_and_masklabel/cal_iou_and_masklabel.cu",
+      "sha256": "1199c786f878a6193640b683a444f6d72c95606236023599c70e010f03612fa2",
+      "bytes": 5145,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/src/cal_iou_and_masklabel/cal_iou_and_masklabel.h",
+      "sha256": "c3c3f6984b907fdfa90c3646e55d31293766a11bbb9ac147f807dfc0c9bff4f2",
+      "bytes": 841,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/src/cuda.cu",
+      "sha256": "bd1e169eecd61b3f1cb35807b6be7996eb3e1831fc5790745394fa3bf4a3ac77",
+      "bytes": 649,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/src/cuda_utils.h",
+      "sha256": "c742973d4b95c00072901c364827d2596fcf73e7555b9ee751834c4642c5d014",
+      "bytes": 628,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/src/datatype/datatype.cpp",
+      "sha256": "1d5a437038ed4cfe1c18c2b229656225cecf6da5c330509a3aea14c8010d383b",
+      "bytes": 463,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/src/datatype/datatype.h",
+      "sha256": "13b082b3f1de021d20fd648cb239bc3582972240f3c8c0755806fd9383645e3d",
+      "bytes": 1340,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/src/get_iou/get_iou.cpp",
+      "sha256": "c71a29a47ae1f577e1863b3d1c33978dc19f87d472f67f34ac6b6948bb7a6a94",
+      "bytes": 801,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/src/get_iou/get_iou.cu",
+      "sha256": "ab2053b0ad35ded1fd88ec93b0eca566add028711e6f15c367429f0ed60b6ec1",
+      "bytes": 1798,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/src/get_iou/get_iou.h",
+      "sha256": "345bd21f356c525d7f0ecb6db1664f57c579408e44b49842571f129b46af1f4e",
+      "bytes": 659,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/src/hais_ops.cpp",
+      "sha256": "eb66a0b0541dfccb020b24c3a1bed8edd2d6960134e583aba50b1ab40e0385e4",
+      "bytes": 2068,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/src/hais_ops.h",
+      "sha256": "db5ddd6de8afd972c628135b6d304471733d8322d640d4f784f26f64b52d7135",
+      "bytes": 1524,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/src/hais_ops_api.cpp",
+      "sha256": "36a27e75a3589e9063df72d48cf742f3d9870726d794853f926805110e0322e6",
+      "bytes": 1084,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/src/hierarchical_aggregation/hierarchical_aggregation.cpp",
+      "sha256": "1c450128cc73289613ceac1d167f3540255a07b663d5b785dee6dcb32d8832d9",
+      "bytes": 9073,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/src/hierarchical_aggregation/hierarchical_aggregation.cu",
+      "sha256": "38bebce80e0357589bab16b69efd18538fb407c22eb81b16542f8037c6a7aa41",
+      "bytes": 9878,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/src/hierarchical_aggregation/hierarchical_aggregation.h",
+      "sha256": "6b0ebf95be50e281f8b345b739df1ec3f653c16e918c09db5a8f7ed6088efa3e",
+      "bytes": 1320,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/src/roipool/roipool.cpp",
+      "sha256": "2bdd97f124ebb6a6199d5b9bc345fb6f5948c97432847c27148333d39e656cf2",
+      "bytes": 1108,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/src/roipool/roipool.cu",
+      "sha256": "05ee501b791a2195322e1199f54162010db47f03a1b2461bcf95c17ed6c5b006",
+      "bytes": 2331,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/src/roipool/roipool.h",
+      "sha256": "e6643af33b663bdb3dc35552c36b939c9264c60edd4e2f8776e9f229b949e7d9",
+      "bytes": 846,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/src/sec_mean/sec_mean.cpp",
+      "sha256": "eec11121c3865d6ab64545cb5ffbea389c2ade0e3f3d9be535fd95952031a0f7",
+      "bytes": 1033,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/src/sec_mean/sec_mean.cu",
+      "sha256": "240aa7f91b1b546af43b2d1da0136a29ae00a9d1e99d8854baa48dce686feac9",
+      "bytes": 3081,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/src/sec_mean/sec_mean.h",
+      "sha256": "650cf18b095f0b3f402bbf70e469dd11e979ee2e937668f75a67335e2725bf1d",
+      "bytes": 848,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/src/voxelize/voxelize.cpp",
+      "sha256": "3fd82d3ccc1fa05c230d7f0d7b2c98386871c156f97331aa955399f8c32efb9e",
+      "bytes": 7460,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/src/voxelize/voxelize.cu",
+      "sha256": "d095ab9cf8d5edb9060442b921495fb1069bb95336a721b212089280df716e8c",
+      "bytes": 2297,
+      "git_tracked": true
+    },
+    {
+      "path": "lib/hais_ops/src/voxelize/voxelize.h",
+      "sha256": "5ed3efd002766dcada8cd34322ce9a634dd9e1127ed9c545d822fec81d090530",
+      "bytes": 2504,
+      "git_tracked": true
+    },
+    {
+      "path": "model/noise_invariant.py",
+      "sha256": "000420fe200ed671bb981b3a9f7134e6284864e8ce1b3092cf7e3077c4fe1e24",
+      "bytes": 11734,
+      "git_tracked": true
+    },
+    {
+      "path": "model/comod.py",
+      "sha256": "63db05d5722642b8403a7b1e4a9c71b5888028d323a30a1def2f778832b39aa0",
+      "bytes": 19420,
+      "git_tracked": true
+    },
+    {
+      "path": "dataset/noise_aug.py",
+      "sha256": "cbff13e8b2f325745cae8f7545e9eea0e7e5508d7bcefae674c4c15674810470",
+      "bytes": 4117,
+      "git_tracked": true
+    }
+  ],
+  "deleted_generated_caches": [
+    {
+      "path": "dataset/__pycache__/basedataset.cpython-38.pyc",
+      "bytes": 3884,
+      "generated": true
+    },
+    {
+      "path": "dataset/__pycache__/ev_uav.cpython-38.pyc",
+      "bytes": 1421,
+      "generated": true
+    },
+    {
+      "path": "model/__pycache__/basemodel.cpython-38.pyc",
+      "bytes": 4807,
+      "generated": true
+    },
+    {
+      "path": "model/__pycache__/changepoint_layer.cpython-310.pyc",
+      "bytes": 48010,
+      "generated": true
+    },
+    {
+      "path": "model/__pycache__/changepoint_layer.cpython-311.pyc",
+      "bytes": 95456,
+      "generated": true
+    },
+    {
+      "path": "model/__pycache__/changepoint_layer.cpython-313.pyc",
+      "bytes": 87503,
+      "generated": true
+    },
+    {
+      "path": "model/__pycache__/changepoint_layer.cpython-38.pyc",
+      "bytes": 48085,
+      "generated": true
+    },
+    {
+      "path": "model/__pycache__/clutter_field.cpython-310.pyc",
+      "bytes": 9295,
+      "generated": true
+    },
+    {
+      "path": "model/__pycache__/clutter_field.cpython-311.pyc",
+      "bytes": 16825,
+      "generated": true
+    },
+    {
+      "path": "model/__pycache__/clutter_field.cpython-313.pyc",
+      "bytes": 15236,
+      "generated": true
+    },
+    {
+      "path": "model/__pycache__/clutter_field.cpython-38.pyc",
+      "bytes": 9299,
+      "generated": true
+    },
+    {
+      "path": "model/__pycache__/evspsegnet.cpython-38.pyc",
+      "bytes": 6701,
+      "generated": true
+    },
+    {
+      "path": "model/__pycache__/evspsegnet_mp.cpython-313.pyc",
+      "bytes": 6330,
+      "generated": true
+    },
+    {
+      "path": "model/__pycache__/evspsegnet_mp.cpython-38.pyc",
+      "bytes": 3173,
+      "generated": true
+    },
+    {
+      "path": "model/__pycache__/lookahead_head.cpython-310.pyc",
+      "bytes": 14073,
+      "generated": true
+    },
+    {
+      "path": "model/__pycache__/lookahead_head.cpython-313.pyc",
+      "bytes": 25737,
+      "generated": true
+    },
+    {
+      "path": "model/__pycache__/lookahead_head.cpython-38.pyc",
+      "bytes": 13954,
+      "generated": true
+    },
+    {
+      "path": "model/__pycache__/object_layer.cpython-310.pyc",
+      "bytes": 33890,
+      "generated": true
+    },
+    {
+      "path": "model/__pycache__/object_layer.cpython-311.pyc",
+      "bytes": 72775,
+      "generated": true
+    },
+    {
+      "path": "model/__pycache__/object_layer.cpython-313.pyc",
+      "bytes": 65713,
+      "generated": true
+    },
+    {
+      "path": "model/__pycache__/object_layer.cpython-38.pyc",
+      "bytes": 34134,
+      "generated": true
+    },
+    {
+      "path": "model/__pycache__/object_tokens.cpython-310.pyc",
+      "bytes": 29153,
+      "generated": true
+    },
+    {
+      "path": "model/__pycache__/object_tokens.cpython-311.pyc",
+      "bytes": 61612,
+      "generated": true
+    },
+    {
+      "path": "model/__pycache__/object_tokens.cpython-313.pyc",
+      "bytes": 55543,
+      "generated": true
+    },
+    {
+      "path": "model/__pycache__/object_tokens.cpython-38.pyc",
+      "bytes": 29279,
+      "generated": true
+    },
+    {
+      "path": "model/__pycache__/track_head.cpython-310.pyc",
+      "bytes": 41928,
+      "generated": true
+    },
+    {
+      "path": "model/__pycache__/track_head.cpython-311.pyc",
+      "bytes": 95396,
+      "generated": true
+    },
+    {
+      "path": "model/__pycache__/track_head.cpython-313.pyc",
+      "bytes": 86994,
+      "generated": true
+    },
+    {
+      "path": "model/__pycache__/track_head.cpython-38.pyc",
+      "bytes": 41916,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_changepoint_layer.cpython-310.pyc",
+      "bytes": 90736,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_changepoint_layer.cpython-311.pyc",
+      "bytes": 211835,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_changepoint_layer.cpython-313-pytest-8.3.4.pyc",
+      "bytes": 178389,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_changepoint_layer.cpython-38.pyc",
+      "bytes": 91162,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_clutter_field.cpython-313-pytest-8.3.4.pyc",
+      "bytes": 11357,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_clutter_field.cpython-38.pyc",
+      "bytes": 6037,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_convert_ebssa.cpython-313-pytest-8.3.4.pyc",
+      "bytes": 12854,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_convert_ebssa.cpython-38.pyc",
+      "bytes": 7023,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_convert_evflying_x4.cpython-313-pytest-8.3.4.pyc",
+      "bytes": 7141,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_convert_evflying_x4.cpython-38.pyc",
+      "bytes": 3722,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_crossfit.cpython-313-pytest-8.3.4.pyc",
+      "bytes": 13116,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_crossfit.cpython-38.pyc",
+      "bytes": 6845,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_deco_v10.cpython-311.pyc",
+      "bytes": 26836,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_deco_v10.cpython-38.pyc",
+      "bytes": 11809,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_deco_v11.cpython-311.pyc",
+      "bytes": 22206,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_deco_v11.cpython-38.pyc",
+      "bytes": 11991,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_end2end.cpython-313-pytest-8.3.4.pyc",
+      "bytes": 23518,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_end2end.cpython-38.pyc",
+      "bytes": 13087,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_final_v9.cpython-310.pyc",
+      "bytes": 43179,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_final_v9.cpython-313-pytest-8.3.4.pyc",
+      "bytes": 71009,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_final_v9.cpython-38.pyc",
+      "bytes": 42887,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_make_blocks.cpython-313-pytest-8.3.4.pyc",
+      "bytes": 7453,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_make_blocks.cpython-38.pyc",
+      "bytes": 3795,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_mp_lr.cpython-313-pytest-8.3.4.pyc",
+      "bytes": 4544,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_mp_lr.cpython-38.pyc",
+      "bytes": 3031,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_mp_routing.cpython-313-pytest-8.3.4.pyc",
+      "bytes": 17782,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_mp_routing.cpython-38.pyc",
+      "bytes": 6883,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_nested_v11.cpython-38.pyc",
+      "bytes": 10278,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_object_layer.cpython-313-pytest-8.3.4.pyc",
+      "bytes": 36082,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_object_layer.cpython-38.pyc",
+      "bytes": 20004,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_object_tokens.cpython-313-pytest-8.3.4.pyc",
+      "bytes": 45191,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_object_tokens.cpython-38.pyc",
+      "bytes": 23933,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_border.cpython-313-pytest-8.3.4.pyc",
+      "bytes": 20179,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_border.cpython-38.pyc",
+      "bytes": 10457,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_comm.cpython-310.pyc",
+      "bytes": 22278,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_comm.cpython-313-pytest-8.3.4.pyc",
+      "bytes": 40961,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_comm.cpython-313.pyc",
+      "bytes": 40848,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_comm.cpython-38.pyc",
+      "bytes": 22109,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_comod.cpython-313-pytest-8.3.4.pyc",
+      "bytes": 25686,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_comod.cpython-313.pyc",
+      "bytes": 25572,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_comod.cpython-38.pyc",
+      "bytes": 13369,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_dual_memory.cpython-313-pytest-8.3.4.pyc",
+      "bytes": 29336,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_dual_memory.cpython-313.pyc",
+      "bytes": 29222,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_dual_memory.cpython-38.pyc",
+      "bytes": 14876,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_invariant.cpython-313-pytest-8.3.4.pyc",
+      "bytes": 37939,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_invariant.cpython-313.pyc",
+      "bytes": 36913,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_invariant.cpython-38.pyc",
+      "bytes": 19762,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_layerwise.cpython-310.pyc",
+      "bytes": 16765,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_layerwise.cpython-313-pytest-8.3.4.pyc",
+      "bytes": 33805,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_layerwise.cpython-313.pyc",
+      "bytes": 33692,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_layerwise.cpython-38.pyc",
+      "bytes": 16519,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_memory_diagnostics.cpython-313-pytest-8.3.4.pyc",
+      "bytes": 5743,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_memory_diagnostics.cpython-313.pyc",
+      "bytes": 5630,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_memory_diagnostics.cpython-38.pyc",
+      "bytes": 3052,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_merged_decoder.cpython-313-pytest-8.3.4.pyc",
+      "bytes": 28769,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_merged_decoder.cpython-313.pyc",
+      "bytes": 28656,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_merged_decoder.cpython-38.pyc",
+      "bytes": 14710,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_multistream.cpython-313-pytest-8.3.4.pyc",
+      "bytes": 34257,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_multistream.cpython-313.pyc",
+      "bytes": 34144,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_multistream.cpython-38.pyc",
+      "bytes": 20678,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_noise_aug.cpython-313-pytest-8.3.4.pyc",
+      "bytes": 14546,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_noise_aug.cpython-313.pyc",
+      "bytes": 14433,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_noise_aug.cpython-38.pyc",
+      "bytes": 7785,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_noise_profile.cpython-313-pytest-8.3.4.pyc",
+      "bytes": 12262,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_noise_profile.cpython-313.pyc",
+      "bytes": 12149,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_noise_profile.cpython-38.pyc",
+      "bytes": 6250,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_speed_tools.cpython-313-pytest-8.3.4.pyc",
+      "bytes": 27515,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_speed_tools.cpython-313.pyc",
+      "bytes": 27402,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_speed_tools.cpython-38.pyc",
+      "bytes": 16156,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_subthreshold_residual.cpython-313-pytest-8.3.4.pyc",
+      "bytes": 29128,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_subthreshold_residual.cpython-313.pyc",
+      "bytes": 29015,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_subthreshold_residual.cpython-38.pyc",
+      "bytes": 14390,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_tbptt_probe.cpython-313-pytest-8.3.4.pyc",
+      "bytes": 14463,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_tbptt_probe.cpython-313.pyc",
+      "bytes": 14350,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_tbptt_probe.cpython-38.pyc",
+      "bytes": 8416,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_tif.cpython-310.pyc",
+      "bytes": 24954,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_tif.cpython-313-pytest-8.3.4.pyc",
+      "bytes": 45491,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_tif.cpython-313.pyc",
+      "bytes": 45378,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_tif.cpython-38.pyc",
+      "bytes": 24522,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_tif_adapt.cpython-313-pytest-8.3.4.pyc",
+      "bytes": 26452,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_tif_adapt.cpython-313.pyc",
+      "bytes": 26339,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_tif_adapt.cpython-38.pyc",
+      "bytes": 14660,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_tif_diagnose.cpython-313-pytest-8.3.4.pyc",
+      "bytes": 28480,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_tif_diagnose.cpython-313.pyc",
+      "bytes": 28367,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_tif_diagnose.cpython-38.pyc",
+      "bytes": 15699,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_torch.cpython-313-pytest-8.3.4.pyc",
+      "bytes": 27743,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_torch.cpython-313.pyc",
+      "bytes": 27630,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_torch.cpython-38.pyc",
+      "bytes": 16545,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_variable_length.cpython-313-pytest-8.3.4.pyc",
+      "bytes": 12870,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_variable_length.cpython-313.pyc",
+      "bytes": 12756,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_stream_variable_length.cpython-38.pyc",
+      "bytes": 6522,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_track_head.cpython-313-pytest-8.3.4.pyc",
+      "bytes": 95999,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_track_head.cpython-38.pyc",
+      "bytes": 50094,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_train_numerics.cpython-313-pytest-8.3.4.pyc",
+      "bytes": 10380,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_train_numerics.cpython-38.pyc",
+      "bytes": 5749,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_v14_experiment.cpython-38.pyc",
+      "bytes": 7245,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_v14_queue.cpython-38.pyc",
+      "bytes": 8308,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_v9_opt.cpython-313-pytest-8.3.4.pyc",
+      "bytes": 27634,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_v9_opt.cpython-38.pyc",
+      "bytes": 15830,
+      "generated": true
+    },
+    {
+      "path": "tests/__pycache__/test_vow.cpython-38.pyc",
+      "bytes": 7185,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/b1_delayed_confirm.cpython-310.pyc",
+      "bytes": 6048,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/b1_delayed_confirm.cpython-313.pyc",
+      "bytes": 11323,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/b1_delayed_confirm.cpython-38.pyc",
+      "bytes": 6032,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/baseline_energy.cpython-313.pyc",
+      "bytes": 20277,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/baseline_energy.cpython-38.pyc",
+      "bytes": 12914,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/bench_stream_batches.cpython-38.pyc",
+      "bytes": 7176,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/bench_stream_speed.cpython-313.pyc",
+      "bytes": 26544,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/bench_stream_speed.cpython-38.pyc",
+      "bytes": 16629,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/check_stream_execution.cpython-313.pyc",
+      "bytes": 30531,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/check_stream_execution.cpython-38.pyc",
+      "bytes": 16649,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/commit_calibration.cpython-313.pyc",
+      "bytes": 14952,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/commit_calibration.cpython-38.pyc",
+      "bytes": 9263,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/convert_ebssa.cpython-313.pyc",
+      "bytes": 32438,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/convert_ebssa.cpython-38.pyc",
+      "bytes": 21371,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/convert_evflying_x4.cpython-313.pyc",
+      "bytes": 16073,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/convert_evflying_x4.cpython-38.pyc",
+      "bytes": 9721,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/convert_to_merged_decoder.cpython-313.pyc",
+      "bytes": 19072,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/convert_to_merged_decoder.cpython-38.pyc",
+      "bytes": 12564,
+      "generated": true
+    },
+    {
+      "path": "tools/deco/__pycache__/calibrate_commit.cpython-311.pyc",
+      "bytes": 18703,
+      "generated": true
+    },
+    {
+      "path": "tools/deco/__pycache__/calibrate_commit.cpython-38.pyc",
+      "bytes": 8851,
+      "generated": true
+    },
+    {
+      "path": "tools/deco/__pycache__/evidence.cpython-311.pyc",
+      "bytes": 24119,
+      "generated": true
+    },
+    {
+      "path": "tools/deco/__pycache__/evidence.cpython-38.pyc",
+      "bytes": 11751,
+      "generated": true
+    },
+    {
+      "path": "tools/deco/__pycache__/fit_head.cpython-311.pyc",
+      "bytes": 23785,
+      "generated": true
+    },
+    {
+      "path": "tools/deco/__pycache__/fit_head.cpython-38.pyc",
+      "bytes": 10930,
+      "generated": true
+    },
+    {
+      "path": "tools/deco/__pycache__/fit_range.cpython-311.pyc",
+      "bytes": 27493,
+      "generated": true
+    },
+    {
+      "path": "tools/deco/__pycache__/fit_range.cpython-38.pyc",
+      "bytes": 13062,
+      "generated": true
+    },
+    {
+      "path": "tools/deco/__pycache__/fit_vow.cpython-38.pyc",
+      "bytes": 21618,
+      "generated": true
+    },
+    {
+      "path": "tools/deco/__pycache__/mil_groups.cpython-311.pyc",
+      "bytes": 5195,
+      "generated": true
+    },
+    {
+      "path": "tools/deco/__pycache__/mil_groups.cpython-38.pyc",
+      "bytes": 2431,
+      "generated": true
+    },
+    {
+      "path": "tools/deco/__pycache__/nested_v11.cpython-311.pyc",
+      "bytes": 12498,
+      "generated": true
+    },
+    {
+      "path": "tools/deco/__pycache__/nested_v11.cpython-38.pyc",
+      "bytes": 7189,
+      "generated": true
+    },
+    {
+      "path": "tools/deco/__pycache__/sdn_v11.cpython-311.pyc",
+      "bytes": 20032,
+      "generated": true
+    },
+    {
+      "path": "tools/deco/__pycache__/sdn_v11.cpython-38.pyc",
+      "bytes": 10193,
+      "generated": true
+    },
+    {
+      "path": "tools/deco/__pycache__/train_dnm.cpython-311.pyc",
+      "bytes": 69908,
+      "generated": true
+    },
+    {
+      "path": "tools/deco/__pycache__/train_dnm.cpython-38.pyc",
+      "bytes": 31676,
+      "generated": true
+    },
+    {
+      "path": "tools/deco/__pycache__/train_nested.cpython-38.pyc",
+      "bytes": 21728,
+      "generated": true
+    },
+    {
+      "path": "tools/deco/__pycache__/vow.cpython-311.pyc",
+      "bytes": 18499,
+      "generated": true
+    },
+    {
+      "path": "tools/deco/__pycache__/vow.cpython-38.pyc",
+      "bytes": 10212,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/diagnose_gap.cpython-313.pyc",
+      "bytes": 21124,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/diagnose_gap.cpython-38.pyc",
+      "bytes": 13249,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/diagnose_stream_memory.cpython-313.pyc",
+      "bytes": 13398,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/diagnose_stream_memory.cpython-38.pyc",
+      "bytes": 7742,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/diagnose_tif.cpython-313.pyc",
+      "bytes": 59611,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/diagnose_tif.cpython-38.pyc",
+      "bytes": 38206,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/dump_baseline_predictions.cpython-313.pyc",
+      "bytes": 6207,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/dump_baseline_predictions.cpython-38.pyc",
+      "bytes": 4065,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/error_budget.cpython-310.pyc",
+      "bytes": 11342,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/error_budget.cpython-311.pyc",
+      "bytes": 22262,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/error_budget.cpython-313.pyc",
+      "bytes": 19056,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/error_budget.cpython-38.pyc",
+      "bytes": 11615,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/eval_baseline_stitched.cpython-38.pyc",
+      "bytes": 8108,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/export_oof_outputs.cpython-313.pyc",
+      "bytes": 8149,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/export_oof_outputs.cpython-38.pyc",
+      "bytes": 4982,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/final_analysis.cpython-310.pyc",
+      "bytes": 24453,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/final_analysis.cpython-311.pyc",
+      "bytes": 50054,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/final_analysis.cpython-313.pyc",
+      "bytes": 43201,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/final_analysis.cpython-38.pyc",
+      "bytes": 24684,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/final_summary.cpython-310.pyc",
+      "bytes": 8111,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/final_summary.cpython-313.pyc",
+      "bytes": 16378,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/final_summary.cpython-38.pyc",
+      "bytes": 8175,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/make_blocks.cpython-313.pyc",
+      "bytes": 9331,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/make_blocks.cpython-38.pyc",
+      "bytes": 5150,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/noise_profile.cpython-313.pyc",
+      "bytes": 23946,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/noise_profile.cpython-38.pyc",
+      "bytes": 13977,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/paper_tables.cpython-313.pyc",
+      "bytes": 48055,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/paper_tables.cpython-38.pyc",
+      "bytes": 32665,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/partition_probe.cpython-38.pyc",
+      "bytes": 30507,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/phase0_step_size.cpython-313.pyc",
+      "bytes": 44625,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/rcl_stage1_check.cpython-311.pyc",
+      "bytes": 16541,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/rcl_stage1_check.cpython-313.pyc",
+      "bytes": 14091,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/rcl_stage1_check.cpython-38.pyc",
+      "bytes": 8494,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/select_backbone.cpython-310.pyc",
+      "bytes": 8083,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/select_backbone.cpython-313.pyc",
+      "bytes": 12450,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/select_backbone.cpython-38.pyc",
+      "bytes": 8113,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/select_checkpoint.cpython-310.pyc",
+      "bytes": 12930,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/select_checkpoint.cpython-313.pyc",
+      "bytes": 18208,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/select_checkpoint.cpython-38.pyc",
+      "bytes": 12204,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/stream_energy.cpython-313.pyc",
+      "bytes": 12406,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/stream_energy.cpython-38.pyc",
+      "bytes": 8225,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/summarize_runs.cpython-313.pyc",
+      "bytes": 15033,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/summarize_runs.cpython-38.pyc",
+      "bytes": 10056,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/sweep_threshold.cpython-313.pyc",
+      "bytes": 13209,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/sweep_threshold.cpython-38.pyc",
+      "bytes": 8620,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/tbptt_grad_probe.cpython-313.pyc",
+      "bytes": 17871,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/tbptt_grad_probe.cpython-38.pyc",
+      "bytes": 11606,
+      "generated": true
+    },
+    {
+      "path": "tools/v14/__pycache__/queue.cpython-311.pyc",
+      "bytes": 28625,
+      "generated": true
+    },
+    {
+      "path": "tools/v14/__pycache__/queue.cpython-38.pyc",
+      "bytes": 13858,
+      "generated": true
+    },
+    {
+      "path": "tools/v14/__pycache__/run_experiment.cpython-311.pyc",
+      "bytes": 28189,
+      "generated": true
+    },
+    {
+      "path": "tools/v14/__pycache__/run_experiment.cpython-38.pyc",
+      "bytes": 14026,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/verify_predictions.cpython-313.pyc",
+      "bytes": 33729,
+      "generated": true
+    },
+    {
+      "path": "tools/__pycache__/verify_predictions.cpython-38.pyc",
+      "bytes": 20304,
+      "generated": true
+    },
+    {
+      "path": "__pycache__/train_end2end.cpython-313.pyc",
+      "bytes": 37767,
+      "generated": true
+    },
+    {
+      "path": "__pycache__/train_end2end.cpython-38.pyc",
+      "bytes": 23053,
+      "generated": true
+    },
+    {
+      "path": "__pycache__/train_mp.cpython-38.pyc",
+      "bytes": 18925,
+      "generated": true
+    },
+    {
+      "path": "__pycache__/train_track_head.cpython-310.pyc",
+      "bytes": 49079,
+      "generated": true
+    },
+    {
+      "path": "__pycache__/train_track_head.cpython-311.pyc",
+      "bytes": 93758,
+      "generated": true
+    },
+    {
+      "path": "__pycache__/train_track_head.cpython-313.pyc",
+      "bytes": 89459,
+      "generated": true
+    },
+    {
+      "path": "__pycache__/train_track_head.cpython-38.pyc",
+      "bytes": 49432,
+      "generated": true
+    },
+    {
+      "path": "utils/__pycache__/aggregate.cpython-38.pyc",
+      "bytes": 4775,
+      "generated": true
+    },
+    {
+      "path": "utils/__pycache__/recording_groups.cpython-310.pyc",
+      "bytes": 4772,
+      "generated": true
+    },
+    {
+      "path": "utils/__pycache__/recording_groups.cpython-311.pyc",
+      "bytes": 7751,
+      "generated": true
+    },
+    {
+      "path": "utils/__pycache__/recording_groups.cpython-313.pyc",
+      "bytes": 6531,
+      "generated": true
+    },
+    {
+      "path": "utils/__pycache__/recording_groups.cpython-38.pyc",
+      "bytes": 4852,
+      "generated": true
+    },
+    {
+      "path": "utils/__pycache__/stcloss.cpython-38.pyc",
+      "bytes": 2132,
+      "generated": true
+    },
+    {
+      "path": "utils/__pycache__/train_numerics.cpython-310.pyc",
+      "bytes": 1821,
+      "generated": true
+    },
+    {
+      "path": "utils/__pycache__/train_numerics.cpython-311.pyc",
+      "bytes": 3132,
+      "generated": true
+    },
+    {
+      "path": "utils/__pycache__/train_numerics.cpython-313.pyc",
+      "bytes": 2571,
+      "generated": true
+    },
+    {
+      "path": "utils/__pycache__/train_numerics.cpython-38.pyc",
+      "bytes": 1829,
+      "generated": true
+    },
+    {
+      "path": "utils/__pycache__/vis.cpython-38.pyc",
+      "bytes": 1278,
+      "generated": true
+    },
+    {
+      "path": "model/__pycache__/noise_invariant.cpython-310.pyc",
+      "bytes": 11540,
+      "generated": true
+    },
+    {
+      "path": "model/__pycache__/noise_invariant.cpython-311.pyc",
+      "bytes": 21470,
+      "generated": true
+    },
+    {
+      "path": "model/__pycache__/noise_invariant.cpython-313.pyc",
+      "bytes": 20096,
+      "generated": true
+    },
+    {
+      "path": "model/__pycache__/noise_invariant.cpython-38.pyc",
+      "bytes": 11606,
+      "generated": true
+    },
+    {
+      "path": "model/__pycache__/comod.cpython-310.pyc",
+      "bytes": 17925,
+      "generated": true
+    },
+    {
+      "path": "model/__pycache__/comod.cpython-311.pyc",
+      "bytes": 32553,
+      "generated": true
+    },
+    {
+      "path": "model/__pycache__/comod.cpython-313.pyc",
+      "bytes": 31298,
+      "generated": true
+    },
+    {
+      "path": "model/__pycache__/comod.cpython-38.pyc",
+      "bytes": 17859,
+      "generated": true
+    },
+    {
+      "path": "dataset/__pycache__/noise_aug.cpython-310.pyc",
+      "bytes": 4420,
+      "generated": true
+    },
+    {
+      "path": "dataset/__pycache__/noise_aug.cpython-311.pyc",
+      "bytes": 7636,
+      "generated": true
+    },
+    {
+      "path": "dataset/__pycache__/noise_aug.cpython-313.pyc",
+      "bytes": 7241,
+      "generated": true
+    },
+    {
+      "path": "dataset/__pycache__/noise_aug.cpython-38.pyc",
+      "bytes": 4422,
+      "generated": true
+    }
+  ],
+  "preserved": [
+    "V15 code/config/tests",
+    "V5 base configs",
+    "existing pool/queue/holder",
+    "all documents, References, Res, datasets, weights",
+    "historical statistics JSON/JSONL"
+  ],
+  "restored_and_pruned_files": [
+    {
+      "path": "tests/test_stream_comm.py",
+      "sha256": "fe92cb77725a4f840204171d8a0a0f3eeef48c3dcaf0ec48ddbcb3474866ac4a",
+      "bytes": 25472,
+      "git_tracked": true,
+      "current_sha256": "7c8177595439f05dd88535c0d70981a830617598b7ef2513cf0f3dd4f3c4350f",
+      "action": "restored_and_pruned_to_v5_numerical_regressions"
+    },
+    {
+      "path": "tests/test_stream_layerwise.py",
+      "sha256": "e51c53d563ed362f54b5552f962a9121574a78ccb4bbb145ccf19a825d727091",
+      "bytes": 20237,
+      "git_tracked": true,
+      "current_sha256": "2cc1b08226a6aac6c440ed8f4188c7b8543ca5c4c6a6ffddd718528e2c75494e",
+      "action": "restored_and_pruned_to_v5_numerical_regressions"
+    },
+    {
+      "path": "tests/test_stream_multistream.py",
+      "sha256": "80f9e14a08fcb3b9f8071aef4f52f13146ee5477788b3b874aee4acdb9929e17",
+      "bytes": 18612,
+      "git_tracked": true,
+      "current_sha256": "48549ff711bb42119c5f1d4b6dd84ccef775947101f7950c5aebad04212af67c",
+      "action": "restored_and_pruned_to_v5_numerical_regressions"
+    },
+    {
+      "path": "tests/test_stream_tif.py",
+      "sha256": "b67f9a089c113008f56b0b7f5de235ce84f26b0f6704d573feb02f2da7a5f330",
+      "bytes": 29724,
+      "git_tracked": true,
+      "current_sha256": "c7dfbdeebb4ebaeed19390c7f2094210493e2168615ac1a996cad70aa0f40531",
+      "action": "restored_and_pruned_to_v5_numerical_regressions"
+    },
+    {
+      "path": "tests/test_stream_torch.py",
+      "sha256": "6b5d9be09ff12a85b2950c7b726598c7369a680583159e945da29a0828d183bb",
+      "bytes": 12396,
+      "git_tracked": true,
+      "current_sha256": "8215107d0c9b4b673c6eb7d98dd3d2a1c095abe30850be8e829b0e876246f6de",
+      "action": "restored_and_pruned_to_v5_numerical_regressions"
+    },
+    {
+      "path": "tests/test_stream_variable_length.py",
+      "sha256": "d4cadd9010fdc2bec8470e61e47b026f43332e77de709017f350ae0aaaa29dd4",
+      "bytes": 6906,
+      "git_tracked": true,
+      "current_sha256": "030cec47f53f1d321d0b7016290f830bd3a2d44ef13f8a787b76b319960a3daa",
+      "action": "restored_and_pruned_to_v5_numerical_regressions"
+    }
+  ],
+  "runtime_dependency_closure_at_initial_cleanup": [
+    "dataset/ev_uav_stream.py",
+    "dataset/noise_aug.py",
+    "dataset/stream_source.py",
+    "dataset/stream_windows.py",
+    "model/comod.py",
+    "model/evspsegnet_stream.py",
+    "model/lif2d_stream.py",
+    "model/noise_invariant.py",
+    "model/observation_revision.py",
+    "tests/test_gpu_hold.py",
+    "tests/test_stream_common_metrics.py",
+    "tests/test_stream_windows.py",
+    "tests/test_v15_backbone.py",
+    "tests/test_v15_profile.py",
+    "tests/test_v15_queue.py",
+    "tests/test_v15_revision.py",
+    "tests/test_v15_training.py",
+    "tools/stream_train_stats.py",
+    "tools/v15/local_probe.py",
+    "tools/v15/package_results.py",
+    "tools/v15/profile.py",
+    "tools/v15/queue_jobs.py",
+    "tools/v15/run_experiment.py",
+    "tools/v15/train.py",
+    "train_stream_v1.py",
+    "utils/comm_budget.py",
+    "utils/eval.py",
+    "utils/stream_common.py",
+    "utils/stream_metrics.py"
+  ],
+  "note_final_helper_cleanup": "Removed legacy noise augmentation/background modules only after V15 helpers, data source and backbone imports were removed.",
+  "final_release_source_files": [
+    "configs/evisseg_stream_tif_comm_peak.yaml",
+    "configs/v15/causal.yaml",
+    "configs/v15/deep.yaml",
+    "configs/v15/observation.yaml",
+    "dataset/ev_uav_stream.py",
+    "dataset/stream_source.py",
+    "dataset/stream_windows.py",
+    "model/__init__.py",
+    "model/evspsegnet_stream.py",
+    "model/lif2d_stream.py",
+    "model/observation_revision.py",
+    "tools/stream_train_stats.py",
+    "tools/v15/package_results.py",
+    "tools/v15/profile.py",
+    "tools/v15/queue_jobs.py",
+    "tools/v15/run_experiment.py",
+    "tools/v15/train.py",
+    "train_stream_v1.py",
+    "utils/comm_budget.py",
+    "utils/eval.py",
+    "utils/stream_common.py",
+    "utils/stream_metrics.py"
+  ],
+  "verification": {
+    "python": "3.8.20 (default, Oct  3 2024, 15:19:54) [MSC v.1929 64 bit (AMD64)]",
+    "source_snapshot_files": 22,
+    "frozen_imports": "train/profile import passed",
+    "frozen_entry_help": "queue/run/package/train/profile passed",
+    "unit_tests_passed": 137
+  }
+}

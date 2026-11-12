@@ -16,7 +16,6 @@ import torch
 
 from dataset.ev_uav_stream import window_to_device
 from dataset.stream_windows import normalization_table, num_input_channels
-from model.noise_invariant import BackgroundTracker
 
 INPUT_DEVICES = ("cpu", "gpu")
 
@@ -33,28 +32,9 @@ def make_window_source(seq, cfg, q99, device, dtype=torch.float32):
         source = TorchWindowSource(seq, cfg, q99, device, dtype)
     else:
         raise ValueError("input_device 必须是 %s 之一，收到 %r" % (INPUT_DEVICES, kind))
-    if cfg.get("invariant_input") and cfg.get("clutter_estimator", "online") == "online":
-        # 模块二：events 另带 "bg"（本窗的因果背景率估计；window: [1,2,H,W]，chunk: [T,1,2,H,W]）
-        # clutter_estimator = learned 时背景率由网络里学出来的杂波场给出（model/clutter_field.py），数据端不再估计
-        return BackgroundSource(source, BackgroundTracker(seq, cfg, device))
+    if cfg.get("invariant_input"):
+        raise ValueError("Historical invariant-input normalization is not part of V15")
     return source
-
-
-class BackgroundSource(object):
-    """给任一窗口数据来源加上 events["bg"]（模块二的背景估计，model/noise_invariant.BackgroundTracker），其余输出不变。"""
-
-    def __init__(self, source, tracker):
-        self.source, self.tracker = source, tracker
-
-    def window(self, k):
-        x, events, labels, idx = self.source.window(k)
-        events["bg"] = self.tracker.background(k, k + 1)
-        return x, events, labels, idx
-
-    def chunk(self, start, end):
-        x, events, labels, idx = self.source.chunk(start, end)
-        events["bg"] = self.tracker.background(start, end).unsqueeze(1)
-        return x, events, labels, idx
 
 
 def _cast(x, events, labels, dtype):
