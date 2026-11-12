@@ -14,6 +14,66 @@ import math
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.autograd.function import once_differentiable
+
+
+def _linear_resize_adjoint(gradient, input_length, scale):
+    """Gather each input's finite interpolation support, then reduce in order.
+
+    For align_corners=False the source coordinate is (j + .5)/scale - .5,
+    clamped at the image boundary. Integer enlargement has at most 2*scale
+    contributing output positions per input. This is the transpose of that
+    interpolation, without the atomic scatter used by old CUDA upsampling.
+    Temporary storage is at most twice the incoming gradient, not a dense
+    input_length x output_length interpolation matrix.
+    """
+    position = torch.arange(input_length, device=gradient.device)
+    offset = torch.arange(2 * scale, device=gradient.device)
+    indices = position[:, None] * scale - scale // 2 + offset[None, :]
+    valid = (indices >= 0) & (indices < gradient.shape[-1])
+    safe = indices.clamp(0, gradient.shape[-1] - 1)
+    coordinate = ((safe.to(gradient.dtype) + 0.5) / scale - 0.5).clamp(0, input_length - 1)
+    weight = (1 - (coordinate - position[:, None].to(gradient.dtype)).abs()).clamp_min(0)
+    weight = weight * valid.to(gradient.dtype)
+    gathered = gradient.index_select(-1, safe.reshape(-1))
+    gathered = gathered.reshape(*gradient.shape[:-1], input_length, 2 * scale)
+    return (gathered * weight).sum(-1)
+
+
+class _BilinearResize(torch.autograd.Function):
+    """Native bilinear forward with a deterministic integer-scale adjoint.
+
+    PyTorch 1.9 CUDA rejects native bilinear backward in strict deterministic
+    mode. Keeping its forward preserves inference exactly; only the order of
+    gradient accumulation changes. This operator supports first-order training
+    and integer enlargement (the patch-to-canvas path), not arbitrary resizing.
+    """
+    @staticmethod
+    def forward(ctx, value, size):
+        height, width = value.shape[-2:]
+        if (len(size) != 2 or size[0] < height or size[1] < width
+                or size[0] % height or size[1] % width):
+            raise ValueError("Deterministic bilinear resize requires integer enlargement")
+        ctx.input_hw = (height, width)
+        ctx.scales = (size[0] // height, size[1] // width)
+        return F.interpolate(value, size=size, mode="bilinear", align_corners=False)
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, gradient):
+        height, width = ctx.input_hw
+        sy, sx = ctx.scales
+        gradient = _linear_resize_adjoint(gradient, width, sx)
+        gradient = _linear_resize_adjoint(gradient.transpose(-2, -1), height, sy)
+        return gradient.transpose(-2, -1), None
+
+
+def bilinear_resize(value, size):
+    # Use the same path on CPU/GPU so old-version CPU tests exercise the
+    # backward implementation used on the server. Inference remains native.
+    if torch.is_grad_enabled() and value.requires_grad:
+        return _BilinearResize.apply(value, tuple(size))
+    return F.interpolate(value, size=size, mode="bilinear", align_corners=False)
 
 
 class ObservationRevision(nn.Module):
@@ -138,19 +198,15 @@ class ObservationRevision(nn.Module):
         reject = attention[:, :, -1].mean(1).reshape(batch, 1, height, width)
         projected = self.output(message)
         if geometry is None:
-            correction = F.interpolate(projected, size=old_features.shape[-2:],
-                                       mode="bilinear", align_corners=False)
-            reject_full = F.interpolate(reject, size=old_features.shape[-2:], mode="bilinear", align_corners=False)
+            correction = bilinear_resize(projected, old_features.shape[-2:])
+            reject_full = bilinear_resize(reject, old_features.shape[-2:])
         else:
             # Do not attenuate a valid boundary pixel by averaging with a
             # nonexistent neighboring patch. Normalize interpolation over
             # valid query patches; the full-resolution mask is applied below.
-            scale = F.interpolate(geometry[1], size=old_features.shape[-2:],
-                                  mode="bilinear", align_corners=False).clamp_min(1e-12)
-            correction = F.interpolate(projected * geometry[1], size=old_features.shape[-2:],
-                                       mode="bilinear", align_corners=False) / scale
-            reject_full = F.interpolate(reject * geometry[1], size=old_features.shape[-2:],
-                                        mode="bilinear", align_corners=False) / scale
+            scale = bilinear_resize(geometry[1], old_features.shape[-2:]).clamp_min(1e-12)
+            correction = bilinear_resize(projected * geometry[1], old_features.shape[-2:]) / scale
+            reject_full = bilinear_resize(reject * geometry[1], old_features.shape[-2:]) / scale
         gate = torch.sigmoid(self.gate(torch.cat((old_features, correction, reject_full), 1)))
         delta = gate * correction
         if geometry is not None:

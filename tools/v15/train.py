@@ -31,6 +31,7 @@ from dataset.stream_source import make_window_source
 from dataset import stream_windows as sw
 from model.evspsegnet_stream import count_parameters
 from model.observation_revision import ObservationRevision
+from tools.v15.runtime_check import check_revision_backward
 from train_stream_v1 import (build_net, seed_everything, load_stats, run_calibration,
                              plan_streams, stream_pieces, stream_total_windows,
                              StreamSources, assemble_streams, stream_valid, tau_statistics)
@@ -38,12 +39,12 @@ from utils.comm_budget import CommBudget, window_messages
 from utils.stream_common import load_flat_config, linear_epoch_lr
 from utils.stream_metrics import FastRoc, window_confusion, threshold_counts, sweep_summary
 
-DESIGN = "v15-native-observation-revision-r2"
+DESIGN = "v15-native-observation-revision-r3"
 MODES = ("observation", "deep", "causal")
 SOURCE_FILES = ("tools/v15/train.py", "train_stream_v1.py", "dataset/ev_uav_stream.py",
                 "dataset/stream_windows.py", "dataset/stream_source.py",
                 "model/evspsegnet_stream.py", "model/lif2d_stream.py",
-                "model/observation_revision.py", "utils/comm_budget.py",
+                "model/observation_revision.py", "tools/v15/runtime_check.py", "utils/comm_budget.py",
                 "utils/stream_common.py", "utils/stream_metrics.py")
 
 
@@ -728,6 +729,11 @@ def train(cfg, args):
         ckpt = load_checkpoint(out / "last.pt", torch.device("cpu"))
         if ckpt.get("design") != DESIGN or ckpt["config"] != cfg:
             raise ValueError("Resume config/source/data differs from checkpoint")
+    if cfg["revision_source"] != "causal":
+        # Check the actual CUDA backward before statistics/calibration. The
+        # isolated probe restores RNG/settings and never touches trained weights.
+        write_json(out / "runtime_check.json", check_revision_backward(device))
+    if args.resume:
         stats = ckpt["stats"]
     elif Path(cfg["stats_path"]).is_file():
         stats, _, _ = load_stats(cfg)

@@ -11,6 +11,6 @@
 
 训练/评估入口是 `tools/v15/train.py`；自动流水线是 `tools/v15/run_experiment.py`。`train_stream_v1.py` 只保留 V5 数据、校准、分流辅助函数，已不是旧训练 CLI。无需稀疏卷积扩展。
 
-当前上传版本为 `feature_20261112_r2`。本地通过不等于正式精度验证；请用完整验证集选模，再报告测试集结果。
+当前上传版本为 `feature_20261112_r3`。本地通过不等于正式精度验证；请用完整验证集选模，再报告测试集结果。
 
 原 EV-UAV 基线的说明及出处保存在 [上游 README](docs/EVUAV_BASELINE_README.md)，完整参考代码仍在本地 `References/同类竞品/EV-UAV` 和 Git 历史中。历史研究记录保留，部分旧文档提到的命令不适用于 V15。

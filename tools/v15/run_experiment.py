@@ -18,14 +18,14 @@ import time
 import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_RELEASE = "feature_20261112_r2"
+DEFAULT_RELEASE = "feature_20261112_r3"
 DEFAULT_DATA = "/media/stephen/nvme0n1/wy_data/datasets/EV-UAV-dataset"
 MODES = ("observation", "deep", "causal")
 SPLIT_COUNTS = {"train": 99, "val": 24, "test": 24}
 RUNTIME_FILES = (
     "train_stream_v1.py", "tools/stream_train_stats.py",
     "tools/v15/train.py", "tools/v15/run_experiment.py", "tools/v15/queue_jobs.py",
-    "tools/v15/package_results.py", "tools/v15/profile.py",
+    "tools/v15/package_results.py", "tools/v15/profile.py", "tools/v15/runtime_check.py",
     "model/evspsegnet_stream.py", "model/lif2d_stream.py", "model/observation_revision.py",
     "dataset/ev_uav_stream.py", "dataset/stream_source.py", "dataset/stream_windows.py",
     "utils/comm_budget.py", "utils/eval.py", "utils/stream_common.py", "utils/stream_metrics.py",
