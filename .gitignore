@@ -11,7 +11,8 @@ References/
 .idea/
 .pytest_cache/
 CLAUDE/
-CLAUDE.md
+# Local research timeline; keep it across branch changes, outside Git.
+/[Cc][Ll][Aa][Uu][Dd][Ee].[Mm][Dd]
 outputs/
 tmp/
 AGENTS.md
