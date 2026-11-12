@@ -49,7 +49,68 @@ class StopLegacyTrainingTests(unittest.TestCase):
         with mock.patch.object(S, "owned_pids", return_value=[123, 124]):
             with self.assertRaisesRegex(S.StopRefused, "Multiple"):
                 S.find_matches(self.root, self.out, 1000,
-                               reader=lambda pid: replace(self.process, pid=pid))
+                               reader=lambda pid: replace(self.process, pid=pid),
+                               argv_reader=lambda pid: self.process.argv)
+
+    def test_unrelated_processes_never_require_cwd_access(self):
+        commands = {2810: ("/usr/bin/session-service",),
+                    2811: ("python", "other.py", "tools/bst/train.py"),
+                    2812: ("python", str(self.root/"other/tools/bst/train.py")),
+                    123: self.process.argv}
+        def full_reader(pid):
+            if pid != 123:
+                raise PermissionError("unrelated /proc/%d/cwd is protected" % pid)
+            return self.process
+        reader = mock.Mock(side_effect=full_reader)
+        with mock.patch.object(S, "owned_pids", return_value=list(commands)):
+            found = S.find_matches(self.root, self.out, 1000, reader=reader,
+                                   argv_reader=commands.get)
+        self.assertEqual(found, [self.process])
+        reader.assert_called_once_with(123)
+
+    def test_candidate_cwd_permission_failure_still_refuses(self):
+        with mock.patch.object(S, "owned_pids", return_value=[123]), mock.patch.object(S.os, "kill") as kill:
+            with self.assertRaisesRegex(S.StopRefused, "cwd"):
+                S.find_matches(self.root, self.out, 1000,
+                    reader=mock.Mock(side_effect=S.StopRefused("candidate cwd permission denied")),
+                    argv_reader=lambda pid: self.process.argv)
+            kill.assert_not_called()
+
+    def test_unreadable_command_line_is_reported_without_blocking_verified_target(self):
+        def commands(pid):
+            if pid == 2810:
+                raise PermissionError("cmdline denied")
+            return self.process.argv
+        reader = mock.Mock(return_value=self.process)
+        with mock.patch.object(S, "owned_pids", return_value=[2810, 123]), \
+             mock.patch("sys.stderr", new_callable=io.StringIO) as output:
+            found = S.find_matches(self.root, self.out, 1000, reader=reader, argv_reader=commands)
+        self.assertEqual(found, [self.process])
+        reader.assert_called_once_with(123)
+        self.assertIn("2810", output.getvalue())
+        self.assertIn("not inspected or signaled", output.getvalue())
+
+    def test_incomplete_scan_does_not_report_target_absent(self):
+        with mock.patch.object(S, "owned_pids", return_value=[2810]), \
+             mock.patch("sys.stderr", new_callable=io.StringIO), mock.patch.object(S.os, "kill") as kill:
+            with self.assertRaisesRegex(S.StopRefused, "Incomplete process scan"):
+                S.find_matches(self.root, self.out, 1000,
+                    argv_reader=mock.Mock(side_effect=PermissionError("cmdline denied")))
+            kill.assert_not_called()
+
+    def test_discovery_race_still_requires_full_identity_match(self):
+        unrelated = replace(self.process, argv=("python", "unrelated.py"))
+        for current in (None, unrelated, replace(self.process, real_uid=99)):
+            with self.subTest(current=current), mock.patch.object(S, "owned_pids", return_value=[123]):
+                self.assertEqual(S.find_matches(self.root, self.out, 1000,
+                    reader=lambda pid: current, argv_reader=lambda pid: self.process.argv), [])
+
+    def test_discovery_handles_exited_and_empty_command_lines(self):
+        reader = mock.Mock(side_effect=AssertionError("no candidate should be inspected"))
+        with mock.patch.object(S, "owned_pids", return_value=[1, 2]):
+            self.assertEqual(S.find_matches(self.root, self.out, 1000, reader=reader,
+                                           argv_reader=lambda pid: None if pid == 1 else ()), [])
+        reader.assert_not_called()
 
     def test_changed_identity_before_signal_is_never_killed(self):
         for changed in (replace(self.process, start_ticks=40002),
@@ -135,6 +196,8 @@ class StopLegacyTrainingTests(unittest.TestCase):
         fields = ["R"] + ["0"] * 18 + [str(self.process.start_ticks)] + ["0"] * 4
         (proc/"stat").write_text("123 (python (worker)) " + " ".join(fields))
         (proc/"cmdline").write_bytes(b"\0".join(word.encode() for word in self.process.argv) + b"\0")
+        self.assertEqual(S.read_argv(123, self.root/"proc"), self.process.argv)
+        self.assertIsNone(S.read_argv(999, self.root/"proc"))
         with mock.patch.object(S.os, "readlink", return_value=str(self.root)):
             self.assertEqual(S.read_process(123, self.root/"proc"), self.process)
         fields[0] = "Z"

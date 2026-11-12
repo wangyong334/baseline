@@ -43,6 +43,15 @@ def stat_identity(raw):
     return fields[0], int(fields[19])
 
 
+def read_argv(pid, proc_root=Path("/proc")):
+    """Discovery only: do not require ptrace permission to inspect a cwd."""
+    try:
+        raw = (Path(proc_root)/str(pid)/"cmdline").read_bytes()
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    return tuple(os.fsdecode(part) for part in raw.rstrip(b"\0").split(b"\0")) if raw else ()
+
+
 def read_process(pid, proc_root=Path("/proc")):
     folder = Path(proc_root)/str(pid)
     try:
@@ -137,14 +146,44 @@ def matches(process, root, output, uid):
     return actual == output
 
 
-def find_matches(root, output, uid, reader=read_process):
+def trainer_entry(argv, root):
+    """Recognize the queue's canonical entry; full identity checks follow."""
+    position = python_script_index(argv)
+    if position is None:
+        return False
+    script = Path(argv[position])
+    # The requested process must have cwd=root. Normalize lexically under that
+    # hypothesis: resolving arbitrary unrelated paths could itself need access
+    # to protected directories. Queue jobs use this canonical script path.
+    candidate = Path(os.path.normpath(str(script if script.is_absolute() else root/script)))
+    return candidate == root/"tools/bst/train.py"
+
+
+def find_matches(root, output, uid, reader=read_process, argv_reader=read_argv):
     found = []
+    unreadable = []
     for pid in owned_pids(uid):
+        try:
+            argv = argv_reader(pid)
+        except PermissionError:
+            unreadable.append(pid)
+            continue
+        except OSError as error:
+            raise StopRefused("Cannot read command line for PID %d: %s" % (pid, error))
+        if not argv or not trainer_entry(argv, root):
+            continue
+        # Only plausible trainers need cwd inspection. A candidate that cannot
+        # be fully inspected must still fail closed, never be silently skipped.
         process = reader(pid)
         if matches(process, root, output, uid):
             found.append(process)
+    if unreadable:
+        print("SCAN_NOTE: unreadable command lines for PIDs %s; these processes were not inspected or signaled"
+              % unreadable, file=sys.stderr)
     if len(found) > 1:
         raise StopRefused("Multiple matching trainers; refusing to guess: %s" % [p.pid for p in found])
+    if not found and unreadable:
+        raise StopRefused("Incomplete process scan: no verified trainer found; unreadable command lines prevent confirming absence")
     return found
 
 

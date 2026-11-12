@@ -16,6 +16,8 @@ python tools/bst/stop_legacy_training.py \
 
 默认仅显示匹配进程，不发送任何信号。匹配条件同时包含当前用户、当前项目的精确工作目录、Python 的 `tools/bst/train.py` 入口、唯一且解析后相同的 `--out`。不依赖截图里的旧 PID；多个匹配或参数歧义会拒绝。
 
+权限兼容修复：枚举时先读取命令行，排除其他程序后才读取候选训练进程的工作目录。无关进程的 `/proc/<pid>/cwd` 不可读不再阻断扫描；无法读取命令行的 PID 单独提示且不发送信号。若候选训练进程无法完整核实，或扫描不完整且没有找到可核实目标，仍明确拒绝。遇到旧版的 `Cannot inspect PID 2810 ... /cwd` 时，重新单独上传更新后的停止工具并重试，无需 sudo。
+
 ## 2. 停止旧 trainer 并确认队列交接
 
 ```bash
@@ -75,7 +77,28 @@ tail -n 12 run/queue/gpu1.log
 
 `--config configs/bst_final.json` 必须显式保留，队列工具的兼容默认仍是旧 `bst_shared.json`。r3 标签必须尚未使用。两个任务在 GPU 1 串行，使用入队时冻结的源码快照；不要重新启动池子，不执行 `--recover-reboot`，不单独启动 worker。
 
-默认读取相邻 `EV-UAV-v8-rcl41/log/stream_tif_commpeak_msg_seed37/` 和 `seed38/` 下对应的 `best_val_iou_seed*.pt`。工具会检查真实权重、内部种子及 SHA256；**服务器种子 38 权重是否存在尚未远程确认**。缺失时预检失败，不发布任务；应使用真实权重路径覆盖 `--backbone-38`，不能拿 37 冒充。
+默认读取相邻 `EV-UAV-v8-rcl41/log/stream_tif_commpeak_msg_seed37/` 和 `seed38/` 下对应的 `best_val_iou_seed*.pt`。这里 seed38 的默认命名与历史实际路径不同：`queue_round2.sh`、`queue_v10.sh` 及历史训练记录明确使用 `log/final/bb_v5_50_seed38/selected_seed38.pt`（V5 TIF、50 ms、carry、seed38，历史选择 epoch36）。若默认路径报缺失，用下面的文件软链接兼容现有队列命令；不复制权重，也不覆盖已有其他文件。
+
+```bash
+(
+  set -e
+  base=/media/stephen/nvme0n1/wy_data/EV-UAV-v8-rcl41
+  src="$base/log/final/bb_v5_50_seed38/selected_seed38.pt"
+  dst="$base/log/stream_tif_commpeak_msg_seed38/best_val_iou_seed38.pt"
+  [ -s "$src" ] || { echo "真实 seed38 权重不存在：$src"; exit 1; }
+  python - "$src" <<'PY'
+import sys
+from tools.bst.queue_final import backbone_seed
+if backbone_seed(sys.argv[1]) != 38:
+    raise SystemExit("权重内部种子不是 38，未创建链接")
+PY
+  mkdir -p "$(dirname "$dst")"
+  if ! [ "$src" -ef "$dst" ]; then ln -sT "$src" "$dst"; fi
+  readlink -f "$dst"
+)
+```
+
+在新项目根目录执行，成功后重跑上面的 dry-run 和入队命令。当前远端实体是否存在仍由 `test -s` 实际确认；工具继续检查内部种子及 SHA256，链接最终解析到真实权重记录，不会把 37 当作 38。
 
 冻结源码位置：`run/bst_final/final_20261111_r3/source/`。两组输出为 `log/bst_final_final_20261111_r3_v5s37_s37/` 和 `log/bst_final_final_20261111_r3_v5s38_s38/`。实际训练日志会记录几何准备、网络更新、验证与各轮耗时；本地探针速度不是服务器整轮时间保证。
 
