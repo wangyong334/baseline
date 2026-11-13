@@ -17,6 +17,12 @@ No neighbour search: the maps are built once per window and shared by every unit
 Cost (11-13 evening): with events as observations a box without events has weight 0, so only boxes with events are
 computed (event-driven); the token form "glm" reads each box with a context-modulated linear model of its count
 statistics instead of a d-dimensional embedding (about 1/50 of the multiply-accumulates of the form "mlp").
+V18 (11-13 night): the unit read as a two-compartment neuron -- the dendrite settles at the conductance-weighted mean
+of the box evidence (conductance = attribution x events, the pseudo-observation is the leak; Eq. 4), the soma
+integrates the dendritic current of every window and fires at its collapsing bound (Eq. 5, 7). Decision spikes as
+messages: units of a first population emit one spike when they commit (target or background, at their event's
+pixel); a second population reads these spikes as two more box statistics, so the events of one source are decided
+together (EvidenceMaps(messages=...), CooperativeStreamingLayer).
 """
 import math
 
@@ -26,6 +32,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 N_FEAT = 5                      # log1p(n_same), log1p(n_opp), log1p(q_same), log1p(q_opp), in-frame area fraction
+N_MSG = 2                       # V18 decision spikes of the first population in the box: log1p(target), log1p(background)
 CENTRE = 4                      # index of the level-0 centre box (it holds the event itself)
 Q_SCALE = 4096                  # fixed-point scale of q in the integer maps (exact, order-independent sums)
 EPS = 1e-6
@@ -52,6 +59,20 @@ def box_layout(levels=4):
     return rect, r, np.asarray(lev, np.int64)
 
 
+def martingale_penalty(U, vm, w, bins=10):
+    """V18 loss term: drift of the posterior P = sigmoid(U) from one step to the next given its current value
+    (triangular soft bins of P, importance weights w). A posterior sequence is a martingale -- its revision cannot be
+    predicted from the current belief -- so this is zero for it. Returns the mass-weighted mean squared drift."""
+    P = torch.sigmoid(U)
+    both = vm[:, :-1] * vm[:, 1:]
+    d = (P[:, 1:] - P[:, :-1]) * both
+    centres = torch.linspace(0.0, 1.0, bins, device=U.device)
+    k = (1.0 - (P[:, :-1, None] - centres).abs() * (bins - 1)).clamp(min=0) * (both * w[:, None])[..., None]
+    mass = k.sum((0, 1))
+    drift = (k * d[..., None]).sum((0, 1)) / mass.clamp(min=1e-6)
+    return (mass / mass.sum().clamp(min=1e-6) * drift ** 2).sum()
+
+
 def quantised_q(z0):
     """sigmoid(z0) in the fixed-point unit of the maps (int64 tensor)."""
     return torch.round(torch.sigmoid(z0.float()) * Q_SCALE).long()
@@ -60,23 +81,33 @@ def quantised_q(z0):
 class EvidenceMaps(object):
     """Integral images of one recording (Eq. 2): for every window and polarity, the event count n and the expected
     number of target events q = sum sigmoid(z0) of each pixel (z0 = calibrated prior of the frozen backbone). Integer
-    arithmetic, so every box sum is exact and independent of the summation order; a box sum costs four lookups."""
+    arithmetic, so every box sum is exact and independent of the summation order; a box sum costs four lookups.
+    messages = (x, y, window, type) of the decision spikes of a first population of units (V18): a unit that commits
+    at the end of window w emits one spike at its event's pixel, type 1 = target, 0 = background; two more channels
+    count them per window (both polarities)."""
 
-    def __init__(self, x, y, win, pol, z0, n_win, height, width, device):
+    def __init__(self, x, y, win, pol, z0, n_win, height, width, device, messages=None):
         dev = torch.device(device)
         self.n_win, self.H, self.W = int(n_win), int(height), int(width)
+        self.n_ch = 4 if messages is None else 6
         P = (self.H + 1) * (self.W + 1)
         x, y, win, pol = (torch.as_tensor(np.asarray(a), dtype=torch.long, device=dev) for a in (x, y, win, pol))
         z0 = torch.as_tensor(np.asarray(z0), dtype=torch.float32, device=dev)
         if x.numel() and (int(x.min()) < 0 or int(x.max()) >= self.W or int(y.min()) < 0 or int(y.max()) >= self.H):
             raise ValueError("events outside the %d x %d sensor" % (self.W, self.H))
-        flat = torch.zeros(self.n_win * 4 * P, dtype=torch.int32, device=dev)
-        base = win * (4 * P) + (y + 1) * (self.W + 1) + (x + 1)
+        C_ = self.n_ch
+        flat = torch.zeros(self.n_win * C_ * P, dtype=torch.int32, device=dev)
+        base = win * (C_ * P) + (y + 1) * (self.W + 1) + (x + 1)
         flat.index_add_(0, base + pol * P, torch.ones_like(base, dtype=torch.int32))
         flat.index_add_(0, base + (2 + pol) * P, quantised_q(z0).int())
-        maps = flat.view(self.n_win, 4, self.H + 1, self.W + 1)
+        if messages is not None:
+            mx, my, mw, mt = (torch.as_tensor(np.asarray(a), dtype=torch.long, device=dev) for a in messages)
+            if mx.numel():
+                mb = mw * (C_ * P) + (my + 1) * (self.W + 1) + (mx + 1)
+                flat.index_add_(0, mb + (4 + (1 - mt)) * P, torch.ones_like(mb, dtype=torch.int32))
+        maps = flat.view(self.n_win, C_, self.H + 1, self.W + 1)
         maps = torch.cumsum(torch.cumsum(maps, 2, dtype=torch.int32), 3, dtype=torch.int32)
-        self.maps = maps.permute(0, 2, 3, 1).reshape(self.n_win, P, 4).contiguous()   # [window, pixel, channel]
+        self.maps = maps.permute(0, 2, 3, 1).reshape(self.n_win, P, C_).contiguous()   # [window, pixel, channel]
         self.device = dev
 
     def window_boxes(self, x, y, rect):
@@ -92,11 +123,13 @@ class EvidenceMaps(object):
         idx = torch.stack([y1 * w1 + x1, y0 * w1 + x1, y1 * w1 + x0, y0 * w1 + x0])
         return idx, area
 
-    def features(self, x, y, win, pol, z0, rect, n_steps, first=0, own_window=True):
+    def features(self, x, y, win, pol, z0, rect, n_steps, first=0, own_window=True, own_msg=None):
         """Box features of events for the windows win + first .. win + first + n_steps - 1 (Eq. 2):
-        feat [B, n_steps, K, N_FEAT] and window mask [B, n_steps] (False past the recording end). Polarity is relative
-        to the event (same / opposite); the event itself is removed from its centre box in its own window (the first
-        window read when first == 0 and own_window: a streaming caller that reads a later window passes False)."""
+        feat [B, n_steps, K, N_FEAT (+ N_MSG with messages)] and window mask [B, n_steps] (False past the recording
+        end). Polarity is relative to the event (same / opposite); the event itself is removed from its centre box in
+        its own window (the first window read when first == 0 and own_window: a streaming caller that reads a later
+        window passes False). own_msg = (step, type) of each event's own first-population spike (step -1: none, counted
+        from the event's window): it is removed from the centre box, so a unit hears only the decisions of others."""
         dev = self.device
         x, y, win, pol = (torch.as_tensor(a, dtype=torch.long, device=dev) for a in (x, y, win, pol))
         z0 = torch.as_tensor(z0, dtype=torch.float32, device=dev)
@@ -108,7 +141,7 @@ class EvidenceMaps(object):
         ok = w < self.n_win
         wc = w.clamp(max=self.n_win - 1)
         sign = (1, -1, -1, 1)
-        tot = torch.zeros(B, S, K, 4, dtype=torch.long, device=dev)
+        tot = torch.zeros(B, S, K, self.n_ch, dtype=torch.long, device=dev)
         for c in range(4):
             tot += sign[c] * self.maps[wc[:, :, None], idx[c][:, None, :]].long()
         same = pol.view(B, 1, 1, 1).expand(B, S, K, 1)
@@ -119,9 +152,21 @@ class EvidenceMaps(object):
         if first == 0 and own_window:                        # remove the event itself from its own centre box
             n_same[:, 0, CENTRE] -= 1
             q_same[:, 0, CENTRE] -= quantised_q(z0)
-        feat = torch.stack([torch.log1p(n_same.clamp(min=0).float()), torch.log1p(n_opp.float()),
-                            torch.log1p(q_same.clamp(min=0).float() / Q_SCALE), torch.log1p(q_opp.float() / Q_SCALE),
-                            area[:, None, :].expand(B, S, K)], -1)
+        cols = [torch.log1p(n_same.clamp(min=0).float()), torch.log1p(n_opp.float()),
+                torch.log1p(q_same.clamp(min=0).float() / Q_SCALE), torch.log1p(q_opp.float() / Q_SCALE),
+                area[:, None, :].expand(B, S, K)]
+        if self.n_ch == 6:                                    # decision spikes of others: target, background
+            msg = tot[..., 4:6].clone()
+            if own_msg is not None:
+                o_step = torch.as_tensor(np.asarray(own_msg[0]), dtype=torch.long, device=dev) - first
+                o_type = torch.as_tensor(np.asarray(own_msg[1]), dtype=torch.long, device=dev)
+                hit = (o_step >= 0) & (o_step < S)
+                if hit.any():
+                    b = torch.nonzero(hit).squeeze(1)
+                    msg[b, o_step[b], CENTRE, 1 - o_type[b]] -= 1
+            msg = msg.clamp(min=0).float()
+            cols += [torch.log1p(msg[..., 0]), torch.log1p(msg[..., 1])]
+        feat = torch.stack(cols, -1)
         return feat * ok[:, :, None, None].float(), ok
 
 
@@ -159,8 +204,9 @@ class SpikingDecisionUnits(nn.Module):
     gate."""
 
     def __init__(self, n_steps, r, dim=64, heads=4, value="ei", gate="attribution", pool="window", evidence="boxes",
-                 context=True, audit="reaudit", tokens="mlp", ctx_ff=True):
+                 context=True, audit="reaudit", tokens="mlp", ctx_ff=True, n_feat=N_FEAT):
         super(SpikingDecisionUnits, self).__init__()
+        self.n_feat = Fn = int(n_feat)                                      # box statistics (V18: + decision spikes)
         if (value not in ("ei", "signed") or gate not in ("attribution", "distance")
                 or pool not in ("window", "mean", "sum") or evidence not in ("boxes", "events")
                 or audit not in ("reaudit", "ledger") or tokens not in TOKENS):
@@ -176,13 +222,13 @@ class SpikingDecisionUnits(nn.Module):
         self.register_buffer("r2", torch.as_tensor(r ** 2, dtype=torch.float32))
         sign = [1.0] * heads if value == "signed" else [1.0] * (heads // 2) + [-1.0] * (heads // 2)
         self.register_buffer("head_sign", torch.tensor(sign))
-        self.register_buffer("feat_mu", torch.zeros(N_FEAT))
-        self.register_buffer("feat_sd", torch.ones(N_FEAT))
+        self.register_buffer("feat_mu", torch.zeros(Fn))
+        self.register_buffer("feat_sd", torch.ones(Fn))
         self.register_buffer("z_ref", torch.tensor([0.0, 5.0]))           # prior mean / std of the input scaling
         S, K, attr = self.n_steps, self.n_box, gate == "attribution"
         self.c0 = nn.Sequential(nn.Linear(2, dim), nn.GELU(), nn.Linear(dim, dim))
         if tokens == "mlp":                                                # module set of the round 1-3 checkpoints
-            self.content = nn.Linear(N_FEAT, dim)
+            self.content = nn.Linear(Fn, dim)
             self.slot = nn.Parameter(torch.randn(S, K, dim) * 0.02)
             self.ln_k, self.ln_q, self.ln_f = nn.LayerNorm(dim), nn.LayerNorm(dim), nn.LayerNorm(dim)
             self.age = nn.Embedding(S, dim)
@@ -192,7 +238,7 @@ class SpikingDecisionUnits(nn.Module):
             self.ff = nn.Sequential(nn.Linear(dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
         else:
             if tokens == "linear":
-                self.content = nn.Linear(N_FEAT, dim)
+                self.content = nn.Linear(Fn, dim)
                 self.slot = nn.Parameter(torch.randn(S, K, dim) * 0.02)
                 if attr:
                     self.ln_q, self.age = nn.LayerNorm(dim), nn.Embedding(S, dim)
@@ -200,12 +246,12 @@ class SpikingDecisionUnits(nn.Module):
                 self.v_ctx, self.v_out = nn.Linear(dim, dim), nn.Linear(dim, heads)
                 self.wo = nn.Linear(dim, dim)
             else:
-                self.coef = nn.Parameter(torch.zeros(S, K, heads, N_FEAT))   # per window offset, box and head
+                self.coef = nn.Parameter(torch.zeros(S, K, heads, Fn))       # per window offset, box and head
                 self.bias = nn.Parameter(torch.zeros(S, K, heads))
-                self.dcoef = nn.Linear(dim, heads * (N_FEAT + 1))           # the context shifts them
+                self.dcoef = nn.Linear(dim, heads * (Fn + 1))               # the context shifts them
                 if attr:
-                    self.gq = nn.Linear(dim, heads * N_FEAT)
-                self.wo = nn.Linear(heads * N_FEAT, dim)
+                    self.gq = nn.Linear(dim, heads * Fn)
+                self.wo = nn.Linear(heads * Fn, dim)
             self.wm = nn.Linear(2 * heads, dim)
             if self.ctx_ff:
                 self.ln_f = nn.LayerNorm(dim)
@@ -254,7 +300,7 @@ class SpikingDecisionUnits(nn.Module):
         if self.tokens == "glm":
             coef = self.coef[first:first + S][None] if slot_idx is None else self.coef[slot_idx][:, None]
             bias = self.bias[first:first + S][None] if slot_idx is None else self.bias[slot_idx][:, None]
-            tok["x"] = x.reshape(B, T, N_FEAT)
+            tok["x"] = x.reshape(B, T, self.n_feat)
             tok["s"] = ((coef * x[..., None, :]).sum(-1) + bias).reshape(B, T, self.heads)
             return tok
         slot = self.slot[first:first + S][None] if slot_idx is None else self.slot[slot_idx][:, None]
@@ -278,8 +324,8 @@ class SpikingDecisionUnits(nn.Module):
         K, H = self.n_box, self.heads
         prior = self.rf_bias[:, None] - self.r2.repeat(n_win)[None, :] / (2.0 * self.sigma()[:, None] ** 2)
         if self.gate == "attribution" and self.tokens == "glm":
-            q = self.gq(c).view(B, H, N_FEAT)
-            logit = torch.einsum("bhf,btf->bht", q, tok["x"]) / math.sqrt(N_FEAT) + prior[None]
+            q = self.gq(c).view(B, H, self.n_feat)
+            logit = torch.einsum("bhf,btf->bht", q, tok["x"]) / math.sqrt(self.n_feat) + prior[None]
         elif self.gate == "attribution":
             q = self.wq(self.ln_q(c + self.age.weight[k])).view(B, H, self.hd)
             logit = torch.einsum("bhd,bthd->bht", q, tok["keys"]) / math.sqrt(self.hd) + prior[None]
@@ -288,8 +334,9 @@ class SpikingDecisionUnits(nn.Module):
         wm = torch.ones(B, n_win, device=cnt.device) if win_mask is None else win_mask.float()
         a = torch.sigmoid(logit) * wm.repeat_interleave(K, 1)[:, None, :]
         if self.tokens == "glm":
-            dc = self.dcoef(c).view(B, H, N_FEAT + 1)
-            v = tok["s"].permute(0, 2, 1) + torch.einsum("bhf,btf->bht", dc[..., :N_FEAT], tok["x"]) + dc[..., N_FEAT:]
+            Fn = self.n_feat
+            dc = self.dcoef(c).view(B, H, Fn + 1)
+            v = tok["s"].permute(0, 2, 1) + torch.einsum("bhf,btf->bht", dc[..., :Fn], tok["x"]) + dc[..., Fn:]
         else:
             v = self.v_out(F.gelu(tok["vals"] + self.v_ctx(c)[:, None, :])).permute(0, 2, 1)   # [B, H, T]
         if self.value == "ei":
@@ -325,7 +372,7 @@ class SpikingDecisionUnits(nn.Module):
     def start_sums(self, B, device):
         """Ledger units: running sums of the windows read so far -- attributed mass [B, H], mass-weighted value (glm:
         features) [B, H, hd or 5] and evidence [B, H]."""
-        width = N_FEAT if self.tokens == "glm" else self.hd
+        width = self.n_feat if self.tokens == "glm" else self.hd
         return (torch.zeros(B, self.heads, device=device), torch.zeros(B, self.heads, width, device=device),
                 torch.zeros(B, self.heads, device=device))
 
@@ -343,10 +390,14 @@ class SpikingDecisionUnits(nn.Module):
             if self.context:
                 c = torch.where(m[:, None], c0 + self.context_delta(ubar, mass, lam), c)
             return U, c, lam, mass, a, None
-        U = torch.where(m, U + ev, U)
         B, H = mass.shape
         new = (sums[0] + mass, sums[1] + ubar.view(B, H, -1) * mass[..., None], sums[2] + lam)
         sums = tuple(torch.where(m.view((B,) + (1,) * (n.dim() - 1)), n, o) for n, o in zip(new, sums))
+        if self.pool == "mean":           # ablation: the mean of the windows read so far, windows do not accumulate
+            n_read = torch.as_tensor(k, dtype=U.dtype, device=U.device) + 1.0
+            U = torch.where(m, z0 + (sums[2] * self.head_sign).sum(-1) / n_read, U)
+        else:
+            U = torch.where(m, U + ev, U)
         if self.context:
             M, X, L = sums
             mean = (X / M[..., None].clamp(min=EPS)).reshape(B, -1)
@@ -389,7 +440,7 @@ class SpikingDecisionUnits(nn.Module):
         boxes with events among them (arrays broadcast with k); None = every box. With evidence="events" a box without
         events has weight 0 everywhere (membrane, mass, context), so it is skipped exactly; with evidence="boxes" every
         box counts. Folded linear maps count once (linear: W_k W_c is one 5 x d map)."""
-        d, H, K, Fn = self.dim, self.heads, self.n_box, N_FEAT
+        d, H, K, Fn = self.dim, self.heads, self.n_box, self.n_feat
         attr = self.gate == "attribution"
         k = np.asarray(k)
         dense_aud = (k + 1) * K if self.audit == "reaudit" else np.full(k.shape, K)
@@ -469,14 +520,25 @@ class StreamingDecisionLayer(object):
         return {n[4:]: v for n, v in st.items() if n.startswith("tok_")}
 
     @torch.no_grad()
-    def window(self, t, x, y, pol, z0, ids, last_step):
+    def window(self, t, x, y, pol, z0, ids, last_step, messages=None, own_now=None):
+        """messages = (x, y, type) of the decision spikes emitted at the end of window t by a first population (units
+        with decision spikes as input, V18); own_now = {event id: type} of those spikes, removed from the own unit."""
         net, dev = self.net, self.device
         S, K = net.n_steps, net.n_box
         ledger = net.audit == "ledger"
         x, y, pol, ids = (np.asarray(a, np.int64) for a in (x, y, pol, ids))
         z0 = np.asarray(z0, np.float32)
         last_step = np.asarray(last_step, np.int64)
-        maps = EvidenceMaps(x, y, np.zeros(len(x), np.int64), pol, z0, 1, self.H, self.W, dev)
+        msg = None
+        if net.n_feat > N_FEAT:
+            mx, my, mt = (np.zeros(0, np.int64),) * 3 if messages is None else \
+                (np.asarray(a, np.int64) for a in messages)
+            msg = (mx, my, np.zeros(len(mx), np.int64), mt)
+        own_now = own_now or {}
+        own = lambda e: None if msg is None else (                   # noqa: E731
+            np.array([0 if i in own_now else -1 for i in e], np.int64),
+            np.array([own_now.get(i, 0) for i in e], np.int64))
+        maps = EvidenceMaps(x, y, np.zeros(len(x), np.int64), pol, z0, 1, self.H, self.W, dev, messages=msg)
         out = ([], [], [])
         z0_t = torch.as_tensor(z0, device=dev)
         entry = (torch.abs(z0_t - self.tau) >= self.bounds[0]).cpu().numpy()
@@ -488,7 +550,8 @@ class StreamingDecisionLayer(object):
         if self.st is not None:                                    # open units read window t
             M = self.open_units()
             f, _ = maps.features(self.meta["x"], self.meta["y"], np.zeros(M, np.int64), self.meta["pol"],
-                                 np.zeros(M, np.float32), self.rect, 1, own_window=False)    # z0 unused: not own window
+                                 np.zeros(M, np.float32), self.rect, 1, own_window=False,    # z0 unused: not own window
+                                 own_msg=own(self.meta["ids"]))
             tok_now = net.embed(f, slot_idx=self.st["age"])
             if not ledger:
                 self._write(self.st, torch.arange(M, device=dev), tok_now)
@@ -500,7 +563,8 @@ class StreamingDecisionLayer(object):
             c0 = net.start(zt, pt)
             nb = {"age": torch.zeros(n, dtype=torch.long, device=dev), "z0": zt, "c0": c0, "c": c0, "U": zt,
                   "last": torch.as_tensor(last_step[new], device=dev)}
-            f, _ = maps.features(x[new], y[new], np.zeros(n, np.int64), pol[new], z0[new], self.rect, 1)
+            f, _ = maps.features(x[new], y[new], np.zeros(n, np.int64), pol[new], z0[new], self.rect, 1,
+                                 own_msg=own(ids[new]))
             tok = net.embed(f, slot_idx=nb["age"])
             if ledger:
                 tok_now = tok if tok_now is None else {n_: torch.cat([tok_now[n_], tok[n_]]) for n_ in tok}
@@ -543,3 +607,34 @@ class StreamingDecisionLayer(object):
                 self.meta = {k: v[~f] for k, v in self.meta.items()}
         cat = lambda parts, dt: np.concatenate(parts) if parts else np.zeros(0, dt)    # noqa: E731
         return cat(out[0], np.int64), cat(out[1], np.int64), cat(out[2], np.float32)
+
+
+class CooperativeStreamingLayer(object):
+    """V18 deployment: two populations of decision units in one stream. Window t: the first population (units that
+    read only the evidence, V17) takes its step; every one of its units that commits at the end of window t emits one
+    decision spike at its event's pixel, target or background by its decision; the second population then takes its
+    step reading the evidence of window t together with these spikes (its own event's spike removed), and its
+    decisions are the output. Both populations run their own entry rule and calibrated bounds."""
+
+    def __init__(self, first, second):
+        self.first, self.second = first, second
+
+    def reset(self, x_all, y_all):
+        """x_all / y_all: positions of every event of the recording, indexed by the event ids passed to window()."""
+        self.first.reset()
+        self.second.reset()
+        self.x_all, self.y_all = np.asarray(x_all, np.int64), np.asarray(y_all, np.int64)
+
+    def open_units(self):
+        return self.first.open_units() + self.second.open_units()
+
+    def window(self, t, x, y, pol, z0, ids, last_step):
+        e1, c1, v1 = self.first.window(t, x, y, pol, z0, ids, last_step)
+        unit = c1 >= 1                                         # entry commits carry only the prior: no spike
+        typ = (v1[unit] >= self.first.tau).astype(np.int64)
+        mid = e1[unit]
+        own_now = dict(zip(mid.tolist(), typ.tolist()))
+        out = self.second.window(t, x, y, pol, z0, ids, last_step,
+                                 messages=(self.x_all[mid], self.y_all[mid], typ), own_now=own_now)
+        self.last_first = (e1, c1, v1)
+        return out
