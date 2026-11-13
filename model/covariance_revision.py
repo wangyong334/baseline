@@ -44,9 +44,10 @@ class CovarianceRevision(ContextEvidence):
     second: unchanged second score, without a fitted or trainable correction.
     """
     VARIANTS = ("full", "no_context", "no_revision", "second")
+    CHANNEL_BASES = ("shared_fisher", "joint_fisher")
 
     def __init__(self, feature_dim=60, hidden=8, kappa=2., variant="full",
-                 channels=8, shrinkage=.05):
+                 channels=8, shrinkage=.05, channel_basis="shared_fisher"):
         nn.Module.__init__(self)
         for name, value in (("feature_dim", feature_dim), ("hidden", hidden), ("channels", channels)):
             if isinstance(value, bool) or int(value) != value or value < 1:
@@ -55,12 +56,17 @@ class CovarianceRevision(ContextEvidence):
             raise ValueError("channels cannot exceed feature_dim + 1")
         if variant not in self.VARIANTS:
             raise ValueError("Unknown covariance variant: " + str(variant))
+        if channel_basis not in self.CHANNEL_BASES:
+            raise ValueError("Unknown covariance channel_basis: " + str(channel_basis))
+        if channel_basis == "joint_fisher" and channels < min(3, feature_dim + 1):
+            raise ValueError("joint_fisher needs at least min(3, feature_dim + 1) channels")
         if not math.isfinite(float(kappa)) or kappa <= 0:
             raise ValueError("kappa must be finite and positive")
         if not math.isfinite(float(shrinkage)) or not 0. < shrinkage <= 1.:
             raise ValueError("shrinkage must be in (0, 1]")
         self.feature_dim, self.hidden, self.channels = int(feature_dim), int(hidden), int(channels)
         self.kappa, self.variant, self.shrinkage = float(kappa), variant, float(shrinkage)
+        self.channel_basis = channel_basis
         self.has_context = variant in ("full", "no_revision")
         self.has_revision = variant != "second"
         d, c = self.feature_dim + 1, self.channels
@@ -92,8 +98,12 @@ class CovarianceRevision(ContextEvidence):
     def fit_statistics(self, first_z, second_z, first_h, second_h, labels):
         """Fit once from caller-supplied training data; forward never refits.
 
-        Labels serve only class-conditioned training moments. Shared channels
-        contain one regularized Fisher direction and orthogonal variance axes.
+        Labels serve only class-conditioned training moments. The legacy basis
+        contains a pooled-view Fisher direction and orthogonal variance axes.
+        joint_fisher retains the second-only and two joint-template blocks in
+        the shared channel span, then fills with variance axes. This preserves
+        those fitted *linear score functions*, not invariance of a subsequent
+        lower-dimensional covariance shrinkage or final nonlinear classifier.
         All solves use CPU float64, then fixed buffers follow the model dtype.
         """
         if self.variant == "second":
@@ -119,7 +129,25 @@ class CovarianceRevision(ContextEvidence):
         difference = (shared_means[1] - shared_means[0]) / scale
         fisher = torch.linalg.solve(regularized_shared, difference)
         _, eigenvectors = torch.linalg.eigh(standardized_cov)
-        candidates = [fisher] + list(eigenvectors.flip(1).t())
+        template_audit = {}
+        templates = None
+        if self.channel_basis == "joint_fisher":
+            # Standardize both observations with exactly the shared coordinates
+            # used at deployment; the joint order remains [second, first].
+            standardized1 = (raw1 - mean) / scale
+            standardized2 = (raw2 - mean) / scale
+            raw_joint = torch.cat((standardized2, standardized1), 1)
+            raw_means, raw_joint_covariance, _ = _within(raw_joint, y)
+            raw_joint_regularized = _regularize(raw_joint_covariance, self.shrinkage)
+            raw_delta = raw_means[1] - raw_means[0]
+            d = len(scale)
+            joint_template = torch.linalg.solve(raw_joint_regularized, raw_delta)
+            second_template = torch.linalg.solve(raw_joint_regularized[:d, :d], raw_delta[:d])
+            templates = (second_template, joint_template[:d], joint_template[d:])
+            candidates = list(templates) + list(eigenvectors.flip(1).t())
+        else:
+            # Keep the old default order and numerical path unchanged.
+            candidates = [fisher] + list(eigenvectors.flip(1).t())
         candidates += list(torch.eye(len(scale), dtype=torch.float64))
         basis = []
         for vector in candidates:
@@ -134,6 +162,21 @@ class CovarianceRevision(ContextEvidence):
             if len(basis) == self.channels:
                 break
         projection = torch.stack(basis, 1)
+        if templates is not None:
+            centered2 = standardized2 - raw_means[0][:d]
+            centered1 = standardized1 - raw_means[0][d:]
+            names = ("second_marginal", "joint_second_block", "joint_first_block")
+            for name, template, observed in zip(names, templates, (centered2, centered2, centered1)):
+                retained = projection.mv(projection.t().mv(template))
+                error = template - retained
+                score_error = observed.mv(error)
+                template_audit[name] = {
+                    "raw_template_norm": float(template.norm()),
+                    "retained_template_norm": float(retained.norm()),
+                    "relative_reconstruction_error": float(error.norm() / template.norm().clamp_min(1e-12)),
+                    "training_score_rmse": float(score_error.square().mean().sqrt()),
+                    "training_score_max_abs_error": float(score_error.abs().max()),
+                }
         compact1, compact2 = (raw1 - mean).mm(projection / scale[:, None]), (raw2 - mean).mm(projection / scale[:, None])
         # The second view comes first so the block transform is triangular.
         joint = torch.cat((compact2, compact1), 1)
@@ -175,6 +218,9 @@ class CovarianceRevision(ContextEvidence):
         transform_spectral_gain = torch.linalg.norm(transform, ord=2)
         return {"fitted": True, "variant": self.variant, "training_pairs": len(y),
                 "class_counts": counts, "raw_channels": self.feature_dim + 1,
+                "channel_basis": self.channel_basis,
+                "channel_basis_template_audit": template_audit,
+                "channel_basis_guarantee": "fitted linear template span only; not shrinkage invariance or accuracy",
                 "channels_per_view": c, "shrinkage": self.shrinkage,
                 "whitening_error_float64": float(whitening_error),
                 "minimum_eigenvalue": float(regularized_eigenvalues[0]),

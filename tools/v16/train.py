@@ -52,6 +52,26 @@ def evidence_model(cfg):
     return cfg.get("revision_architecture", "dense") in ("evidence", "anchored", "covariance")
 
 
+def covariance_feature_source(cfg):
+    source = cfg.get("covariance_feature_source", "multilevel")
+    if source not in ("multilevel", "dec1"):
+        raise ValueError("Unknown covariance_feature_source: " + str(source))
+    return source
+
+
+def covariance_feature_dim(cfg):
+    """Descriptor width before appending the original event logit."""
+    if covariance_feature_source(cfg) == "dec1":
+        return int(cfg["channels"][0])
+    return 2 * int(cfg["channels"][1]) + int(cfg["channels"][0])
+
+
+def readout_feature_source(cfg):
+    # Adaptation switches to evidence/second while retaining covariance options.
+    # Its original MLP activation must remain independent of those options.
+    return covariance_feature_source(cfg) if cfg.get("revision_architecture") == "covariance" else "mlp"
+
+
 def design_name(cfg):
     if cfg.get("revision_architecture") == "covariance":
         if cfg.get("constraint") == "record_fn_reference":
@@ -163,10 +183,11 @@ def make_models(cfg, device):
         if cfg.get("revision_architecture") == "covariance":
             # Keep the validated r4 head seed independent of backbone creation.
             torch.manual_seed(int(cfg["seed"]))
-            head = CovarianceRevision(feature_dim=2*int(cfg["channels"][1])+int(cfg["channels"][0]),
+            head = CovarianceRevision(feature_dim=covariance_feature_dim(cfg),
                         hidden=int(cfg.get("evidence_hidden", 8)), kappa=float(cfg.get("evidence_kappa", 2.)),
                         variant=cfg["revision_variant"], channels=int(cfg.get("covariance_channels", 8)),
-                        shrinkage=float(cfg.get("covariance_shrinkage", .05)))
+                        shrinkage=float(cfg.get("covariance_shrinkage", .05)),
+                        channel_basis=cfg.get("covariance_channel_basis", "shared_fisher"))
         elif evidence_model(cfg):
             head_type = AnchoredRevision if cfg.get("revision_architecture") == "anchored" else ContextEvidence
             common_head = head_type(feature_dim=int(cfg["readout_hidden"]),
@@ -271,17 +292,28 @@ def detach_pending(pending):
     return own(pending)
 
 
-def readout_with_hidden(net, features, events, context=None):
-    """Reuse the existing V5 MLP activation; no third readout or spatial head."""
+def readout_with_hidden(net, features, events, context=None, source=None):
+    """Return unchanged V5 logits with an explicitly selected descriptor.
+
+    Legacy callers without a source retain MLP activations (or the multilevel
+    descriptor when context is supplied). Internal paths specify the source.
+    """
+    source = ("multilevel" if context is not None else "mlp") if source is None else source
+    if source not in ("mlp", "multilevel", "dec1"):
+        raise ValueError("Unknown readout feature source: " + str(source))
+    if source == "multilevel" and (context is None or len(context) != 2):
+        raise ValueError("multilevel descriptors require enc2 and dec2 feature taps")
     values = features[events["t"], events["b"], :, events["y"], events["x"]]
     extra = torch.stack([events["p"], events["t_local"]], 1).to(values.dtype)
     if net.readout_ablation != "none":
         raise ValueError("Evidence training requires the original V5 readout")
     hidden = net.readout[1](net.readout[0](torch.cat([values, extra], 1)))
     logits = net.readout[2](hidden).squeeze(1)
-    if context is not None:
+    if source == "multilevel":
         taps = [f[events["t"], events["b"], :, events["y"]//2, events["x"]//2] for f in context]
         hidden = torch.cat(taps + [values], 1)
+    elif source == "dec1":
+        hidden = values
     return logits, hidden
 
 
@@ -401,7 +433,8 @@ def classification_loss(net, head, features, logits, labels, events, segments, p
         singles += int((~paired).sum())
     if isinstance(head, ContextEvidence):
         if hidden is None:
-            logits, hidden = readout_with_hidden(net, features, events)
+            source = covariance_feature_source(cfg or {}) if isinstance(head, CovarianceRevision) else "mlp"
+            logits, hidden = readout_with_hidden(net, features, events, source=source)
         final, rows, cross = evidence_pairs(head, logits, hidden, segments, pending)
     else:
         final, rows, cross = fuse_chunk(net, head, features, events, segments, pieces, pending)
@@ -450,12 +483,14 @@ def train_epoch(net, head, dataset, optimizer, cfg, q99, pos_weight, device, rng
         valid = stream_valid(pieces, k, device, x.dtype)
         optimizer.zero_grad(set_to_none=True)
         prev = states
+        feature_source = readout_feature_source(cfg)
         logits, states, info = net.forward_chunk(x, events, prev, keep=keep, collect=comm is not None,
                                                 return_features=True, skip_readout=evidence_model(cfg),
-                                                feature_taps=cfg.get("revision_architecture") == "covariance")
+                                                feature_taps=feature_source == "multilevel")
         hidden = None
         if evidence_model(cfg):
-            logits, hidden = readout_with_hidden(net, info["features"], events, info.get("context_features"))
+            logits, hidden = readout_with_hidden(net, info["features"], events, info.get("context_features"),
+                                                source=feature_source)
         raw_loss, mass, nfinal, ncross = classification_loss(net, head, info["features"], logits, labels, events,
                                                            segments, pieces, pending, pos_weight, hidden, cfg)
         terms = [raw_loss / mass] if mass else []
@@ -559,7 +594,9 @@ def infer_record(net, head, seq, cfg, q99, device, modes=None, step=False, diagn
         t1, prev = time.perf_counter(), states
         need_aux = "first" in modes or "second" in modes
         sparse_evidence = isinstance(head, ContextEvidence)
-        covariance_taps = isinstance(head, CovarianceRevision) and "main" in modes
+        feature_source = (covariance_feature_source(cfg)
+                          if isinstance(head, CovarianceRevision) and "main" in modes else "mlp")
+        covariance_taps = feature_source == "multilevel"
         if step:
             ev = {k: v for k, v in events.items() if k != "t"}
             logits, states, info = net(x[0], ev, prev, collect=diagnostics,
@@ -575,7 +612,7 @@ def infer_record(net, head, seq, cfg, q99, device, modes=None, step=False, diagn
             context = info.get("context_features")
         hidden = None
         if sparse_evidence:
-            logits, hidden = readout_with_hidden(net, features, events, context)
+            logits, hidden = readout_with_hidden(net, features, events, context, source=feature_source)
         if step: sync(device)
         t2 = time.perf_counter()
         segment = (0, lo, hi, 0, seq, np.asarray(ids))

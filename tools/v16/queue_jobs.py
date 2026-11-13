@@ -289,6 +289,35 @@ def show_status(project_root, release, tail=12):
                     print("  " + line.rstrip())
 
 
+def validated_completed_artifacts(project_root, result):
+    """Validate every recorded artifact without assuming a queue or new stage."""
+    project = Path(project_root).resolve()
+    recorded = result.get("artifact_sha256", {})
+    if not isinstance(recorded, dict):
+        raise ValueError("completed artifact hash inventory must be a mapping")
+    paths = {}
+    for name, expected in recorded.items():
+        if not isinstance(name, str) or not name:
+            raise ValueError("unsafe completed artifact path")
+        relative = PurePosixPath(name)
+        if (not relative.parts or relative.is_absolute() or ".." in relative.parts or
+                PureWindowsPath(name).anchor or "\\" in name):
+            raise ValueError("unsafe completed artifact path: " + name)
+        path = project / Path(*relative.parts)
+        try:
+            path.resolve().relative_to(project)
+        except ValueError:
+            raise ValueError("completed artifact path escapes project: " + name)
+        if path.is_symlink():
+            raise ValueError("unsafe completed artifact symlink: " + name)
+        if not path.is_file() or not path.stat().st_size:
+            raise ValueError("completed artifact is missing or empty: " + name)
+        if digest(path) != expected:
+            raise ValueError("completed artifact is changed: " + name)
+        paths[name] = path
+    return paths
+
+
 def pack(project_root, release, allow_partial=False):
     """Package a stable artifact snapshot, excluding data, credentials and caches."""
     project = Path(project_root).resolve()
@@ -328,33 +357,10 @@ def pack(project_root, release, allow_partial=False):
                 raise ValueError("completed experiment identity mismatch: " + job["name"])
             if checkpoint.is_file() and digest(checkpoint) != result.get("checkpoint_sha256"):
                 raise ValueError("selected checkpoint is missing or changed: %s" % checkpoint)
-            recorded = result.get("artifact_sha256", {})
-            if not isinstance(recorded, dict):
-                raise ValueError("completed artifact hash inventory must be a mapping")
+            recorded = validated_completed_artifacts(project, result)
             for path in artifacts:
-                if path.is_file() and digest(path) != recorded.get(path.relative_to(project).as_posix()):
+                if path.is_file() and path.relative_to(project).as_posix() not in recorded:
                     raise ValueError("completed artifact is changed or lacks its recorded hash: %s" % path)
-            # A completed result may record additional training stages. Verify
-            # its entire inventory, without imposing new stage keys on older
-            # results or letting --allow-partial conceal a damaged completion.
-            for name, expected in recorded.items():
-                if not isinstance(name, str) or not name:
-                    raise ValueError("unsafe completed artifact path")
-                relative = PurePosixPath(name)
-                if (not relative.parts or relative.is_absolute() or ".." in relative.parts or
-                        PureWindowsPath(name).anchor or "\\" in name):
-                    raise ValueError("unsafe completed artifact path: " + name)
-                path = project / Path(*relative.parts)
-                try:
-                    path.resolve().relative_to(project)
-                except ValueError:
-                    raise ValueError("completed artifact path escapes project: " + name)
-                if path.is_symlink():
-                    raise ValueError("unsafe completed artifact symlink: " + name)
-                if not path.is_file() or not path.stat().st_size:
-                    raise ValueError("completed artifact is missing or empty: " + name)
-                if digest(path) != expected:
-                    raise ValueError("completed artifact is changed: " + name)
         if done:
             summary = runner.read_json(out / "summary.json")
             if hasattr(runner, "validate_training_summary"):

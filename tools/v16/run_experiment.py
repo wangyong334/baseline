@@ -174,8 +174,21 @@ def validate_covariance_protocol(flat):
     if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
         raise ValueError("head_batch_size must be a positive integer")
     channels = flat.get("covariance_channels")
-    if isinstance(channels, bool) or not isinstance(channels, int) or not 1 <= channels <= 60:
-        raise ValueError("covariance_channels must be an integer between 1 and 60")
+    source = flat.get("covariance_feature_source", "multilevel")
+    if source not in ("multilevel", "dec1"):
+        raise ValueError("unsupported covariance_feature_source")
+    feature_dim = int(flat["channels"][0])
+    if source == "multilevel":
+        feature_dim += 2 * int(flat["channels"][1])
+    if (isinstance(channels, bool) or not isinstance(channels, int) or
+            not 1 <= channels <= feature_dim + 1):
+        raise ValueError("covariance_channels must be an integer between 1 and %d for %s" %
+                         (feature_dim + 1, source))
+    basis = flat.get("covariance_channel_basis", "shared_fisher")
+    if basis not in ("shared_fisher", "joint_fisher"):
+        raise ValueError("unsupported covariance_channel_basis")
+    if basis == "joint_fisher" and channels < min(3, feature_dim + 1):
+        raise ValueError("joint_fisher requires at least min(3, feature_dim + 1) covariance_channels")
     for key, low, high, closed_low in (
             ("covariance_shrinkage", 0., 1., False),
             ("covariance_regularizer", 0., float("inf"), True),

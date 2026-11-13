@@ -54,22 +54,25 @@ def observations(net, seq, cfg, q99, device, selected=None):
     selected = np.arange(seq.n_events) if selected is None else np.asarray(selected, dtype=np.int64)
     lookup = np.full(seq.n_events, -1, np.int64)
     lookup[selected] = np.arange(len(selected))
-    dim = 2 * int(cfg['channels'][1]) + int(cfg['channels'][0])
+    feature_source = tr.covariance_feature_source(cfg)
+    dim = tr.covariance_feature_dim(cfg)
     h1, h2 = np.zeros((len(selected), dim), np.float32), np.zeros((len(selected), dim), np.float32)
     z1, z2 = np.zeros(len(selected), np.float32), np.zeros(len(selected), np.float32)
     hits = np.zeros((len(selected), 2), np.int8)
     states = None
     for k in range(seq.n_windows):
         x, ev, _, ids = source.window(k)
-        _, states, info = net(x, ev, states, return_features=True, skip_readout=True, feature_taps=True)
+        _, states, info = net(x, ev, states, return_features=True, skip_readout=True,
+                              feature_taps=feature_source == 'multilevel')
         rows = np.flatnonzero(lookup[ids] >= 0)
         if not len(rows):
             continue
         index = torch.as_tensor(rows, device=device, dtype=torch.long)
         events = {key: value[index] for key, value in ev.items() if key in ('b', 'y', 'x', 'p', 't_local')}
         events['t'] = torch.zeros_like(events['b'])
+        context = tuple(f.unsqueeze(0) for f in info['context_features']) if 'context_features' in info else None
         logits, hidden = tr.readout_with_hidden(net, info['features'].unsqueeze(0), events,
-                                              tuple(f.unsqueeze(0) for f in info['context_features']))
+                                              context, source=feature_source)
         values = torch.cat([logits[:, None], hidden], 1).cpu().numpy()
         event_ids, dest = ids[rows], lookup[ids[rows]]
         for slot, times, zs, hs in ((0, seq.first_window, z1, h1), (1, seq.last_window, z2, h2)):
