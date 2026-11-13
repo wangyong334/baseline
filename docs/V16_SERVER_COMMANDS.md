@@ -1,5 +1,7 @@
 # V16：GPU 1 六作业部署与结果回收
 
+> 本文保留 r1 复现命令。当前 r2 上传、入池与打包请使用 `docs/V16_R2_SERVER_COMMANDS.md`；r2 配置在 `configs/v16/r2/`。
+
 上传项目代码到 `/media/stephen/nvme0n1/wy_data/EV-UAV-v16` 后，在服务器已有 `evuav` 环境执行下面命令。数据保持 `/media/stephen/nvme0n1/wy_data/datasets/EV-UAV-dataset`，调度器仍是 `/media/stephen/nvme0n1/wy_data/EV-UAV-v13` 的现有池。
 
 ## 新建目录与上传
@@ -38,10 +40,10 @@ mkdir -p /media/stephen/nvme0n1/wy_data/EV-UAV-v16
   cd /media/stephen/nvme0n1/wy_data/EV-UAV-v16
   python -B tools/v16/queue_jobs.py enqueue \
     --scheduler-root /media/stephen/nvme0n1/wy_data/EV-UAV-v13 \
-    --release context_20261112_r1 --dry-run
+    --config-dir configs/v16 --release context_20261112_r1 --dry-run
   python -B tools/v16/queue_jobs.py enqueue \
     --scheduler-root /media/stephen/nvme0n1/wy_data/EV-UAV-v13 \
-    --release context_20261112_r1
+    --config-dir configs/v16 --release context_20261112_r1
 )
 ```
 

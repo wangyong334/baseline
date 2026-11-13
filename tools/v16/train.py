@@ -1,8 +1,9 @@
-"""V16 shared-feature context revision; design in docs/V16_METHOD.md.
+"""V16 context revision; r2 design in docs/V16_R2_METHOD.md.
 
 V5 state dynamics and readout are preserved. Observation length, state clock
-and evaluation frame length are distinct. Dense context is cached by window;
-events have no neighbour graph or recurrent hidden state. Python 3.8 / torch 1.9.
+and evaluation frame length are distinct. r2 caches paired readout observations;
+r1 caches dense context. No event neighbour graph or recurrent event state.
+Python 3.8 / torch 1.9.
 """
 import os
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
@@ -29,7 +30,8 @@ import torch.nn.functional as F
 from dataset.overlap_windows import (load_overlap_npz, OverlapWindowSource,
                                      compute_overlap_stats)
 from model.context_revision import ContextRevision
-from model.evspsegnet_stream import calibrate_gains, count_parameters
+from model.context_evidence import ContextEvidence
+from model.evspsegnet_stream import calibrate_gains, count_parameters, tif_settings
 from model.lif2d_stream import detach_states
 from train_stream_v1 import (build_net, seed_everything, plan_streams, stream_pieces,
                              stream_total_windows, stream_valid, tau_statistics)
@@ -39,7 +41,29 @@ from utils.stream_metrics import FastRoc, window_confusion, threshold_counts, sw
 from tools.v14.run_experiment import write_json, sha256
 
 DESIGN = "v16-context-revision-r1"
-MODES = ("full", "no_context", "no_revision")
+EVIDENCE_DESIGN = "v16-context-evidence-r2"
+MODES = ("full", "no_context", "no_revision", "second")
+
+
+def evidence_model(cfg):
+    return cfg.get("revision_architecture", "dense") == "evidence"
+
+
+def design_name(cfg):
+    return EVIDENCE_DESIGN if evidence_model(cfg) else DESIGN
+
+
+def supervised_excess_risk(logits, reference, labels, pos_weight):
+    """Penalize worsening either class relative to the detached second view.
+
+    This is a train-label loss, not a test-time veto or an error-rate guarantee.
+    Beneficial corrections pay zero extra cost. Both classes use the same
+    weighting as the task BCE; no threshold or validation labels are fitted.
+    """
+    reference = reference.detach()
+    positive = F.relu(F.softplus(-logits) - F.softplus(-reference))
+    negative = F.relu(F.softplus(logits) - F.softplus(reference))
+    return labels * float(pos_weight) * positive + (1. - labels) * negative
 
 
 def validate_config(cfg):
@@ -66,8 +90,19 @@ def validate_config(cfg):
         raise ValueError("Use streams=4 without extra stream grouping in this release")
     if cfg.get("revision_variant") not in MODES:
         raise ValueError("Unsupported V16 variant")
-    if int(cfg["revision_dim"]) != int(cfg["channels"][0]):
+    if cfg.get("revision_architecture", "dense") not in ("dense", "evidence"):
+        raise ValueError("Unknown revision architecture")
+    if not evidence_model(cfg) and int(cfg["revision_dim"]) != int(cfg["channels"][0]):
         raise ValueError("revision_dim must match the V5 readout channels")
+    if evidence_model(cfg):
+        if float(cfg.get("threshold", .9)) != .9:
+            raise ValueError("Evidence experiments keep threshold=0.9")
+        if int(cfg.get("early_stop_patience", 0)) < 0 or int(cfg.get("min_epochs", 1)) < 1:
+            raise ValueError("Invalid stopping schedule")
+        if cfg.get("fusion_loss", "bce") not in ("bce", "excess_risk"):
+            raise ValueError("Unknown evidence loss")
+        if not math.isfinite(float(cfg.get("excess_risk_weight", 1.))) or float(cfg.get("excess_risk_weight", 1.)) < 0:
+            raise ValueError("excess_risk_weight must be finite and nonnegative")
     if int(cfg["pad_height"]) % 8 or int(cfg["pad_width"]) % 8:
         raise ValueError("V5 padded canvas must be divisible by 8")
     if int(cfg["streams"]) < 1 or int(cfg["tbptt_k"]) < 1 or int(cfg["epochs"]) < 1:
@@ -94,7 +129,19 @@ def make_models(cfg, device):
     net = build_net(clock_cfg, device)
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(int(cfg["seed"]) + 16000)
-        head = ContextRevision(channels=int(cfg["channels"][0]), dim=int(cfg["revision_dim"]),
+        if evidence_model(cfg):
+            common_head = ContextEvidence(feature_dim=int(cfg["readout_hidden"]),
+                                   hidden=int(cfg.get("evidence_hidden", 8)),
+                                   kappa=float(cfg.get("evidence_kappa", 1.)),
+                                   variant="full")
+            head = ContextEvidence(feature_dim=int(cfg["readout_hidden"]),
+                                   hidden=int(cfg.get("evidence_hidden", 8)),
+                                   kappa=float(cfg.get("evidence_kappa", 1.)),
+                                   variant=cfg["revision_variant"])
+            head.load_state_dict({k: v for k, v in common_head.state_dict().items()
+                                  if k in head.state_dict()})
+        else:
+            head = ContextRevision(channels=int(cfg["channels"][0]), dim=int(cfg["revision_dim"]),
                                hidden=int(cfg["revision_hidden"]), heads=int(cfg["revision_heads"]),
                                radius=int(cfg["revision_radius"]), downsample=int(cfg["revision_downsample"]),
                                height=int(cfg["height"]), width=int(cfg["width_px"]),
@@ -110,14 +157,21 @@ class Records(object):
                       else sorted(directory.glob("*.npz")))
         if not self.paths:
             raise ValueError("No records in " + str(directory))
+        self._cache = {}
 
     def __len__(self):
         return len(self.paths)
 
     def __getitem__(self, index):
         c = self.cfg
-        return load_overlap_npz(self.paths[index], c["height"], c["width_px"],
-                                c["window_ms"], c["stride_ms"], c["total_ms"], c["time_bins"])
+        path = self.paths[index]
+        if not c.get("cache_record_indices", False):
+            return load_overlap_npz(path, c["height"], c["width_px"], c["window_ms"],
+                                    c["stride_ms"], c["total_ms"], c["time_bins"])
+        if path not in self._cache:
+            self._cache[path] = load_overlap_npz(path, c["height"], c["width_px"],
+                                                c["window_ms"], c["stride_ms"], c["total_ms"], c["time_bins"])
+        return self._cache[path]
 
 
 class Sources(object):
@@ -169,10 +223,71 @@ def _index(array, device):
 
 def detach_pending(pending):
     # Clone a single slot: detach alone retains storage for the complete TBPTT batch.
-    return {key: {"window": value["window"],
-                  "feature": value["feature"].detach().clone(),
-                  "encoded": {k: v.detach().clone() for k, v in value["encoded"].items()}}
-            for key, value in pending.items()}
+    def own(value):
+        if torch.is_tensor(value):
+            return value.detach().clone()
+        if isinstance(value, dict):
+            return {key: own(child) for key, child in value.items()}
+        return value
+    return own(pending)
+
+
+def readout_with_hidden(net, features, events):
+    """Reuse the existing V5 MLP activation; no third readout or spatial head."""
+    values = features[events["t"], events["b"], :, events["y"], events["x"]]
+    extra = torch.stack([events["p"], events["t_local"]], 1).to(values.dtype)
+    if net.readout_ablation != "none":
+        raise ValueError("Evidence training requires the original V5 readout")
+    hidden = net.readout[1](net.readout[0](torch.cat([values, extra], 1)))
+    return net.readout[2](hidden).squeeze(1), hidden
+
+
+def evidence_pairs(head, logits, hidden, segments, pending):
+    """Match original event IDs. Cache only the uncommitted half-window.
+
+    Every appearance is read once. A pair inside TBPTT has gradients through
+    both views; only the old half-window is detached at the TBPTT boundary.
+    """
+    first_z, first_h, second_rows = [], [], []
+    cross = 0
+    for index, lo, hi, row, seq, ids in segments:
+        old = pending.pop(index, None)
+        if lo and (old is None or old["window"] != lo - 1):
+            raise RuntimeError("Missing preceding evidence window")
+        if not lo and old is not None:
+            raise RuntimeError("Evidence cache leaked across recordings")
+        start = int(seq.bounds[lo])
+        positions = np.arange(start, int(seq.bounds[hi]))
+        final = np.flatnonzero((seq.coverage_count[ids] == 2) &
+                              (seq.last_position[ids] == positions))
+        prior = seq.first_position[ids[final]] - start
+        inside = prior >= 0
+        for mask in (inside, ~inside):
+            selected = final[mask]
+            if not len(selected):
+                continue
+            second_rows.append(selected + row)
+            if mask is inside:
+                rid = _index(prior[mask] + row, logits.device)
+                first_z.append(logits[rid]); first_h.append(hidden[rid])
+            else:
+                if old is None or not np.array_equal(old["ids"], ids[selected]):
+                    raise RuntimeError("Original event IDs do not match pending evidence")
+                first_z.append(old["logits"]); first_h.append(old["hidden"])
+                cross += len(selected)
+        if hi < seq.n_windows:
+            keep = np.flatnonzero((seq.coverage_count[ids] == 2) &
+                                 (seq.first_position[ids] == positions) &
+                                 (seq.last_window[ids] >= hi))
+            rid = _index(keep + row, logits.device)
+            pending[index] = {"window": hi - 1, "ids": ids[keep].copy(),
+                              "logits": logits[rid], "hidden": hidden[rid]}
+    if not second_rows:
+        return logits.new_empty((0,)), np.empty(0, dtype=np.int64), cross
+    rows = np.concatenate(second_rows)
+    rid = _index(rows, logits.device)
+    final = head(torch.cat(first_z), logits[rid], torch.cat(first_h), hidden[rid])
+    return final, rows, cross
 
 
 def fuse_chunk(net, head, features, events, segments, pieces, pending):
@@ -230,7 +345,8 @@ def fuse_chunk(net, head, features, events, segments, pieces, pending):
     return logits, rows, cross
 
 
-def classification_loss(net, head, features, logits, labels, events, segments, pieces, pending, pos_weight):
+def classification_loss(net, head, features, logits, labels, events, segments, pieces, pending, pos_weight,
+                        hidden=None, cfg=None):
     weight = logits.new_tensor([float(pos_weight)])
     per_read = F.binary_cross_entropy_with_logits(logits, labels, pos_weight=weight, reduction="none")
     loss, mass, singles = logits.sum() * 0, 0., 0
@@ -240,10 +356,19 @@ def classification_loss(net, head, features, logits, labels, events, segments, p
         loss = loss + (per_read[row:row+len(ids)] * torch.as_tensor(weights, device=logits.device)).sum()
         mass += float(weights.sum())
         singles += int((~paired).sum())
-    final, rows, cross = fuse_chunk(net, head, features, events, segments, pieces, pending)
+    if isinstance(head, ContextEvidence):
+        if hidden is None:
+            logits, hidden = readout_with_hidden(net, features, events)
+        final, rows, cross = evidence_pairs(head, logits, hidden, segments, pending)
+    else:
+        final, rows, cross = fuse_chunk(net, head, features, events, segments, pieces, pending)
     if len(rows):
         loss = loss + .5 * F.binary_cross_entropy_with_logits(final, labels[_index(rows, logits.device)],
                                                               pos_weight=weight, reduction="sum")
+        if isinstance(head, ContextEvidence) and (cfg or {}).get("fusion_loss") == "excess_risk":
+            rid = _index(rows, logits.device)
+            loss = loss + .5 * float(cfg.get("excess_risk_weight", 1.)) * supervised_excess_risk(
+                final, logits[rid], labels[rid], pos_weight).sum()
         mass += .5 * len(rows)
     return loss, mass, singles + len(rows), cross
 
@@ -271,8 +396,13 @@ def train_epoch(net, head, dataset, optimizer, cfg, q99, pos_weight, device, rng
         valid = stream_valid(pieces, k, device, x.dtype)
         optimizer.zero_grad(set_to_none=True)
         prev = states
-        logits, states, info = net.forward_chunk(x, events, prev, keep=keep, collect=comm is not None, return_features=True)
-        raw_loss, mass, nfinal, ncross = classification_loss(net, head, info["features"], logits, labels, events, segments, pieces, pending, pos_weight)
+        logits, states, info = net.forward_chunk(x, events, prev, keep=keep, collect=comm is not None,
+                                                return_features=True, skip_readout=evidence_model(cfg))
+        hidden = None
+        if evidence_model(cfg):
+            logits, hidden = readout_with_hidden(net, info["features"], events)
+        raw_loss, mass, nfinal, ncross = classification_loss(net, head, info["features"], logits, labels, events,
+                                                           segments, pieces, pending, pos_weight, hidden, cfg)
         terms = [raw_loss / mass] if mass else []
         if comm is not None:
             penalty = comm.chunk_loss(net, info["u_pre"], prev, keep, 1, valid)
@@ -312,7 +442,7 @@ def train_epoch(net, head, dataset, optimizer, cfg, q99, pos_weight, device, rng
                     raise RuntimeError("Record ended with uncommitted predictions")
                 sources.active.pop(index, None)
         # Drop full chunk graphs before the next convolution allocation.
-        del logits, info, x, events, labels, raw_loss, terms
+        del logits, info, x, events, labels, raw_loss, terms, hidden
         if mass or (comm is not None and penalty is not None):
             del loss
         if comm is not None:
@@ -373,21 +503,28 @@ def infer_record(net, head, seq, cfg, q99, device, modes=None, step=False, diagn
         if step: sync(device)
         t1, prev = time.perf_counter(), states
         need_aux = "first" in modes or "second" in modes
+        sparse_evidence = isinstance(head, ContextEvidence)
         if step:
             ev = {k: v for k, v in events.items() if k != "t"}
             logits, states, info = net(x[0], ev, prev, collect=diagnostics,
-                                      return_features=True, skip_readout=not need_aux)
+                                      return_features=True, skip_readout=sparse_evidence or not need_aux)
             features = info["features"].unsqueeze(0)
         else:
             logits, states, info = net.forward_chunk(x, events, prev, collect=diagnostics,
-                                                     return_features=True, skip_readout=not need_aux)
+                                                     return_features=True, skip_readout=sparse_evidence or not need_aux)
             features = info["features"]
+        hidden = None
+        if sparse_evidence:
+            logits, hidden = readout_with_hidden(net, features, events)
         if step: sync(device)
         t2 = time.perf_counter()
         segment = (0, lo, hi, 0, seq, np.asarray(ids))
         pieces = [[(0, lo, hi, 0, lo == 0)]]
         if "main" in modes:
-            revised, pair_rows, _ = fuse_chunk(net, head, features, events, [segment], pieces, pending)
+            if sparse_evidence:
+                revised, pair_rows, _ = evidence_pairs(head, logits, hidden, [segment], pending)
+            else:
+                revised, pair_rows, _ = fuse_chunk(net, head, features, events, [segment], pieces, pending)
             pending = detach_pending(pending)
         else:
             pair_rows = np.flatnonzero((seq.coverage_count[ids] == 2) &
@@ -407,7 +544,7 @@ def infer_record(net, head, seq, cfg, q99, device, modes=None, step=False, diagn
                 value = torch.sigmoid(logits[rid]).cpu().numpy()
             else:
                 sr = _index(single_rows, device)
-                if need_aux:
+                if need_aux or sparse_evidence:
                     single_logits = logits[sr]
                 else:
                     f = features[events["t"][sr], events["b"][sr], :, events["y"][sr], events["x"][sr]]
@@ -424,7 +561,7 @@ def infer_record(net, head, seq, cfg, q99, device, modes=None, step=False, diagn
         if diagnostics:
             memories = [m.unsqueeze(0) for m in info["u_pre"]] if step else info["u_pre"]
             message_counts.extend(window_messages(net, memories, prev, None).reshape(-1).cpu().tolist())
-        del x, logits, info, features
+        del x, logits, info, features, hidden
     if pending or np.any(hits != 1) or any(not np.isfinite(v).all() for v in probs.values()):
         raise RuntimeError("Output coverage/finite-value check failed: " + seq.name)
     return probs, {"execution": "step" if step else "layer", "step_ms": durations,
@@ -478,11 +615,14 @@ def evaluate(net, head, dataset, cfg, q99, device, full=False, step=None, dump_d
             for m in modes:
                 base = prob[m] >= np.float32(cfg["threshold"])
                 cc = changes.setdefault(m, {"corrected": 0, "harmed": 0, "rescued_target": 0,
-                                             "suppressed_false_positive": 0})
+                                             "suppressed_false_positive": 0, "lost_target": 0,
+                                             "new_false_positive": 0})
                 cc["corrected"] += int(np.sum((base != target) & (full_pred == target)))
                 cc["harmed"] += int(np.sum((base == target) & (full_pred != target)))
                 cc["rescued_target"] += int(np.sum(target & ~base & full_pred))
                 cc["suppressed_false_positive"] += int(np.sum(~target & base & ~full_pred))
+                cc["lost_target"] += int(np.sum(target & base & ~full_pred))
+                cc["new_false_positive"] += int(np.sum(~target & ~base & full_pred))
         if dump_dir is not None:
             Path(dump_dir).mkdir(parents=True, exist_ok=True)
             np.savez_compressed(str(Path(dump_dir) / seq.name),
@@ -509,9 +649,9 @@ def evaluate(net, head, dataset, cfg, q99, device, full=False, step=None, dump_d
         if full:
             print("EVAL %d/%d %s IoU %.5f" %
                   (i + 1, len(dataset), seq.name, row["readouts"][main]["iou"] or 0.), flush=True)
-    result = {"design": DESIGN, "readouts": {m: metric_row(counts[m], roc[m]) for m in modes},
+    result = {"design": design_name(cfg), "readouts": {m: metric_row(counts[m], roc[m]) for m in modes},
               "threshold": cfg["threshold"], "n_sequences": len(dataset), "events": total_events,
-              "production_event_readouts": total_events,
+              "production_event_readouts": total_reads if evidence_model(cfg) else total_events,
               "diagnostic_view_readouts": total_reads, "per_record": per_record,
               "threshold_sweeps": {m: sweep_summary(sweeps[m]) for m in modes},
               "diagnostics": {"relative_to_final": changes,
@@ -532,9 +672,11 @@ def evaluate(net, head, dataset, cfg, q99, device, full=False, step=None, dump_d
               "operations": {}}
     result["metrics"] = result["readouts"][main]
     result["readout_policy"] = cfg["revision_variant"]
-    result["operations"] = {"production_event_readout_linear_macs": total_events *
+    reads = total_reads if evidence_model(cfg) else total_events
+    result["operations"] = {"production_event_readout_linear_macs": reads *
                             ((int(cfg["channels"][0])+2)*int(cfg["readout_hidden"])+int(cfg["readout_hidden"])),
-                            "context_dense_macs_per_window": head.dense_macs(int(cfg["pad_height"]), int(cfg["pad_width"])),
+                            "context_dense_macs_per_window": (0 if evidence_model(cfg) else head.dense_macs(int(cfg["pad_height"]), int(cfg["pad_width"]))),
+                            "paired_fusion_linear_macs": ((total_reads - total_events) * head.macs_per_pair() if evidence_model(cfg) else 0),
                             "scope": "head MAC estimates exclude backbone, softmax, interpolation, indexing; no MAC-to-energy claim",
                             "energy_joules": None}
     if msg_all:
@@ -565,7 +707,7 @@ def calibrate(net, dataset, cfg, q99, device, out):
 
 
 def save_checkpoint(path, net, head, optimizer, epoch, best, cfg, stats, comm):
-    payload = {"design": DESIGN, "model": net.state_dict(), "fusion": head.state_dict(),
+    payload = {"design": design_name(cfg), "model": net.state_dict(), "fusion": head.state_dict(),
                "optimizer": optimizer.state_dict(), "epoch": epoch, "best_val_iou": best,
                "config": cfg, "stats": stats, "comm_mu": comm.mu if comm else 0.}
     temporary = path.with_name(path.name + ".tmp")
@@ -595,6 +737,7 @@ def train(cfg, args):
     cfg["_training_inventory"] = {p.name: {"bytes": p.stat().st_size, "mtime_ns": p.stat().st_mtime_ns}
                                   for p in dataset.paths}
     source_paths = [Path(__file__), ROOT / "dataset/overlap_windows.py", ROOT / "model/context_revision.py",
+                    ROOT / "model/context_evidence.py",
                     ROOT / "model/deterministic_resize.py", ROOT / "dataset/stream_windows.py",
                     ROOT / "utils/stream_common.py",
                     ROOT / "model/evspsegnet_stream.py", ROOT / "model/lif2d_stream.py", ROOT / "utils/comm_budget.py",
@@ -603,8 +746,14 @@ def train(cfg, args):
     stats_path = out / "train_stats.json"
     if args.resume:
         ckpt = load_checkpoint(out / "last.pt", torch.device("cpu"))
-        if ckpt["design"] != DESIGN or ckpt["config"] != cfg:
+        if ckpt["design"] != design_name(cfg) or ckpt["config"] != cfg:
             raise ValueError("Resume config/design mismatch")
+        summary_path = out / "summary.json"
+        if summary_path.is_file():
+            previous_summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            if (previous_summary.get("complete") is True and
+                    previous_summary.get("epochs_completed") == int(ckpt["epoch"]) + 1):
+                raise ValueError("Completed training cannot be resumed; use a new release for a new experiment")
         stats = ckpt["stats"]
     elif stats_path.exists():
         raise ValueError("Stale stats without checkpoint; choose a clean output")
@@ -627,21 +776,46 @@ def train(cfg, args):
         (out / "metrics.jsonl").write_text("".join(json.dumps(r) + "\n" for r in history), encoding="utf-8")
         del ckpt
     else:
-        write_json(out / "run_config.json", {"design": DESIGN, "config": cfg,
+        write_json(out / "run_config.json", {"design": design_name(cfg), "config": cfg,
                    "backbone_parameters": count_parameters(net), "fusion_parameters": count_parameters(head),
                    "precision": "float32; CUDA matmul and cuDNN TF32 disabled",
                    "actual_optimizer_step": "per parallel-stream TBPTT chunk, as in V14",
                    "torch": torch.__version__, "python": sys.version,
                    "data": {p.name: {"bytes": p.stat().st_size, "mtime_ns": p.stat().st_mtime_ns} for p in dataset.paths},
                    "source": {str(p.relative_to(ROOT)): sha256(p) for p in
-                              [Path(__file__), ROOT / "dataset/overlap_windows.py", ROOT / "model/context_revision.py",
+                              [Path(__file__), ROOT / "dataset/overlap_windows.py", ROOT / "model/context_revision.py", ROOT / "model/context_evidence.py",
                                ROOT / "model/evspsegnet_stream.py", ROOT / "model/lif2d_stream.py", ROOT / "utils/comm_budget.py"]}})
-        calibrate(net, dataset, cfg, q99, device, out)
+        if cfg.get("init_checkpoint"):
+            initial = load_checkpoint(cfg["init_checkpoint"], torch.device("cpu"))
+            initial_cfg = initial.get("config", {})
+            if initial_cfg.get("seed") != int(cfg["seed"]):
+                raise ValueError("Initial backbone seed does not match the experiment")
+            initial_q99 = np.asarray(initial.get("stats", {}).get("q99", []))
+            if initial_q99.shape != q99.shape or not np.allclose(initial_q99, q99, rtol=0, atol=1e-6):
+                raise ValueError("Initial checkpoint must use this training-set normalization and window representation")
+            for key in ("channels", "neuron", "state_mode", "window_ms", "stride_ms", "time_bins",
+                        "input_clip", "height", "width_px", "pad_height", "pad_width", "norm",
+                        "v_threshold", "tau_init_ms", "tau_min_ms", "tau_max_ms", "readout_hidden"):
+                if initial_cfg.get(key) != cfg.get(key):
+                    raise ValueError("Initial backbone configuration mismatch: " + key)
+            if tif_settings(initial_cfg.get("tif")) != tif_settings(cfg.get("tif")):
+                raise ValueError("Initial backbone BIR configuration mismatch")
+            initial_mu = float(initial.get("comm_mu", 0.))
+            if not math.isfinite(initial_mu) or initial_mu < 0:
+                raise ValueError("Initial communication multiplier must be finite and nonnegative")
+            net.load_state_dict(initial["model"], strict=True)
+            comm.mu = initial_mu
+            write_json(out / "calibration.json", {"mode": "inherited matched backbone", "checkpoint": cfg["init_checkpoint"],
+                       "sha256": sha256(cfg["init_checkpoint"]), "seed": cfg["seed"]})
+            del initial
+        else:
+            calibrate(net, dataset, cfg, q99, device, out)
     validation = Records(cfg, "val")
     if args.limit_records:
         validation.paths = validation.paths[:args.limit_records]
     subset = select_subset([p.name for p in dataset.paths], int(cfg["train_subset_size"]), int(cfg["seed"]) + 2000)
     subset_data = Records(cfg, "train", subset)
+    best_epoch = min((r["epoch"] for r in history if r["val_iou"] == best), default=-1)
     for epoch in range(start, int(cfg["epochs"])):
         t0 = time.perf_counter()
         lr = (float(cfg["lr"]) if int(cfg["epochs"]) == 1 else
@@ -666,11 +840,16 @@ def train(cfg, args):
         history.append(record)
         if record["val_iou"] > best:
             best = record["val_iou"]
+            best_epoch = epoch
             save_checkpoint(out / ("best_val_iou_seed%d.pt" % cfg["seed"]), net, head, optimizer, epoch, best, cfg, stats, comm)
         save_checkpoint(out / "last.pt", net, head, optimizer, epoch, best, cfg, stats, comm)
-        write_json(out / "summary.json", {"design": DESIGN, "epochs_completed": epoch + 1, "epochs_requested": cfg["epochs"],
+        patience = int(cfg.get("early_stop_patience", 0))
+        early_stopped = bool(patience and epoch + 1 >= int(cfg.get("min_epochs", 1)) and epoch - best_epoch >= patience)
+        write_json(out / "summary.json", {"design": design_name(cfg), "epochs_completed": epoch + 1, "epochs_requested": cfg["epochs"],
                    "best_val_iou": best,
-                   "complete": epoch + 1 == int(cfg["epochs"]) and args.limit_records is None and args.max_chunks is None,
+                   "best_epoch": best_epoch + 1, "early_stopped": early_stopped,
+                   "stopping_rule": "validation IoU patience only; test never used",
+                   "complete": (epoch + 1 == int(cfg["epochs"]) or early_stopped) and args.limit_records is None and args.max_chunks is None,
                    "training_scope": cfg["_training_scope"],
                    "probe_only": args.limit_records is not None or args.max_chunks is not None,
                    "train_seconds_total": sum(r["train_seconds"] for r in history),
@@ -679,6 +858,9 @@ def train(cfg, args):
         print("EPOCH %d/%d train %.1fs total %.1fs loss %.5f val IoU %.5f ACC %.5f comm_mu %.4f" %
               (epoch + 1, cfg["epochs"], result["train_seconds"], record["epoch_seconds"], result["loss_per_event"],
                record["val_iou"], record["val_acc"], comm.mu), flush=True)
+        if early_stopped:
+            print("EARLY STOP after %d epochs without a higher validation IoU" % patience, flush=True)
+            break
 
 
 def main():
@@ -722,7 +904,7 @@ def main():
         if not args.checkpoint:
             raise ValueError("--checkpoint required for eval")
         ckpt = load_checkpoint(args.checkpoint, torch.device("cpu"))
-        if ckpt.get("design") != DESIGN:
+        if ckpt.get("design") != design_name(ckpt.get("config", {})):
             raise ValueError("Not a V16 context checkpoint")
         original = ckpt["config"]
         # Architecture, thresholds and time bases come from the trained model.

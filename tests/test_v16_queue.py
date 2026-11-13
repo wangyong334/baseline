@@ -132,7 +132,8 @@ class V16QueueTests(unittest.TestCase):
              mock.patch.object(queue, "live_pool", return_value=1234) as pool, \
              redirect_stdout(io.StringIO()) as output:
             queue.main(["enqueue", "--project-root", str(self.project), "--scheduler-root", str(self.scheduler),
-                        "--data-root", str(self.data), "--release", self.release, "--dry-run"])
+                        "--data-root", str(self.data), "--release", self.release,
+                        "--config-dir", "configs/v16", "--dry-run"])
         dependencies.assert_called_once_with(self.project.resolve())
         pool.assert_called_once_with(self.scheduler.resolve())
         self.assertIn("DRY_RUN_OK: 6 training job(s)", output.getvalue())
@@ -403,6 +404,93 @@ class V16QueueTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "summary.json"):
             self.pack()
         self.assertIn("_partial", self.pack(allow_partial=True).name)
+
+    def test_early_stop_requires_configured_policy_and_complete_training(self):
+        raw = {"TRAIN": {"epochs": 40, "min_epochs": 15, "early_stop_patience": 8}}
+        summary = {"epochs_completed": 23, "early_stopped": True,
+                   "complete": True, "probe_only": False}
+        self.assertEqual(runner.validate_training_summary(summary, raw), 23)
+        for changed in ({"early_stopped": False}, {"epochs_completed": 14},
+                        {"probe_only": True}, {"complete": False}, {"epochs_completed": 41}):
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                runner.validate_training_summary(dict(summary, **changed), raw)
+        with self.assertRaises(ValueError):
+            runner.validate_training_summary(summary, {"TRAIN": {"epochs": 40}})
+
+    def test_initial_checkpoint_seed_and_statistics_are_checked(self):
+        import torch
+        init = self.project / "initial"
+        init.mkdir()
+        path = init / "seed37.pt"
+        torch.save({"config": {"seed": 38}, "model": {}, "stats": {"q99": [1.]}}, str(path))
+        with self.assertRaisesRegex(ValueError, "seed mismatch"):
+            self.plan(seeds=(37,), init_root=init)
+        torch.save({"config": {"seed": 37}, "model": {}, "stats": {}}, str(path))
+        with self.assertRaisesRegex(ValueError, "q99"):
+            self.plan(seeds=(37,), init_root=init)
+        torch.save({"config": {"seed": 37}, "model": {}, "stats": {"q99": [1.]}}, str(path))
+        plan = self.plan(seeds=(37,), init_root=init)
+        frozen = Path(plan["initializations"]["37"]["path"])
+        self.assertFalse(frozen.exists())
+        manifest = self.enqueue(plan)
+        self.assertEqual(queue.digest(frozen), queue.digest(path))
+        for job in plan["jobs"]:
+            self.assertIn("--init-sha256", queue.job_script(plan, job, manifest))
+        frozen.write_bytes(b"changed")
+        with self.assertRaisesRegex(ValueError, "initial checkpoint"):
+            queue.verify_source(manifest)
+
+    def test_nested_r2_configs_are_frozen(self):
+        path = self.project / "configs/v16/r2/full.yaml"
+        path.parent.mkdir()
+        path.write_text("# new architecture\n", encoding="utf-8")
+        plan = self.plan()
+        self.assertIn("configs/v16/r2/full.yaml", plan["files"])
+        manifest = self.enqueue(plan)
+        changed = Path(plan["source"]) / "configs/v16/r2/full.yaml"
+        changed.write_text("# mutated\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "snapshot changed"):
+            queue.verify_source(manifest)
+
+    def evidence_configs(self):
+        import yaml
+        for variant in queue.VARIANTS:
+            raw = runner.load_yaml(self.project / ("configs/v16/%s.yaml" % variant))
+            raw["CONTEXT"] = {"revision_architecture": "evidence", "revision_variant": variant,
+                              "evidence_hidden": 8, "evidence_kappa": 1.0}
+            raw["TRAIN"].update(epochs=40, min_epochs=15, early_stop_patience=8)
+            path = self.project / "configs/v16/r2" / (variant + ".yaml")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    def test_r2_config_family_uses_isolated_sources_and_same_seed_protocol(self):
+        self.evidence_configs()
+        plan = self.plan(config_dir="configs/v16/r2")
+        self.assertTrue(plan["jobs"][0]["name"].startswith("1280_"))
+        self.assertFalse(plan["initializations"])
+        self.assertEqual(plan["config_dir"], "configs/v16/r2")
+        raw = runner.runtime_config("no_context", 38, self.release, self.data, self.project,
+                                    self.project, "configs/v16/r2")
+        self.assertEqual(raw["TRAIN"]["seed"], 38)
+        self.assertEqual(raw["TRAIN"]["epochs"], 40)
+        self.assertEqual(raw["CONTEXT"]["revision_architecture"], "evidence")
+        path = self.project / "configs/v16/r2/no_revision.yaml"
+        path.write_text(path.read_text(encoding="utf-8").replace("evidence_hidden: 8", "evidence_hidden: 16"),
+                        encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "ablations may differ only"):
+            self.plan(config_dir="configs/v16/r2")
+
+    def test_cli_default_points_to_r2_and_same_existing_pool(self):
+        self.evidence_configs()
+        with mock.patch.object(queue.sys, "platform", "linux"), \
+             mock.patch.object(queue, "dependency_check", return_value="torch=fixture"), \
+             mock.patch.object(queue, "live_pool", return_value=1234), \
+             redirect_stdout(io.StringIO()) as output:
+            queue.main(["enqueue", "--project-root", str(self.project), "--scheduler-root", str(self.scheduler),
+                        "--data-root", str(self.data), "--dry-run"])
+        self.assertIn("context_20261113_r2", output.getvalue())
+        self.assertIn("configs/v16/r2", output.getvalue())
+        self.assertFalse((self.project / "run").exists())
 
 
 if __name__ == "__main__":

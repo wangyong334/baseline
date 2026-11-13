@@ -15,7 +15,7 @@ import time
 
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_RELEASE = "context_20261112_r1"
+DEFAULT_RELEASE = "context_20261113_r2"
 VARIANTS = ("full", "no_revision", "no_context")
 
 
@@ -35,7 +35,7 @@ load_yaml = common.load_yaml
 flatten = common.flatten
 
 
-def validate_configs(source_root=ROOT):
+def _validate_legacy_configs(source_root=ROOT):
     """Keep V14/V5 settings fixed; only the two V16 modules may be ablated."""
     source_root = Path(source_root)
     base = load_yaml(source_root / "configs/v14/overlap_conditional.yaml")
@@ -84,11 +84,58 @@ def validate_configs(source_root=ROOT):
     return configs
 
 
-def runtime_config(variant, seed, release, data_root, project_root, source_root=ROOT):
+def validate_configs(source_root=ROOT, config_dir="configs/v16"):
+    """Validate matched ablations without silently changing the V5 protocol."""
+    source_root = Path(source_root).resolve()
+    relative = Path(config_dir)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("config-dir must be a project-relative directory")
+    if relative.as_posix() == "configs/v16":
+        return _validate_legacy_configs(source_root)
+    base = load_yaml(source_root / "configs/v14/overlap_conditional.yaml")
+    configs, reference = {}, None
+    for variant in VARIANTS:
+        path = source_root / relative / (variant + ".yaml")
+        if not path.is_file():
+            raise ValueError("required configuration missing: %s" % path)
+        raw = load_yaml(path)
+        flat = flatten(raw)
+        if set(raw) != {"DATA", "NET", "TRAIN", "CALIB", "EVAL", "CONTEXT"}:
+            raise ValueError("r2 requires DATA/NET/TRAIN/CALIB/EVAL/CONTEXT")
+        for section in ("NET", "CALIB", "EVAL"):
+            if raw[section] != base[section]:
+                raise ValueError("r2 changes the V5 %s protocol" % section)
+        for key, value in base["DATA"].items():
+            if key not in ("root", "stats_path") and raw["DATA"].get(key) != value:
+                raise ValueError("r2 changes DATA." + key)
+        required = {"revision_architecture": "evidence", "revision_variant": variant,
+                    "state_mode": "carry", "state_layout": "single_rolling",
+                    "trainer": "streams", "streams": 4, "tbptt_k": 16,
+                    "stream_layout": "greedy", "eval_execution": "step",
+                    "execution": "layer", "seed": 37,
+                    "comm_budget_messages": 157700.0, "comm_budget_mode": "peak"}
+        for key, value in required.items():
+            if flat.get(key) != value:
+                raise ValueError("r2 requires %s=%r" % (key, value))
+        if int(flat.get("epochs", 0)) < 1:
+            raise ValueError("r2 epochs must be positive")
+        normalized = copy.deepcopy(raw)
+        normalized["CONTEXT"].pop("revision_variant")
+        normalized["DATA"].pop("stats_path")
+        normalized["TRAIN"].pop("save_root")
+        if reference is not None and normalized != reference:
+            raise ValueError("r2 ablations may differ only in variant/output/statistics paths")
+        reference = normalized
+        configs[variant] = raw
+    return configs
+
+
+def runtime_config(variant, seed, release, data_root, project_root, source_root=ROOT,
+                   config_dir="configs/v16", init_checkpoint=None):
     common.checked_name(release)
     if seed < 0:
         raise ValueError("seed must be nonnegative")
-    configs = validate_configs(source_root)
+    configs = validate_configs(source_root, config_dir)
     if variant not in configs:
         raise ValueError("configuration unavailable: " + variant)
     raw = copy.deepcopy(configs[variant])
@@ -98,7 +145,24 @@ def runtime_config(variant, seed, release, data_root, project_root, source_root=
     raw["DATA"]["stats_path"] = str(out / "train_stats.json")
     raw["TRAIN"]["seed"] = seed
     raw["TRAIN"]["save_root"] = str(out)
+    if init_checkpoint:
+        raw["TRAIN"]["init_checkpoint"] = str(Path(init_checkpoint).resolve())
     return raw
+
+
+def validate_training_summary(summary, raw):
+    completed = int(summary.get("epochs_completed", -1))
+    maximum = int(raw["TRAIN"]["epochs"])
+    if summary.get("complete") is not True or summary.get("probe_only") is not False:
+        raise ValueError("formal run requires a complete, non-probe training summary")
+    if completed == maximum:
+        return completed
+    stopped = summary.get("early_stopped") is True
+    minimum = int(raw["TRAIN"].get("min_epochs", maximum))
+    patience = int(raw["TRAIN"].get("early_stop_patience", 0))
+    if not (stopped and patience > 0 and minimum <= completed < maximum):
+        raise ValueError("training ended before all configured epochs without a valid early stop: %d" % completed)
+    return completed
 
 
 def source_hashes(source_root):
@@ -167,7 +231,18 @@ def run(args):
     source = ROOT.resolve()
     project = Path(args.project_root).resolve()
     raw = runtime_config(args.variant, args.seed, args.release,
-                         args.data_root, project, source)
+                         args.data_root, project, source,
+                         getattr(args, "config_dir", "configs/v16"),
+                         getattr(args, "init_checkpoint", None))
+    initialization = None
+    if raw["TRAIN"].get("init_checkpoint"):
+        init_path = Path(raw["TRAIN"]["init_checkpoint"])
+        if not init_path.is_file() or not init_path.stat().st_size:
+            raise ValueError("initial checkpoint is missing or empty: " + str(init_path))
+        initialization = {"path": str(init_path), "sha256": sha256(init_path)}
+        expected = getattr(args, "init_sha256", None)
+        if expected and initialization["sha256"] != expected:
+            raise ValueError("initial checkpoint changed since enqueue")
     out = Path(raw["TRAIN"]["save_root"])
     meta = project / "run/v16_context" / args.release / "jobs" / ("%s_s%d" % (args.variant, args.seed))
     if out.exists() or meta.exists():
@@ -184,7 +259,8 @@ def run(args):
                 "source_sha256": source_hashes(source), "out": str(out),
                 "python": sys.executable, "python_version": sys.version,
                 "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
-                "trained_from_scratch": True, "resume": False}
+                "trained_from_scratch": initialization is None, "initialization": initialization,
+                "resume": False}
     manifest = meta / "manifest.json"
     started = time.time()
     state = dict(identity, status="preflight", started_at_unix=started)
@@ -203,11 +279,7 @@ def run(args):
         write_json(manifest, state)
         execute(base_command + ["--mode", "train"], source)
         summary = read_json(out / "summary.json")
-        completed = int(summary.get("epochs_completed", -1))
-        if completed != int(raw["TRAIN"]["epochs"]):
-            raise ValueError("training ended before all configured epochs: %d" % completed)
-        if summary.get("complete") is not True or summary.get("probe_only") is not False:
-            raise ValueError("formal run requires a complete, non-probe training summary")
+        completed = validate_training_summary(summary, raw)
         if not checkpoint.is_file() or not checkpoint.stat().st_size:
             raise ValueError("trained best checkpoint missing: %s" % checkpoint)
         selected_hash = sha256(checkpoint)
@@ -231,6 +303,8 @@ def run(args):
             raise ValueError("selected checkpoint changed during evaluation")
         if sha256(config) != identity["config_sha256"] or source_hashes(source) != identity["source_sha256"]:
             raise ValueError("source or runtime configuration changed during training")
+        if initialization and sha256(Path(initialization["path"])) != initialization["sha256"]:
+            raise ValueError("initial checkpoint changed during training")
         result = dict(identity, status="complete", epochs_completed=completed,
                       checkpoint=str(checkpoint), checkpoint_sha256=selected_hash,
                       elapsed_seconds=time.time() - started, evaluations=results, profile=profile,
@@ -258,6 +332,9 @@ def main(argv=None):
     parser.add_argument("--project-root", type=Path, default=ROOT)
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--release", default=DEFAULT_RELEASE)
+    parser.add_argument("--config-dir", default="configs/v16/r2")
+    parser.add_argument("--init-checkpoint", type=Path)
+    parser.add_argument("--init-sha256")
     parser.add_argument("--variant", choices=VARIANTS, default="full")
     parser.add_argument("--seed", type=int, default=37)
     parser.add_argument("--device", default="cuda:0")

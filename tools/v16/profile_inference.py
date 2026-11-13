@@ -21,7 +21,7 @@ sys.path.insert(0, str(ROOT))
 import numpy as np
 import torch
 
-from tools.v16.train import (DESIGN, Records, infer_record, make_models,
+from tools.v16.train import (design_name, evidence_model, Records, infer_record, make_models,
                                      load_checkpoint, sync, distribution, validate_config)
 from tools.v14.run_experiment import write_json, sha256
 from train_stream_v1 import seed_everything
@@ -135,7 +135,7 @@ def main():
         raise ValueError("Profile exists; use --overwrite deliberately")
     device = torch.device(args.device)
     ckpt = load_checkpoint(args.checkpoint, torch.device("cpu"))
-    if ckpt.get("design") != DESIGN:
+    if ckpt.get("design") != design_name(ckpt.get("config", {})):
         raise ValueError("Not a V16 overlap checkpoint")
     supplied = load_flat_config(args.config)
     cfg = dict(ckpt["config"], root=str(Path(args.data_root).resolve()))
@@ -192,7 +192,8 @@ def main():
                 finish.append(completion)
             latency = np.asarray(finish)[seq.last_window] - seq.t
             row = {"record": seq.name, "repeat": repeat, "events": seq.n_events,
-                   "event_reads": seq.n_events, "windows": seq.n_windows,
+                   "event_reads": len(seq.order) if evidence_model(cfg) else seq.n_events,
+                   "windows": seq.n_windows,
                    "load_and_index_seconds": load_seconds,
                    "source_prepare_seconds": timing["source_prepare_seconds"],
                    "total_wall_seconds": total_seconds,
@@ -215,13 +216,18 @@ def main():
     energy = power.finish(start, end)
     if energy["board_joules"] is not None:
         energy["board_joules_per_million_events"] = energy["board_joules"] * 1e6 / max(total_events, 1)
-    result = {"design": DESIGN, "checkpoint_sha256": sha256(args.checkpoint), "seed": cfg["seed"],
+    dense_macs = 0 if evidence_model(cfg) else head.dense_macs(int(cfg["pad_height"]), int(cfg["pad_width"]))
+    paired_events = total_reads - total_events
+    fusion_macs = head.estimated_macs(paired_events) if evidence_model(cfg) else None
+    result = {"design": design_name(cfg), "checkpoint_sha256": sha256(args.checkpoint), "seed": cfg["seed"],
               "device": str(device), "torch": torch.__version__,
               "precision": "float32; CUDA matmul and cuDNN TF32 disabled",
               "gpu": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
               "split": args.split, "selection": "input event-count quantiles (includes minimum/maximum for records>=2)",
               "repeats": args.repeats, "readout_policy": cfg["revision_variant"], "rows": rows,
-              "events": total_events, "event_reads": total_events, "windows": total_windows, "context_dense_macs_per_window": head.dense_macs(int(cfg["pad_height"]), int(cfg["pad_width"])),
+              "events": total_events, "event_reads": total_reads if evidence_model(cfg) else total_events,
+              "windows": total_windows, "context_dense_macs_per_window": dense_macs,
+              "paired_events": paired_events, "fusion_event_macs": fusion_macs,
               "total_wall_seconds": end - start,
               "events_per_second_including_preparation": total_events / max(end - start, 1e-9),
               "step_ms": distribution(all_steps), "network_ms": distribution(all_net),

@@ -45,14 +45,23 @@ def check(config, device):
     tr.calibrate_gains(net, factory, .99, 32, 1, .05, 20., 4037)
     # Zero initialization would hide upstream head failures on step one.
     with torch.no_grad():
-        head.revision[-1].weight.normal_(0., .01)
+        if cfg.get("revision_architecture") == "evidence":
+            if head.has_revision:
+                head.output.weight.normal_(0., .01)
+            if head.has_context:
+                head.reliability[-1].weight.normal_(0., .01)
+        else:
+            head.revision[-1].weight.normal_(0., .01)
     optimizer = torch.optim.Adam(list(net.parameters()) + list(head.parameters()), lr=.001)
     result = tr.train_epoch(net, head, records, optimizer, cfg, q99, 1., device,
                             np.random.RandomState(37), CommBudget.from_config(cfg, net),
                             plan=[(0, [(0, 4)]), (0, [(1, 4)])])
     if result["updates"] != 2 or result["committed_events"] != 480:
         raise RuntimeError("Preflight did not execute both updates and commit every event")
-    if not all(v > 0 for v in result["grad_groups_mean"].values()):
+    gradient_groups = dict(result["grad_groups_mean"])
+    if cfg["revision_variant"] == "second":
+        gradient_groups.pop("fusion", None)
+    if not all(v > 0 for v in gradient_groups.values()):
         raise RuntimeError("Preflight has a dead backbone/readout/revision gradient")
     net.eval(); head.eval()
     first, _, _ = tr.infer_record(net, head, records[0], cfg, q99, device, modes=["main"], step=True)
@@ -61,6 +70,7 @@ def check(config, device):
         raise RuntimeError("Online deterministic repeat mismatch")
     return {"passed": True, "torch": torch.__version__, "python": sys.version,
             "device": str(device), "variant": cfg["revision_variant"],
+            "architecture": cfg.get("revision_architecture", "shared_feature_r1"),
             "gpu": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
             "strict_deterministic": torch.are_deterministic_algorithms_enabled(),
             "checks": "nonzero revision; two Adam/TBPTT updates; original-ID coverage; repeatable online output",

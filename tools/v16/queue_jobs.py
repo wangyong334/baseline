@@ -21,7 +21,7 @@ import uuid
 
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_RELEASE = "context_20261112_r1"
+DEFAULT_RELEASE = "context_20261113_r2"
 DEFAULT_DATA = "/media/stephen/nvme0n1/wy_data/datasets/EV-UAV-dataset"
 VARIANTS = ("full", "no_revision", "no_context")
 
@@ -60,7 +60,7 @@ def source_files(root):
             raise ValueError("required source directory is missing or empty: " + directory)
         paths.update(found)
     paths.update((root / "configs/v14").glob("*.yaml"))
-    paths.update((root / "configs/v16").glob("*.yaml"))
+    paths.update((root / "configs/v16").rglob("*.yaml"))
     result = {}
     for path in sorted(paths):
         if not path.is_file() or (path in required and not path.stat().st_size):
@@ -77,12 +77,38 @@ def verify_source(manifest):
     plan = common.verify_source(manifest)
     if source_files(plan["source"]) != plan["files"]:
         raise ValueError("source snapshot changed: source inventory differs from release")
+    for item in plan.get("initializations", {}).values():
+        path = Path(item["path"])
+        if not path.is_file() or digest(path) != item["sha256"]:
+            raise ValueError("frozen initial checkpoint is missing or changed: " + str(path))
     return plan
 
 
-def validate_configs(root):
+def validate_configs(root, config_dir="configs/v16"):
     module = load_module("v16_context_preflight", Path(root) / "tools/v16/run_experiment.py")
-    return module.validate_configs(source_root=Path(root))
+    return module.validate_configs(source_root=Path(root), config_dir=config_dir)
+
+
+def initial_checkpoint(path, seed):
+    """Load metadata on CPU; never substitute a different seed's backbone."""
+    import torch
+    path = Path(path).resolve()
+    if not path.is_file() or not path.stat().st_size:
+        raise ValueError("initial checkpoint is missing or empty: " + str(path))
+    try:
+        checkpoint = torch.load(str(path), map_location="cpu", weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(str(path), map_location="cpu")
+    config = checkpoint.get("config", checkpoint.get("cfg", {}))
+    recorded_seed = config.get("seed", config.get("TRAIN", {}).get("seed"))
+    if recorded_seed != seed:
+        raise ValueError("initial checkpoint seed mismatch: requested %d, found %r" % (seed, recorded_seed))
+    if not isinstance(checkpoint.get("model"), dict):
+        raise ValueError("initial checkpoint lacks model weights")
+    stats = checkpoint.get("stats", {})
+    if "q99" not in stats:
+        raise ValueError("initial checkpoint lacks training q99 statistics")
+    return {"original": str(path), "sha256": digest(path), "seed": seed}
 
 
 def dependency_check(root):
@@ -99,7 +125,7 @@ def dependency_check(root):
 
 
 def prepare_plan(project_root, scheduler_root, data_root, release, seeds=(37, 38),
-                 variants=VARIANTS, runtime_checks=True):
+                 variants=VARIANTS, runtime_checks=True, config_dir="configs/v16", init_root=None):
     project = Path(project_root).resolve()
     scheduler = Path(scheduler_root).resolve()
     data_root = Path(data_root).resolve()
@@ -122,7 +148,7 @@ def prepare_plan(project_root, scheduler_root, data_root, release, seeds=(37, 38
     if release_root.exists():
         raise ValueError("release already exists; refusing duplicate or partial enqueue: %s" % release_root)
     hashes = source_files(project)
-    configs = validate_configs(project)
+    configs = validate_configs(project, config_dir)
     if any(v not in configs for v in variants):
         raise ValueError("requested variant configuration unavailable")
     data = dataset_summary(data_root)
@@ -130,8 +156,15 @@ def prepare_plan(project_root, scheduler_root, data_root, release, seeds=(37, 38
     prefix = "v16_context_%s_" % release
     if any(prefix in path.name for path in scripts):
         raise ValueError("release jobs already exist in the scheduler")
-    number = max([1090] + [int(m.group(1)) for path in scripts
+    evidence = configs[variants[0]]["CONTEXT"].get("revision_architecture") == "evidence"
+    number = max([1270 if evidence else 1090] + [int(m.group(1)) for path in scripts
                           for m in [re.match(r"^(\d+)_", path.name)] if m])
+    initializations = {}
+    if init_root is not None:
+        for seed in seeds:
+            item = initial_checkpoint(Path(init_root) / ("seed%d.pt" % seed), seed)
+            item["path"] = str(release_root / "initialization" / ("seed%d.pt" % seed))
+            initializations[str(seed)] = item
     jobs = []
     for variant in variants:
         for seed in seeds:
@@ -149,6 +182,7 @@ def prepare_plan(project_root, scheduler_root, data_root, release, seeds=(37, 38
     return {"format_version": 1, "release": release, "project_root": str(project),
             "scheduler_root": str(scheduler), "data_root": str(data_root), "physical_gpu": 1,
             "seeds": list(seeds), "variants": list(variants), "jobs": jobs, "data": data,
+            "config_dir": str(config_dir), "initializations": initializations,
             "source": str(release_root / "source"), "files": hashes,
             "python": str(Path(sys.executable).resolve()), "python_version": sys.version,
             "runtime": runtime}
@@ -161,7 +195,11 @@ def job_script(plan, job, manifest):
     command = [plan["python"], "-B", "-u", str(source / "tools/v16/run_experiment.py"),
                "--project-root", plan["project_root"], "--variant", job["variant"],
                "--seed", str(job["seed"]), "--release", plan["release"],
-               "--data-root", plan["data_root"], "--device", "cuda:0"]
+               "--data-root", plan["data_root"], "--device", "cuda:0",
+               "--config-dir", plan.get("config_dir", "configs/v16")]
+    initial = plan.get("initializations", {}).get(str(job["seed"]))
+    if initial:
+        command.extend(["--init-checkpoint", initial["path"], "--init-sha256", initial["sha256"]])
     return "\n".join([
         "#!/usr/bin/env bash", "set -euo pipefail",
         '[ "${GPU:-}" = 1 ] || { echo "ERROR: this job requires pool GPU=1" >&2; exit 1; }',
@@ -188,6 +226,12 @@ def enqueue(plan):
             shutil.copyfile(str(project / relative), str(target))
             if digest(target) != expected:
                 raise ValueError("source changed after preflight: " + relative)
+        for initial in plan.get("initializations", {}).values():
+            target = Path(initial["path"])
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(initial["original"], str(target))
+            if digest(target) != initial["sha256"]:
+                raise ValueError("initial checkpoint changed after preflight: " + initial["original"])
         verify_source(manifest)
         for relative in ("run/queue/pool/STOP", "run/queue/gpu1/STOP"):
             if (Path(plan["scheduler_root"]) / relative).exists():
@@ -286,9 +330,11 @@ def pack(project_root, release, allow_partial=False):
                     raise ValueError("completed artifact is changed or lacks its recorded hash: %s" % path)
         if done:
             summary = runner.read_json(out / "summary.json")
-            if (summary.get("epochs_completed") != 50 or summary.get("complete") is not True
+            if hasattr(runner, "validate_training_summary"):
+                runner.validate_training_summary(summary, runner.load_yaml(meta / "config.yaml"))
+            elif (summary.get("epochs_completed") != 50 or summary.get("complete") is not True
                     or summary.get("probe_only") is not False):
-                raise ValueError("completed experiment lacks a formal 50-epoch summary")
+                raise ValueError("completed legacy experiment lacks a formal 50-epoch summary")
             if runner.read_json(meta / "manifest.json").get("status") != "complete":
                 raise ValueError("job metadata has not reached complete: " + job["name"])
             runner.validate_preflight(meta / "runtime_preflight.json")
@@ -304,6 +350,9 @@ def pack(project_root, release, allow_partial=False):
         if log.is_file():
             files["scheduler_logs/" + log.name] = log
     files[manifest.relative_to(project).as_posix()] = manifest
+    for initial in plan.get("initializations", {}).values():
+        path = Path(initial["path"])
+        files[path.relative_to(project).as_posix()] = path
     for relative in plan["files"]:
         path = Path(plan["source"]) / relative
         files[path.relative_to(project).as_posix()] = path
@@ -354,6 +403,9 @@ def main(argv=None):
     add.add_argument("--scheduler-root", type=Path)
     add.add_argument("--data-root", type=Path, default=Path(DEFAULT_DATA))
     add.add_argument("--release", default=DEFAULT_RELEASE)
+    add.add_argument("--config-dir", default="configs/v16/r2")
+    add.add_argument("--init-root", type=Path,
+                     help="Optional directory containing seed37.pt and seed38.pt; weights are frozen into this release")
     add.add_argument("--seeds", nargs="+", type=int, default=[37, 38])
     add.add_argument("--variants", nargs="+", choices=VARIANTS, default=list(VARIANTS))
     add.add_argument("--dry-run", action="store_true")
@@ -381,7 +433,8 @@ def main(argv=None):
         else:
             scheduler = args.scheduler_root or args.project_root.resolve().parent / "EV-UAV-v13"
             plan = prepare_plan(args.project_root, scheduler, args.data_root,
-                                args.release, args.seeds, args.variants)
+                                args.release, args.seeds, args.variants,
+                                config_dir=args.config_dir, init_root=args.init_root)
             if args.dry_run:
                 print(json.dumps({k: v for k, v in plan.items() if k != "files"}, indent=2))
                 print("DRY_RUN_OK: %d training job(s); GPU 1; %d frozen source files" %
