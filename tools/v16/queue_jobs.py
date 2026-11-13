@@ -151,13 +151,16 @@ def prepare_plan(project_root, scheduler_root, data_root, release, seeds=(37, 38
     configs = validate_configs(project, config_dir)
     if any(v not in configs for v in variants):
         raise ValueError("requested variant configuration unavailable")
+    if init_root is None and any(configs[v]["TRAIN"].get("require_initialization", False)
+                                 for v in variants):
+        raise ValueError("selected configuration requires --init-root with matched seed checkpoints")
     data = dataset_summary(data_root)
     scripts = queue_scripts(scheduler)
     prefix = "v16_context_%s_" % release
     if any(prefix in path.name for path in scripts):
         raise ValueError("release jobs already exist in the scheduler")
-    evidence = configs[variants[0]]["CONTEXT"].get("revision_architecture") == "evidence"
-    number = max([1270 if evidence else 1090] + [int(m.group(1)) for path in scripts
+    paired = configs[variants[0]]["CONTEXT"].get("revision_architecture") in ("evidence", "anchored")
+    number = max([1270 if paired else 1090] + [int(m.group(1)) for path in scripts
                           for m in [re.match(r"^(\d+)_", path.name)] if m])
     initializations = {}
     if init_root is not None:

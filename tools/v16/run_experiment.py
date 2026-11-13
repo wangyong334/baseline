@@ -101,14 +101,16 @@ def validate_configs(source_root=ROOT, config_dir="configs/v16"):
         raw = load_yaml(path)
         flat = flatten(raw)
         if set(raw) != {"DATA", "NET", "TRAIN", "CALIB", "EVAL", "CONTEXT"}:
-            raise ValueError("r2 requires DATA/NET/TRAIN/CALIB/EVAL/CONTEXT")
+            raise ValueError("paired V16 requires DATA/NET/TRAIN/CALIB/EVAL/CONTEXT")
         for section in ("NET", "CALIB", "EVAL"):
             if raw[section] != base[section]:
-                raise ValueError("r2 changes the V5 %s protocol" % section)
+                raise ValueError("paired V16 changes the V5 %s protocol" % section)
         for key, value in base["DATA"].items():
             if key not in ("root", "stats_path") and raw["DATA"].get(key) != value:
-                raise ValueError("r2 changes DATA." + key)
-        required = {"revision_architecture": "evidence", "revision_variant": variant,
+                raise ValueError("paired V16 changes DATA." + key)
+        if flat.get("revision_architecture") not in ("evidence", "anchored"):
+            raise ValueError("paired V16 requires evidence or anchored revision_architecture")
+        required = {"revision_variant": variant,
                     "state_mode": "carry", "state_layout": "single_rolling",
                     "trainer": "streams", "streams": 4, "tbptt_k": 16,
                     "stream_layout": "greedy", "eval_execution": "step",
@@ -116,15 +118,15 @@ def validate_configs(source_root=ROOT, config_dir="configs/v16"):
                     "comm_budget_messages": 157700.0, "comm_budget_mode": "peak"}
         for key, value in required.items():
             if flat.get(key) != value:
-                raise ValueError("r2 requires %s=%r" % (key, value))
+                raise ValueError("paired V16 requires %s=%r" % (key, value))
         if int(flat.get("epochs", 0)) < 1:
-            raise ValueError("r2 epochs must be positive")
+            raise ValueError("paired V16 epochs must be positive")
         normalized = copy.deepcopy(raw)
         normalized["CONTEXT"].pop("revision_variant")
         normalized["DATA"].pop("stats_path")
         normalized["TRAIN"].pop("save_root")
         if reference is not None and normalized != reference:
-            raise ValueError("r2 ablations may differ only in variant/output/statistics paths")
+            raise ValueError("paired V16 ablations may differ only in variant/output/statistics paths")
         reference = normalized
         configs[variant] = raw
     return configs

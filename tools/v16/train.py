@@ -31,6 +31,7 @@ from dataset.overlap_windows import (load_overlap_npz, OverlapWindowSource,
                                      compute_overlap_stats)
 from model.context_revision import ContextRevision
 from model.context_evidence import ContextEvidence
+from model.anchored_revision import AnchoredRevision
 from model.evspsegnet_stream import calibrate_gains, count_parameters, tif_settings
 from model.lif2d_stream import detach_states
 from train_stream_v1 import (build_net, seed_everything, plan_streams, stream_pieces,
@@ -42,15 +43,34 @@ from tools.v14.run_experiment import write_json, sha256
 
 DESIGN = "v16-context-revision-r1"
 EVIDENCE_DESIGN = "v16-context-evidence-r2"
+ANCHORED_DESIGN = "v16-anchored-revision-r3"
 MODES = ("full", "no_context", "no_revision", "second")
 
 
 def evidence_model(cfg):
-    return cfg.get("revision_architecture", "dense") == "evidence"
+    return cfg.get("revision_architecture", "dense") in ("evidence", "anchored")
 
 
 def design_name(cfg):
+    if cfg.get("revision_architecture") == "anchored":
+        return ANCHORED_DESIGN
     return EVIDENCE_DESIGN if evidence_model(cfg) else DESIGN
+
+
+def boundary_retention_loss(logits, reference, labels, threshold=.9, retention_weight=5., margin=1.):
+    """Fixed operating-point classification plus supervised positive retention.
+
+    BCE(z-logit(tau), y) locates the classification boundary at tau without
+    changing inference. The reference is detached and only correct training
+    positives above that boundary are protected; wrong background scores remain
+    free to fall. This is a soft training objective, not a recall guarantee.
+    """
+    boundary = math.log(float(threshold) / (1. - float(threshold)))
+    reference = reference.detach()
+    base = F.binary_cross_entropy_with_logits(logits - boundary, labels, reduction="none")
+    protected = labels * (reference >= boundary).to(labels.dtype)
+    target = torch.clamp(reference, max=boundary + float(margin))
+    return base + float(retention_weight) * protected * F.relu(target - logits).square()
 
 
 def supervised_excess_risk(logits, reference, labels, pos_weight):
@@ -90,7 +110,7 @@ def validate_config(cfg):
         raise ValueError("Use streams=4 without extra stream grouping in this release")
     if cfg.get("revision_variant") not in MODES:
         raise ValueError("Unsupported V16 variant")
-    if cfg.get("revision_architecture", "dense") not in ("dense", "evidence"):
+    if cfg.get("revision_architecture", "dense") not in ("dense", "evidence", "anchored"):
         raise ValueError("Unknown revision architecture")
     if not evidence_model(cfg) and int(cfg["revision_dim"]) != int(cfg["channels"][0]):
         raise ValueError("revision_dim must match the V5 readout channels")
@@ -99,10 +119,13 @@ def validate_config(cfg):
             raise ValueError("Evidence experiments keep threshold=0.9")
         if int(cfg.get("early_stop_patience", 0)) < 0 or int(cfg.get("min_epochs", 1)) < 1:
             raise ValueError("Invalid stopping schedule")
-        if cfg.get("fusion_loss", "bce") not in ("bce", "excess_risk"):
+        if cfg.get("fusion_loss", "bce") not in ("bce", "excess_risk", "boundary_retention"):
             raise ValueError("Unknown evidence loss")
         if not math.isfinite(float(cfg.get("excess_risk_weight", 1.))) or float(cfg.get("excess_risk_weight", 1.)) < 0:
             raise ValueError("excess_risk_weight must be finite and nonnegative")
+        for key, default in (("retention_weight", 5.), ("retention_margin", 1.), ("backbone_lr_scale", 1.)):
+            if not math.isfinite(float(cfg.get(key, default))) or float(cfg.get(key, default)) <= 0:
+                raise ValueError(key + " must be finite and positive")
     if int(cfg["pad_height"]) % 8 or int(cfg["pad_width"]) % 8:
         raise ValueError("V5 padded canvas must be divisible by 8")
     if int(cfg["streams"]) < 1 or int(cfg["tbptt_k"]) < 1 or int(cfg["epochs"]) < 1:
@@ -130,11 +153,12 @@ def make_models(cfg, device):
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(int(cfg["seed"]) + 16000)
         if evidence_model(cfg):
-            common_head = ContextEvidence(feature_dim=int(cfg["readout_hidden"]),
+            head_type = AnchoredRevision if cfg.get("revision_architecture") == "anchored" else ContextEvidence
+            common_head = head_type(feature_dim=int(cfg["readout_hidden"]),
                                    hidden=int(cfg.get("evidence_hidden", 8)),
                                    kappa=float(cfg.get("evidence_kappa", 1.)),
                                    variant="full")
-            head = ContextEvidence(feature_dim=int(cfg["readout_hidden"]),
+            head = head_type(feature_dim=int(cfg["readout_hidden"]),
                                    hidden=int(cfg.get("evidence_hidden", 8)),
                                    kappa=float(cfg.get("evidence_kappa", 1.)),
                                    variant=cfg["revision_variant"])
@@ -363,8 +387,13 @@ def classification_loss(net, head, features, logits, labels, events, segments, p
     else:
         final, rows, cross = fuse_chunk(net, head, features, events, segments, pieces, pending)
     if len(rows):
-        loss = loss + .5 * F.binary_cross_entropy_with_logits(final, labels[_index(rows, logits.device)],
-                                                              pos_weight=weight, reduction="sum")
+        rid = _index(rows, logits.device)
+        if (cfg or {}).get("fusion_loss") == "boundary_retention":
+            final_loss = boundary_retention_loss(final, logits[rid], labels[rid], cfg["threshold"],
+                                                cfg.get("retention_weight", 5.), cfg.get("retention_margin", 1.)).sum()
+        else:
+            final_loss = F.binary_cross_entropy_with_logits(final, labels[rid], pos_weight=weight, reduction="sum")
+        loss = loss + .5 * final_loss
         if isinstance(head, ContextEvidence) and (cfg or {}).get("fusion_loss") == "excess_risk":
             rid = _index(rows, logits.device)
             loss = loss + .5 * float(cfg.get("excess_risk_weight", 1.)) * supervised_excess_risk(
@@ -725,6 +754,8 @@ def load_checkpoint(path, device):
 
 
 def train(cfg, args):
+    if cfg.get("require_initialization", False) and not cfg.get("init_checkpoint"):
+        raise ValueError("This fine-tuning experiment requires --init-root at enqueue (matched seed backbone)")
     out, device = Path(args.out), torch.device(args.device)
     out.mkdir(parents=True, exist_ok=True)
     if not args.resume and any((out / n).exists() for n in ("last.pt", "metrics.jsonl", "run_config.json")):
@@ -737,7 +768,7 @@ def train(cfg, args):
     cfg["_training_inventory"] = {p.name: {"bytes": p.stat().st_size, "mtime_ns": p.stat().st_mtime_ns}
                                   for p in dataset.paths}
     source_paths = [Path(__file__), ROOT / "dataset/overlap_windows.py", ROOT / "model/context_revision.py",
-                    ROOT / "model/context_evidence.py",
+                    ROOT / "model/context_evidence.py", ROOT / "model/anchored_revision.py",
                     ROOT / "model/deterministic_resize.py", ROOT / "dataset/stream_windows.py",
                     ROOT / "utils/stream_common.py",
                     ROOT / "model/evspsegnet_stream.py", ROOT / "model/lif2d_stream.py", ROOT / "utils/comm_budget.py",
@@ -762,7 +793,12 @@ def train(cfg, args):
         write_json(stats_path, stats)
     q99, pos_weight = np.asarray(stats["q99"], dtype=np.float32), float(stats["pos_weight"])
     net, head = make_models(cfg, device)
-    optimizer = torch.optim.Adam(list(net.parameters()) + list(head.parameters()), lr=float(cfg["lr"]))
+    groups = [
+        {"params": list(net.parameters()), "lr_scale": float(cfg.get("backbone_lr_scale", 1.))},
+        {"params": list(head.parameters()), "lr_scale": 1.}]
+    if cfg.get("revision_architecture") != "anchored":
+        groups = list(net.parameters()) + list(head.parameters())
+    optimizer = torch.optim.Adam(groups, lr=float(cfg["lr"]))
     comm = CommBudget.from_config(cfg, net)
     start, best, history = 0, -float("inf"), []
     if args.resume:
@@ -783,7 +819,7 @@ def train(cfg, args):
                    "torch": torch.__version__, "python": sys.version,
                    "data": {p.name: {"bytes": p.stat().st_size, "mtime_ns": p.stat().st_mtime_ns} for p in dataset.paths},
                    "source": {str(p.relative_to(ROOT)): sha256(p) for p in
-                              [Path(__file__), ROOT / "dataset/overlap_windows.py", ROOT / "model/context_revision.py", ROOT / "model/context_evidence.py",
+                              [Path(__file__), ROOT / "dataset/overlap_windows.py", ROOT / "model/context_revision.py", ROOT / "model/context_evidence.py", ROOT / "model/anchored_revision.py",
                                ROOT / "model/evspsegnet_stream.py", ROOT / "model/lif2d_stream.py", ROOT / "utils/comm_budget.py"]}})
         if cfg.get("init_checkpoint"):
             initial = load_checkpoint(cfg["init_checkpoint"], torch.device("cpu"))
@@ -816,12 +852,22 @@ def train(cfg, args):
     subset = select_subset([p.name for p in dataset.paths], int(cfg["train_subset_size"]), int(cfg["seed"]) + 2000)
     subset_data = Records(cfg, "train", subset)
     best_epoch = min((r["epoch"] for r in history if r["val_iou"] == best), default=-1)
+    # A warm start must beat its own online validation result, rather than being
+    # declared improved merely because every trained epoch is accepted.
+    if not args.resume and cfg.get("validate_initial", False):
+        initial_val = evaluate(net, head, validation, cfg, q99, device)
+        best = float(initial_val["metrics"]["iou"])
+        if not math.isfinite(best):
+            raise RuntimeError("Initial validation IoU is not finite")
+        write_json(out / "initial_validation.json", initial_val)
+        save_checkpoint(out / ("best_val_iou_seed%d.pt" % cfg["seed"]), net, head, optimizer, -1, best, cfg, stats, comm)
+        print("INITIAL VALIDATION IoU %.6f ACC %.6f" % (best, initial_val["metrics"]["acc"]), flush=True)
     for epoch in range(start, int(cfg["epochs"])):
         t0 = time.perf_counter()
         lr = (float(cfg["lr"]) if int(cfg["epochs"]) == 1 else
               linear_epoch_lr(epoch, int(cfg["epochs"]), float(cfg["lr"]), float(cfg["lr_end"])))
         for group in optimizer.param_groups:
-            group["lr"] = lr
+            group["lr"] = lr * float(group.get("lr_scale", 1.))
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
         result = train_epoch(net, head, dataset, optimizer, cfg, q99, pos_weight, device,

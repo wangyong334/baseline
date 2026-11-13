@@ -452,14 +452,16 @@ class V16QueueTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "snapshot changed"):
             queue.verify_source(manifest)
 
-    def evidence_configs(self):
+    def evidence_configs(self, architecture="evidence", config_dir="configs/v16/r2"):
         import yaml
         for variant in queue.VARIANTS:
             raw = runner.load_yaml(self.project / ("configs/v16/%s.yaml" % variant))
-            raw["CONTEXT"] = {"revision_architecture": "evidence", "revision_variant": variant,
+            raw["CONTEXT"] = {"revision_architecture": architecture, "revision_variant": variant,
                               "evidence_hidden": 8, "evidence_kappa": 1.0}
             raw["TRAIN"].update(epochs=40, min_epochs=15, early_stop_patience=8)
-            path = self.project / "configs/v16/r2" / (variant + ".yaml")
+            if architecture == "anchored":
+                raw["TRAIN"]["require_initialization"] = True
+            path = self.project / config_dir / (variant + ".yaml")
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(yaml.safe_dump(raw), encoding="utf-8")
 
@@ -491,6 +493,77 @@ class V16QueueTests(unittest.TestCase):
         self.assertIn("context_20261113_r2", output.getvalue())
         self.assertIn("configs/v16/r2", output.getvalue())
         self.assertFalse((self.project / "run").exists())
+
+    def test_r3_explicit_cli_publishes_only_full37_with_frozen_initialization(self):
+        import torch
+        self.evidence_configs("anchored", "configs/v16/r3")
+        self.release = "context_20261113_r3"
+        initial = self.project / "initial"
+        initial.mkdir()
+        # No seed38 file: this release explicitly needs only seed37.
+        torch.save({"config": {"seed": 37}, "model": {"weight": torch.ones(1)},
+                    "stats": {"q99": [1.]}}, str(initial / "seed37.pt"))
+        arguments = ["enqueue", "--project-root", str(self.project),
+                     "--scheduler-root", str(self.scheduler), "--data-root", str(self.data),
+                     "--release", self.release, "--config-dir", "configs/v16/r3",
+                     "--variants", "full", "--seeds", "37", "--init-root", str(initial)]
+        with mock.patch.object(queue.sys, "platform", "linux"), \
+             mock.patch.object(queue, "dependency_check", return_value="torch=fixture"), \
+             mock.patch.object(queue, "live_pool", return_value=1234), \
+             redirect_stdout(io.StringIO()) as output:
+            queue.main(arguments + ["--dry-run"])
+            self.assertFalse((self.project / "run").exists())
+            queue.main(arguments)
+        self.assertIn("DRY_RUN_OK: 1 training job(s); GPU 1", output.getvalue())
+        manifest, plan = queue.release_plan(self.project, self.release)
+        self.assertEqual([(j["variant"], j["seed"]) for j in plan["jobs"]], [("full", 37)])
+        scripts = list((self.scheduler / "run/queue/pool/pending").glob("*.sh"))
+        self.assertEqual(len(scripts), 1)
+        self.assertTrue(scripts[0].name.endswith("full_s37@gpu1.sh"))
+        text = scripts[0].read_text(encoding="utf-8")
+        self.assertIn("configs/v16/r3", text)
+        self.assertIn("--init-sha256", text)
+        self.assertIn("CUDA_VISIBLE_DEVICES=1", text)
+        self.assertEqual(queue.verify_source(manifest)["status"], "queued")
+        self.assertIn("configs/v16/r3/full.yaml", plan["files"])
+        self.assertEqual(set(plan["initializations"]), {"37"})
+        raw = runner.runtime_config("full", 37, self.release, self.data, self.project,
+                                    self.project, "configs/v16/r3",
+                                    plan["initializations"]["37"]["path"])
+        self.assertEqual(raw["CONTEXT"]["revision_architecture"], "anchored")
+        self.assertEqual(raw["TRAIN"]["init_checkpoint"], plan["initializations"]["37"]["path"])
+
+    def test_r3_rejects_unknown_or_mixed_architecture(self):
+        self.evidence_configs("unsupported", "configs/v16/r3")
+        with self.assertRaisesRegex(ValueError, "revision_architecture"):
+            self.plan(config_dir="configs/v16/r3", seeds=(37,), variants=("full",))
+        self.evidence_configs("anchored", "configs/v16/r3")
+        path = self.project / "configs/v16/r3/no_revision.yaml"
+        path.write_text(path.read_text(encoding="utf-8").replace("anchored", "evidence"), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "ablations may differ only"):
+            self.plan(config_dir="configs/v16/r3", seeds=(37,), variants=("full",))
+
+    def test_r3_requires_initialization_before_publishing_or_runtime(self):
+        self.evidence_configs("anchored", "configs/v16/r3")
+        with self.assertRaisesRegex(ValueError, "requires --init-root"):
+            self.plan(config_dir="configs/v16/r3", seeds=(37,), variants=("full",))
+        self.assertFalse((self.project / "run").exists())
+        self.assertFalse((self.scheduler / "run").exists())
+
+    def test_anchored_preflight_does_not_access_r2_reliability(self):
+        import torch
+        from types import SimpleNamespace
+        from tools.v16.runtime_preflight import activate_head_for_preflight
+        head = SimpleNamespace(has_revision=True, has_context=True,
+                               output=torch.nn.Linear(8, 1, bias=False))
+        with torch.no_grad():
+            head.output.weight.zero_()
+        activate_head_for_preflight(head, "anchored")
+        self.assertGreater(float(head.output.weight.detach().abs().sum()), 0.)
+        head.has_revision = False
+        before = head.output.weight.detach().clone()
+        activate_head_for_preflight(head, "anchored")
+        self.assertTrue(torch.equal(head.output.weight, before))
 
 
 if __name__ == "__main__":

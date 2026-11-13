@@ -18,6 +18,20 @@ from tools.v16 import train as tr
 from utils.comm_budget import CommBudget
 
 
+def activate_head_for_preflight(head, architecture):
+    """Exercise upstream gradients hidden by zero-initialized output weights."""
+    with torch.no_grad():
+        if architecture in ("evidence", "anchored"):
+            if head.has_revision:
+                head.output.weight.normal_(0., .01)
+            # The anchored head has one correction path, not r2's reliability
+            # blend. Do not require or silently synthesize a second module.
+            if architecture == "evidence" and head.has_context:
+                head.reliability[-1].weight.normal_(0., .01)
+        else:
+            head.revision[-1].weight.normal_(0., .01)
+
+
 def check(config, device):
     cfg = dict(config)
     cfg.update(height=24, width_px=30, pad_height=24, pad_width=32,
@@ -43,15 +57,7 @@ def check(config, device):
                 yield x, ev
         yield windows()
     tr.calibrate_gains(net, factory, .99, 32, 1, .05, 20., 4037)
-    # Zero initialization would hide upstream head failures on step one.
-    with torch.no_grad():
-        if cfg.get("revision_architecture") == "evidence":
-            if head.has_revision:
-                head.output.weight.normal_(0., .01)
-            if head.has_context:
-                head.reliability[-1].weight.normal_(0., .01)
-        else:
-            head.revision[-1].weight.normal_(0., .01)
+    activate_head_for_preflight(head, cfg.get("revision_architecture", "dense"))
     optimizer = torch.optim.Adam(list(net.parameters()) + list(head.parameters()), lr=.001)
     result = tr.train_epoch(net, head, records, optimizer, cfg, q99, 1., device,
                             np.random.RandomState(37), CommBudget.from_config(cfg, net),
@@ -59,7 +65,7 @@ def check(config, device):
     if result["updates"] != 2 or result["committed_events"] != 480:
         raise RuntimeError("Preflight did not execute both updates and commit every event")
     gradient_groups = dict(result["grad_groups_mean"])
-    if cfg["revision_variant"] == "second":
+    if not any(parameter.requires_grad for parameter in head.parameters()):
         gradient_groups.pop("fusion", None)
     if not all(v > 0 for v in gradient_groups.values()):
         raise RuntimeError("Preflight has a dead backbone/readout/revision gradient")
