@@ -108,8 +108,8 @@ def validate_configs(source_root=ROOT, config_dir="configs/v16"):
         for key, value in base["DATA"].items():
             if key not in ("root", "stats_path") and raw["DATA"].get(key) != value:
                 raise ValueError("paired V16 changes DATA." + key)
-        if flat.get("revision_architecture") not in ("evidence", "anchored"):
-            raise ValueError("paired V16 requires evidence or anchored revision_architecture")
+        if flat.get("revision_architecture") not in ("evidence", "anchored", "covariance"):
+            raise ValueError("paired V16 requires evidence, anchored or covariance revision_architecture")
         required = {"revision_variant": variant,
                     "state_mode": "carry", "state_layout": "single_rolling",
                     "trainer": "streams", "streams": 4, "tbptt_k": 16,
@@ -121,6 +121,8 @@ def validate_configs(source_root=ROOT, config_dir="configs/v16"):
                 raise ValueError("paired V16 requires %s=%r" % (key, value))
         if int(flat.get("epochs", 0)) < 1:
             raise ValueError("paired V16 epochs must be positive")
+        if flat.get("revision_architecture") == "covariance":
+            validate_covariance_protocol(flat)
         normalized = copy.deepcopy(raw)
         normalized["CONTEXT"].pop("revision_variant")
         normalized["DATA"].pop("stats_path")
@@ -130,6 +132,35 @@ def validate_configs(source_root=ROOT, config_dir="configs/v16"):
         reference = normalized
         configs[variant] = raw
     return configs
+
+
+def validate_covariance_protocol(flat):
+    """Keep train-fitted statistics and the fixed operating point explicit."""
+    required = {"freeze_backbone": True, "require_initialization": True,
+                "validate_initial": True, "fusion_loss": "rate_constrained",
+                "threshold": .9, "recall_tolerance": 0., "pd_tolerance": 0.,
+                "selection_rule": "four_metric_noninferiority",
+                "constraint": "smooth_fn_reference"}
+    for key, value in required.items():
+        if flat.get(key) != value:
+            raise ValueError("covariance V16 requires %s=%r" % (key, value))
+    channels = flat.get("covariance_channels")
+    if isinstance(channels, bool) or not isinstance(channels, int) or not 1 <= channels <= 60:
+        raise ValueError("covariance_channels must be an integer between 1 and 60")
+    for key, low, high, closed_low in (
+            ("covariance_shrinkage", 0., 1., False),
+            ("covariance_regularizer", 0., float("inf"), True),
+            ("recall_tolerance", 0., 1., True),
+            ("recall_dual_lr", 0., float("inf"), False),
+            ("recall_dual_init", 0., float("inf"), True)):
+        value = flat.get(key)
+        if (isinstance(value, bool) or not isinstance(value, (int, float)) or
+                not math.isfinite(value) or value > high or
+                (value < low if closed_low else value <= low)):
+            raise ValueError("invalid covariance training setting: " + key)
+    minimum, maximum = int(flat.get("min_epochs", 0)), int(flat.get("epochs", 0))
+    if not 1 <= minimum <= maximum or int(flat.get("early_stop_patience", -1)) < 1:
+        raise ValueError("covariance V16 requires a valid minimum/maximum/patience schedule")
 
 
 def runtime_config(variant, seed, release, data_root, project_root, source_root=ROOT,

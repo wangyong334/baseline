@@ -21,7 +21,7 @@ from utils.comm_budget import CommBudget
 def activate_head_for_preflight(head, architecture):
     """Exercise upstream gradients hidden by zero-initialized output weights."""
     with torch.no_grad():
-        if architecture in ("evidence", "anchored"):
+        if architecture in ("evidence", "anchored", "covariance"):
             if head.has_revision:
                 head.output.weight.normal_(0., .01)
             # The anchored head has one correction path, not r2's reliability
@@ -32,6 +32,30 @@ def activate_head_for_preflight(head, architecture):
             head.revision[-1].weight.normal_(0., .01)
 
 
+def fit_preflight_statistics(head, device):
+    """Exercise train-only covariance fitting before its first forward pass.
+
+    These labelled synthetic pairs belong only to this compatibility check.
+    They are never serialized into the formal training checkpoint.
+    """
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(4037)
+    n, d = 256, int(head.feature_dim)
+    labels = (torch.arange(n) % 2).float()
+    first_h = torch.randn(n, d, generator=generator)
+    first_h[:, 0] += labels
+    second_h = .7 * first_h + .7 * torch.randn(n, d, generator=generator)
+    second_h[:, 1] += labels
+    first_z = first_h[:, 0] + .3 * torch.randn(n, generator=generator)
+    second_z = second_h[:, 1] + .3 * torch.randn(n, generator=generator)
+    observations = [value.to(device) for value in
+                    (first_z, second_z, first_h, second_h, labels)]
+    report = head.fit_statistics(*observations)
+    if not report.get("fitted"):
+        raise RuntimeError("Covariance preflight failed to fit synthetic training statistics")
+    return report
+
+
 def check(config, device):
     cfg = dict(config)
     cfg.update(height=24, width_px=30, pad_height=24, pad_width=32,
@@ -40,6 +64,9 @@ def check(config, device):
     tr.validate_config(cfg)
     tr.seed_everything(int(cfg["seed"]), True)
     net, head = tr.make_models(cfg, device)
+    statistics = None
+    if cfg.get("revision_architecture") == "covariance":
+        statistics = fit_preflight_statistics(head, device)
     records = []
     for seed in (37, 38):
         rng = np.random.RandomState(seed)
@@ -80,6 +107,7 @@ def check(config, device):
             "gpu": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
             "strict_deterministic": torch.are_deterministic_algorithms_enabled(),
             "checks": "nonzero revision; two Adam/TBPTT updates; original-ID coverage; repeatable online output",
+            "synthetic_training_statistics": statistics,
             "training": result}
 
 

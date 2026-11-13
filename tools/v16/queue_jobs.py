@@ -159,7 +159,7 @@ def prepare_plan(project_root, scheduler_root, data_root, release, seeds=(37, 38
     prefix = "v16_context_%s_" % release
     if any(prefix in path.name for path in scripts):
         raise ValueError("release jobs already exist in the scheduler")
-    paired = configs[variants[0]]["CONTEXT"].get("revision_architecture") in ("evidence", "anchored")
+    paired = configs[variants[0]]["CONTEXT"].get("revision_architecture") in ("evidence", "anchored", "covariance")
     number = max([1270 if paired else 1090] + [int(m.group(1)) for path in scripts
                           for m in [re.match(r"^(\d+)_", path.name)] if m])
     initializations = {}

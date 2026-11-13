@@ -32,6 +32,7 @@ from dataset.overlap_windows import (load_overlap_npz, OverlapWindowSource,
 from model.context_revision import ContextRevision
 from model.context_evidence import ContextEvidence
 from model.anchored_revision import AnchoredRevision
+from model.covariance_revision import CovarianceRevision
 from model.evspsegnet_stream import calibrate_gains, count_parameters, tif_settings
 from model.lif2d_stream import detach_states
 from train_stream_v1 import (build_net, seed_everything, plan_streams, stream_pieces,
@@ -48,10 +49,12 @@ MODES = ("full", "no_context", "no_revision", "second")
 
 
 def evidence_model(cfg):
-    return cfg.get("revision_architecture", "dense") in ("evidence", "anchored")
+    return cfg.get("revision_architecture", "dense") in ("evidence", "anchored", "covariance")
 
 
 def design_name(cfg):
+    if cfg.get("revision_architecture") == "covariance":
+        return "v16-covariance-revision-r4"
     if cfg.get("revision_architecture") == "anchored":
         return ANCHORED_DESIGN
     return EVIDENCE_DESIGN if evidence_model(cfg) else DESIGN
@@ -110,7 +113,7 @@ def validate_config(cfg):
         raise ValueError("Use streams=4 without extra stream grouping in this release")
     if cfg.get("revision_variant") not in MODES:
         raise ValueError("Unsupported V16 variant")
-    if cfg.get("revision_architecture", "dense") not in ("dense", "evidence", "anchored"):
+    if cfg.get("revision_architecture", "dense") not in ("dense", "evidence", "anchored", "covariance"):
         raise ValueError("Unknown revision architecture")
     if not evidence_model(cfg) and int(cfg["revision_dim"]) != int(cfg["channels"][0]):
         raise ValueError("revision_dim must match the V5 readout channels")
@@ -119,7 +122,7 @@ def validate_config(cfg):
             raise ValueError("Evidence experiments keep threshold=0.9")
         if int(cfg.get("early_stop_patience", 0)) < 0 or int(cfg.get("min_epochs", 1)) < 1:
             raise ValueError("Invalid stopping schedule")
-        if cfg.get("fusion_loss", "bce") not in ("bce", "excess_risk", "boundary_retention"):
+        if cfg.get("fusion_loss", "bce") not in ("bce", "excess_risk", "boundary_retention", "rate_constrained"):
             raise ValueError("Unknown evidence loss")
         if not math.isfinite(float(cfg.get("excess_risk_weight", 1.))) or float(cfg.get("excess_risk_weight", 1.)) < 0:
             raise ValueError("excess_risk_weight must be finite and nonnegative")
@@ -135,6 +138,9 @@ def validate_config(cfg):
     for key in ("dual_memory", "subthreshold_residual", "invariant_input", "noise_aug", "comod"):
         if cfg.get(key):
             raise ValueError("Unrelated mechanism enabled: " + key)
+    if cfg.get("revision_architecture") == "covariance":
+        from tools.v16.run_experiment import validate_covariance_protocol
+        validate_covariance_protocol(cfg)
     return cfg
 
 
@@ -152,7 +158,14 @@ def make_models(cfg, device):
     net = build_net(clock_cfg, device)
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(int(cfg["seed"]) + 16000)
-        if evidence_model(cfg):
+        if cfg.get("revision_architecture") == "covariance":
+            # Keep the validated r4 head seed independent of backbone creation.
+            torch.manual_seed(int(cfg["seed"]))
+            head = CovarianceRevision(feature_dim=2*int(cfg["channels"][1])+int(cfg["channels"][0]),
+                        hidden=int(cfg.get("evidence_hidden", 8)), kappa=float(cfg.get("evidence_kappa", 2.)),
+                        variant=cfg["revision_variant"], channels=int(cfg.get("covariance_channels", 8)),
+                        shrinkage=float(cfg.get("covariance_shrinkage", .05)))
+        elif evidence_model(cfg):
             head_type = AnchoredRevision if cfg.get("revision_architecture") == "anchored" else ContextEvidence
             common_head = head_type(feature_dim=int(cfg["readout_hidden"]),
                                    hidden=int(cfg.get("evidence_hidden", 8)),
@@ -256,14 +269,18 @@ def detach_pending(pending):
     return own(pending)
 
 
-def readout_with_hidden(net, features, events):
+def readout_with_hidden(net, features, events, context=None):
     """Reuse the existing V5 MLP activation; no third readout or spatial head."""
     values = features[events["t"], events["b"], :, events["y"], events["x"]]
     extra = torch.stack([events["p"], events["t_local"]], 1).to(values.dtype)
     if net.readout_ablation != "none":
         raise ValueError("Evidence training requires the original V5 readout")
     hidden = net.readout[1](net.readout[0](torch.cat([values, extra], 1)))
-    return net.readout[2](hidden).squeeze(1), hidden
+    logits = net.readout[2](hidden).squeeze(1)
+    if context is not None:
+        taps = [f[events["t"], events["b"], :, events["y"]//2, events["x"]//2] for f in context]
+        hidden = torch.cat(taps + [values], 1)
+    return logits, hidden
 
 
 def evidence_pairs(head, logits, hidden, segments, pending):
@@ -388,7 +405,13 @@ def classification_loss(net, head, features, logits, labels, events, segments, p
         final, rows, cross = fuse_chunk(net, head, features, events, segments, pieces, pending)
     if len(rows):
         rid = _index(rows, logits.device)
-        if (cfg or {}).get("fusion_loss") == "boundary_retention":
+        if (cfg or {}).get("fusion_loss") == "rate_constrained":
+            # This path exercises end-to-end gradients in preflight. Formal r4
+            # training freezes V5 and uses the population-cached rate objective.
+            from tools.v16.train_covariance import constrained_loss
+            risk = constrained_loss(final, labels[rid], float(cfg.get("recall_dual_init", 1.)), cfg["threshold"])
+            final_loss = (risk + cfg["covariance_regularizer"] * head.variance_regularizer()) * len(rows)
+        elif (cfg or {}).get("fusion_loss") == "boundary_retention":
             final_loss = boundary_retention_loss(final, logits[rid], labels[rid], cfg["threshold"],
                                                 cfg.get("retention_weight", 5.), cfg.get("retention_margin", 1.)).sum()
         else:
@@ -426,10 +449,11 @@ def train_epoch(net, head, dataset, optimizer, cfg, q99, pos_weight, device, rng
         optimizer.zero_grad(set_to_none=True)
         prev = states
         logits, states, info = net.forward_chunk(x, events, prev, keep=keep, collect=comm is not None,
-                                                return_features=True, skip_readout=evidence_model(cfg))
+                                                return_features=True, skip_readout=evidence_model(cfg),
+                                                feature_taps=cfg.get("revision_architecture") == "covariance")
         hidden = None
         if evidence_model(cfg):
-            logits, hidden = readout_with_hidden(net, info["features"], events)
+            logits, hidden = readout_with_hidden(net, info["features"], events, info.get("context_features"))
         raw_loss, mass, nfinal, ncross = classification_loss(net, head, info["features"], logits, labels, events,
                                                            segments, pieces, pending, pos_weight, hidden, cfg)
         terms = [raw_loss / mass] if mass else []
@@ -533,18 +557,23 @@ def infer_record(net, head, seq, cfg, q99, device, modes=None, step=False, diagn
         t1, prev = time.perf_counter(), states
         need_aux = "first" in modes or "second" in modes
         sparse_evidence = isinstance(head, ContextEvidence)
+        covariance_taps = isinstance(head, CovarianceRevision) and "main" in modes
         if step:
             ev = {k: v for k, v in events.items() if k != "t"}
             logits, states, info = net(x[0], ev, prev, collect=diagnostics,
-                                      return_features=True, skip_readout=sparse_evidence or not need_aux)
+                                      return_features=True, skip_readout=sparse_evidence or not need_aux,
+                                      feature_taps=covariance_taps)
             features = info["features"].unsqueeze(0)
+            context = tuple(v.unsqueeze(0) for v in info["context_features"]) if "context_features" in info else None
         else:
             logits, states, info = net.forward_chunk(x, events, prev, collect=diagnostics,
-                                                     return_features=True, skip_readout=sparse_evidence or not need_aux)
+                                                     return_features=True, skip_readout=sparse_evidence or not need_aux,
+                                                     feature_taps=covariance_taps)
             features = info["features"]
+            context = info.get("context_features")
         hidden = None
         if sparse_evidence:
-            logits, hidden = readout_with_hidden(net, features, events)
+            logits, hidden = readout_with_hidden(net, features, events, context)
         if step: sync(device)
         t2 = time.perf_counter()
         segment = (0, lo, hi, 0, seq, np.asarray(ids))
@@ -754,6 +783,9 @@ def load_checkpoint(path, device):
 
 
 def train(cfg, args):
+    if cfg.get("revision_architecture") == "covariance":
+        from tools.v16.train_covariance import train_cached
+        return train_cached(cfg, args)
     if cfg.get("require_initialization", False) and not cfg.get("init_checkpoint"):
         raise ValueError("This fine-tuning experiment requires --init-root at enqueue (matched seed backbone)")
     out, device = Path(args.out), torch.device(args.device)

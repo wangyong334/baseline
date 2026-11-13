@@ -581,7 +581,7 @@ class EvSpSegNetStream(nn.Module):
             getattr(self, name).neuron.memory_read_enabled = bool(enabled)
 
     def forward(self, x, events, states, state_mode=None, collect=False,
-                return_features=False, skip_readout=False):
+                return_features=False, skip_readout=False, feature_taps=False):
         mode = self.state_mode if state_mode is None else state_mode
         if mode not in ("carry", "reset_each_window"):
             raise ValueError("state_mode 必须是 carry 或 reset_each_window")
@@ -636,10 +636,12 @@ class EvSpSegNetStream(nn.Module):
         if return_features:
             info = {} if info is None else info
             info["features"] = u7
+            if feature_taps:
+                info["context_features"] = (u2, u6)
         return logits, [n1, n2, n3, n4, n5, n6, n7], info
 
     def forward_chunk(self, x, events, states, state_mode=None, collect=False, keep=None,
-                      return_features=False, skip_readout=False):
+                      return_features=False, skip_readout=False, feature_taps=False):
         """逐层时间并行：一次处理一个片段的 T 个连续窗口，与按时间顺序调用 forward T 次数学等价。
 
         本网络层与层之间没有时间反馈，每层的输出序列只取决于它的输入序列，
@@ -696,17 +698,17 @@ class EvSpSegNetStream(nn.Module):
             residual1 = None
         vertical1 = self._vertical_residual(residual1) if self.subthreshold_vertical_enabled else None
         enc2_input = s1 + vertical1 if vertical1 is not None else s1
-        s2, n2, u2 = run_layer("enc2", enc2_input)
+        s2, n2, u2 = run_layer("enc2", enc2_input, keep_u_pre=collect or feature_taps)
         s3, n3, u3 = run_layer("enc3", s2)
         s4, n4, u4 = run_layer("enc4", s3)
         if self.merged_decoder:
             s5, n5, u5 = run_layer("dec3", s3, self.up3(flat(s4)))
-            s6, n6, u6 = run_layer("dec2", s2, self.up2(flat(s5)))
+            s6, n6, u6 = run_layer("dec2", s2, self.up2(flat(s5)), keep_u_pre=collect or feature_taps)
             deep1 = unflat(self.up1(flat(s6)))
             s7, n7, u7 = run_layer("dec1", s1, flat(deep1), keep_u_pre=True)
         else:
             s5, n5, u5 = run_layer("dec3", torch.cat([unflat(self.up3(flat(s4))), s3], 2))
-            s6, n6, u6 = run_layer("dec2", torch.cat([unflat(self.up2(flat(s5))), s2], 2))
+            s6, n6, u6 = run_layer("dec2", torch.cat([unflat(self.up2(flat(s5))), s2], 2), keep_u_pre=collect or feature_taps)
             deep1 = unflat(self.up1(flat(s6)))
             s7, n7, u7 = run_layer("dec1", torch.cat([deep1, s1], 2),
                                    keep_u_pre=True)
@@ -734,6 +736,8 @@ class EvSpSegNetStream(nn.Module):
         if return_features:
             info = {} if info is None else info
             info["features"] = u7
+            if feature_taps:
+                info["context_features"] = (u2, u6)
         return logits, [n1, n2, n3, n4, n5, n6, n7], info
 
     def _readout(self, feat, events):
