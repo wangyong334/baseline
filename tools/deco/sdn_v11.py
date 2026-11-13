@@ -55,8 +55,16 @@ def redundancy_evidence(S, M, mw, rho_w, rho_t):
 
 class SpikingDecisionNeuronsV11(nn.Module):
     def __init__(self, n_off, K, sigma0, dim=64, heads=4, dmax=40, audit="reaudit", rho="learn", gate="sigmoid",
-                 rho_init=(0.5, 0.12), ctx_mass=True, n_extra=0, value="signed"):
+                 rho_init=(0.5, 0.12), ctx_mass=True, n_extra=0, value="signed", attn="query"):
         super(SpikingDecisionNeuronsV11, self).__init__()
+        if attn not in ("query", "query_c0", "kernel", "kernel_c0"):
+            raise ValueError("unknown V11 option: attn=%s" % attn)
+        # attn (11-13 probe): "query" = the 11-08 neuron. "query_c0": the query and the values see only c0 (own arrival
+        # logit, polarity) and the step, the context is never updated from the audit. "kernel": no query, no context --
+        # the gate is the spatial kernel alone and the value depends on the token alone, so the evidence is a fixed
+        # learned kernel over the neighbouring events (what a convolution on the pixel grid computes). "kernel_c0": the
+        # value also sees c0, still without a query or a context update.
+        self.attn = attn
         if (audit not in ("reaudit", "ledger") or rho not in ("learn", "sum", "mean")
                 or gate not in ("sigmoid", "softmax", "compete") or value not in ("signed", "ei")):
             raise ValueError("unknown V11 option: audit=%s rho=%s gate=%s value=%s" % (audit, rho, gate, value))
@@ -129,8 +137,11 @@ class SpikingDecisionNeuronsV11(nn.Module):
                 sel = ok & (dw <= 0.5)
             else:
                 sel = ok & ((dw - d).abs() < 0.5)
-            q = self.wq(self.ln_q(c + self.age.weight[d])).view(B, H, hd)
-            logit = torch.einsum("bhd,bthd->bht", q, Kt) / math.sqrt(hd) + prior          # [B, H, T]
+            if self.attn in ("query", "query_c0"):
+                q = self.wq(self.ln_q(c + self.age.weight[d])).view(B, H, hd)
+                logit = torch.einsum("bhd,bthd->bht", q, Kt) / math.sqrt(hd) + prior      # [B, H, T]
+            else:
+                logit = prior.expand(B, H, T)
             selh = sel[:, None, :]
             if self.gate == "sigmoid":
                 a = torch.sigmoid(logit) * selh.float()
@@ -142,7 +153,10 @@ class SpikingDecisionNeuronsV11(nn.Module):
                 mx = torch.where(torch.isfinite(mx), mx, torch.zeros_like(mx))
                 e = torch.exp(L - mx) * selh.float()
                 a = e / e.sum(-1, keepdim=True).clamp(min=1e-12)
-            v = self.v_out(F.gelu(Vt + self.v_ctx(c)[:, None, :])).permute(0, 2, 1)       # [B, H, T]
+            if self.attn == "kernel":
+                v = self.v_out(F.gelu(Vt)).permute(0, 2, 1)
+            else:
+                v = self.v_out(F.gelu(Vt + self.v_ctx(c)[:, None, :])).permute(0, 2, 1)   # [B, H, T]
             if self.value == "ei":
                 v = F.softplus(v)                                   # log(1 + intensity ratio) >= 0
             S = (a * v).sum(-1)                                                             # [B, H]
@@ -164,7 +178,9 @@ class SpikingDecisionNeuronsV11(nn.Module):
             mass_in = torch.log1p(M) if self.ctx_mass else torch.zeros_like(M)
             dc = self.wo(ubar.reshape(B, self.dim)) + self.wm(torch.cat([mass_in, lam_h], -1))
             dc = dc + self.ff(self.ln_f(dc))
-            if self.audit == "reaudit":
+            if self.attn != "query":
+                pass                                                 # no context update: c stays c0
+            elif self.audit == "reaudit":
                 c = torch.where(m[:, None], c0 + dc, c)
             else:
                 c = c + m.float()[:, None] * dc

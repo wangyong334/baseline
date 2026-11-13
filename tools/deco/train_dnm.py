@@ -441,6 +441,13 @@ def main():
                     help="v11: starting rho_w and rho_t / rho_w (identifiability check: different starts should meet)")
     ap.add_argument("--v11-ctx-mass", choices=("on", "off"), default="on",
                     help="v11: off = the context / values never see the attributed mass (only rho scales the evidence)")
+    ap.add_argument("--v11-attn", choices=("query", "query_c0", "kernel", "kernel_c0"), default="query",
+                    help="v11 probe (11-13): query = the neuron as designed; query_c0 = query and values from the "
+                         "event's own arrival logit, polarity and step only (no context update); kernel = no query and "
+                         "no context (a fixed learned kernel over the neighbouring events); kernel_c0 = kernel whose "
+                         "values also see the event's own arrival logit and polarity")
+    ap.add_argument("--v11-no-dt", action="store_true",
+                    help="v11 probe (11-13): hide the within-window time offset of the tokens (window offset stays)")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--gpu-evidence-gb", type=float, default=8.0,
                     help="per-token evidence of the three splits above this size (GiB) stays memory-mapped in host "
@@ -511,13 +518,19 @@ def main():
         net = sdn_v11.SpikingDecisionNeuronsV11(int(m_tr["tok"].shape[1]), int(m_tr["tok"].shape[2]), sigma0,
                                                 audit=args.v11_audit, rho=args.v11_rho, gate=args.v11_gate,
                                                 rho_init=tuple(args.v11_rho_init),
-                                                ctx_mass=args.v11_ctx_mass == "on", value=args.v11_value).to(dev)
-        extra.update(sigma0=sigma0, audit=args.v11_audit, rho=args.v11_rho, gate=args.v11_gate, value=args.v11_value)
-        print("v11: audit %s, redundancy %s, gate %s, values %s; receptive field starts at sigma0 = %.1f px"
-              % (args.v11_audit, args.v11_rho, args.v11_gate, args.v11_value, sigma0), flush=True)
+                                                ctx_mass=args.v11_ctx_mass == "on", value=args.v11_value,
+                                                attn=args.v11_attn).to(dev)
+        extra.update(sigma0=sigma0, audit=args.v11_audit, rho=args.v11_rho, gate=args.v11_gate, value=args.v11_value,
+                     attn=args.v11_attn, no_dt=bool(args.v11_no_dt))
+        print("v11: audit %s, redundancy %s, gate %s, values %s, attn %s%s; receptive field starts at sigma0 = %.1f px"
+              % (args.v11_audit, args.v11_rho, args.v11_gate, args.v11_value, args.v11_attn,
+                 ", no dt" if args.v11_no_dt else "", sigma0), flush=True)
 
         def fwd(g, idx):
             feat, ok, dw, valid, z_in, z0, p, y, dist2 = fz.batch(g, idx)
+            if args.v11_no_dt:
+                feat = feat.clone()
+                feat[..., 2] = 0.0
             return net(feat, ok, dw, valid, z_in, z0, p, D, dist2), valid, y
     else:
         net = DecisionNeurons().to(dev)
