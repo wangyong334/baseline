@@ -21,13 +21,22 @@
 # (audit ledger), constant cost per step (~3.5 k MAC) and a state of a few numbers instead of a token buffer:
 #   l_glm        e_glm with the ledger; the context = a linear map of the accumulated window statistics
 #   l_glm_noctx  the same without context (membrane only): does the reading need what the unit has seen?
+# (The lanes of rounds 3-5 ran with the defaults of their time; the defaults are now the main model, so re-running a
+# lane without explicit options gives a different model.)
+# Final round (11-13 night, main model = l_glm = the defaults of tools/v17/train_sdu.py), seven lanes, 19 jobs:
+#   f1  v5s37 final s0, then dev_cascade (fine-tune final_s0 on the events its entry rule sends to units), dev_levels3
+#   f2  v5s37 final s1, s2, then dev_ep8 (8 epochs instead of 12: training cost)
+#   f3  v5s38 final s0, s1, s2        f4  v5s39 final s0, s1, s2       (3 backbones x 3 decision seeds)
+#   f5  ablations: re-audit, no context, one mean over all windows
+#   f6  ablations: every event independent (sum), boxes as observations, content attribution
+#   f7  ablation: one signed channel
 # Usage (V17 code dir, after `conda activate evuav`):
 #   GPU=2 LANE=main nohup bash tools/v17/round_v17.sh > run/v17/lane_main.log 2>&1 < /dev/null &
 # Stop a lane after its current job: touch run/v17/STOP_<LANE>. Last line: "ROUND V17 LANE <LANE> FINISHED ...".
 set -u
 cd "$(dirname "$0")/../.."
 GPU=${GPU:?GPU=<physical id>}
-LANE=${LANE:?LANE=main|abl1|abl2|e_glm|e_glm_attr|e_linear|l_glm|l_glm_noctx}
+LANE=${LANE:?LANE=f1..f7 for the final round, or a lane of rounds 3-5}
 LEAN="--context-ff off --dim 32"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=$GPU OMP_NUM_THREADS=4 MKL_NUM_THREADS=4
 case $LANE in
@@ -41,7 +50,17 @@ case $LANE in
   e_linear) JOBS=("v5s37 0 e_linear --tokens linear --gate distance $LEAN") ;;
   l_glm) JOBS=("v5s37 0 l_glm --tokens glm --gate distance --audit ledger $LEAN") ;;
   l_glm_noctx) JOBS=("v5s37 0 l_glm_noctx --tokens glm --gate distance --audit ledger --context off $LEAN") ;;
-  *) echo "ROUND V17 LANE $LANE NOT STARTED: LANE=main|abl1|abl2|e_glm|e_glm_attr|e_linear|l_glm|l_glm_noctx"; exit 1 ;;
+  f1) JOBS=("v5s37 0 final" "v5s37 0 dev_cascade --cascade-from run/v17/v5s37/final_s0 --epochs 4 --lr 5e-4"
+            "v5s37 0 dev_levels3 --levels 3") ;;
+  f2) JOBS=("v5s37 1 final" "v5s37 2 final" "v5s37 0 dev_ep8 --epochs 8") ;;
+  f3) JOBS=("v5s38 0 final" "v5s38 1 final" "v5s38 2 final") ;;
+  f4) JOBS=("v5s39 0 final" "v5s39 1 final" "v5s39 2 final") ;;
+  f5) JOBS=("v5s37 0 abl_reaudit --audit reaudit" "v5s37 0 abl_noctx --context off" "v5s37 0 abl_pool_mean --pool mean") ;;
+  f6) JOBS=("v5s37 0 abl_pool_sum --pool sum" "v5s37 0 abl_boxes --evidence boxes"
+            "v5s37 0 abl_gate_content --gate attribution") ;;
+  f7) JOBS=("v5s37 0 abl_signed --value signed") ;;
+  *) echo "ROUND V17 LANE $LANE NOT STARTED: LANE=f1..f7 or main|abl1|abl2|e_glm|e_glm_attr|e_linear|l_glm|l_glm_noctx"
+     exit 1 ;;
 esac
 mkdir -p run/v17
 rm -f "run/v17/STOP_$LANE"
