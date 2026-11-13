@@ -151,6 +151,9 @@ def prepare_plan(project_root, scheduler_root, data_root, release, seeds=(37, 38
     configs = validate_configs(project, config_dir)
     if any(v not in configs for v in variants):
         raise ValueError("requested variant configuration unavailable")
+    if init_root is not None and any(configs[v]["CONTEXT"].get("revision_architecture") == "hotelling"
+                                     for v in variants):
+        raise ValueError("from-scratch Hotelling forbids --init-root")
     if init_root is None and any(configs[v]["TRAIN"].get("require_initialization", False)
                                  for v in variants):
         raise ValueError("selected configuration requires --init-root with matched seed checkpoints")
@@ -159,7 +162,7 @@ def prepare_plan(project_root, scheduler_root, data_root, release, seeds=(37, 38
     prefix = "v16_context_%s_" % release
     if any(prefix in path.name for path in scripts):
         raise ValueError("release jobs already exist in the scheduler")
-    paired = configs[variants[0]]["CONTEXT"].get("revision_architecture") in ("evidence", "anchored", "covariance")
+    paired = configs[variants[0]]["CONTEXT"].get("revision_architecture") in ("evidence", "anchored", "covariance", "hotelling")
     number = max([1270 if paired else 1090] + [int(m.group(1)) for path in scripts
                           for m in [re.match(r"^(\d+)_", path.name)] if m])
     initializations = {}
@@ -338,6 +341,12 @@ def pack(project_root, release, allow_partial=False):
         artifacts = [out / name for name in ("summary.json", "train_stats.json", "eval_val.json",
                                              "eval_test.json", "profile.json")]
         artifacts.extend((checkpoint, meta / "config.yaml", meta / "runtime_preflight.json"))
+        runtime_config = runner.load_yaml(meta / "config.yaml") if (meta / "config.yaml").is_file() else {}
+        if (result.get("status") == "complete" and
+                runtime_config.get("CONTEXT", {}).get("revision_architecture") == "hotelling"):
+            if result.get("trained_from_scratch") is not True or result.get("initialization") is not None:
+                raise ValueError("Hotelling result does not record random initialization")
+            artifacts.extend(runner.hotelling_artifacts(out))
         required = artifacts + [result_path, meta / "manifest.json", log]
         missing = [str(path) for path in required if not path.is_file() or not path.stat().st_size]
         if result.get("status") != "complete":

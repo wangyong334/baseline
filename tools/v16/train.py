@@ -33,6 +33,7 @@ from model.context_revision import ContextRevision
 from model.context_evidence import ContextEvidence
 from model.anchored_revision import AnchoredRevision
 from model.covariance_revision import CovarianceRevision
+from model.hotelling_readout import HotellingReadout
 from model.evspsegnet_stream import calibrate_gains, count_parameters, tif_settings
 from model.lif2d_stream import detach_states
 from train_stream_v1 import (build_net, seed_everything, plan_streams, stream_pieces,
@@ -49,7 +50,7 @@ MODES = ("full", "no_context", "no_revision", "second")
 
 
 def evidence_model(cfg):
-    return cfg.get("revision_architecture", "dense") in ("evidence", "anchored", "covariance")
+    return cfg.get("revision_architecture", "dense") in ("evidence", "anchored", "covariance", "hotelling")
 
 
 def covariance_feature_source(cfg):
@@ -69,10 +70,14 @@ def covariance_feature_dim(cfg):
 def readout_feature_source(cfg):
     # Adaptation switches to evidence/second while retaining covariance options.
     # Its original MLP activation must remain independent of those options.
+    if cfg.get("revision_architecture") == "hotelling":
+        return "dec1"
     return covariance_feature_source(cfg) if cfg.get("revision_architecture") == "covariance" else "mlp"
 
 
 def design_name(cfg):
+    if cfg.get("revision_architecture") == "hotelling":
+        return "v16-hotelling-from-scratch"
     if cfg.get("revision_architecture") == "covariance":
         if cfg.get("constraint") == "record_fn_reference":
             return "v16-covariance-revision-r5"
@@ -135,7 +140,7 @@ def validate_config(cfg):
         raise ValueError("Use streams=4 without extra stream grouping in this release")
     if cfg.get("revision_variant") not in MODES:
         raise ValueError("Unsupported V16 variant")
-    if cfg.get("revision_architecture", "dense") not in ("dense", "evidence", "anchored", "covariance"):
+    if cfg.get("revision_architecture", "dense") not in ("dense", "evidence", "anchored", "covariance", "hotelling"):
         raise ValueError("Unknown revision architecture")
     if not evidence_model(cfg) and int(cfg["revision_dim"]) != int(cfg["channels"][0]):
         raise ValueError("revision_dim must match the V5 readout channels")
@@ -163,7 +168,17 @@ def validate_config(cfg):
     if cfg.get("revision_architecture") == "covariance":
         from tools.v16.run_experiment import validate_covariance_protocol
         validate_covariance_protocol(cfg)
+    if cfg.get("revision_architecture") == "hotelling":
+        validate_hotelling_training_config(cfg)
     return cfg
+
+
+def validate_hotelling_training_config(cfg):
+    """Keep random initialization and live-backbone statistics explicit."""
+    from tools.v16.run_experiment import validate_hotelling_protocol
+    validate_hotelling_protocol(cfg, formal=False)
+    if cfg.get("validate_initial", False):
+        raise ValueError("Hotelling selects trained epochs by validation IoU")
 
 
 def make_models(cfg, device):
@@ -180,7 +195,11 @@ def make_models(cfg, device):
     net = build_net(clock_cfg, device)
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(int(cfg["seed"]) + 16000)
-        if cfg.get("revision_architecture") == "covariance":
+        if cfg.get("revision_architecture") == "hotelling":
+            head = HotellingReadout(feature_dim=int(cfg["channels"][0]),
+                                   variant=cfg["revision_variant"],
+                                   shrinkage=float(cfg.get("hotelling_shrinkage", .05)))
+        elif cfg.get("revision_architecture") == "covariance":
             # Keep the validated r4 head seed independent of backbone creation.
             torch.manual_seed(int(cfg["seed"]))
             head = CovarianceRevision(feature_dim=covariance_feature_dim(cfg),
@@ -433,7 +452,8 @@ def classification_loss(net, head, features, logits, labels, events, segments, p
         singles += int((~paired).sum())
     if isinstance(head, ContextEvidence):
         if hidden is None:
-            source = covariance_feature_source(cfg or {}) if isinstance(head, CovarianceRevision) else "mlp"
+            source = "dec1" if isinstance(head, HotellingReadout) else (
+                covariance_feature_source(cfg or {}) if isinstance(head, CovarianceRevision) else "mlp")
             logits, hidden = readout_with_hidden(net, features, events, source=source)
         final, rows, cross = evidence_pairs(head, logits, hidden, segments, pending)
     else:
@@ -594,8 +614,8 @@ def infer_record(net, head, seq, cfg, q99, device, modes=None, step=False, diagn
         t1, prev = time.perf_counter(), states
         need_aux = "first" in modes or "second" in modes
         sparse_evidence = isinstance(head, ContextEvidence)
-        feature_source = (covariance_feature_source(cfg)
-                          if isinstance(head, CovarianceRevision) and "main" in modes else "mlp")
+        feature_source = (readout_feature_source(cfg)
+                          if isinstance(head, (CovarianceRevision, HotellingReadout)) and "main" in modes else "mlp")
         covariance_taps = feature_source == "multilevel"
         if step:
             ev = {k: v for k, v in events.items() if k != "t"}
@@ -860,6 +880,10 @@ def validate_backbone_initialization(initial, cfg, q99):
 
 
 def train(cfg, args):
+    hotelling = cfg.get("revision_architecture") == "hotelling"
+    if hotelling:
+        validate_hotelling_training_config(cfg)
+        from tools.v16 import train_hotelling as ho_training
     if cfg.get("revision_architecture") == "covariance":
         from tools.v16.train_covariance import train_cached
         return train_cached(cfg, args)
@@ -882,6 +906,9 @@ def train(cfg, args):
                     ROOT / "utils/stream_common.py",
                     ROOT / "model/evspsegnet_stream.py", ROOT / "model/lif2d_stream.py", ROOT / "utils/comm_budget.py",
                     ROOT / "train_stream_v1.py", ROOT / "utils/stream_metrics.py"]
+    if hotelling:
+        source_paths += [ROOT / "model/hotelling_readout.py", ROOT / "tools/v16/train_hotelling.py",
+                         ROOT / "tools/v16/train_covariance.py", ROOT / "tools/v16/run_experiment.py"]
     cfg["_source_sha256"] = {str(p.relative_to(ROOT)): sha256(p) for p in source_paths}
     stats_path = out / "train_stats.json"
     if args.resume:
@@ -902,6 +929,7 @@ def train(cfg, args):
         write_json(stats_path, stats)
     q99, pos_weight = np.asarray(stats["q99"], dtype=np.float32), float(stats["pos_weight"])
     net, head = make_models(cfg, device)
+    random_backbone_hash = ho_training.backbone_sha256(net) if hotelling and not args.resume else None
     groups = [
         {"params": list(net.parameters()), "lr_scale": float(cfg.get("backbone_lr_scale", 1.))},
         {"params": list(head.parameters()), "lr_scale": 1.}]
@@ -919,6 +947,8 @@ def train(cfg, args):
         history = [json.loads(line) for line in (out / "metrics.jsonl").read_text(encoding="utf-8").splitlines()]
         history = [row for row in history if row["epoch"] < start]
         (out / "metrics.jsonl").write_text("".join(json.dumps(r) + "\n" for r in history), encoding="utf-8")
+        if hotelling:
+            hotelling_report = ho_training.resume_statistics(net, head, out, int(ckpt["epoch"]))
         del ckpt
     else:
         write_json(out / "run_config.json", {"design": design_name(cfg), "config": cfg,
@@ -927,9 +957,12 @@ def train(cfg, args):
                    "actual_optimizer_step": "per parallel-stream TBPTT chunk, as in V14",
                    "torch": torch.__version__, "python": sys.version,
                    "data": {p.name: {"bytes": p.stat().st_size, "mtime_ns": p.stat().st_mtime_ns} for p in dataset.paths},
-                   "source": {str(p.relative_to(ROOT)): sha256(p) for p in
+                   "source": cfg["_source_sha256"] if hotelling else {str(p.relative_to(ROOT)): sha256(p) for p in
                               [Path(__file__), ROOT / "dataset/overlap_windows.py", ROOT / "model/context_revision.py", ROOT / "model/context_evidence.py", ROOT / "model/anchored_revision.py",
-                               ROOT / "model/evspsegnet_stream.py", ROOT / "model/lif2d_stream.py", ROOT / "utils/comm_budget.py"]}})
+                               ROOT / "model/evspsegnet_stream.py", ROOT / "model/lif2d_stream.py", ROOT / "utils/comm_budget.py"]},
+                   **({"from_scratch": True, "initial_checkpoint": None,
+                       "training": "joint backbone/readout/calibration optimization; train-only epoch statistics"}
+                      if hotelling else {})})
         if cfg.get("init_checkpoint"):
             initial = load_checkpoint(cfg["init_checkpoint"], torch.device("cpu"))
             changed_window, initial_mu = validate_backbone_initialization(initial, cfg, q99)
@@ -952,6 +985,16 @@ def train(cfg, args):
             del initial
         else:
             calibrate(net, dataset, cfg, q99, device, out)
+            if hotelling:
+                if not all(parameter.requires_grad for parameter in net.parameters()):
+                    raise ValueError("Hotelling from-scratch backbone has frozen parameters")
+                write_json(out / "initialization.json", {
+                    "mode": "random", "from_scratch": True, "initial_checkpoint": None,
+                    "seed": int(cfg["seed"]), "random_backbone_sha256": random_backbone_hash,
+                    "calibrated_backbone_sha256": ho_training.backbone_sha256(net),
+                    "normalization": "current training set", "gain_calibration_split": "train"})
+                hotelling_report = ho_training.refresh_statistics(
+                    net, head, dataset, cfg, q99, device, out, epoch=-1, split="train")
     validation = Records(cfg, "val")
     if args.limit_records:
         validation.paths = validation.paths[:args.limit_records]
@@ -984,15 +1027,27 @@ def train(cfg, args):
             group["lr"] = lr * float(group.get("lr_scale", 1.))
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
+        frozen_statistics = ho_training.statistics_sha256(head) if hotelling else None
         result = train_epoch(net, head, dataset, optimizer, cfg, q99, pos_weight, device,
                              np.random.RandomState(int(cfg["seed"]) * 1000 + epoch + 7), comm,
                              max_chunks=args.max_chunks)
-        val = evaluate(net, head, validation, cfg, q99, device, full=guarded_selection)
+        if hotelling:
+            if ho_training.statistics_sha256(head) != frozen_statistics:
+                raise RuntimeError("Hotelling statistics changed during backbone optimization")
+            hotelling_report = ho_training.refresh_statistics(
+                net, head, dataset, cfg, q99, device, out, epoch=epoch, split="train")
+        val = evaluate(net, head, validation, cfg, q99, device, full=guarded_selection or hotelling)
         sub = evaluate(net, head, subset_data, cfg, q99, device) if subset_due(epoch, int(cfg["epochs"]), int(cfg["train_subset_every"])) else None
         record = dict(result, epoch=epoch, lr=lr, val_iou=val["metrics"]["iou"], val_acc=val["metrics"]["acc"],
                       val_readouts=val["readouts"], train_subset_readouts=sub["readouts"] if sub else None,
                       epoch_seconds=time.perf_counter() - t0, tau=tau_statistics(net),
                       peak_allocated_gib=torch.cuda.max_memory_allocated(device) / 2**30 if device.type == "cuda" else None)
+        if hotelling:
+            record.update(val_pd=val["metrics"]["pd"], val_fa=val["metrics"]["fa"],
+                          statistics_seconds=hotelling_report["seconds"],
+                          statistics_backbone_sha256=hotelling_report["backbone_sha256"],
+                          statistics_sha256=hotelling_report["statistics_sha256"],
+                          hotelling_statistics=head.statistics_summary())
         if record["val_iou"] is None or not math.isfinite(record["val_iou"]):
             raise RuntimeError("Validation IoU is not finite")
         if guarded_selection:
@@ -1005,9 +1060,16 @@ def train(cfg, args):
             best = record["val_iou"]
             best_epoch = epoch
             save_checkpoint(out / ("best_val_iou_seed%d.pt" % cfg["seed"]), net, head, optimizer, epoch, best, cfg, stats, comm)
+            if hotelling:
+                write_json(out / "hotelling_stats_selected.json", hotelling_report)
         save_checkpoint(out / "last.pt", net, head, optimizer, epoch, best, cfg, stats, comm)
         patience = int(cfg.get("early_stop_patience", 0))
         early_stopped = bool(patience and epoch + 1 >= int(cfg.get("min_epochs", 1)) and epoch - best_epoch >= patience)
+        if hotelling:
+            ho_training.write_training_audit(
+                net, head, out, epoch, best_epoch,
+                complete=(epoch + 1 == int(cfg["epochs"]) or early_stopped)
+                         and args.limit_records is None and args.max_chunks is None)
         write_json(out / "summary.json", {"design": design_name(cfg), "epochs_completed": epoch + 1, "epochs_requested": cfg["epochs"],
                    "best_val_iou": best,
                    "best_epoch": best_epoch + 1, "early_stopped": early_stopped,
@@ -1019,10 +1081,19 @@ def train(cfg, args):
                    "probe_only": args.limit_records is not None or args.max_chunks is not None,
                    "train_seconds_total": sum(r["train_seconds"] for r in history),
                    "epoch_seconds_total": sum(r["epoch_seconds"] for r in history),
+                   **({"from_scratch": True, "initial_checkpoint": None,
+                       "statistics_seconds_total": sum(r["statistics_seconds"] for r in history),
+                       "initial_statistics_seconds": json.loads((out / "hotelling_stats_initial.json").read_text(encoding="utf8"))["seconds"],
+                       "statistics_refreshed_before_validation": True} if hotelling else {}),
                    "seed": cfg["seed"], "revision_variant": cfg["revision_variant"]})
-        print("EPOCH %d/%d train %.1fs total %.1fs loss %.5f val IoU %.5f ACC %.5f comm_mu %.4f" %
-              (epoch + 1, cfg["epochs"], result["train_seconds"], record["epoch_seconds"], result["loss_per_event"],
-               record["val_iou"], record["val_acc"], comm.mu), flush=True)
+        if hotelling:
+            print("EPOCH %d/%d train %.1fs total %.1fs loss %.5f val IoU %.5f ACC %.5f Pd %.5f Fa %.5f comm_mu %.4f" %
+                  (epoch + 1, cfg["epochs"], result["train_seconds"], record["epoch_seconds"], result["loss_per_event"],
+                   record["val_iou"], record["val_acc"], record["val_pd"], record["val_fa"], comm.mu), flush=True)
+        else:
+            print("EPOCH %d/%d train %.1fs total %.1fs loss %.5f val IoU %.5f ACC %.5f comm_mu %.4f" %
+                  (epoch + 1, cfg["epochs"], result["train_seconds"], record["epoch_seconds"], result["loss_per_event"],
+                   record["val_iou"], record["val_acc"], comm.mu), flush=True)
         if early_stopped:
             print("EARLY STOP after %d epochs without an eligible higher validation IoU" % patience, flush=True)
             break

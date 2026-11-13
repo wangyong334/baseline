@@ -133,8 +133,8 @@ def validate_configs(source_root=ROOT, config_dir="configs/v16"):
         for key, value in expected_data.items():
             if key not in ("root", "stats_path") and raw["DATA"].get(key) != value:
                 raise ValueError("paired V16 changes DATA." + key)
-        if flat.get("revision_architecture") not in ("evidence", "anchored", "covariance"):
-            raise ValueError("paired V16 requires evidence, anchored or covariance revision_architecture")
+        if flat.get("revision_architecture") not in ("evidence", "anchored", "covariance", "hotelling"):
+            raise ValueError("paired V16 requires a supported readout revision_architecture")
         required = {"revision_variant": variant,
                     "state_mode": "carry", "state_layout": "single_rolling",
                     "trainer": "streams", "streams": 4, "tbptt_k": 16,
@@ -148,6 +148,8 @@ def validate_configs(source_root=ROOT, config_dir="configs/v16"):
             raise ValueError("paired V16 epochs must be positive")
         if flat.get("revision_architecture") == "covariance":
             validate_covariance_protocol(flat)
+        elif flat.get("revision_architecture") == "hotelling":
+            validate_hotelling_protocol(flat, formal=True)
         normalized = copy.deepcopy(raw)
         normalized["CONTEXT"].pop("revision_variant")
         normalized["DATA"].pop("stats_path")
@@ -157,6 +159,45 @@ def validate_configs(source_root=ROOT, config_dir="configs/v16"):
         reference = normalized
         configs[variant] = raw
     return configs
+
+
+def validate_hotelling_protocol(flat, formal=False):
+    """Reject warm starts and frozen shortcuts for the direct HO experiment."""
+    required = {"from_scratch": True, "freeze_backbone": False,
+                "require_initialization": False, "backbone_adaptation": False,
+                "fusion_loss": "bce", "selection_rule": "val_iou", "validate_initial": False,
+                "covariance_feature_source": "dec1", "threshold": .9}
+    for key, expected in required.items():
+        if flat.get(key) != expected:
+            raise ValueError("from-scratch Hotelling requires %s=%r" % (key, expected))
+    if flat.get("init_checkpoint") or flat.get("initialization_policy"):
+        raise ValueError("from-scratch Hotelling forbids an initial checkpoint or adaptation policy")
+    if any(key.startswith("adaptation_") for key in flat):
+        raise ValueError("from-scratch Hotelling forbids adaptation settings")
+    shrinkage = flat.get("hotelling_shrinkage")
+    if (isinstance(shrinkage, bool) or not isinstance(shrinkage, (int, float)) or
+            not math.isfinite(shrinkage) or not 0. < shrinkage <= 1.):
+        raise ValueError("hotelling_shrinkage must be finite in (0,1]")
+    if formal:
+        for key, expected in (("epochs", 50), ("min_epochs", 50), ("early_stop_patience", 0)):
+            if flat.get(key) != expected:
+                raise ValueError("formal Hotelling requires %s=%r" % (key, expected))
+
+
+def hotelling_artifacts(out):
+    """Bind refreshed statistics and random-initialization evidence to results."""
+    out = Path(out)
+    paths = [out / name for name in (
+        "hotelling_stats_initial.json", "hotelling_stats_latest.json", "hotelling_stats_selected.json",
+        "initialization.json", "hotelling_training_audit.json")]
+    epochs = sorted((out / "hotelling_statistics").glob("epoch_*.json"))
+    summary = read_json(out / "summary.json")
+    if len(epochs) != int(summary["epochs_completed"]):
+        raise ValueError("Hotelling requires a current-training statistics record for every epoch")
+    paths += epochs
+    if any(not p.is_file() or not p.stat().st_size for p in paths):
+        raise ValueError("Hotelling is missing initialization or statistics audit artifacts")
+    return paths
 
 
 def validate_covariance_protocol(flat):
@@ -221,6 +262,8 @@ def runtime_config(variant, seed, release, data_root, project_root, source_root=
     raw["TRAIN"]["seed"] = seed
     raw["TRAIN"]["save_root"] = str(out)
     if init_checkpoint:
+        if raw["CONTEXT"].get("revision_architecture") == "hotelling":
+            raise ValueError("from-scratch Hotelling forbids --init-checkpoint")
         raw["TRAIN"]["init_checkpoint"] = str(Path(init_checkpoint).resolve())
     return raw
 
@@ -511,6 +554,8 @@ def run(args):
         artifacts = [out / "summary.json", out / "train_stats.json",
                      out / "eval_val.json", out / "eval_test.json", out / "profile.json",
                      checkpoint, config, preflight_path] + stage_artifacts
+        if raw["CONTEXT"].get("revision_architecture") == "hotelling":
+            artifacts += hotelling_artifacts(out)
         result["artifact_sha256"] = {
             p.relative_to(project).as_posix(): sha256(p) for p in artifacts}
         write_json(out / "comparison_result.json", result)

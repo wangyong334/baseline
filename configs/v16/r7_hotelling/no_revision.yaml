@@ -1,0 +1,96 @@
+# V16 r7: random-initialized V5 BIR plus a direct train-refitted Hotelling readout.
+# Fifty complete epochs; no inherited checkpoint, frozen head stage or early stopping.
+DATA:
+  root: /media/stephen/nvme0n1/wy_data/datasets/EV-UAV-dataset
+  stats_path: log/v16_hotelling_r7/no_revision_seed37/train_stats.json
+  total_ms: 8000
+  window_ms: 100
+  stride_ms: 50
+  n_windows: 159
+  time_bins: 5
+  height: 260
+  width_px: 346
+  pad_height: 264
+  pad_width: 352
+  input_clip: 3.0
+NET:
+  channels:
+  - 12
+  - 24
+  - 48
+  - 48
+  neuron: tif
+  tif:
+    levels: 7
+    quantize: true
+    k_init: 0.05
+  state_mode: carry
+  state_layout: single_rolling
+  norm: none
+  v_threshold: 1.0
+  tau_init_ms: 200.0
+  tau_min_ms: 50.0
+  tau_max_ms: 2000.0
+  readout_hidden: 32
+CONTEXT:
+  revision_architecture: hotelling
+  revision_variant: no_revision
+  covariance_feature_source: dec1
+  hotelling_shrinkage: 0.05
+CALIB:
+  calib_sequences: 8
+  calib_windows: 32
+  calib_samples_per_channel: 2048
+  calib_min_positive: 1024
+  calib_quantile: 0.99
+  calib_gain_min: 0.05
+  calib_gain_max: 20.0
+TRAIN:
+  seed: 37
+  epochs: 50
+  min_epochs: 50
+  early_stop_patience: 0
+  fusion_loss: bce
+  cache_record_indices: true
+  lr: 0.001
+  lr_end: 0.0001
+  tbptt_k: 16
+  trainer: streams
+  streams: 4
+  stream_layout: greedy
+  accumulate: 1
+  optimizer_step: per_chunk
+  grad_clip: 1.0
+  comm_budget_messages: 157700.0
+  comm_dual_lr: 0.01
+  comm_budget_mode: peak
+  comm_peak_alpha: 0.05
+  pos_weight_cap: 30.0
+  train_subset_size: 24
+  num_workers: 2
+  execution: layer
+  eval_execution: step
+  input_device: gpu
+  train_subset_every: 10
+  eval_chunk: 32
+  deterministic: true
+  save_root: log/v16_hotelling_r7/no_revision_seed37
+  from_scratch: true
+  freeze_backbone: false
+  require_initialization: false
+  backbone_adaptation: false
+  selection_rule: val_iou
+  validate_initial: false
+EVAL:
+  threshold: 0.9
+  pd_detT: 50
+  correct_thresh: 0.0001
+  rolling_window: 10
+  segments:
+  - - 0
+    - 15
+  - - 64
+    - 79
+  - - 144
+    - 158
+  timing_warmup_windows: 20

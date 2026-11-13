@@ -21,6 +21,10 @@ from utils.comm_budget import CommBudget
 def activate_head_for_preflight(head, architecture):
     """Exercise upstream gradients hidden by zero-initialized output weights."""
     with torch.no_grad():
+        if architecture == "hotelling":
+            # Analytic observer with positive calibration scale is already live.
+            # There is no zero-initialized MLP output to perturb.
+            return
         if architecture in ("evidence", "anchored", "covariance"):
             if head.has_revision:
                 head.output.weight.normal_(0., .01)
@@ -67,7 +71,8 @@ def check(config, device):
     tr.seed_everything(int(cfg["seed"]), True)
     net, head = tr.make_models(cfg, device)
     statistics = None
-    if cfg.get("revision_architecture") == "covariance":
+    if (cfg.get("revision_architecture") == "covariance" or
+            (cfg.get("revision_architecture") == "hotelling" and head.has_revision)):
         statistics = fit_preflight_statistics(head, device)
     records = []
     for seed in (37, 38):
@@ -89,6 +94,10 @@ def check(config, device):
     tr.calibrate_gains(net, factory, .99, 32, 1, .05, 20., 4037)
     activate_head_for_preflight(head, cfg.get("revision_architecture", "dense"))
     optimizer = torch.optim.Adam(list(net.parameters()) + list(head.parameters()), lr=.001)
+    frozen_statistics = None
+    if cfg.get("revision_architecture") == "hotelling":
+        from tools.v16.train_hotelling import statistics_sha256
+        frozen_statistics = statistics_sha256(head)
     result = tr.train_epoch(net, head, records, optimizer, cfg, q99, 1., device,
                             np.random.RandomState(37), CommBudget.from_config(cfg, net),
                             plan=[(0, [(0, 4)]), (0, [(1, 4)])])
@@ -104,6 +113,8 @@ def check(config, device):
     second, _, _ = tr.infer_record(net, head, records[0], cfg, q99, device, modes=["main"], step=True)
     if not np.array_equal(first["main"], second["main"]):
         raise RuntimeError("Online deterministic repeat mismatch")
+    if frozen_statistics is not None and statistics_sha256(head) != frozen_statistics:
+        raise RuntimeError("Hotelling statistics mutated during optimization or online inference")
     return {"passed": True, "torch": torch.__version__, "python": sys.version,
             "device": str(device), "variant": cfg["revision_variant"],
             "architecture": cfg.get("revision_architecture", "shared_feature_r1"),
