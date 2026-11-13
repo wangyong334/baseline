@@ -17,6 +17,8 @@ import time
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RELEASE = "context_20261113_r2"
 VARIANTS = ("full", "no_revision", "no_context")
+R5_WINDOWS = {"configs/v16/r5_w100": 100, "configs/v16/r5_w200": 200,
+              "configs/v16/r5_w400": 400}
 
 
 def _load_common():
@@ -92,6 +94,7 @@ def validate_configs(source_root=ROOT, config_dir="configs/v16"):
         raise ValueError("config-dir must be a project-relative directory")
     if relative.as_posix() == "configs/v16":
         return _validate_legacy_configs(source_root)
+    r5_window = R5_WINDOWS.get(relative.as_posix())
     base = load_yaml(source_root / "configs/v14/overlap_conditional.yaml")
     configs, reference = {}, None
     for variant in VARIANTS:
@@ -102,10 +105,32 @@ def validate_configs(source_root=ROOT, config_dir="configs/v16"):
         flat = flatten(raw)
         if set(raw) != {"DATA", "NET", "TRAIN", "CALIB", "EVAL", "CONTEXT"}:
             raise ValueError("paired V16 requires DATA/NET/TRAIN/CALIB/EVAL/CONTEXT")
-        for section in ("NET", "CALIB", "EVAL"):
+        for section in ("NET", "CALIB"):
             if raw[section] != base[section]:
                 raise ValueError("paired V16 changes the V5 %s protocol" % section)
-        for key, value in base["DATA"].items():
+        expected_data, expected_eval = copy.deepcopy(base["DATA"]), copy.deepcopy(base["EVAL"])
+        if r5_window is not None:
+            stride = r5_window // 2
+            n_windows = (int(base["DATA"]["total_ms"]) - r5_window) // stride + 1
+            expected_data.update(window_ms=r5_window, stride_ms=stride, n_windows=n_windows)
+            # Preserve the original half-open ranges of window start times,
+            # clipping the tail to the last complete observation window.
+            expected_eval["segments"] = [
+                [int(a * 50 // stride), min(n_windows - 1, int(math.ceil((b + 1) * 50. / stride)) - 1)]
+                for a, b in base["EVAL"]["segments"]]
+            expected_eval["timing_warmup_windows"] = 1000 // stride
+            required_r5 = {"revision_architecture": "covariance", "constraint": "record_fn_reference",
+                           "backbone_adaptation": True, "adaptation_epochs": 20,
+                           "adaptation_min_epochs": 8, "adaptation_early_stop_patience": 5,
+                           "adaptation_lr": 1e-4, "adaptation_lr_end": 1e-5}
+            for key, value in required_r5.items():
+                if flat.get(key) != value:
+                    raise ValueError("r5 window study requires %s=%r" % (key, value))
+        elif flat.get("backbone_adaptation", False):
+            raise ValueError("backbone adaptation requires an explicit r5 window configuration")
+        if raw["EVAL"] != expected_eval:
+            raise ValueError("paired V16 changes the window-matched EVAL protocol")
+        for key, value in expected_data.items():
             if key not in ("root", "stats_path") and raw["DATA"].get(key) != value:
                 raise ValueError("paired V16 changes DATA." + key)
         if flat.get("revision_architecture") not in ("evidence", "anchored", "covariance"):
@@ -139,11 +164,15 @@ def validate_covariance_protocol(flat):
     required = {"freeze_backbone": True, "require_initialization": True,
                 "validate_initial": True, "fusion_loss": "rate_constrained",
                 "threshold": .9, "recall_tolerance": 0., "pd_tolerance": 0.,
-                "selection_rule": "four_metric_noninferiority",
-                "constraint": "smooth_fn_reference"}
+                "selection_rule": "four_metric_noninferiority"}
     for key, value in required.items():
         if flat.get(key) != value:
             raise ValueError("covariance V16 requires %s=%r" % (key, value))
+    if flat.get("constraint") not in ("smooth_fn_reference", "record_fn_reference"):
+        raise ValueError("unsupported covariance constraint")
+    batch_size = flat.get("head_batch_size")
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+        raise ValueError("head_batch_size must be a positive integer")
     channels = flat.get("covariance_channels")
     if isinstance(channels, bool) or not isinstance(channels, int) or not 1 <= channels <= 60:
         raise ValueError("covariance_channels must be an integer between 1 and 60")
@@ -174,13 +203,64 @@ def runtime_config(variant, seed, release, data_root, project_root, source_root=
     raw = copy.deepcopy(configs[variant])
     out = Path(project_root).resolve() / "log/v16_context" / release / ("%s_s%d" % (variant, seed))
     raw["DATA"]["root"] = str(Path(data_root).resolve())
-    # Statistics belong to this 100/50 representation, never the old 50 ms run.
+    # Statistics belong to this experiment's observation/stride representation.
     raw["DATA"]["stats_path"] = str(out / "train_stats.json")
     raw["TRAIN"]["seed"] = seed
     raw["TRAIN"]["save_root"] = str(out)
     if init_checkpoint:
         raw["TRAIN"]["init_checkpoint"] = str(Path(init_checkpoint).resolve())
     return raw
+
+
+def adaptation_runtime_config(raw, out):
+    """Create a train/validation-only second-readout backbone adaptation stage."""
+    if raw["TRAIN"].get("backbone_adaptation") is not True:
+        raise ValueError("backbone adaptation was not enabled")
+    stage = copy.deepcopy(raw)
+    stage["DATA"]["stats_path"] = str(Path(out) / "train_stats.json")
+    stage["CONTEXT"] = {"revision_architecture": "evidence", "revision_variant": "second",
+                        "evidence_hidden": 8, "evidence_kappa": 1.0}
+    training = stage["TRAIN"]
+    for destination, source in (("epochs", "adaptation_epochs"), ("min_epochs", "adaptation_min_epochs"),
+                                ("early_stop_patience", "adaptation_early_stop_patience"),
+                                ("lr", "adaptation_lr"), ("lr_end", "adaptation_lr_end")):
+        training[destination] = training[source]
+    for key in tuple(training):
+        if key.startswith("adaptation_") or key in (
+                "constraint", "covariance_regularizer", "head_batch_size",
+                "recall_dual_lr", "recall_dual_init"):
+            training.pop(key)
+    training.update(save_root=str(Path(out)), backbone_adaptation=False, freeze_backbone=False,
+                    fusion_loss="bce", initialization_policy="window_adaptation", validate_initial=True,
+                    selection_rule="four_metric_noninferiority", recall_tolerance=0., pd_tolerance=0.)
+    return stage
+
+
+def validate_adapted_checkpoint(path, raw, summary):
+    """Require the adapted weights to implement the exact requested time base."""
+    import torch
+    try:
+        checkpoint = torch.load(str(path), map_location="cpu", weights_only=False)
+    except TypeError:  # torch 1.9 on the server
+        checkpoint = torch.load(str(path), map_location="cpu")
+    actual, expected = checkpoint.get("config", {}), flatten(raw)
+    for key, value in expected.items():
+        if actual.get(key) != value:
+            raise ValueError("adapted checkpoint configuration mismatch: " + key)
+    if not isinstance(checkpoint.get("model"), dict) or not checkpoint["model"]:
+        raise ValueError("adapted checkpoint lacks backbone weights")
+    epoch = checkpoint.get("epoch")
+    if (isinstance(epoch, bool) or not isinstance(epoch, int) or
+            not -1 <= epoch < summary["epochs_completed"] or
+            epoch + 1 != summary.get("best_epoch")):
+        raise ValueError("adapted checkpoint selection does not match the training summary")
+    q99 = checkpoint.get("stats", {}).get("q99")
+    if (not isinstance(q99, (list, tuple)) or len(q99) != 2 + 2 * int(expected["time_bins"]) or
+            any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in q99)):
+        raise ValueError("adapted checkpoint lacks valid per-channel normalization")
+    return {"path": str(path), "sha256": sha256(path), "selected_epoch": epoch + 1,
+            "window_ms": expected["window_ms"], "stride_ms": expected["stride_ms"],
+            "n_windows": expected["n_windows"]}
 
 
 def validate_training_summary(summary, raw):
@@ -276,6 +356,8 @@ def run(args):
         expected = getattr(args, "init_sha256", None)
         if expected and initialization["sha256"] != expected:
             raise ValueError("initial checkpoint changed since enqueue")
+    if raw["TRAIN"].get("require_initialization", False) and initialization is None:
+        raise ValueError("selected configuration requires an initial checkpoint")
     out = Path(raw["TRAIN"]["save_root"])
     meta = project / "run/v16_context" / args.release / "jobs" / ("%s_s%d" % (args.variant, args.seed))
     if out.exists() or meta.exists():
@@ -302,7 +384,74 @@ def run(args):
     base_command = [sys.executable, "-B", "-u", str(source / "tools/v16/train.py"),
                     "--config", str(config), "--data-root", str(Path(args.data_root).resolve()),
                     "--out", str(out), "--device", args.device]
+    stage_artifacts, stage_hashes = [], {}
     try:
+        if raw["TRAIN"].get("backbone_adaptation", False):
+            requested_config = meta / "requested_config.yaml"
+            with requested_config.open("x", encoding="utf-8", newline="\n") as handle:
+                yaml.safe_dump(raw, handle, sort_keys=False, allow_unicode=True)
+            stage_out = out / "backbone_adaptation"
+            stage_raw = adaptation_runtime_config(raw, stage_out)
+            stage_config = meta / "backbone_adaptation_config.yaml"
+            with stage_config.open("x", encoding="utf-8", newline="\n") as handle:
+                yaml.safe_dump(stage_raw, handle, sort_keys=False, allow_unicode=True)
+            stage_config_hash = sha256(stage_config)
+            stage_preflight = meta / "backbone_adaptation_preflight.json"
+            stage_started = time.time()
+            state.update(status="preflight_backbone_adaptation",
+                         backbone_adaptation={"status": "preflight", "out": str(stage_out),
+                                              "config": str(stage_config), "config_sha256": stage_config_hash,
+                                              "initialization": initialization})
+            write_json(manifest, state)
+            execute([sys.executable, "-B", "-u", str(source / "tools/v16/runtime_preflight.py"),
+                     "--config", str(stage_config), "--device", args.device,
+                     "--out", str(stage_preflight)], source)
+            validate_preflight(stage_preflight)
+            state.update(status="training_backbone_adaptation")
+            state["backbone_adaptation"]["status"] = "training"
+            write_json(manifest, state)
+            execute([sys.executable, "-B", "-u", str(source / "tools/v16/train.py"),
+                     "--config", str(stage_config), "--data-root", str(Path(args.data_root).resolve()),
+                     "--out", str(stage_out), "--device", args.device, "--mode", "train"], source)
+            stage_summary = read_json(stage_out / "summary.json")
+            validate_training_summary(stage_summary, stage_raw)
+            stage_checkpoint = stage_out / ("best_val_iou_seed%d.pt" % args.seed)
+            if not stage_checkpoint.is_file() or not stage_checkpoint.stat().st_size:
+                raise ValueError("adapted best checkpoint is missing")
+            adapted = validate_adapted_checkpoint(stage_checkpoint, stage_raw, stage_summary)
+            stage_artifacts = [stage_out / name for name in (
+                "summary.json", "train_stats.json", "calibration.json", "initialization.json",
+                "initial_validation.json", "metrics.jsonl", "run_config.json", "last.pt")]
+            stage_artifacts.extend((stage_checkpoint, stage_config, stage_preflight, requested_config))
+            if any(not path.is_file() or not path.stat().st_size for path in stage_artifacts):
+                raise ValueError("backbone adaptation is missing required training artifacts")
+            if sha256(stage_config) != stage_config_hash or sha256(config) != identity["config_sha256"]:
+                raise ValueError("runtime configuration changed during backbone adaptation")
+            stage_hashes = {path.relative_to(project).as_posix(): sha256(path) for path in stage_artifacts}
+            stage_result = {"status": "complete", "training_only": True, "test_access": False,
+                            "initialization": initialization, "checkpoint": adapted,
+                            "summary": stage_summary, "config": stage_raw,
+                            "config_sha256": stage_config_hash,
+                            "elapsed_seconds": time.time() - stage_started,
+                            "artifact_sha256": dict(stage_hashes)}
+            stage_result_path = stage_out / "adaptation_result.json"
+            write_json(stage_result_path, stage_result)
+            stage_artifacts.append(stage_result_path)
+            stage_hashes[stage_result_path.relative_to(project).as_posix()] = sha256(stage_result_path)
+            # Preserve the requested r2 initialization, then bind the head to
+            # the validation-selected adapted backbone at this exact time base.
+            raw = copy.deepcopy(raw)
+            raw["TRAIN"]["init_checkpoint"] = adapted["path"]
+            temporary_config = config.with_suffix(".tmp")
+            with temporary_config.open("x", encoding="utf-8", newline="\n") as handle:
+                yaml.safe_dump(raw, handle, sort_keys=False, allow_unicode=True)
+            os.replace(str(temporary_config), str(config))
+            identity.update(config=raw, config_sha256=sha256(config), initialization=adapted,
+                            original_initialization=initialization,
+                            initialization_chain=[initialization, adapted], backbone_adaptation=stage_result)
+            state.update(identity)
+            state.update(status="preflight")
+            write_json(manifest, state)
         preflight_path = meta / "runtime_preflight.json"
         execute([sys.executable, "-B", "-u", str(source / "tools/v16/runtime_preflight.py"),
                  "--config", str(config), "--device", args.device,
@@ -338,14 +487,17 @@ def run(args):
             raise ValueError("source or runtime configuration changed during training")
         if initialization and sha256(Path(initialization["path"])) != initialization["sha256"]:
             raise ValueError("initial checkpoint changed during training")
+        for path in stage_artifacts:
+            if sha256(path) != stage_hashes[path.relative_to(project).as_posix()]:
+                raise ValueError("backbone adaptation artifact changed during head training: " + str(path))
         result = dict(identity, status="complete", epochs_completed=completed,
                       checkpoint=str(checkpoint), checkpoint_sha256=selected_hash,
                       elapsed_seconds=time.time() - started, evaluations=results, profile=profile,
                       preflight=preflight,
                       note="first/second are diagnostics of these weights; each revision variant is independently trained.")
-        artifacts = (out / "summary.json", out / "train_stats.json",
+        artifacts = [out / "summary.json", out / "train_stats.json",
                      out / "eval_val.json", out / "eval_test.json", out / "profile.json",
-                     checkpoint, config, preflight_path)
+                     checkpoint, config, preflight_path] + stage_artifacts
         result["artifact_sha256"] = {
             p.relative_to(project).as_posix(): sha256(p) for p in artifacts}
         write_json(out / "comparison_result.json", result)

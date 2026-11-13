@@ -2,6 +2,7 @@
 import os
 import sys
 import unittest
+import math
 
 import torch
 
@@ -60,6 +61,41 @@ class CovarianceRevisionTests(unittest.TestCase):
                 if variant != "second":
                     q = model.encode_pair(*self.values)
                     self.assertTrue(torch.equal(actual, model.forward_encoded(q, self.values[1])))
+
+    def test_report_exposes_conditioning_and_worst_direction_gain(self):
+        model, report = self.fit()
+        for name in ("regularized_condition_number", "schur_condition_number",
+                     "schur_minimum_eigenvalue", "transform_spectral_gain"):
+            self.assertTrue(math.isfinite(report[name]), name)
+            self.assertGreater(report[name], 0., name)
+        self.assertGreaterEqual(report["regularized_condition_number"], 1.)
+        self.assertGreaterEqual(report["schur_condition_number"], 1.)
+        # T Omega T^T = I implies singular-value gain 1/sqrt(lambda_min).
+        expected_gain = report["minimum_eigenvalue"] ** -.5
+        self.assertAlmostEqual(report["transform_spectral_gain"], expected_gain, places=8)
+        self.assertAlmostEqual(report["schur_minimum_eigenvalue"],
+                               float(torch.linalg.eigvalsh(model.schur_covariance)[0]), places=12)
+
+    def test_duplicate_observation_can_have_regularized_gain_without_new_information(self):
+        # Identical observations have rank one and cannot supply new information.
+        # Diagonal shrinkage nevertheless gives a strictly positive Schur d^2:
+        # increment/second = (rho + ridge)/(2 - rho + ridge).
+        noise = torch.tensor([-1., -.5, .5, 1.], dtype=torch.float64).repeat(2)
+        labels = torch.tensor([0., 0., 0., 0., 1., 1., 1., 1.], dtype=torch.float64)
+        z = noise + 3. * labels
+        features = z[:, None].clone()
+        model = CovarianceRevision(feature_dim=1, channels=1, hidden=2,
+                                   variant="full", shrinkage=.05).double()
+        report = model.fit_statistics(z, z, features, features, labels)
+        q = model.encode_pair(z, z, features, features)
+        self.assertEqual(int(torch.linalg.matrix_rank(q - q.mean(0))), 1)
+        self.assertEqual(int(torch.linalg.matrix_rank(model.within_covariance)), 1)
+        self.assertGreater(report["fisher_conditional_increment"], 0.)
+        expected_ratio = (.05 + 1e-5) / (2. - .05 + 1e-5)
+        self.assertAlmostEqual(report["fisher_conditional_increment"] / report["fisher_second"],
+                               expected_ratio, places=10)
+        self.assertLess(report["whitening_error_float64"], 1e-9)
+        self.assertLess(report["fisher_decomposition_error"], 1e-9)
 
     def test_unfitted_learned_head_fails_in_training_and_eval(self):
         model = make()

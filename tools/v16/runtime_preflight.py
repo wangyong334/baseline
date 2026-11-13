@@ -58,8 +58,10 @@ def fit_preflight_statistics(head, device):
 
 def check(config, device):
     cfg = dict(config)
+    stride = int(cfg["stride_ms"])
+    total_ms = 5 * stride
     cfg.update(height=24, width_px=30, pad_height=24, pad_width=32,
-               total_ms=250, n_windows=4, streams=2, tbptt_k=2,
+               total_ms=total_ms, n_windows=4, streams=2, tbptt_k=2,
                timing_warmup_windows=0, comm_budget_messages=20.)
     tr.validate_config(cfg)
     tr.seed_everything(int(cfg["seed"]), True)
@@ -71,10 +73,11 @@ def check(config, device):
     for seed in (37, 38):
         rng = np.random.RandomState(seed)
         n = 240
-        t = np.concatenate([np.arange(0, 250, 5), rng.randint(0, 250, n-50)])
+        t = np.concatenate([np.arange(50) * (total_ms / 50.), rng.uniform(0, total_ms, n-50)])
         records.append(OverlapSequence("preflight%d" % seed, rng.randint(0, 30, n),
                        rng.randint(0, 24, n), t, np.arange(n) % 2,
-                       (np.arange(n) % 3 == 0).astype(np.float32), np.zeros(n), total_ms=250))
+                       (np.arange(n) % 3 == 0).astype(np.float32), np.zeros(n), total_ms=total_ms,
+                       window_ms=cfg["window_ms"], stride_ms=stride))
     q99 = np.full(12, np.log1p(2), dtype=np.float32)
     def factory():
         source = OverlapWindowSource(records[0], cfg, q99, device)
@@ -104,6 +107,7 @@ def check(config, device):
     return {"passed": True, "torch": torch.__version__, "python": sys.version,
             "device": str(device), "variant": cfg["revision_variant"],
             "architecture": cfg.get("revision_architecture", "shared_feature_r1"),
+            "window_ms": cfg["window_ms"], "stride_ms": stride,
             "gpu": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
             "strict_deterministic": torch.are_deterministic_algorithms_enabled(),
             "checks": "nonzero revision; two Adam/TBPTT updates; original-ID coverage; repeatable online output",

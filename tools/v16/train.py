@@ -54,6 +54,8 @@ def evidence_model(cfg):
 
 def design_name(cfg):
     if cfg.get("revision_architecture") == "covariance":
+        if cfg.get("constraint") == "record_fn_reference":
+            return "v16-covariance-revision-r5"
         return "v16-covariance-revision-r4"
     if cfg.get("revision_architecture") == "anchored":
         return ANCHORED_DESIGN
@@ -782,6 +784,44 @@ def load_checkpoint(path, device):
         return torch.load(str(path), map_location=device)
 
 
+def validate_backbone_initialization(initial, cfg, q99):
+    """Only an explicit trainable adaptation stage may change the window clock.
+
+    Loading weights does not migrate the event representation. New windows use
+    freshly computed train normalization and recalibrated train-only gains.
+    The frozen statistical head must still match its source representation.
+    """
+    source = initial.get("config", {})
+    adaptation = cfg.get("initialization_policy") == "window_adaptation"
+    if cfg.get("initialization_policy") not in (None, "matched", "window_adaptation"):
+        raise ValueError("Unknown initialization policy")
+    if adaptation and (cfg.get("revision_architecture") != "evidence" or
+                       cfg.get("revision_variant") != "second" or cfg.get("freeze_backbone", False)):
+        raise ValueError("Window adaptation requires trainable backbone and second-only readout")
+    for key in ("seed", "channels", "neuron", "state_mode", "time_bins", "input_clip",
+                "height", "width_px", "pad_height", "pad_width", "norm", "v_threshold",
+                "tau_init_ms", "tau_min_ms", "tau_max_ms", "readout_hidden"):
+        if source.get(key) != cfg.get(key):
+            raise ValueError("Initial backbone configuration mismatch: " + key)
+    if tif_settings(source.get("tif")) != tif_settings(cfg.get("tif")):
+        raise ValueError("Initial backbone BIR configuration mismatch")
+    changed = any(source.get(k) != cfg.get(k) for k in ("window_ms", "stride_ms"))
+    if changed and not adaptation:
+        raise ValueError("Initial backbone window mismatch; explicit trainable window_adaptation is required")
+    if source.get("state_layout", "single_rolling") != cfg.get("state_layout", "single_rolling"):
+        raise ValueError("Initial backbone state layout mismatch")
+    previous = np.asarray(initial.get("stats", {}).get("q99", []), dtype=np.float32)
+    current = np.asarray(q99, dtype=np.float32)
+    if previous.shape != current.shape or previous.ndim != 1 or not np.isfinite(previous).all():
+        raise ValueError("Initial normalization must be finite and have the matched channel shape")
+    if not changed and not np.allclose(previous, current, rtol=0, atol=1e-6):
+        raise ValueError("Initial checkpoint must use this training-set normalization")
+    mu = float(initial.get("comm_mu", 0.))
+    if not math.isfinite(mu) or mu < 0:
+        raise ValueError("Initial communication multiplier must be finite and nonnegative")
+    return changed, mu
+
+
 def train(cfg, args):
     if cfg.get("revision_architecture") == "covariance":
         from tools.v16.train_covariance import train_cached
@@ -855,26 +895,23 @@ def train(cfg, args):
                                ROOT / "model/evspsegnet_stream.py", ROOT / "model/lif2d_stream.py", ROOT / "utils/comm_budget.py"]}})
         if cfg.get("init_checkpoint"):
             initial = load_checkpoint(cfg["init_checkpoint"], torch.device("cpu"))
-            initial_cfg = initial.get("config", {})
-            if initial_cfg.get("seed") != int(cfg["seed"]):
-                raise ValueError("Initial backbone seed does not match the experiment")
-            initial_q99 = np.asarray(initial.get("stats", {}).get("q99", []))
-            if initial_q99.shape != q99.shape or not np.allclose(initial_q99, q99, rtol=0, atol=1e-6):
-                raise ValueError("Initial checkpoint must use this training-set normalization and window representation")
-            for key in ("channels", "neuron", "state_mode", "window_ms", "stride_ms", "time_bins",
-                        "input_clip", "height", "width_px", "pad_height", "pad_width", "norm",
-                        "v_threshold", "tau_init_ms", "tau_min_ms", "tau_max_ms", "readout_hidden"):
-                if initial_cfg.get(key) != cfg.get(key):
-                    raise ValueError("Initial backbone configuration mismatch: " + key)
-            if tif_settings(initial_cfg.get("tif")) != tif_settings(cfg.get("tif")):
-                raise ValueError("Initial backbone BIR configuration mismatch")
-            initial_mu = float(initial.get("comm_mu", 0.))
-            if not math.isfinite(initial_mu) or initial_mu < 0:
-                raise ValueError("Initial communication multiplier must be finite and nonnegative")
+            changed_window, initial_mu = validate_backbone_initialization(initial, cfg, q99)
             net.load_state_dict(initial["model"], strict=True)
             comm.mu = initial_mu
-            write_json(out / "calibration.json", {"mode": "inherited matched backbone", "checkpoint": cfg["init_checkpoint"],
-                       "sha256": sha256(cfg["init_checkpoint"]), "seed": cfg["seed"]})
+            provenance = {"mode": "window adaptation" if changed_window else "inherited matched backbone",
+                          "checkpoint": cfg["init_checkpoint"], "sha256": sha256(cfg["init_checkpoint"]),
+                          "seed": cfg["seed"], "source_window_ms": initial["config"]["window_ms"],
+                          "window_ms": cfg["window_ms"], "stride_ms": cfg["stride_ms"],
+                          "normalization": "current training set", "gain_recalibrated": changed_window}
+            if changed_window:
+                net.gain_calibrated.fill_(False)
+                calibrate(net, dataset, cfg, q99, device, out)
+                report = json.loads((out / "calibration.json").read_text(encoding="utf-8"))
+                report["initialization"] = provenance
+                write_json(out / "calibration.json", report)
+            else:
+                write_json(out / "calibration.json", provenance)
+            write_json(out / "initialization.json", provenance)
             del initial
         else:
             calibrate(net, dataset, cfg, q99, device, out)
@@ -883,11 +920,19 @@ def train(cfg, args):
         validation.paths = validation.paths[:args.limit_records]
     subset = select_subset([p.name for p in dataset.paths], int(cfg["train_subset_size"]), int(cfg["seed"]) + 2000)
     subset_data = Records(cfg, "train", subset)
-    best_epoch = min((r["epoch"] for r in history if r["val_iou"] == best), default=-1)
+    guarded_selection = cfg.get("selection_rule") == "four_metric_noninferiority"
+    selection_reference = None
+    if guarded_selection and not cfg.get("validate_initial", False):
+        raise ValueError("Four-metric selection requires an initial validation reference")
+    if guarded_selection and args.resume:
+        selection_reference = json.loads((out / "initial_validation.json").read_text(encoding="utf-8"))["metrics"]
+    best_epoch = min((r["epoch"] for r in history if r["val_iou"] == best and
+                      r.get("selection_eligible", True)), default=-1)
     # A warm start must beat its own online validation result, rather than being
     # declared improved merely because every trained epoch is accepted.
     if not args.resume and cfg.get("validate_initial", False):
-        initial_val = evaluate(net, head, validation, cfg, q99, device)
+        initial_val = evaluate(net, head, validation, cfg, q99, device, full=guarded_selection)
+        selection_reference = initial_val["metrics"]
         best = float(initial_val["metrics"]["iou"])
         if not math.isfinite(best):
             raise RuntimeError("Initial validation IoU is not finite")
@@ -905,7 +950,7 @@ def train(cfg, args):
         result = train_epoch(net, head, dataset, optimizer, cfg, q99, pos_weight, device,
                              np.random.RandomState(int(cfg["seed"]) * 1000 + epoch + 7), comm,
                              max_chunks=args.max_chunks)
-        val = evaluate(net, head, validation, cfg, q99, device)
+        val = evaluate(net, head, validation, cfg, q99, device, full=guarded_selection)
         sub = evaluate(net, head, subset_data, cfg, q99, device) if subset_due(epoch, int(cfg["epochs"]), int(cfg["train_subset_every"])) else None
         record = dict(result, epoch=epoch, lr=lr, val_iou=val["metrics"]["iou"], val_acc=val["metrics"]["acc"],
                       val_readouts=val["readouts"], train_subset_readouts=sub["readouts"] if sub else None,
@@ -913,10 +958,13 @@ def train(cfg, args):
                       peak_allocated_gib=torch.cuda.max_memory_allocated(device) / 2**30 if device.type == "cuda" else None)
         if record["val_iou"] is None or not math.isfinite(record["val_iou"]):
             raise RuntimeError("Validation IoU is not finite")
+        if guarded_selection:
+            from tools.v16.train_covariance import four_metric_noninferiority
+            record["selection_eligible"] = four_metric_noninferiority(val["metrics"], selection_reference)
         with (out / "metrics.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record, allow_nan=False) + "\n")
         history.append(record)
-        if record["val_iou"] > best:
+        if record.get("selection_eligible", True) and record["val_iou"] > best:
             best = record["val_iou"]
             best_epoch = epoch
             save_checkpoint(out / ("best_val_iou_seed%d.pt" % cfg["seed"]), net, head, optimizer, epoch, best, cfg, stats, comm)
@@ -926,7 +974,9 @@ def train(cfg, args):
         write_json(out / "summary.json", {"design": design_name(cfg), "epochs_completed": epoch + 1, "epochs_requested": cfg["epochs"],
                    "best_val_iou": best,
                    "best_epoch": best_epoch + 1, "early_stopped": early_stopped,
-                   "stopping_rule": "validation IoU patience only; test never used",
+                   "stopping_rule": ("eligible validation IoU patience; all four metrics noninferior to initial validation; test never used"
+                                     if guarded_selection else "validation IoU patience only; test never used"),
+                   "selection_reference": selection_reference if guarded_selection else None,
                    "complete": (epoch + 1 == int(cfg["epochs"]) or early_stopped) and args.limit_records is None and args.max_chunks is None,
                    "training_scope": cfg["_training_scope"],
                    "probe_only": args.limit_records is not None or args.max_chunks is not None,
@@ -937,7 +987,7 @@ def train(cfg, args):
               (epoch + 1, cfg["epochs"], result["train_seconds"], record["epoch_seconds"], result["loss_per_event"],
                record["val_iou"], record["val_acc"], comm.mu), flush=True)
         if early_stopped:
-            print("EARLY STOP after %d epochs without a higher validation IoU" % patience, flush=True)
+            print("EARLY STOP after %d epochs without an eligible higher validation IoU" % patience, flush=True)
             break
 
 

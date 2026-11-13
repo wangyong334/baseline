@@ -167,11 +167,21 @@ class CovarianceRevision(ContextEvidence):
         residual_distance = torch.dot(residual_delta, torch.linalg.solve(schur, residual_delta))
         joint_distance = torch.dot(delta, torch.linalg.solve(regularized, delta))
         whitening_error = (transform.mm(regularized).mm(transform.t()) - torch.eye(2*c, dtype=torch.float64)).abs().max()
+        # Diagnostics only: do not change the fitted transform or forward path.
+        # A successful Cholesky need not imply a well-conditioned transform;
+        # log amplification as well as relative conditioning for new windows.
+        regularized_eigenvalues = torch.linalg.eigvalsh(regularized)
+        schur_eigenvalues = torch.linalg.eigvalsh(schur)
+        transform_spectral_gain = torch.linalg.norm(transform, ord=2)
         return {"fitted": True, "variant": self.variant, "training_pairs": len(y),
                 "class_counts": counts, "raw_channels": self.feature_dim + 1,
                 "channels_per_view": c, "shrinkage": self.shrinkage,
                 "whitening_error_float64": float(whitening_error),
-                "minimum_eigenvalue": float(torch.linalg.eigvalsh(regularized).min()),
+                "minimum_eigenvalue": float(regularized_eigenvalues[0]),
+                "regularized_condition_number": float(regularized_eigenvalues[-1] / regularized_eigenvalues[0]),
+                "schur_minimum_eigenvalue": float(schur_eigenvalues[0]),
+                "schur_condition_number": float(schur_eigenvalues[-1] / schur_eigenvalues[0]),
+                "transform_spectral_gain": float(transform_spectral_gain),
                 "fisher_second": float(second_distance), "fisher_conditional_increment": float(residual_distance),
                 "fisher_joint": float(joint_distance),
                 "fisher_decomposition_error": abs(float(joint_distance-second_distance-residual_distance)),

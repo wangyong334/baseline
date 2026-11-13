@@ -396,14 +396,53 @@ class V16QueueTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "artifact is changed"):
             self.pack()
 
-    def test_completed_result_missing_summary_requires_explicit_partial(self):
+    def test_completed_result_missing_recorded_summary_is_not_hidden_by_partial(self):
         plan = self.plan(variants=("full",), seeds=(37,))
         self.enqueue(plan)
         self.complete_job(plan["jobs"][0])
         (Path(plan["jobs"][0]["out"]) / "summary.json").unlink()
         with self.assertRaisesRegex(ValueError, "summary.json"):
             self.pack()
-        self.assertIn("_partial", self.pack(allow_partial=True).name)
+        with self.assertRaisesRegex(ValueError, "summary.json"):
+            self.pack(allow_partial=True)
+
+    def test_completed_pack_validates_all_recorded_adaptation_artifacts(self):
+        plan = self.plan(variants=("full",), seeds=(37,))
+        self.enqueue(plan)
+        result = self.complete_job(plan["jobs"][0])
+        out = Path(plan["jobs"][0]["out"])
+        artifact = out / "backbone_adaptation" / "last.pt"
+        artifact.parent.mkdir()
+        original = b"completed adapted backbone weights"
+        artifact.write_bytes(original)
+        relative = artifact.relative_to(self.project).as_posix()
+        result["artifact_sha256"][relative] = queue.digest(artifact)
+        runner.write_json(out / "comparison_result.json", result)
+        archive = self.pack()
+        with tarfile.open(str(archive)) as handle:
+            self.assertIn(relative, handle.getnames())
+        for corruption in ("deleted", "empty", "changed"):
+            if corruption == "deleted":
+                artifact.unlink()
+            else:
+                artifact.write_bytes(b"" if corruption == "empty" else b"changed adapted weights")
+            for partial in (False, True):
+                with self.subTest(corruption=corruption, partial=partial), \
+                        self.assertRaisesRegex(ValueError, "completed artifact"):
+                    self.pack(allow_partial=partial)
+            artifact.write_bytes(original)
+
+    def test_completed_artifact_inventory_rejects_escaping_and_absolute_paths(self):
+        plan = self.plan(variants=("full",), seeds=(37,))
+        self.enqueue(plan)
+        result = self.complete_job(plan["jobs"][0])
+        out = Path(plan["jobs"][0]["out"])
+        original = dict(result["artifact_sha256"])
+        for name in ("../outside.pt", "/outside.pt", "C:\\outside.pt", "\\outside.pt", "."):
+            result["artifact_sha256"] = dict(original, **{name: "0" * 64})
+            runner.write_json(out / "comparison_result.json", result)
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "unsafe completed artifact path"):
+                self.pack()
 
     def test_early_stop_requires_configured_policy_and_complete_training(self):
         raw = {"TRAIN": {"epochs": 40, "min_epochs": 15, "early_stop_patience": 8}}

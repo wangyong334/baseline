@@ -1,0 +1,109 @@
+# V16 r5: 400 ms observation / 200 ms stride; adapt the backbone before frozen-head fitting.
+# Train/validation select both stages; test is evaluated only after head selection.
+DATA:
+  root: /media/stephen/nvme0n1/wy_data/datasets/EV-UAV-dataset
+  stats_path: log/v16_context_r5_w400/full_seed37/train_stats.json
+  total_ms: 8000
+  window_ms: 400
+  stride_ms: 200
+  n_windows: 39
+  time_bins: 5
+  height: 260
+  width_px: 346
+  pad_height: 264
+  pad_width: 352
+  input_clip: 3.0
+NET:
+  channels:
+  - 12
+  - 24
+  - 48
+  - 48
+  neuron: tif
+  tif:
+    levels: 7
+    quantize: true
+    k_init: 0.05
+  state_mode: carry
+  state_layout: single_rolling
+  norm: none
+  v_threshold: 1.0
+  tau_init_ms: 200.0
+  tau_min_ms: 50.0
+  tau_max_ms: 2000.0
+  readout_hidden: 32
+CONTEXT:
+  revision_architecture: covariance
+  revision_variant: full
+  evidence_hidden: 8
+  evidence_kappa: 2.0
+  covariance_channels: 8
+  covariance_shrinkage: 0.05
+CALIB:
+  calib_sequences: 8
+  calib_windows: 32
+  calib_samples_per_channel: 2048
+  calib_min_positive: 1024
+  calib_quantile: 0.99
+  calib_gain_min: 0.05
+  calib_gain_max: 20.0
+TRAIN:
+  seed: 37
+  epochs: 20
+  min_epochs: 8
+  early_stop_patience: 5
+  fusion_loss: rate_constrained
+  cache_record_indices: true
+  lr: 0.001
+  lr_end: 0.0001
+  tbptt_k: 16
+  trainer: streams
+  streams: 4
+  stream_layout: greedy
+  accumulate: 1
+  optimizer_step: per_chunk
+  grad_clip: 1.0
+  comm_budget_messages: 157700.0
+  comm_dual_lr: 0.01
+  comm_budget_mode: peak
+  comm_peak_alpha: 0.05
+  pos_weight_cap: 30.0
+  train_subset_size: 24
+  num_workers: 2
+  execution: layer
+  eval_execution: step
+  input_device: gpu
+  train_subset_every: 10
+  eval_chunk: 32
+  deterministic: true
+  save_root: log/v16_context_r5_w400/full_seed37
+  validate_initial: true
+  require_initialization: true
+  freeze_backbone: true
+  covariance_regularizer: 0.001
+  recall_tolerance: 0.0
+  pd_tolerance: 0.0
+  selection_rule: four_metric_noninferiority
+  constraint: record_fn_reference
+  head_batch_size: 32768
+  recall_dual_lr: 0.5
+  recall_dual_init: 1.0
+  backbone_adaptation: true
+  adaptation_epochs: 20
+  adaptation_min_epochs: 8
+  adaptation_early_stop_patience: 5
+  adaptation_lr: 0.0001
+  adaptation_lr_end: 1.0e-05
+EVAL:
+  threshold: 0.9
+  pd_detT: 50
+  correct_thresh: 0.0001
+  rolling_window: 10
+  segments:
+  - - 0
+    - 3
+  - - 16
+    - 19
+  - - 36
+    - 38
+  timing_warmup_windows: 5
