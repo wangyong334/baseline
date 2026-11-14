@@ -402,12 +402,14 @@ class SpikingDecisionUnits(nn.Module):
         self.pseudo = evidence == "events" and bool(pseudo) and dendrite == "mean"   # leak conductance (mean form)
         self.context, self.audit, self.tokens, self.ctx_ff = bool(context), audit, tokens, bool(ctx_ff)
         self.register_buffer("r2", torch.as_tensor(r ** 2, dtype=torch.float32))
-        self.register_buffer("r", torch.as_tensor(r, dtype=torch.float32))
+        # V19 layout buffers: derived from the box layout, not saved, so V18 checkpoints load unchanged
+        self.register_buffer("r", torch.as_tensor(r, dtype=torch.float32), persistent=False)
         j = np.arange(len(r))                                              # box_layout order: 9 + 8 per level
         lev = np.where(j < 9, 0, (j - 9) // 8 + 1)
-        self.register_buffer("box_area", torch.as_tensor(9.0 ** (lev + 1), dtype=torch.float32))   # px, full box
+        self.register_buffer("box_area", torch.as_tensor(9.0 ** (lev + 1), dtype=torch.float32),   # px, full box
+                             persistent=False)
         ring_of = np.where(j == CENTRE, 0, lev + 1)                        # centre, then one ring per level
-        self.register_buffer("ring_idx", torch.as_tensor(ring_of, dtype=torch.long))
+        self.register_buffer("ring_idx", torch.as_tensor(ring_of, dtype=torch.long), persistent=False)
         self.n_ring = int(ring_of.max()) + 1
         sign = [1.0] * heads if value == "signed" else [1.0] * (heads // 2) + [-1.0] * (heads // 2)
         self.register_buffer("head_sign", torch.tensor(sign))
@@ -487,6 +489,11 @@ class SpikingDecisionUnits(nn.Module):
 
     def sigma(self):
         return torch.exp(self.log_sigma)
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        for name in ("r", "box_area", "ring_idx"):         # saved by the V19 checkpoints of 11-14; rebuilt from the layout
+            state_dict.pop(prefix + name, None)
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     def start(self, z0, pol, memb=None):
         """Initial context c0 from the event's own prior and polarity (and the membership cue [B, 2] with memb)."""
