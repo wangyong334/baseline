@@ -106,7 +106,9 @@ def build_net(cfg, device):
                                n_feat=cfg.get("n_feat", N_FEAT), n_msg=cfg.get("n_msg", 0),
                                track={"off": False, "on": "recentre"}.get(cfg.get("track", "off"), cfg.get("track")),
                                memb=cfg.get("membership", "off") == "on",
-                               pseudo=cfg.get("pseudo", "on") == "on").to(device)
+                               pseudo=cfg.get("pseudo", "on") == "on", dendrite=cfg.get("dendrite", "mean"),
+                               ring=cfg.get("ring", "off") == "on", clutter=cfg.get("clutter", "off") == "on",
+                               content=cfg.get("content", "box")).to(device)
     return net, rect
 
 

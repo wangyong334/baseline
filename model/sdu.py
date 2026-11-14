@@ -37,6 +37,14 @@ without training (V17 test, units of uncertain events): after 3 windows 21% of a
 fixed +-4 px square, 73% transported, 88% re-centred; but re-centring also puts 84% of the background units next to a
 target onto it (fixed 19%, transported 42%), and units of targets faster than 4 px per window end with more misses
 than the backbone when the boxes stay fixed.
+Existence dendrite (V19, 11-14 evening; SpikingDecisionUnits(dendrite="existence", ring=True, clutter=True,
+content="ring"); docs/V19_DESIGN.md): the question a unit answers is whether a target source exists at its event, so
+its dendrite computes the integrated-PDA existence likelihood ratio of every window -- miss + sum over the boxes of
+events x exp(association prior + content log-likelihood ratio - clutter normaliser) -- instead of the attributed mean
+(a state-update form). The association prior is a ring that grows with the window offset (a source of unknown
+direction moves away from the event), the content coefficients are shared around each ring (no preferred direction),
+and the clutter normaliser divides a box's events by 1 + the clutter expected there (the background-like events of the
+unit's square per px). An empty window gives log miss: evidence of absence.
 Membership cue (V18, 11-14 night; SpikingDecisionUnits(memb=True)): the same centroid measured in the event's own
 window, without the event itself, gives the event's distance from its source; it enters the unit's initial state.
 Waiting can confirm THAT a target is there (existence), not WHICH border events belong to it (membership): on V17
@@ -363,7 +371,7 @@ class SpikingDecisionUnits(nn.Module):
 
     def __init__(self, n_steps, r, dim=64, heads=4, value="ei", gate="attribution", pool="window", evidence="boxes",
                  context=True, audit="reaudit", tokens="mlp", ctx_ff=True, n_feat=N_FEAT, n_msg=0, track=False,
-                 memb=False, pseudo=True):
+                 memb=False, pseudo=True, dendrite="mean", ring=False, clutter=False, content="box"):
         super(SpikingDecisionUnits, self).__init__()
         self.n_feat = Fn = int(n_feat)                                      # box statistics read by the dendrite
         self.n_msg = int(n_msg)                                             # V18: decision-spike types (lateral)
@@ -372,18 +380,35 @@ class SpikingDecisionUnits(nn.Module):
         self.memb = bool(memb)                                              # V18: membership cue in the start state
         if (value not in ("ei", "signed") or gate not in ("attribution", "distance", "none")
                 or pool not in ("window", "mean", "sum") or evidence not in ("boxes", "events")
-                or audit not in ("reaudit", "ledger") or tokens not in TOKENS):
-            raise ValueError("unknown option value=%s gate=%s pool=%s evidence=%s audit=%s tokens=%s"
-                             % (value, gate, pool, evidence, audit, tokens))
+                or audit not in ("reaudit", "ledger") or tokens not in TOKENS or dendrite not in ("mean", "existence")
+                or content not in ("box", "ring")):
+            raise ValueError("unknown option value=%s gate=%s pool=%s evidence=%s audit=%s tokens=%s dendrite=%s "
+                             "content=%s" % (value, gate, pool, evidence, audit, tokens, dendrite, content))
         if dim % heads or (value == "ei" and heads % 2):
             raise ValueError("dim must be a multiple of heads; value=ei needs an even number of heads")
+        if dendrite == "existence" and (evidence != "events" or value != "ei" or pool != "window" or tokens != "glm"
+                                        or gate == "attribution"):
+            raise ValueError("the existence dendrite needs evidence=events, value=ei, pool=window, tokens=glm and a "
+                             "distance (or no) association prior")
+        if (content == "ring" and tokens != "glm") or ((ring or clutter) and evidence != "events"):
+            raise ValueError("content=ring needs tokens=glm; ring / clutter need evidence=events")
+        if clutter and dendrite == "mean" and not pseudo:
+            raise ValueError("clutter with the mean dendrite scales the pseudo-observation: pseudo must be on")
         r = np.asarray(r, np.float64)
         self.n_steps, self.n_box, self.dim, self.heads, self.hd = int(n_steps), len(r), int(dim), int(heads), \
             int(dim) // int(heads)
         self.value, self.gate, self.pool, self.evidence = value, gate, pool, evidence
-        self.pseudo = evidence == "events" and bool(pseudo)                # leak conductance of the dendrite
+        self.dendrite, self.ring, self.clutter, self.content_share = dendrite, bool(ring), bool(clutter), content
+        self.pseudo = evidence == "events" and bool(pseudo) and dendrite == "mean"   # leak conductance (mean form)
         self.context, self.audit, self.tokens, self.ctx_ff = bool(context), audit, tokens, bool(ctx_ff)
         self.register_buffer("r2", torch.as_tensor(r ** 2, dtype=torch.float32))
+        self.register_buffer("r", torch.as_tensor(r, dtype=torch.float32))
+        j = np.arange(len(r))                                              # box_layout order: 9 + 8 per level
+        lev = np.where(j < 9, 0, (j - 9) // 8 + 1)
+        self.register_buffer("box_area", torch.as_tensor(9.0 ** (lev + 1), dtype=torch.float32))   # px, full box
+        ring_of = np.where(j == CENTRE, 0, lev + 1)                        # centre, then one ring per level
+        self.register_buffer("ring_idx", torch.as_tensor(ring_of, dtype=torch.long))
+        self.n_ring = int(ring_of.max()) + 1
         sign = [1.0] * heads if value == "signed" else [1.0] * (heads // 2) + [-1.0] * (heads // 2)
         self.register_buffer("head_sign", torch.tensor(sign))
         self.register_buffer("feat_mu", torch.zeros(Fn))
@@ -410,8 +435,12 @@ class SpikingDecisionUnits(nn.Module):
                 self.v_ctx, self.v_out = nn.Linear(dim, dim), nn.Linear(dim, heads)
                 self.wo = nn.Linear(dim, dim)
             else:
-                self.coef = nn.Parameter(torch.zeros(S, K, heads, Fn))       # per window offset, box and head
-                self.bias = nn.Parameter(torch.zeros(S, K, heads))
+                if content == "ring":                                       # isotropic: one per window offset and ring
+                    self.coef = nn.Parameter(torch.zeros(S, self.n_ring, heads, Fn))
+                    self.bias = nn.Parameter(torch.zeros(S, 1, heads))     # no place bias: geometry is the prior's
+                else:
+                    self.coef = nn.Parameter(torch.zeros(S, K, heads, Fn))   # per window offset, box and head
+                    self.bias = nn.Parameter(torch.zeros(S, K, heads))
                 self.dcoef = nn.Linear(dim, heads * (Fn + 1))               # the context shifts them
                 if attr:
                     self.gq = nn.Linear(dim, heads * Fn)
@@ -433,7 +462,17 @@ class SpikingDecisionUnits(nn.Module):
             self.sink_val = nn.Linear(dim, heads)                          # its evidence, given the context
         if self.n_msg:                                                      # lateral synapses: one weight per age,
             self.lat = nn.Parameter(torch.zeros(S, K, self.n_msg))         # box and spike type (0 = silent start)
+        if self.ring:                   # expanding association ring: radius v k, spread^2 sigma^2 + (w k)^2 (px, k =
+            self.ring_v = nn.Parameter(torch.full((heads,), -2.0))         # window offset); softplus, starts ~0.13
+            self.ring_w = nn.Parameter(torch.full((heads,), -2.0))
+        if self.clutter:                # divisive clutter normalisation n / (1 + expected clutter)^kappa, kappa = 1
+            self.clutter_k = nn.Parameter(torch.full((heads,), math.log(math.e - 1.0)))
+        if dendrite == "existence":     # detection-or-miss: miss probability 1 - P_D of each hypothesis, given c
+            self.miss_logit = nn.Parameter(torch.zeros(heads))
+            self.miss_ctx = nn.Linear(dim, heads)
         zero = (self.dcoef,) if tokens == "glm" else (self.v_out,)
+        if dendrite == "existence":
+            zero = zero + (self.miss_ctx,)
         with torch.no_grad():                                              # U = z0 and an unused audit at the start
             for lin in zero + (self.wm,) + ((self.sink_val,) if self.pseudo else ()):
                 lin.weight.zero_()
@@ -468,13 +507,20 @@ class SpikingDecisionUnits(nn.Module):
         T = S * K
         x = (feat[..., :self.n_feat] - self.feat_mu) / self.feat_sd
         tok = {"cnt": (torch.expm1(feat[..., 0]) + torch.expm1(feat[..., 1])).reshape(B, T)}
+        if self.clutter:                                   # background-like events (count - prior mass) and the
+            q = torch.expm1(feat[..., 2]) + torch.expm1(feat[..., 3])          # in-frame area (px) of every box
+            tok["bg"] = (tok["cnt"].view(B, S, K) - q).clamp(min=0).reshape(B, T)
+            tok["px"] = (feat[..., 4] * self.box_area).reshape(B, T)
         if self.n_msg:                                     # lateral current of every box: weight x log(1 + spikes)
             lat = self.lat[first:first + S][None] if slot_idx is None else self.lat[slot_idx][:, None]
             spikes = feat[..., self.n_feat:self.n_feat + self.n_msg]
             tok["lat"] = (lat * spikes).sum(-1).reshape(B, T)
         if self.tokens == "glm":
-            coef = self.coef[first:first + S][None] if slot_idx is None else self.coef[slot_idx][:, None]
-            bias = self.bias[first:first + S][None] if slot_idx is None else self.bias[slot_idx][:, None]
+            cf, bs = self.coef, self.bias
+            if self.content_share == "ring":               # one coefficient set per ring, the same around it
+                cf, bs = cf[:, self.ring_idx], bs.expand(-1, K, -1)
+            coef = cf[first:first + S][None] if slot_idx is None else cf[slot_idx][:, None]
+            bias = bs[first:first + S][None] if slot_idx is None else bs[slot_idx][:, None]
             tok["x"] = x.reshape(B, T, self.n_feat)
             tok["s"] = ((coef * x[..., None, :]).sum(-1) + bias).reshape(B, T, self.heads)
             return tok
@@ -497,18 +543,18 @@ class SpikingDecisionUnits(nn.Module):
         cnt = tok["cnt"]
         B, T = cnt.shape
         K, H = self.n_box, self.heads
-        if self.gate == "none":                   # ablation: every box of the square weighs the same (no attribution)
-            prior = self.rf_bias[:, None].expand(H, n_win * K)
-        else:
-            prior = self.rf_bias[:, None] - self.r2.repeat(n_win)[None, :] / (2.0 * self.sigma()[:, None] ** 2)
+        prior = self.association_prior(k, n_win)                           # [H, T] or [B, H, T] (ring, per-unit age)
+        pr = prior if prior.dim() == 3 else prior[None]
+        if self.dendrite == "existence":
+            return self._existence(c, tok, n_win, pr, win_mask)
         if self.gate == "attribution" and self.tokens == "glm":
             q = self.gq(c).view(B, H, self.n_feat)
-            logit = torch.einsum("bhf,btf->bht", q, tok["x"]) / math.sqrt(self.n_feat) + prior[None]
+            logit = torch.einsum("bhf,btf->bht", q, tok["x"]) / math.sqrt(self.n_feat) + pr
         elif self.gate == "attribution":
             q = self.wq(self.ln_q(c + self.age.weight[k])).view(B, H, self.hd)
-            logit = torch.einsum("bhd,bthd->bht", q, tok["keys"]) / math.sqrt(self.hd) + prior[None]
+            logit = torch.einsum("bhd,bthd->bht", q, tok["keys"]) / math.sqrt(self.hd) + pr
         else:
-            logit = prior[None].expand(B, H, T)
+            logit = pr.expand(B, H, T)
         wm = torch.ones(B, n_win, device=cnt.device) if win_mask is None else win_mask.float()
         a = torch.sigmoid(logit) * wm.repeat_interleave(K, 1)[:, None, :]
         if self.tokens == "glm":
@@ -524,6 +570,9 @@ class SpikingDecisionUnits(nn.Module):
         den = w.view(B, H, n_win, K).sum(-1)
         if self.pseudo:                                                    # pseudo-observation of every window
             a0 = torch.sigmoid(self.sink_logit)[None, :, None] * wm[:, None, :]
+            if self.clutter:                    # PDA: "none of these is mine" grows with the clutter of the window
+                bg = tok["bg"].view(B, n_win, K).sum(-1)                       # background-like events [B, n_win]
+                a0 = a0 * torch.exp(F.softplus(self.clutter_k)[None, :, None] * torch.log1p(bg)[:, None, :])
             v0 = self.sink_val(c)
             if self.value == "ei":
                 v0 = F.softplus(v0)
@@ -541,6 +590,74 @@ class SpikingDecisionUnits(nn.Module):
         else:
             ubar = torch.einsum("bht,bthd->bhd", w, tok["vals"].view(B, T, H, self.hd)) / mass[..., None].clamp(min=EPS)
         return lam, mass, ubar.reshape(B, -1), a
+
+    def association_prior(self, k, n_win):
+        """Log association prior of the tokens of n_win windows: [H, T], or [B, H, T] when the expanding ring needs a
+        per-unit age (k [B], one window). Fixed field: b_h - r^2 / (2 sigma_h^2). Expanding ring (V19): a source of
+        unknown direction that moves about v_h px per window is, a windows after the event, on a ring of radius v_h a
+        that widens: b_h - (r - v_h a)^2 / (2 s_h(a)^2) - log(s_h(a)^2 / sigma_h^2), s_h(a)^2 = sigma_h^2 + (w_h a)^2
+        (the last term: the same mass spread over a larger area); a = the window offset of the token (the step k for
+        one window, 0 .. n_win - 1 for a re-audit). gate none: b_h only (no attribution)."""
+        H, K = self.heads, self.n_box
+        if self.gate == "none":
+            return self.rf_bias[:, None].expand(H, n_win * K)
+        s2 = self.sigma()[:, None] ** 2                                    # [H, 1]
+        if not self.ring:
+            return self.rf_bias[:, None] - self.r2.repeat(n_win)[None, :] / (2.0 * s2)
+        v, w = F.softplus(self.ring_v), F.softplus(self.ring_w)
+        if n_win > 1:                                                      # re-audit: windows 0 .. n_win - 1
+            a = torch.arange(n_win, dtype=s2.dtype, device=s2.device).repeat_interleave(K)
+        else:
+            age = torch.as_tensor(k, device=s2.device)
+            if age.dim() == 1:                                             # stream: one age per unit
+                return self.association_prior_units(age)
+            a = age.to(s2.dtype).expand(K)
+        rr = self.r.repeat(n_win)
+        sa2 = s2 + (w[:, None] * a[None]) ** 2
+        return self.rf_bias[:, None] - (rr[None] - v[:, None] * a[None]) ** 2 / (2.0 * sa2) - torch.log(sa2 / s2)
+
+    def association_prior_units(self, age):
+        """Expanding-ring prior for units of different ages age [B] (one window each): [B, H, K]."""
+        s2 = self.sigma()[None, :, None] ** 2
+        v, w = F.softplus(self.ring_v)[None, :, None], F.softplus(self.ring_w)[None, :, None]
+        a = age.to(s2.dtype)[:, None, None]
+        sa2 = s2 + (w * a) ** 2
+        return self.rf_bias[None, :, None] - (self.r[None, None, :] - v * a) ** 2 / (2.0 * sa2) - torch.log(sa2 / s2)
+
+    def _existence(self, c, tok, n_win, prior, win_mask):
+        """Existence dendrite (V19), Eq. E1-E3 of docs/V19_DESIGN.md. One window is one chance for the source of
+        hypothesis h to be detected: either it was missed (probability 1 - P_D(c)) or one of the window's events is
+        its detection. With the events of a box sharing a score, the likelihood ratio of the window against clutter
+        alone (integrated PDA) is  miss_h + sum_b n_b exp(score_hb),  score = association prior (geometry, time) +
+        content log-likelihood ratio (the box statistics, context-shifted) - kappa_h log(1 + expected clutter events of
+        the box) (divisive normalisation; the clutter density is the background-like events of the unit's square per
+        px). The channel current is log(miss + D) = log miss (evidence of absence, <= 0) + softplus(log D - log miss)
+        (detection, >= 0); the soma adds sign_h x current (target channels excite, background ones inhibit). The
+        posterior association of a box (PDA beta) n_b exp(score) / (miss + D) is the gate it reports; the attributed
+        mass is the detection probability 1 - beta_0 summed over windows. prior: [1 or B, H, T]."""
+        cnt = tok["cnt"]
+        B, T = cnt.shape
+        K, H, Fn = self.n_box, self.heads, self.n_feat
+        dc = self.dcoef(c).view(B, H, Fn + 1)
+        content = tok["s"].permute(0, 2, 1) + torch.einsum("bhf,btf->bht", dc[..., :Fn], tok["x"]) + dc[..., Fn:]
+        score = content + prior
+        if self.clutter:
+            px = tok["px"].view(B, n_win, K)
+            dens = tok["bg"].view(B, n_win, K).sum(-1) / px.sum(-1).clamp(min=1.0)   # events per px [B, n_win]
+            expect = (dens[:, :, None] * px).reshape(B, T)                           # expected clutter per box
+            score = score - F.softplus(self.clutter_k)[None, :, None] * torch.log1p(expect)[:, None, :]
+        wm = torch.ones(B, n_win, device=cnt.device) if win_mask is None else win_mask.float()
+        live = (cnt > 0.5) & (wm.repeat_interleave(K, 1) > 0)
+        z = torch.where(live[:, None, :], torch.log(cnt.clamp(min=0.5))[:, None, :] + score,
+                        torch.full_like(score, -1e4))
+        logd = torch.logsumexp(z.view(B, H, n_win, K), -1)                 # log sum_b n_b exp(score) [B, H, n_win]
+        log_miss = F.logsigmoid(self.miss_logit[None] + self.miss_ctx(c))[:, :, None]
+        total = log_miss + F.softplus(logd - log_miss)                    # log(miss + D)
+        lam = (total * wm[:, None, :]).sum(-1)
+        resp = torch.exp(z - total.repeat_interleave(K, 2))               # posterior association [B, H, T]
+        mass = resp.sum(-1)
+        ubar = torch.einsum("bht,btf->bhf", resp, tok["x"]) / mass[..., None].clamp(min=EPS)
+        return lam, mass, ubar.reshape(B, -1), resp
 
     def context_delta(self, ubar, mass, lam):
         """Eq. 6: what the last audit found -> change of the context."""
@@ -640,10 +757,21 @@ class SpikingDecisionUnits(nn.Module):
         dense_aud = (k + 1) * K if self.audit == "reaudit" else np.full(k.shape, K)
         if nz_new is None or self.evidence == "boxes":
             nz_new, nz_aud = np.full(k.shape, K), dense_aud
-        if self.tokens == "glm":
+        if self.tokens == "glm" and self.dendrite == "existence":
+            new = Fn + Fn * H                                             # normalise + fixed logit
+            # shift, score = prior (a table of age, box, head) + content - clutter + log n, exp and sum, the
+            # posterior association and its mean feature
+            aud = Fn * H + 3 * H + 2 * H + H + Fn * H
+            fixed = d * H * (Fn + 1) + d * H + 4 * H                      # coefficient shift, miss(c), log-sum per head
+            if self.clutter:
+                fixed += 3 * K + K * H                                    # density (2 sums), log1p, kappa per box
+            ctx = H * Fn * d + 2 * H * d
+        elif self.tokens == "glm":
             new = Fn + Fn * H                                             # normalise + fixed logit
             aud = Fn * H + H + Fn * H + 3 * H + (Fn * H if attr else 0)   # shift, mean feature, sums (+ gate)
             fixed = d * H * (Fn + 1) + (d * H * Fn if attr else 0)        # coefficient shift (+ gate query)
+            if self.clutter:
+                fixed += K + 2 * H                                        # background count, its power per head
             ctx = H * Fn * d + 2 * H * d
         else:
             new = Fn * d + (d * d if self.tokens == "mlp" else 0)         # values
@@ -691,6 +819,13 @@ class SpikingDecisionUnits(nn.Module):
         if self.pseudo:
             out["pseudo_observation_weight"] = [round(v, 3) for v in
                                                 torch.sigmoid(self.sink_logit).detach().cpu().tolist()]
+        if self.ring:                          # V19: ring speed (px per window) and spread growth of every head
+            out["ring_speed_px_per_window"] = [round(v, 3) for v in F.softplus(self.ring_v).detach().cpu().tolist()]
+            out["ring_spread_px_per_window"] = [round(v, 3) for v in F.softplus(self.ring_w).detach().cpu().tolist()]
+        if self.clutter:
+            out["clutter_exponent"] = [round(v, 3) for v in F.softplus(self.clutter_k).detach().cpu().tolist()]
+        if self.dendrite == "existence":
+            out["miss_probability"] = [round(v, 3) for v in torch.sigmoid(self.miss_logit).detach().cpu().tolist()]
         if self.n_msg:                         # lateral synaptic weight per box level (mean over ages), by spike type
             j = torch.arange(self.n_box)
             lev = torch.where(j < 9, torch.zeros_like(j), (j - 9) // 8 + 1)    # box_layout order: 9 + 8 per level

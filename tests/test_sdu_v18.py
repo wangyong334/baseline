@@ -16,6 +16,7 @@
        ledger mean ablation, the martingale term; tracked fields (brute-force tracker and counts, the field follows a
        moving target, the own spike is removed from the box that holds the event, stream == offline)
 """
+import math
 import os
 import sys
 import unittest
@@ -206,14 +207,23 @@ def membership_ref(rec, e):
 
 def unit(value="ei", gate="attribution", pool="window", evidence="boxes", context=True, audit="reaudit", n_steps=4,
          levels=2, nonzero=True, tokens="mlp", ctx_ff=True, n_feat=S.N_FEAT, seed=1, n_msg=0, track=False,
-         memb=False, pseudo=True):
+         memb=False, pseudo=True, dendrite="mean", ring=False, clutter=False, content="box"):
     torch.manual_seed(seed)
     _, r, _ = S.box_layout(levels)
     net = S.SpikingDecisionUnits(n_steps, r, dim=16, heads=4, value=value, gate=gate, pool=pool, evidence=evidence,
                                  context=context, audit=audit, tokens=tokens, ctx_ff=ctx_ff, n_feat=n_feat,
-                                 n_msg=n_msg, track=track, memb=memb, pseudo=pseudo)
+                                 n_msg=n_msg, track=track, memb=memb, pseudo=pseudo, dendrite=dendrite, ring=ring,
+                                 clutter=clutter, content=content)
     if nonzero:
         with torch.no_grad():
+            if ring:
+                net.ring_v.normal_(0.5, 0.5)
+                net.ring_w.normal_(0.0, 0.5)
+            if clutter:
+                net.clutter_k.normal_(0.5, 0.3)
+            if dendrite == "existence":
+                net.miss_logit.normal_(0, 1.0)
+                net.miss_ctx.weight.normal_(0, 0.3)
             if n_msg:
                 net.lat.normal_(0, 0.5)
             if tokens == "glm":
@@ -579,13 +589,13 @@ class V18Tests(unittest.TestCase):
         for second in ({"n_msg": S.N_MSG}, {"n_feat": S.N_FEAT + S.N_MSG}):
             self.check_cooperative(second)
 
-    def check_cooperative(self, second):
+    def check_cooperative(self, second, first=None):
         rec = recording(n=700, W=40, H=30, n_win=8, seed=6)
         rect, _, _ = S.box_layout(2)
         n_steps, tau = 4, -1.2
         bounds1, bounds2 = [2.5, 2.0, 1.5, 1.0, 0.0], [2.2, 1.8, 1.4, 0.9, 0.0]
         kw = dict(n_steps=n_steps, tokens="glm", gate="distance", evidence="events", audit="ledger", ctx_ff=False)
-        net1 = unit(**kw)
+        net1 = unit(**dict(kw, **(first or {})))
         net2 = unit(seed=2, **dict(kw, **second))
         step, typ, spikes, F_ = first_population(rec, net1, rect, n_steps, tau, bounds1)
         maps2 = S.EvidenceMaps(rec["x"], rec["y"], rec["win"], rec["pol"], rec["z0"], rec["n_win"], rec["H"],
@@ -614,6 +624,103 @@ class V18Tests(unittest.TestCase):
         self.assertEqual(layer.open_units(), 0)
         np.testing.assert_array_equal(col, L2)
         np.testing.assert_allclose(val, Z2[np.arange(len(idx)), L2], rtol=1e-5, atol=1e-5)
+
+
+EXIST = dict(tokens="glm", gate="distance", audit="ledger", ctx_ff=False, dendrite="existence")
+V19 = dict(EXIST, ring=True, clutter=True, content="ring")
+
+
+class V19Tests(unittest.TestCase):
+    """V19 existence dendrite: detection-or-miss log-likelihood ratio, expanding association ring, divisive clutter
+    normalisation, content coefficients shared around each ring."""
+
+    def test_starts_at_prior(self):
+        feat, valid, z0, pol = unit_inputs()
+        for kw in ({}, {"ring": True}, {"ring": True, "clutter": True, "content": "ring"}):
+            with torch.no_grad():
+                U = unit(nonzero=False, evidence="events", **dict(EXIST, **kw))(feat, valid, z0, pol)
+            self.assertLess(float((U - z0[:, None]).abs().max()), 1e-5, str(kw))
+
+    def test_formula_one_window(self):
+        """lambda_h = log(miss_h + sum_b n_b exp(prior + content - kappa_h log(1 + density x px))), the attributed
+        mass is the detection probability D / (miss + D) and the gates are n_b exp(score) / (miss + D)."""
+        net = unit(evidence="events", **V19)
+        feat, valid, z0, pol = unit_inputs(B=3)
+        Fn, H = S.N_FEAT, 4
+        with torch.no_grad():
+            tok = net.embed(feat[:, :1])
+            c = net.start(z0, pol)
+            lam, mass, _, resp = net.audit_tokens(c, 0, tok, 1)
+            dc = net.dcoef(c).view(3, H, Fn + 1)
+            content = tok["s"].permute(0, 2, 1) + torch.einsum("bhf,btf->bht", dc[..., :Fn], tok["x"]) + dc[..., Fn:]
+            dens = tok["bg"].sum(-1) / tok["px"].sum(-1).clamp(min=1.0)
+            score = (content + net.association_prior(0, 1)[None]
+                     - torch.nn.functional.softplus(net.clutter_k)[None, :, None]
+                     * torch.log1p(dens[:, None] * tok["px"])[:, None, :])
+            n = tok["cnt"] * (tok["cnt"] > 0.5).float()
+            D = (n[:, None, :] * torch.exp(score)).sum(-1)
+            miss = torch.sigmoid(net.miss_logit[None] + net.miss_ctx(c))
+        np.testing.assert_allclose(lam.numpy(), torch.log(miss + D).numpy(), rtol=1e-4, atol=1e-4)
+        np.testing.assert_allclose(mass.numpy(), (D / (miss + D)).numpy(), rtol=1e-4, atol=1e-5)
+        np.testing.assert_allclose(resp.sum(-1).numpy(), mass.numpy(), rtol=1e-5, atol=1e-6)
+        self.assertTrue(bool((resp >= 0).all()) and bool((resp.sum(-1) <= 1 + 1e-5).all()))
+
+    def test_empty_window_is_evidence_of_absence(self):
+        """A window without events in the unit's boxes adds sum_h sign_h log miss_h: when the target hypothesis
+        expects detections (small miss), nothing seen pulls the membrane towards background."""
+        feat, valid, z0, pol = unit_inputs()
+        feat[:, 2, :, :2] = 0.0
+        net = unit(evidence="events", **V19)
+        with torch.no_grad():
+            net.miss_ctx.weight.zero_()
+            net.miss_ctx.bias.zero_()
+            net.miss_logit.copy_(torch.tensor([-2.0, -1.0, 0.5, 1.0]))
+            U = net(feat, valid, z0, pol)
+            expect = float((torch.nn.functional.logsigmoid(net.miss_logit) * net.head_sign).sum())
+        self.assertLess(expect, 0.0)
+        np.testing.assert_allclose((U[:, 2] - U[:, 1]).numpy(), expect, rtol=1e-5, atol=1e-5)
+
+    def test_ring_prior(self):
+        """Without growth the ring is the fixed distance field; with speed v and no spread the prior of window offset
+        k peaks at the box nearest to v k; per-unit ages give the same priors as one age at a time."""
+        net = unit(evidence="events", **V19)
+        with torch.no_grad():
+            net.ring_v.fill_(-30.0)
+            net.ring_w.fill_(-30.0)
+            ref = net.rf_bias[:, None] - net.r2[None] / (2.0 * net.sigma()[:, None] ** 2)
+            np.testing.assert_allclose(net.association_prior(5, 1).numpy(), ref.numpy(), rtol=1e-5, atol=1e-5)
+            net.ring_v.fill_(math.log(math.expm1(3.0)))                   # 3 px per window
+            net.log_sigma.fill_(math.log(1.5))
+            for k, r_best in ((0, 0.0), (1, 3.0), (3, 9.0)):
+                self.assertAlmostEqual(float(net.r[net.association_prior(k, 1)[0].argmax()]), r_best, places=4)
+            per = net.association_prior(torch.tensor([0, 1, 3]), 1)
+            one = torch.stack([net.association_prior(k, 1) for k in (0, 1, 3)])
+            np.testing.assert_allclose(per.numpy(), one.numpy(), rtol=1e-6, atol=1e-6)
+            many = net.association_prior(3, 4)                              # re-audit: windows 0 .. 3
+            np.testing.assert_allclose(many.view(4, 4, -1)[:, 3].numpy(), one[2].numpy(), rtol=1e-6, atol=1e-6)
+
+    def test_stream_equals_offline(self):
+        for kw in (V19, dict(EXIST, ring=True), dict(EXIST, clutter=True), EXIST,
+                   dict(EXIST, audit="reaudit", ring=True, clutter=True),
+                   {"tokens": "glm", "gate": "distance", "audit": "ledger", "ctx_ff": False, "ring": True,
+                    "clutter": True}):                          # the mean dendrite with ring and clutter (fallback)
+            StreamingTests.check_stream(self, "events", **kw)
+
+    def test_cooperative(self):
+        """Both populations with the existence dendrite; the second reads the decision spikes as box statistics."""
+        V18Tests.check_cooperative(self, dict(V19, n_feat=S.N_FEAT + S.N_MSG), first=V19)
+
+    def test_cost_and_constants(self):
+        net = unit(evidence="events", **V19)
+        c = [net.step_macs(k, 5, 5) for k in range(4)]
+        self.assertTrue(all(v > 0 for v in c))
+        lc = net.learned_constants()
+        for key in ("ring_speed_px_per_window", "ring_spread_px_per_window", "clutter_exponent", "miss_probability"):
+            self.assertEqual(len(lc[key]), 4)
+        self.assertFalse(hasattr(net, "sink_logit"))
+        self.assertEqual(tuple(net.coef.shape[1:3]), (net.n_ring, 4))
+        with self.assertRaises(ValueError):
+            unit(evidence="boxes", **EXIST)
 
 
 class TrackTests(unittest.TestCase):

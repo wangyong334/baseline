@@ -189,6 +189,17 @@ def main():
                          "weight by box, age and type; ablation, 9 runs test -0.0045)")
     ap.add_argument("--pseudo", choices=("on", "off"), default="on",
                     help="pseudo-observation of every window (the dendrite's leak conductance); off = ablation")
+    ap.add_argument("--dendrite", choices=("mean", "existence"), default="mean",
+                    help="V19: what one window contributes -- the attributed mean (V18) or the integrated-PDA "
+                         "existence log-likelihood ratio log(miss + sum_b n_b exp(score)) (docs/V19_DESIGN.md)")
+    ap.add_argument("--ring", choices=("on", "off"), default="off",
+                    help="V19 association prior: a ring of radius v k and spread sqrt(sigma^2 + (w k)^2) that grows "
+                         "with the window offset k (off = the fixed distance field)")
+    ap.add_argument("--clutter", choices=("on", "off"), default="off",
+                    help="V19 divisive clutter normalisation of a box's events by 1 + its expected clutter (existence) "
+                         "or a pseudo-observation that grows with the window's background-like events (mean)")
+    ap.add_argument("--content", choices=("box", "ring"), default="box",
+                    help="glm coefficients per box (V18) or shared around each ring (V19: no preferred direction)")
     ap.add_argument("--martingale", type=float, default=0.0,
                     help="weight of the martingale-consistency term (drift of the posterior given its value)")
     ap.add_argument("--sample-cap", type=int, default=50000,
@@ -225,7 +236,7 @@ def main():
     else:
         cfg = {k: getattr(args, k) for k in ("levels", "dim", "heads", "value", "gate", "pool", "evidence", "context",
                                              "context_ff", "audit", "tokens", "martingale", "track", "membership",
-                                             "pseudo")}
+                                             "pseudo", "dendrite", "ring", "clutter", "content")}
         feature = bool(args.stage1) and args.spikes == "feature"
         cfg.update(n_steps=n_steps, window_ms=wms, tau=tau, n_feat=N_FEAT + N_MSG if feature else N_FEAT,
                    n_msg=N_MSG if (args.stage1 and not feature) else 0, spikes=args.spikes if args.stage1 else "",
