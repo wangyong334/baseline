@@ -12,6 +12,9 @@
        the offline trajectories (boxes and events; re-audit and ledger units; every token form)
     4. Stopping rule: isotonic bound at the margin where changes stop, forced commit at the last column, entry column
        commits safe priors, unit load per window
+    5. V18: decision spikes as messages (box counts, own spike left out, lateral synapses, cooperative stream), the
+       ledger mean ablation, the martingale term; tracked fields (brute-force tracker and counts, the field follows a
+       moving target, the own spike is removed from the box that holds the event, stream == offline)
 """
 import os
 import sys
@@ -59,9 +62,83 @@ def brute(rec, e, rect, n_steps):
     return out, ok
 
 
-def maps_of(rec):
+def maps_of(rec, track=False, messages=None):
     return S.EvidenceMaps(rec["x"], rec["y"], rec["win"], rec["pol"], rec["z0"], rec["n_win"], rec["H"], rec["W"],
-                          "cpu")
+                          "cpu", messages=messages, track=track)
+
+
+def moving_recording(n_noise=500, W=60, H=40, n_win=8, v=(4.0, 2.0), per_win=25, seed=0):
+    """Uniform noise (low priors) plus a compact target (high priors) that moves v px per window."""
+    rng = np.random.RandomState(seed)
+    xs, ys, ws = [rng.randint(0, W, n_noise)], [rng.randint(0, H, n_noise)], [rng.randint(0, n_win, n_noise)]
+    z = [rng.randn(n_noise) * 3.0 - 8.0]
+    for t in range(n_win):
+        cx, cy = 12.0 + v[0] * t, 10.0 + v[1] * t
+        xs.append(np.clip(np.round(cx + rng.randn(per_win) * 1.2), 0, W - 1).astype(np.int64))
+        ys.append(np.clip(np.round(cy + rng.randn(per_win) * 1.2), 0, H - 1).astype(np.int64))
+        ws.append(np.full(per_win, t))
+        z.append(rng.randn(per_win) + 3.0)
+    n = n_noise + n_win * per_win
+    return {"x": np.concatenate(xs), "y": np.concatenate(ys), "win": np.concatenate(ws), "pol": rng.randint(0, 2, n),
+            "z0": np.concatenate(z).astype(np.float32), "W": W, "H": H, "n_win": n_win,
+            "target": np.arange(n) >= n_noise, "v": v}
+
+
+def brute_track(rec, e, rect, n_steps, spikes=None, mode="recentre"):
+    """Moving-field features of event e: a numpy alpha-beta tracker on exact centroids and direct counting.
+    spikes = (index of the spiking event, window, type) of first-population decision spikes (own spike excluded);
+    mode = recentre (the field on the predicted source centre) or transport (on the event moved with its source)."""
+    q = np.round(1.0 / (1.0 + np.exp(-rec["z0"].astype(np.float32).astype(np.float64))) * S.Q_SCALE)
+    px, py, vx, vy = float(rec["x"][e]), float(rec["y"][e]), 0.0, 0.0
+    ox = oy = 0.0
+    sh = 1.0 if mode == "transport" else 0.0
+    nf = S.N_FEAT + (0 if spikes is None else S.N_MSG)
+    out, ok, centres = np.zeros((n_steps, len(rect), nf)), np.zeros(n_steps, bool), []
+    for s in range(n_steps):
+        w = rec["win"][e] + s
+        cx = int(np.clip(np.round(px + vx + sh * ox), 0, rec["W"] - 1))           # where the field reads
+        cy = int(np.clip(np.round(py + vy + sh * oy), 0, rec["H"] - 1))
+        sx = int(np.clip(np.round(px + vx), 0, rec["W"] - 1))                     # where the tracker measures
+        sy = int(np.clip(np.round(py + vy), 0, rec["H"] - 1))
+        centres.append((cx, cy))
+        has = False
+        if w < rec["n_win"]:
+            ok[s] = True
+            for k, (x0, x1, y0, y1) in enumerate(rect):
+                gx0, gx1, gy0, gy1 = cx + x0, cx + x1, cy + y0, cy + y1
+                inside = ((rec["win"] == w) & (rec["x"] >= gx0) & (rec["x"] <= gx1) & (rec["y"] >= gy0) &
+                          (rec["y"] <= gy1))
+                if s == 0:
+                    inside[e] = False
+                same = inside & (rec["pol"] == rec["pol"][e])
+                opp = inside & (rec["pol"] != rec["pol"][e])
+                ax = max(0, min(gx1, rec["W"] - 1) - max(gx0, 0) + 1)
+                ay = max(0, min(gy1, rec["H"] - 1) - max(gy0, 0) + 1)
+                area = ax * ay / float((x1 - x0 + 1) * (y1 - y0 + 1))
+                row = [np.log1p(same.sum()), np.log1p(opp.sum()), np.log1p(q[same].sum() / S.Q_SCALE),
+                       np.log1p(q[opp].sum() / S.Q_SCALE), area]
+                if spikes is not None:
+                    mi, mw, mt = spikes
+                    hit = ((mw == w) & (mi != e) & (rec["x"][mi] >= gx0) & (rec["x"][mi] <= gx1) &
+                           (rec["y"][mi] >= gy0) & (rec["y"][mi] <= gy1))
+                    row += [np.log1p((hit & (mt == 1)).sum()), np.log1p((hit & (mt == 0)).sum())]
+                out[s, k] = row
+            sq = ((rec["win"] == w) & (np.abs(rec["x"] - sx) <= S.TRACK_HALF) &
+                  (np.abs(rec["y"] - sy) <= S.TRACK_HALF))
+            if s == 0:
+                sq[e] = False                                  # the own event is not its own source
+            mass = q[sq].sum()
+            has = mass >= S.TRACK_MIN_Q
+        if has:
+            mx, my = (q[sq] * rec["x"][sq]).sum() / mass, (q[sq] * rec["y"][sq]).sum() / mass
+            if s > 0:
+                vx, vy = mx - px, my - py
+            else:
+                ox, oy = rec["x"][e] - mx, rec["y"][e] - my
+            px, py = mx, my
+        else:
+            px, py = px + vx, py + vy
+    return out, ok, centres
 
 
 class LayoutTests(unittest.TestCase):
@@ -113,14 +190,32 @@ class MapTests(unittest.TestCase):
         self.assertEqual(float(feat[:, 1:].abs().sum()), 0.0)
 
 
+def membership_ref(rec, e):
+    """Membership cue of event e by direct counting: log(1 + distance from the prior-weighted centroid of the other
+    events of its +-13 px square in its own window), and whether there is prior mass at all."""
+    q = np.round(1.0 / (1.0 + np.exp(-rec["z0"].astype(np.float32).astype(np.float64))) * S.Q_SCALE)
+    sq = ((rec["win"] == rec["win"][e]) & (np.abs(rec["x"] - rec["x"][e]) <= S.TRACK_HALF) &
+          (np.abs(rec["y"] - rec["y"][e]) <= S.TRACK_HALF))
+    sq[e] = False
+    m = q[sq].sum()
+    if m < S.TRACK_MIN_Q:
+        return np.array([0.0, 0.0])
+    cx, cy = (q[sq] * rec["x"][sq]).sum() / m, (q[sq] * rec["y"][sq]).sum() / m
+    return np.array([np.log1p(np.hypot(cx - rec["x"][e], cy - rec["y"][e])), 1.0])
+
+
 def unit(value="ei", gate="attribution", pool="window", evidence="boxes", context=True, audit="reaudit", n_steps=4,
-         levels=2, nonzero=True, tokens="mlp", ctx_ff=True, n_feat=S.N_FEAT, seed=1):
+         levels=2, nonzero=True, tokens="mlp", ctx_ff=True, n_feat=S.N_FEAT, seed=1, n_msg=0, track=False,
+         memb=False):
     torch.manual_seed(seed)
     _, r, _ = S.box_layout(levels)
     net = S.SpikingDecisionUnits(n_steps, r, dim=16, heads=4, value=value, gate=gate, pool=pool, evidence=evidence,
-                                 context=context, audit=audit, tokens=tokens, ctx_ff=ctx_ff, n_feat=n_feat)
+                                 context=context, audit=audit, tokens=tokens, ctx_ff=ctx_ff, n_feat=n_feat,
+                                 n_msg=n_msg, track=track, memb=memb)
     if nonzero:
         with torch.no_grad():
+            if n_msg:
+                net.lat.normal_(0, 0.5)
             if tokens == "glm":
                 net.coef.normal_(0, 0.5)
                 net.bias.normal_(0, 0.5)
@@ -269,11 +364,29 @@ class UnitTests(unittest.TestCase):
                    {"value": "signed", "pool": "sum"}, {"evidence": "events"}, {"audit": "ledger", "evidence": "events"},
                    {"tokens": "linear", "gate": "distance", "ctx_ff": False, "evidence": "events"},
                    {"tokens": "glm", "gate": "distance", "ctx_ff": False, "evidence": "events"},
-                   {"tokens": "glm", "value": "signed"}, {"tokens": "mlp", "ctx_ff": False}):
+                   {"tokens": "glm", "value": "signed"}, {"tokens": "mlp", "ctx_ff": False},
+                   {"tokens": "glm", "gate": "none", "ctx_ff": False, "evidence": "events", "audit": "ledger"}):
             net = unit(**kw)
             with torch.no_grad():
                 U = net(feat, valid, z0, pol)
             self.assertTrue(bool(torch.isfinite(U).all()), str(kw))
+
+    def test_no_attribution(self):
+        """gate none (V18 ablation): every box of every window weighs the same, whatever its distance; starts at the
+        prior like the other forms."""
+        feat, valid, z0, pol = unit_inputs()
+        for audit in ("ledger", "reaudit"):
+            net = unit(tokens="glm", gate="none", evidence="events", audit=audit, ctx_ff=False)
+            with torch.no_grad():
+                net(feat, valid, z0, pol, keep=True)
+                g = net.extras["gates"]                                  # [B, step, H, all tokens]
+                k = 3
+                read = g[:, k, :, :(k + 1) * 17] if audit == "reaudit" else g[:, k, :, k * 17:(k + 1) * 17]
+                np.testing.assert_allclose(read.numpy(), torch.sigmoid(net.rf_bias)[None, :, None].expand_as(read)
+                                           .numpy(), rtol=1e-6, atol=1e-6)
+                U = unit(tokens="glm", gate="none", evidence="events", audit=audit, ctx_ff=False, nonzero=False)(
+                    feat, valid, z0, pol)
+            self.assertLess(float((U - z0[:, None]).abs().max()), 1e-5)
 
     def test_step_cost_grows(self):
         net = unit()
@@ -292,17 +405,33 @@ class StreamingTests(unittest.TestCase):
                    {"tokens": "mlp"}):                          # ledger units: membrane + context only
             self.check_stream("events", audit="ledger", **kw)
 
-    def check_stream(self, evidence, **kw):
-        rec = recording(n=600, W=40, H=30, n_win=7, seed=3)
+    def test_stream_equals_offline_tracked(self):
+        for kw in ({"audit": "ledger", "tokens": "glm", "gate": "distance", "ctx_ff": False, "track": "transport",
+                    "memb": True},
+                   {"audit": "reaudit", "tokens": "glm", "gate": "distance", "ctx_ff": False, "track": "transport"},
+                   {"audit": "ledger", "tokens": "glm", "gate": "distance", "ctx_ff": False},
+                   {"audit": "reaudit", "tokens": "glm", "gate": "distance", "ctx_ff": False},
+                   {"audit": "ledger", "tokens": "glm", "gate": "distance", "ctx_ff": False, "memb": True},
+                   {"audit": "ledger", "tokens": "glm", "gate": "distance", "ctx_ff": False, "memb": True,
+                    "track": False}):
+            kw = dict({"track": True}, **kw)
+            self.check_stream("events", rec=moving_recording(n_noise=500, n_win=9, seed=8), **kw)
+
+    def check_stream(self, evidence, track=False, memb=False, rec=None, **kw):
+        rec = recording(n=600, W=40, H=30, n_win=7, seed=3) if rec is None else rec
         rect, r, _ = S.box_layout(2)
         n_steps = 4
-        net = unit(n_steps=n_steps, evidence=evidence, **kw)
-        maps = maps_of(rec)
+        net = unit(n_steps=n_steps, evidence=evidence, track=track, memb=memb, **kw)
+        if memb:
+            with torch.no_grad():                                   # the cue must change the start state
+                net.c0[0].weight[:, 2:].normal_(0, 2.0)
+        maps = maps_of(rec, track=bool(track) or memb)
         idx = np.arange(len(rec["x"]))
         F_ = np.minimum(n_steps - 1, rec["n_win"] - 1 - rec["win"])
         with torch.no_grad():
-            feat, ok = maps.features(rec["x"], rec["y"], rec["win"], rec["pol"], rec["z0"], rect, n_steps)
-            U = net(feat, ok, torch.as_tensor(rec["z0"]), torch.as_tensor(rec["pol"])).numpy()
+            feat, ok, cue = maps.features(rec["x"], rec["y"], rec["win"], rec["pol"], rec["z0"], rect, n_steps,
+                                          follow=net.track_mode if net.track else False, return_memb=True)
+            U = net(feat, ok, torch.as_tensor(rec["z0"]), torch.as_tensor(rec["pol"]), memb=cue).numpy()
         tau = -1.2
         Z = np.concatenate([rec["z0"][:, None], U], 1).astype(np.float64)
         bounds = [2.5, 2.0, 1.5, 1.0, 0.0]
@@ -373,11 +502,34 @@ class V18Tests(unittest.TestCase):
         feat = torch.rand(5, 4, 17, S.N_FEAT + S.N_MSG, generator=g) * 3.0
         z0 = torch.randn(5, generator=g) * 3.0
         pol = (torch.rand(5, generator=g) > 0.5).long()
-        net = unit(tokens="glm", gate="distance", evidence="events", audit="ledger", ctx_ff=False,
-                   n_feat=S.N_FEAT + S.N_MSG, nonzero=False)
+        for audit in ("ledger", "reaudit"):
+            net = unit(tokens="glm", gate="distance", evidence="events", audit=audit, ctx_ff=False,
+                       n_msg=S.N_MSG, nonzero=False)
+            with torch.no_grad():
+                U = net(feat, torch.ones(5, 4, dtype=torch.bool), z0, pol)
+            self.assertLess(float((U - z0[:, None]).abs().max()), 1e-5)
+
+    def test_lateral_synapses(self):
+        """Spikes of others reach the soma even in a box without events (their weight does not depend on the
+        evidence of the box); with zero lateral weights the unit is exactly the V17 unit."""
+        feat, valid, z0, pol = unit_inputs()
+        spikes = torch.zeros(feat.shape[:3] + (S.N_MSG,))
+        spikes[:, 1, 3, 0] = np.log1p(2.0)                          # two target spikes in box 3 at step 1
+        feat[:, 1, 3, 0:2] = 0.0                                     # ... a box without events in that window
+        kw = dict(tokens="glm", gate="distance", evidence="events", audit="ledger", ctx_ff=False)
+        net2 = unit(n_msg=S.N_MSG, **kw)
         with torch.no_grad():
-            U = net(feat, torch.ones(5, 4, dtype=torch.bool), z0, pol)
-        self.assertLess(float((U - z0[:, None]).abs().max()), 1e-5)
+            U_with = net2(torch.cat([feat, spikes], -1), valid, z0, pol)
+            U_none = net2(torch.cat([feat, torch.zeros_like(spikes)], -1), valid, z0, pol)
+        diff = (U_with - U_none).numpy()
+        np.testing.assert_allclose(diff[:, 0], 0.0, atol=1e-6)      # nothing before the spike arrives
+        np.testing.assert_allclose(diff[:, 1:], float(net2.lat[1, 3, 0]) * np.log1p(2.0), rtol=1e-4, atol=1e-5)
+        net1 = unit(**kw)
+        net2.load_state_dict(net1.state_dict(), strict=False)          # same weights, lateral synapses aside
+        with torch.no_grad():
+            net2.lat.zero_()
+            np.testing.assert_allclose(net2(torch.cat([feat, spikes], -1), valid, z0, pol).numpy(),
+                                       net1(feat, valid, z0, pol).numpy(), rtol=1e-6, atol=1e-6)
 
     def test_ledger_mean_ablation(self):
         feat, valid, z0, pol = unit_inputs()
@@ -390,10 +542,19 @@ class V18Tests(unittest.TestCase):
         np.testing.assert_allclose(U.numpy(), (z0[:, None] + mean).numpy(), rtol=1e-5, atol=1e-5)
 
     def test_martingale_penalty(self):
-        vm, w = torch.ones(64, 4), torch.ones(64)
-        flat = torch.randn(64, 1).expand(64, 4)
+        g = torch.Generator().manual_seed(3)
+        vm, w = torch.ones(4000, 6), torch.ones(4000)
+        start = torch.randn(4000, 1, generator=g) * 2.0
+        flat = start.expand(4000, 6)
         self.assertLess(float(S.martingale_penalty(flat, vm, w)), 1e-12)
-        self.assertGreater(float(S.martingale_penalty(flat + torch.arange(4.0)[None], vm, w)), 1e-3)
+        drift = start - 0.3 * torch.arange(6.0)[None]                 # predictable downward revisions
+        self.assertGreater(float(S.martingale_penalty(drift, vm, w)), 1e-4)
+        # zero-mean revisions of the probability (a martingale): the noise of single revisions is not penalised
+        P = 0.2 + 0.6 * torch.rand(4000, 1, generator=g)
+        for _ in range(5):
+            P = torch.cat([P, P[:, -1:] + 0.03 * (2 * (torch.rand(4000, 1, generator=g) > 0.5).float() - 1)], 1)
+        noisy = torch.log(P / (1 - P))
+        self.assertLess(float(S.martingale_penalty(noisy, vm, w)), 0.1 * float(S.martingale_penalty(drift, vm, w)))
 
     def test_cooperative_stream_equals_offline(self):
         rec = recording(n=700, W=40, H=30, n_win=8, seed=6)
@@ -402,7 +563,7 @@ class V18Tests(unittest.TestCase):
         bounds1, bounds2 = [2.5, 2.0, 1.5, 1.0, 0.0], [2.2, 1.8, 1.4, 0.9, 0.0]
         kw = dict(n_steps=n_steps, tokens="glm", gate="distance", evidence="events", audit="ledger", ctx_ff=False)
         net1 = unit(**kw)
-        net2 = unit(n_feat=S.N_FEAT + S.N_MSG, seed=2, **kw)
+        net2 = unit(n_msg=S.N_MSG, seed=2, **kw)
         step, typ, spikes, F_ = first_population(rec, net1, rect, n_steps, tau, bounds1)
         maps2 = S.EvidenceMaps(rec["x"], rec["y"], rec["win"], rec["pol"], rec["z0"], rec["n_win"], rec["H"],
                                rec["W"], "cpu", messages=spikes)
@@ -432,6 +593,183 @@ class V18Tests(unittest.TestCase):
         np.testing.assert_allclose(val, Z2[np.arange(len(idx)), L2], rtol=1e-5, atol=1e-5)
 
 
+class TrackTests(unittest.TestCase):
+    """V18 tracked fields: the boxes of a unit follow its source."""
+
+    def test_brute_force(self):
+        rec = moving_recording(seed=1)
+        rect, _, _ = S.box_layout(2)
+        idx = np.concatenate([np.nonzero(rec["target"])[0][::9], np.arange(0, 500, 23)])
+        for mode in ("recentre", "transport"):
+            feat, ok, state = maps_of(rec, track=True).features(rec["x"][idx], rec["y"][idx], rec["win"][idx],
+                                                                rec["pol"][idx], rec["z0"][idx], rect, 5,
+                                                                return_track=True, follow=mode)
+            self.assertEqual(tuple(state.shape), (len(idx), 6))
+            for j, e in enumerate(idx):
+                ref, ref_ok, _ = brute_track(rec, e, rect, 5, mode=mode)
+                np.testing.assert_array_equal(ok[j].numpy(), ref_ok)
+                np.testing.assert_allclose(feat[j].numpy(), ref * ref_ok[:, None, None], rtol=1e-5, atol=1e-5,
+                                           err_msg=mode)
+
+    def test_transport_keeps_the_place_in_the_source(self):
+        """An event 6 px beside a moving target: the transported field moves with the target and stays 6 px beside
+        it (its centre box stays off the target); the re-centred field lands on the target."""
+        rec = moving_recording(n_noise=200, seed=7, v=(4.0, 0.0))
+        n = len(rec["x"])
+        side = {k: np.append(rec[k], v) for k, v in (("x", 12 + 0), ("y", 10 + 7), ("win", 0), ("pol", 0))}
+        side["z0"] = np.append(rec["z0"], np.float32(-2.0))
+        side.update(W=rec["W"], H=rec["H"], n_win=rec["n_win"])
+        rect, _, _ = S.box_layout(2)
+        e = np.array([n])
+        args = (side["x"][e], side["y"][e], side["win"][e], side["pol"][e], side["z0"][e], rect, 6)
+        maps = maps_of(side, track=True)
+        centre = {}
+        for mode in ("recentre", "transport"):
+            f, _ = maps.features(*args, follow=mode)
+            centre[mode] = float((torch.expm1(f[0, 3:, S.CENTRE, 0]) + torch.expm1(f[0, 3:, S.CENTRE, 1])).mean())
+        self.assertGreater(centre["recentre"], 2.0 * max(centre["transport"], 0.5))
+
+    def test_follows_a_moving_target(self):
+        """A target that moves 4 px per window leaves a fixed +-4 px square after two windows; the tracked field keeps
+        it in its centre boxes."""
+        rec = moving_recording(n_noise=300, seed=2)
+        rect, _, _ = S.box_layout(2)
+        e = np.nonzero(rec["target"] & (rec["win"] == 0))[0]
+        args = (rec["x"][e], rec["y"][e], rec["win"][e], rec["pol"][e], rec["z0"][e], rect, 6)
+        fixed, _ = maps_of(rec).features(*args)
+        tracked, _ = maps_of(rec, track=True).features(*args)
+        level0 = slice(0, 9)                                        # the +-4 px square
+        n_fixed = (torch.expm1(fixed[:, 3:, level0, 0]) + torch.expm1(fixed[:, 3:, level0, 1])).sum(-1).mean()
+        n_tracked = (torch.expm1(tracked[:, 3:, level0, 0]) + torch.expm1(tracked[:, 3:, level0, 1])).sum(-1).mean()
+        self.assertLess(float(n_fixed), 2.0)
+        self.assertGreater(float(n_tracked), 18.0)                  # of 25 target events per window
+
+    def test_fixed_maps_unchanged(self):
+        """Maps without tracking give the same features as before (V17), with and without returning the state."""
+        rec = recording()
+        rect, _, _ = S.box_layout(2)
+        idx = np.arange(0, 400, 7)
+        args = (rec["x"][idx], rec["y"][idx], rec["win"][idx], rec["pol"][idx], rec["z0"][idx], rect, 3)
+        feat, ok, state = maps_of(rec).features(*args, return_track=True)
+        self.assertIsNone(state)
+        for j, e in enumerate(idx):
+            ref, ref_ok = brute(rec, e, rect, 3)
+            np.testing.assert_allclose(feat[j].numpy(), ref * ref_ok[:, None, None], rtol=1e-5, atol=1e-5)
+
+    def test_own_spike_in_tracked_box(self):
+        rec = moving_recording(seed=4)
+        n = len(rec["x"])
+        rng = np.random.RandomState(5)
+        mi = rng.choice(n, 120, replace=False)
+        mstep, mtype = rng.randint(0, 4, 120), rng.randint(0, 2, 120)
+        mwin = rec["win"][mi] + mstep
+        keep = mwin < rec["n_win"]
+        mi, mstep, mtype, mwin = mi[keep], mstep[keep], mtype[keep], mwin[keep]
+        own_step, own_type = np.full(n, -1), np.zeros(n, np.int64)
+        own_step[mi], own_type[mi] = mstep, mtype
+        rect, _, _ = S.box_layout(2)
+        maps = maps_of(rec, track=True, messages=(rec["x"][mi], rec["y"][mi], mwin, mtype))
+        idx = np.concatenate([mi[:40], np.nonzero(rec["target"])[0][::7]])
+        for mode in ("recentre", "transport"):
+            feat, _ = maps.features(rec["x"][idx], rec["y"][idx], rec["win"][idx], rec["pol"][idx], rec["z0"][idx],
+                                    rect, 4, own_msg=(own_step[idx], own_type[idx]), follow=mode)
+            for j, e in enumerate(idx):
+                ref, ref_ok, _ = brute_track(rec, e, rect, 4, spikes=(mi, mwin, mtype), mode=mode)
+                np.testing.assert_allclose(feat[j].numpy(), ref * ref_ok[:, None, None], rtol=1e-5, atol=1e-5)
+
+    def test_tracker_cost(self):
+        ne1 = np.array([[3, 5, 7]])
+        np.testing.assert_array_equal(unit(track=True).track_macs(ne1), 2 * ne1 + S.TRACK_OPS)
+        np.testing.assert_array_equal(unit(memb=True).track_macs(ne1), [[2 * 3 + S.TRACK_OPS, 0, 0]])
+        np.testing.assert_array_equal(unit().track_macs(ne1), [[0, 0, 0]])
+
+    def test_membership_cue(self):
+        """The cue equals a direct computation; it is the same with fixed and tracked fields; units with the cue
+        start at the prior; the cue changes the start state."""
+        rec = moving_recording(n_noise=150, W=120, H=80, seed=6)
+        rect, _, _ = S.box_layout(2)
+        idx = np.concatenate([np.nonzero(rec["target"])[0][::5], np.arange(0, 150, 3)])
+        args = (rec["x"][idx], rec["y"][idx], rec["win"][idx], rec["pol"][idx], rec["z0"][idx], rect, 3)
+        maps = maps_of(rec, track=True)
+        f_fix, ok, cue_fix = maps.features(*args, follow=False, return_memb=True)
+        f_trk, _, cue_trk = maps.features(*args, return_memb=True)
+        ref = np.stack([membership_ref(rec, e) for e in idx])
+        np.testing.assert_allclose(cue_fix.numpy(), ref, rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(cue_trk.numpy(), ref, rtol=1e-5, atol=1e-5)
+        self.assertTrue(0 < ref[:, 1].sum() < len(idx))                     # both cases occur
+        np.testing.assert_allclose(f_fix.numpy(), maps_of(rec).features(*args)[0].numpy())   # fixed boxes as V17
+        net = unit(tokens="glm", gate="distance", evidence="events", audit="ledger", ctx_ff=False, memb=True,
+                   nonzero=False, n_steps=3)
+        with torch.no_grad():
+            U = net(f_fix, ok, torch.as_tensor(rec["z0"][idx]), torch.as_tensor(rec["pol"][idx]), memb=cue_fix)
+            self.assertLess(float((U - torch.as_tensor(rec["z0"][idx])[:, None]).abs().max()), 1e-5)
+            c_a = net.start(torch.as_tensor(rec["z0"][idx]), torch.as_tensor(rec["pol"][idx]), cue_fix)
+            c_b = net.start(torch.as_tensor(rec["z0"][idx]), torch.as_tensor(rec["pol"][idx]), torch.zeros_like(cue_fix))
+        self.assertGreater(float((c_a - c_b).abs().max()), 1e-3)
+        with self.assertRaises(ValueError):
+            net.start(torch.as_tensor(rec["z0"][idx]), torch.as_tensor(rec["pol"][idx]))
+
+    def test_cooperative_tracked_stream(self):
+        """Second population with tracked fields reading the spikes of a fixed-field first population."""
+        rec = moving_recording(n_noise=600, n_win=9, seed=9)
+        rect, _, _ = S.box_layout(2)
+        n_steps, tau = 4, -1.2
+        bounds1, bounds2 = [2.5, 2.0, 1.5, 1.0, 0.0], [2.2, 1.8, 1.4, 0.9, 0.0]
+        kw = dict(n_steps=n_steps, tokens="glm", gate="distance", evidence="events", audit="ledger", ctx_ff=False)
+        net1 = unit(**kw)
+        net2 = unit(n_msg=S.N_MSG, seed=2, track="transport", **kw)
+        step, typ, spikes, F_ = first_population(rec, net1, rect, n_steps, tau, bounds1)
+        with torch.no_grad():
+            f2, ok2 = maps_of(rec, track=True, messages=spikes).features(
+                rec["x"], rec["y"], rec["win"], rec["pol"], rec["z0"], rect, n_steps, own_msg=(step, typ),
+                follow="transport")
+            U2 = net2(f2, ok2, torch.as_tensor(rec["z0"]), torch.as_tensor(rec["pol"])).numpy()
+        Z2 = np.concatenate([rec["z0"][:, None], U2], 1).astype(np.float64)
+        L2 = P.commit(Z2, 1 + F_, tau, bounds2)
+        layer = S.CooperativeStreamingLayer(
+            S.StreamingDecisionLayer(net1, rect, bounds1, tau, rec["H"], rec["W"], "cpu"),
+            S.StreamingDecisionLayer(net2, rect, bounds2, tau, rec["H"], rec["W"], "cpu"))
+        layer.reset(rec["x"], rec["y"])
+        idx = np.arange(len(rec["x"]))
+        col, val = np.full(len(idx), -1), np.zeros(len(idx))
+        for t in range(rec["n_win"]):
+            ids = idx[rec["win"] == t]
+            e, c, v = layer.window(t, rec["x"][ids], rec["y"][ids], rec["pol"][ids], rec["z0"][ids], ids, F_[ids])
+            col[e], val[e] = c, v
+        self.assertEqual(layer.open_units(), 0)
+        np.testing.assert_array_equal(col, L2)
+        np.testing.assert_allclose(val, Z2[np.arange(len(idx)), L2], rtol=1e-5, atol=1e-5)
+        self.assertTrue((L2 > 1).any())
+
+
+class HelperTests(unittest.TestCase):
+    """tools/v18/common.py with every field option: features, cue and trajectories (with box counts) of a split."""
+
+    def test_event_features_and_trajectories(self):
+        import importlib.util                      # by path: the V17 tests import their own 'common'
+        spec = importlib.util.spec_from_file_location("v18_common", os.path.join(ROOT, "tools", "v18", "common.py"))
+        C = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(C)
+        mv = moving_recording(n_noise=400, W=C.SENSOR[1], H=C.SENSOR[0], n_win=6, seed=11)
+        rec = {"x": mv["x"].astype(np.int32), "y": mv["y"].astype(np.int32), "win": mv["win"].astype(np.int32),
+               "pol": mv["pol"].astype(np.int8), "z0": mv["z0"], "n_win": mv["n_win"], "lab": mv["target"],
+               "F": np.minimum(3, mv["n_win"] - 1 - mv["win"]).astype(np.int16)}
+        idx = np.arange(0, len(rec["x"]), 5)
+        for track in ("off", "recentre", "transport"):
+            for memb in ("off", "on"):
+                cfg = dict(levels=2, dim=16, heads=4, value="ei", gate="distance", pool="window", evidence="events",
+                           context="on", context_ff="off", audit="ledger", tokens="glm", n_steps=4, track=track,
+                           membership=memb)
+                net, rect = C.build_net(cfg, "cpu")
+                maps = C.rec_maps(rec, "cpu", track=C.needs_moments(net))
+                feat, ok, cue = C.event_features(maps, rec, idx, rect, 4, None, net)
+                self.assertEqual(tuple(feat.shape), (len(idx), 4, len(rect), S.N_FEAT))
+                self.assertEqual(cue is None, memb == "off", (track, memb))
+                U, nz, ne, ne1 = C.trajectories(net, [rec], rect, "cpu", counts=True)
+                self.assertEqual(U[0].shape, (len(rec["x"]), 4))
+                self.assertTrue(bool((ne1[0] <= ne[0]).all()))
+                np.testing.assert_allclose(U[0], np.repeat(rec["z0"][:, None], 4, 1), atol=1e-5)   # starts at prior
+
 class StoppingTests(unittest.TestCase):
     def test_bound_where_changes_stop(self):
         rng = np.random.RandomState(0)
@@ -441,6 +779,28 @@ class StoppingTests(unittest.TestCase):
         self.assertGreater(b, 2.95)                          # just after the last change below 3
         self.assertLess(b, 3.5)
         self.assertEqual(P.bound_from_changes(m, np.ones_like(change), 0.01, 0.01), float("inf"))
+
+    def test_window_bound_robust_to_a_late_flip(self):
+        """One change among the most confident events: the isotonic rule cannot certify the 200 events above it
+        (infinite bound); the window rule still finds the bound just above the margins that change often, and the
+        same bound as the isotonic rule without that flip; frequent changes everywhere or too few events certify
+        nothing; easy events far from the bound do not lower it (no averaging over a tail)."""
+        rng = np.random.RandomState(2)
+        m = rng.rand(30000) * 10.0
+        base = (m < 2.0) & (rng.rand(30000) < 0.3)
+        change = base.copy()
+        change[np.argsort(-m)[200]] = True               # one of the 201 most confident events flips later
+        level = 0.1 / 10
+        self.assertEqual(P.bound_from_changes(m, change, 0.01, level), float("inf"))
+        b = P.bound_from_window(m, change, 0.01, level)
+        self.assertTrue(2.0 <= b < 2.8, b)
+        self.assertLess(abs(b - P.bound_from_window(m, base, 0.01, level)), 0.05)
+        self.assertLess(abs(b - P.bound_from_changes(m, base, 0.01, level)), 0.8)
+        self.assertEqual(P.bound_from_window(m, rng.rand(30000) < 0.05, 0.01, level), float("inf"))
+        self.assertEqual(P.bound_from_window(m[:100], change[:100], 0.01, level), float("inf"))
+        easy = np.r_[m, 20.0 + rng.rand(10 ** 6)]          # a million easy events far above the bound
+        self.assertLess(abs(P.bound_from_window(easy, np.r_[change, np.zeros(10 ** 6, bool)], 0.01, level) - b),
+                        1e-9)
 
     def test_calibrate_and_commit(self):
         rng = np.random.RandomState(1)
@@ -452,6 +812,7 @@ class StoppingTests(unittest.TestCase):
         last[:300] = 2
         b = P.calibrate(Z, last, tau, 0.01, 0.1)
         self.assertEqual(len(b), C)
+        self.assertEqual(len(P.calibrate(Z, last, tau, 0.01, 0.1, rule="isotonic")), C)
         self.assertEqual(b[-1], 0.0)
         L = P.commit(Z, last, tau, b)
         self.assertTrue((L <= last).all())

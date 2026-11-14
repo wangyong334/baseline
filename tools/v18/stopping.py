@@ -9,7 +9,19 @@ bins); b_c is the smallest margin from which every isotonic block has a Clopper-
 delta / number of columns, Bonferroni). Column 0 is the entry rule: an event gets a decision unit only while its prior
 is not yet safe, so there is no hand-set band. Constants: alpha (declared risk) and delta (calibration confidence); the
 deadline is the latency requirement. The bounds narrow towards the deadline by themselves (less left to come).
+V18 (11-14): rule "window" (default). The change probability r(m) of an open event is taken non-increasing in its
+margin m (the isotonic assumption of V17). Then the events just BELOW a candidate bound b change at least as often as
+an event at b, so their change rate, certified below alpha, certifies r(b) < alpha and, by monotonicity, every margin
+above b. Candidates are scanned from the largest margin down (fixed-sequence testing: the hypotheses r(b) >= alpha
+are nested, so no multiplicity correction); each uses the n_w events at or below it (n_w = 4 x the fewest events that
+can certify alpha without any change); the bound is the last candidate that passes. Why: rule "isotonic" (V17)
+certifies every isotonic block from the top down, so the block above the largest late flip must certify alpha on
+its own; one flip among the few hundred most confident units of a column made its bound infinite (V18 local,
+v5s37: seed 0 at step 0, seed 1 at steps 0-6; born units then waited 3.1 vs 7.2 windows, energy x 2, same accuracy).
+A tail rule (the change rate of everything above b) is not used: millions of easy events would average it away.
 """
+import math
+
 import numpy as np
 from scipy.stats import beta as beta_dist
 
@@ -51,11 +63,46 @@ def bound_from_changes(m, change, alpha, level):
     return b
 
 
-def calibrate(Z, last, tau, alpha, delta, collapse=True):
+def window_size(alpha, level, factor=4):
+    """Events per certification window: factor x the fewest events that can certify alpha without any change."""
+    return factor * int(math.ceil(math.log(level) / math.log(1.0 - alpha)))
+
+
+def bound_from_window(m, change, alpha, level, n_w=None):
+    """Smallest margin b reached by scanning from the largest margin down while the n_w events at or below each
+    candidate have a change rate with a Clopper-Pearson upper bound below alpha (monotone change probability)."""
+    N = int(m.size)
+    n_w = window_size(alpha, level) if n_w is None else int(n_w)
+    if N == 0:
+        return float("inf")
+    order = np.argsort(-m, kind="stable")
+    ms = m[order]
+    cs = np.r_[0, np.cumsum(change[order].astype(np.int64))]
+    i = np.arange(N)
+    j = np.minimum(N, i + n_w)
+    k, n = cs[j] - cs[i], j - i
+    full = n == n_w
+    ok = np.zeros(N, bool)
+    if full.any():                                       # the largest change count that still certifies alpha
+        k_max = -1
+        while ucb(k_max + 1, n_w, level) < alpha:
+            k_max += 1
+        ok[full] = k[full] <= k_max
+    for t in np.nonzero(~full)[0]:                       # truncated windows at the smallest margins
+        ok[t] = ucb(int(k[t]), int(n[t]), level) < alpha
+    fail = np.nonzero(~ok)[0]
+    first = int(fail[0]) if fail.size else N
+    return float("inf") if first == 0 else float(ms[first - 1])
+
+
+def calibrate(Z, last, tau, alpha, delta, collapse=True, rule="window"):
     """Bounds b_0 .. b_{C-1} of a split's trajectories Z [N, C] (column 0 = prior); last [N] = last available column.
     collapse: a unit's bound never widens from one step to the next (b_c <= b_{c-1} for c >= 2): with less still to
     come, the same margin is at least as safe. It replaces an infinite bound where too few held-out events remain open
-    to certify one; the realised change rate on test checks the assumption."""
+    to certify one; the realised change rate on test checks the assumption. rule: "window" (V18) or "isotonic" (V17)."""
+    if rule not in ("window", "isotonic"):
+        raise ValueError("unknown stopping rule %r" % (rule,))
+    fit = bound_from_window if rule == "window" else bound_from_changes
     n, C = Z.shape
     final = Z[np.arange(n), last] >= tau
     open_ = np.ones(n, bool)
@@ -65,7 +112,7 @@ def calibrate(Z, last, tau, alpha, delta, collapse=True):
         cand = open_ & (c < last)
         m = np.abs(Z[cand, c] - tau)
         change = (Z[cand, c] >= tau) != final[cand]
-        b = bound_from_changes(m, change, alpha, level)
+        b = fit(m, change, alpha, level)
         if collapse and c >= 2:
             b = min(b, bounds[-1])
         bounds.append(b)

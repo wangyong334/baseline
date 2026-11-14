@@ -15,7 +15,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from model.sdu import N_FEAT, N_MSG, EvidenceMaps, SpikingDecisionUnits, box_layout  # noqa: E402,F401
+from model.sdu import N_FEAT, N_MSG, TRACK_BOXES, EvidenceMaps, SpikingDecisionUnits, box_layout  # noqa: E402,F401
 import stopping as P  # noqa: E402
 
 MSG_KEYS = ("own_step", "own_type", "mx", "my", "mwin", "mtype")
@@ -103,25 +103,41 @@ def build_net(cfg, device):
                                gate=cfg["gate"], pool=cfg["pool"], evidence=cfg.get("evidence", "boxes"),
                                context=cfg["context"] == "on", audit=cfg["audit"], tokens=cfg.get("tokens", "mlp"),
                                ctx_ff=cfg.get("context_ff", "on") == "on",
-                               n_feat=cfg.get("n_feat", N_FEAT)).to(device)
+                               n_feat=cfg.get("n_feat", N_FEAT), n_msg=cfg.get("n_msg", 0),
+                               track={"off": False, "on": "recentre"}.get(cfg.get("track", "off"), cfg.get("track")),
+                               memb=cfg.get("membership", "off") == "on").to(device)
     return net, rect
 
 
-def rec_maps(rec, device, sensor=SENSOR, msg=None):
-    """Evidence maps of one recording; msg = its first-population decision spikes (V18) or None."""
+def rec_maps(rec, device, sensor=SENSOR, msg=None, track=False):
+    """Evidence maps of one recording; msg = its first-population decision spikes (V18) or None; track = tracked
+    fields (V18: the boxes follow the source)."""
     messages = None if msg is None else (msg["mx"], msg["my"], msg["mwin"], msg["mtype"])
     return EvidenceMaps(rec["x"], rec["y"], rec["win"], rec["pol"], rec["z0"], rec["n_win"], sensor[0], sensor[1],
-                        device, messages=messages)
+                        device, messages=messages, track=track)
 
 
-def event_features(maps, rec, idx, rect, n_steps, msg=None):
+def event_features(maps, rec, idx, rect, n_steps, msg=None, net=None):
     """Features [n, S, K, n_feat] and step mask [n, S] of the events idx of one recording (with msg: the own decision
-    spike of each event is left out)."""
+    spike of each event is left out). With net: the fields the units read (fixed or tracked) and a third output, the
+    membership cue [n, 2] (None for units without it)."""
     idx = np.asarray(idx, np.int64)
     own = None if msg is None else (msg["own_step"][idx], msg["own_type"][idx])
-    return maps.features(rec["x"][idx].astype(np.int64), rec["y"][idx].astype(np.int64),
-                         rec["win"][idx].astype(np.int64), rec["pol"][idx].astype(np.int64), rec["z0"][idx], rect,
-                         n_steps, own_msg=own)
+    args = (rec["x"][idx].astype(np.int64), rec["y"][idx].astype(np.int64), rec["win"][idx].astype(np.int64),
+            rec["pol"][idx].astype(np.int64), rec["z0"][idx], rect, n_steps)
+    if net is None:
+        return maps.features(*args, own_msg=own)
+    if not (net.track or net.memb):
+        feat, ok = maps.features(*args, own_msg=own)
+        return feat, ok, None
+    feat, ok, cue = maps.features(*args, own_msg=own, follow=net.track_mode if net.track else False,
+                                  return_memb=True)
+    return feat, ok, (cue if net.memb else None)
+
+
+def needs_moments(net):
+    """Maps of units with tracked fields or the membership cue hold the prior-weighted moments."""
+    return bool(getattr(net, "track", False) or getattr(net, "memb", False))
 
 
 def load_run(run, z0_root=None, data_root=None, device="cpu"):
@@ -142,7 +158,7 @@ def first_population_messages(run1, recs, device, z0_root=None, data_root=None):
     spike in window win + L - 1 at its pixel, type 1 = target. Per recording: own_step (-1: no unit), own_type and the
     spikes (mx, my, mwin, mtype)."""
     net1, rect1, cfg1, bounds1 = load_run(run1, z0_root, data_root, device)
-    if cfg1.get("n_feat", N_FEAT) != N_FEAT:
+    if cfg1.get("n_feat", N_FEAT) != N_FEAT or cfg1.get("n_msg", 0):
         raise ValueError("the first population must read the evidence only (%s)" % run1)
     U = trajectories(net1, recs, rect1, device)
     tau = cfg1["tau"]
@@ -200,58 +216,63 @@ def release(device):
 
 
 def box_counts(feat):
-    """Per event and step: boxes that hold events (nz) and the events inside the unit's square (ne), from features
-    [n, S, K, N_FEAT] (log1p counts; zero past the recording end)."""
+    """Per event and step: boxes that hold events (nz), the events inside the unit's square (ne) and inside its
+    level-0/1 boxes (ne1, what a tracked field's centroid reads), from features [n, S, K, N_FEAT] (log1p counts; zero
+    past the recording end)."""
     n_box = torch.round(torch.expm1(feat[..., 0].float()) + torch.expm1(feat[..., 1].float()))
-    return (n_box > 0).sum(-1).to(torch.int16), n_box.sum(-1).to(torch.int32)
+    return ((n_box > 0).sum(-1).to(torch.int16), n_box.sum(-1).to(torch.int32),
+            n_box[..., :TRACK_BOXES].sum(-1).to(torch.int32))
 
 
 def trajectories(net, recs, rect, device, chunk=4096, sensor=SENSOR, counts=False, msgs=None):
     """Membrane U [n_events, S] of every event of every recording (decision units run for all events; the stopping
     rule later decides which ones a deployment would actually run). counts=True also returns box_counts (lists of
-    nz, ne [n_events, S]) for the event-driven cost. msgs: first-population spikes per recording (V18)."""
+    nz, ne, ne1 [n_events, S]) for the event-driven cost. msgs: first-population spikes per recording (V18)."""
     net.eval()
-    out, nzs, nes = [], [], []
+    out, cnt = [], ([], [], [])
     with torch.no_grad():
         for ri, rec in enumerate(recs):
             msg = None if msgs is None else msgs[ri]
-            maps = rec_maps(rec, device, sensor, msg)
+            maps = rec_maps(rec, device, sensor, msg, track=needs_moments(net))
             n = rec["z0"].shape[0]
             U = np.zeros((n, net.n_steps), np.float32)
-            nz, ne = np.zeros((n, net.n_steps), np.int16), np.zeros((n, net.n_steps), np.int32)
+            c = (np.zeros((n, net.n_steps), np.int16), np.zeros((n, net.n_steps), np.int32),
+                 np.zeros((n, net.n_steps), np.int32))
             for a in range(0, n, chunk):
                 idx = np.arange(a, min(a + chunk, n))
-                feat, ok = event_features(maps, rec, idx, rect, net.n_steps, msg)
+                feat, ok, cue = event_features(maps, rec, idx, rect, net.n_steps, msg, net)
                 z0 = torch.as_tensor(rec["z0"][idx], device=maps.device)
                 pol = torch.as_tensor(rec["pol"][idx].astype(np.int64), device=maps.device)
-                U[idx] = net(feat, ok, z0, pol).float().cpu().numpy()
+                U[idx] = net(feat, ok, z0, pol, memb=cue).float().cpu().numpy()
                 if counts:
-                    nz[idx], ne[idx] = (t.cpu().numpy() for t in box_counts(feat))
+                    for arr, t in zip(c, box_counts(feat)):
+                        arr[idx] = t.cpu().numpy()
             out.append(U)
-            nzs.append(nz)
-            nes.append(ne)
+            for lst, arr in zip(cnt, c):
+                lst.append(arr)
             del maps
             release(device)
-    return (out, nzs, nes) if counts else out
+    return (out,) + cnt if counts else out
 
 
-def split_counts(recs, rect, n_steps, device, chunk=8192, sensor=SENSOR):
-    """box_counts of every event of a split without a network (runs whose trajectories have no counts)."""
-    nzs, nes = [], []
+def split_counts(recs, rect, n_steps, device, chunk=8192, sensor=SENSOR, track=False):
+    """box_counts (nz, ne, ne1) of every event of a split without a network (runs whose trajectories have none)."""
+    cnt = ([], [], [])
     with torch.no_grad():
         for rec in recs:
-            maps = rec_maps(rec, device, sensor)
+            maps = rec_maps(rec, device, sensor, track=track)
             n = rec["z0"].shape[0]
-            nz, ne = np.zeros((n, n_steps), np.int16), np.zeros((n, n_steps), np.int32)
+            c = (np.zeros((n, n_steps), np.int16), np.zeros((n, n_steps), np.int32), np.zeros((n, n_steps), np.int32))
             for a in range(0, n, chunk):
                 idx = np.arange(a, min(a + chunk, n))
                 feat, _ = event_features(maps, rec, idx, rect, n_steps)
-                nz[idx], ne[idx] = (t.cpu().numpy() for t in box_counts(feat))
-            nzs.append(nz)
-            nes.append(ne)
+                for arr, t in zip(c, box_counts(feat)):
+                    arr[idx] = t.cpu().numpy()
+            for lst, arr in zip(cnt, c):
+                lst.append(arr)
             del maps
             release(device)
-    return np.concatenate(nzs), np.concatenate(nes)
+    return tuple(np.concatenate(lst) for lst in cnt)
 
 
 def report_prob(z, log_w):

@@ -50,27 +50,35 @@ def load(run, split, cfg, limit, rect=None, device=None):
     rec = np.concatenate([np.full(len(r["F"]), i) for i, r in enumerate(recs)])
     if "nz" in tr.files:
         nz, ne = tr["nz"], tr["ne"]
+        ne1 = tr["ne1"] if "ne1" in tr.files else None
     elif device:
-        nz, ne = C.split_counts(recs, rect, cfg["n_steps"], device)
+        if cfg.get("track", "off") != "off":
+            raise RuntimeError("runs with moving fields store their box counts in the trajectories")
+        nz, ne, ne1 = C.split_counts(recs, rect, cfg["n_steps"], device)
     else:
-        nz = ne = None
+        nz = ne = ne1 = None
     return {"recs": recs, "Z": Z, "last": 1 + tr["F"].astype(np.int64), "rec": rec, "start": tr["start"],
             "win": np.concatenate([r["win"] for r in recs]).astype(np.int64),
             "t": np.concatenate([r["t"] for r in recs]).astype(np.int64),
             "lab": np.concatenate([r["lab"] for r in recs]), "n_win": {i: r["n_win"] for i, r in enumerate(recs)},
-            "wms": recs[0]["window_ms"], "nz": nz, "ne": ne}
+            "wms": recs[0]["window_ms"], "nz": nz, "ne": ne, "ne1": ne1}
 
 
 def step_costs(net, d, S):
-    """Cost of step k of event i: multiply-accumulates (boxes without events skipped) and accumulates of the box
-    sums, [N, S] each; without box counts the dense multiply-accumulates (a function of k) and no accumulates."""
+    """Cost of step k of event i: multiply-accumulates (boxes without events skipped; tracked fields add their
+    tracker) and accumulates of the box sums, [N, S] each; without box counts the dense multiply-accumulates (a
+    function of k) and no accumulates."""
     if d["nz"] is None:
         return net.step_macs, None
     k = np.arange(S)[None, :]
     nz = d["nz"].astype(np.int64)
     aud = np.cumsum(nz, 1) if net.audit == "reaudit" else nz
-    return (np.broadcast_to(net.step_macs(k, nz, aud), nz.shape).astype(np.float32),
-            net.step_acs(d["ne"]).astype(np.float32))
+    macs = np.broadcast_to(net.step_macs(k, nz, aud), nz.shape).astype(np.float64)
+    if net.track or net.memb:
+        if d.get("ne1") is None:
+            raise RuntimeError("tracked fields / membership cue without level-0/1 event counts in the trajectories")
+        macs = macs + net.track_macs(d["ne1"])
+    return macs.astype(np.float32), net.step_acs(d["ne"]).astype(np.float32)
 
 
 def columns_of(name, d, tau, bounds, alpha):
@@ -157,6 +165,9 @@ def main():
     ap.add_argument("--alpha", type=float, default=0.01, help="declared risk: P(decision changes before deadline)")
     ap.add_argument("--delta", type=float, default=0.1, help="confidence budget of the calibration (Bonferroni)")
     ap.add_argument("--no-collapse", action="store_true", help="bounds per step without the collapse envelope")
+    ap.add_argument("--stop", choices=("window", "isotonic"), default="window",
+                    help="how a bound is certified: by the events just below it (window, V18: robust to a rare late "
+                         "flip of a confident unit) or by every isotonic block above it (isotonic, V17)")
     ap.add_argument("--z0-root", default=None, help="override the prior dir stored in the run (another machine)")
     ap.add_argument("--data-root", default=None, help="override the data root stored in the run")
     ap.add_argument("--device", default="cpu",
@@ -175,9 +186,9 @@ def main():
     dev = None if args.device == "none" else args.device
     val, test = (load(args.run, s, cfg, limit, rect, dev) for s in ("val", "test"))
     costs = {"val": step_costs(net, val, S), "test": step_costs(net, test, S)}
-    bounds = P.calibrate(val["Z"], val["last"], tau, args.alpha, args.delta, collapse)
-    res = {"alpha": args.alpha, "delta": args.delta, "collapse": collapse, "tau": tau, "bounds": [None if not np.isfinite(b) else
-                                                                               round(b, 4) for b in bounds],
+    bounds = P.calibrate(val["Z"], val["last"], tau, args.alpha, args.delta, collapse, args.stop)
+    res = {"alpha": args.alpha, "delta": args.delta, "collapse": collapse, "stop": args.stop, "tau": tau,
+           "bounds": [None if not np.isfinite(b) else round(b, 4) for b in bounds],
            "val": {}, "test": {}, "macs_per_step": [net.step_macs(k) for k in range(S)]}
     recs_v = np.unique(val["rec"])
     half = np.isin(val["rec"], np.random.RandomState(0).permutation(recs_v)[: len(recs_v) // 2])
@@ -186,7 +197,7 @@ def main():
         L = np.zeros(len(val["last"]), np.int64)
         for a, b in ((half, ~half), (~half, half)):
             sub = {k: val[k][a] for k in ("Z", "last")}
-            bd = P.calibrate(sub["Z"], sub["last"], tau, args.alpha, args.delta, collapse)
+            bd = P.calibrate(sub["Z"], sub["last"], tau, args.alpha, args.delta, collapse, args.stop)
             L[b] = columns_of(name, {"Z": val["Z"][b], "last": val["last"][b]}, tau, bd, args.alpha)
         honest[name] = L
     for split, d in (("val", val), ("test", test)):

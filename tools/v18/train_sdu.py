@@ -4,7 +4,9 @@ V18 (11-13 night): --stage1 <V17 run> makes this the second population of a coop
 first population (V17 units, frozen, calibrated) is run on every split, every unit of it emits one decision spike
 when it commits, and the units trained here read these spikes (target / background counts per box, the own event's
 spike left out) beside the evidence. --martingale w adds w x the drift of the posterior given its current value (a
-posterior sequence is a martingale). 8 epochs by default (V17 dev_ep8 matched 12).
+posterior sequence is a martingale). --track transport | recentre: moving fields, the boxes of a unit move with its
+source (EvidenceMaps(track=True)); --membership on: the membership cue (the event's distance from its source in its own
+window) enters the unit's initial state. 8 epochs by default (V17 dev_ep8 matched 12).
 
 Every training step draws events by margin-stratified importance sampling (tools/v17/common.sampling_probs: all target
 events, background capped per margin bin, weight 1 / p), so the units see every margin and the loss equals in
@@ -37,9 +39,10 @@ from model.sdu import N_FEAT, N_MSG, martingale_penalty  # noqa: E402
 build_net = C.build_net
 
 
-def normalization(recs, probs, rect, n_steps, device, seed, per_rec=400, msgs=None, n_feat=N_FEAT):
+def normalization(recs, probs, rect, n_steps, device, seed, per_rec=400, msgs=None, net=None):
     """Training statistics of the token features (valid windows) and of the prior, from a fixed thinned sample."""
     rng = np.random.RandomState(seed + 7)
+    n_feat = net.n_feat
     s1, s2, cnt, zs = np.zeros(n_feat), np.zeros(n_feat), 0.0, []
     for ri, (rec, p) in enumerate(zip(recs, probs)):
         idx = np.nonzero(rng.rand(len(p)) < p)[0]
@@ -48,9 +51,9 @@ def normalization(recs, probs, rect, n_steps, device, seed, per_rec=400, msgs=No
         if not idx.size:
             continue
         msg = None if msgs is None else msgs[ri]
-        maps = C.rec_maps(rec, device, msg=msg)
-        feat, ok = C.event_features(maps, rec, idx, rect, n_steps, msg)
-        x = feat[ok].reshape(-1, n_feat).double().cpu().numpy()
+        maps = C.rec_maps(rec, device, msg=msg, track=C.needs_moments(net))
+        feat, ok, _ = C.event_features(maps, rec, idx, rect, n_steps, msg, net)
+        x = feat[ok][..., :n_feat].reshape(-1, n_feat).double().cpu().numpy()   # evidence statistics only
         s1 += x.sum(0)
         s2 += (x * x).sum(0)
         cnt += x.shape[0]
@@ -77,25 +80,26 @@ def train_epoch(net, opt, recs, probs, rect, n_steps, device, rng, batch, pool_e
             idx = np.nonzero(rng.rand(len(p)) < p)[0]
             if not idx.size:
                 continue
-            maps = C.rec_maps(rec, device, msg=msg)
+            maps = C.rec_maps(rec, device, msg=msg, track=C.needs_moments(net))
             for a in range(0, idx.size, 8192):
                 sub = idx[a:a + 8192]
-                feat, ok = C.event_features(maps, rec, sub, rect, n_steps, msg)
+                feat, ok, cue = C.event_features(maps, rec, sub, rect, n_steps, msg, net)
                 parts.append((feat.half(), ok, torch.as_tensor(rec["z0"][sub], device=device),
                               torch.as_tensor(rec["pol"][sub].astype(np.int64), device=device),
                               torch.as_tensor(rec["lab"][sub].astype(np.float32), device=device),
-                              torch.as_tensor(1.0 / p[sub], dtype=torch.float32, device=device)))
+                              torch.as_tensor(1.0 / p[sub], dtype=torch.float32, device=device),
+                              torch.zeros(len(sub), 2, device=device) if cue is None else cue))
             total += idx.size
             del maps
         if not parts:
             continue
-        feat, ok, z0, pol, y, w = (torch.cat([q[j] for q in parts]) for j in range(6))
+        feat, ok, z0, pol, y, w, cue = (torch.cat([q[j] for q in parts]) for j in range(7))
         del parts
         C.release(device)
         perm = torch.as_tensor(rng.permutation(feat.shape[0]), dtype=torch.long, device=device)
         for b in range(0, feat.shape[0], batch):
             sel = perm[b:b + batch]
-            U = net(feat[sel].float(), ok[sel], z0[sel], pol[sel])
+            U = net(feat[sel].float(), ok[sel], z0[sel], pol[sel], memb=cue[sel] if net.memb else None)
             vm = ok[sel].float()
             ell = F.binary_cross_entropy_with_logits(U, y[sel][:, None].expand_as(U), reduction="none") * vm
             loss = (ell.sum(1) * w[sel]).sum() / (vm.sum(1) * w[sel]).sum().clamp(min=1e-6)
@@ -126,8 +130,8 @@ def split_scores(recs, U, tau, b0=None):
     return out
 
 
-def save_traj(path, recs, U, nz=None, ne=None):
-    extra = {} if nz is None else {"nz": np.concatenate(nz), "ne": np.concatenate(ne)}
+def save_traj(path, recs, U, nz=None, ne=None, ne1=None):
+    extra = {} if nz is None else {"nz": np.concatenate(nz), "ne": np.concatenate(ne), "ne1": np.concatenate(ne1)}
     np.savez(path, U=np.concatenate(U).astype(np.float32), F=np.concatenate([r["F"] for r in recs]),
              start=np.cumsum([0] + [len(r["F"]) for r in recs]), names=np.array([r["name"] for r in recs]), **extra)
 
@@ -146,8 +150,9 @@ def main():
     ap.add_argument("--dim", type=int, default=32, help="width of the context (rounds 1-3: 64)")
     ap.add_argument("--heads", type=int, default=4)
     ap.add_argument("--value", choices=("ei", "signed"), default="ei")
-    ap.add_argument("--gate", choices=("attribution", "distance"), default="distance",
-                    help="attribution of a box: distance only (main) or also its content (rounds 1-3)")
+    ap.add_argument("--gate", choices=("attribution", "distance", "none"), default="distance",
+                    help="attribution of a box: distance only (main), also its content (rounds 1-3), or none (V18 "
+                         "ablation: every box of the square weighs the same)")
     ap.add_argument("--pool", choices=("window", "mean", "sum"), default="window",
                     help="window: attributed mean inside a window, windows add up (default); mean: one mean over all "
                          "windows (11-13 round 1); sum: every token independent")
@@ -169,6 +174,13 @@ def main():
     ap.add_argument("--stage1", default="",
                     help="V18: trained first population (V17 run dir with sdu.pt and eval/eval.json); its decision "
                          "spikes become two more box statistics")
+    ap.add_argument("--track", choices=("off", "transport", "recentre", "on"), default="off",
+                    help="V18 moving fields: the boxes of a unit move with its source (constant-velocity tracker on "
+                         "the prior-weighted centroid of its level-0/1 square): transport = the event's pixel moved by "
+                         "the source's displacement, recentre (= on, X4) = the source centre; off = fixed boxes")
+    ap.add_argument("--membership", choices=("on", "off"), default="off",
+                    help="V18 membership cue: the unit's initial state also reads the event's distance from the "
+                         "prior-weighted centroid of the other events of its +-13 px square in its own window")
     ap.add_argument("--martingale", type=float, default=0.0,
                     help="weight of the martingale-consistency term (drift of the posterior given its value)")
     ap.add_argument("--sample-cap", type=int, default=50000,
@@ -204,8 +216,8 @@ def main():
         cfg.update(cascade_from=os.path.abspath(args.cascade_from), cascade_b0=b0)
     else:
         cfg = {k: getattr(args, k) for k in ("levels", "dim", "heads", "value", "gate", "pool", "evidence", "context",
-                                             "context_ff", "audit", "tokens", "martingale")}
-        cfg.update(n_steps=n_steps, window_ms=wms, tau=tau, n_feat=N_FEAT + (N_MSG if args.stage1 else 0),
+                                             "context_ff", "audit", "tokens", "martingale", "track", "membership")}
+        cfg.update(n_steps=n_steps, window_ms=wms, tau=tau, n_feat=N_FEAT, n_msg=N_MSG if args.stage1 else 0,
                    stage1=os.path.abspath(args.stage1) if args.stage1 else "")
     cfg.update(z0_root=os.path.abspath(args.z0_root), data_root=os.path.abspath(args.data_root), seed=args.seed)
     net, rect = build_net(cfg, dev)
@@ -236,7 +248,7 @@ def main():
           flush=True)
     if b0 is None:
         mu, sd, z_mu, z_sd = normalization(data["train"], probs, rect, n_steps, dev, args.seed, msgs=msgs["train"],
-                                           n_feat=net.n_feat)
+                                           net=net)
         net.set_normalization(mu, sd, z_mu, z_sd)
         print("feature mean %s std %s; prior mean %.3f std %.3f" % (np.round(mu, 3), np.round(sd, 3), z_mu, z_sd),
               flush=True)
@@ -280,8 +292,8 @@ def main():
                "learned": net.learned_constants(), "parameters": int(sum(p.numel() for p in net.parameters())),
                "seconds": round(time.time() - t0, 1)}
     for split in ("val", "test"):
-        U, nz, ne = C.trajectories(net, data[split], rect, dev, counts=True, msgs=msgs[split])
-        save_traj(os.path.join(args.out, "traj_%s.npz" % split), data[split], U, nz, ne)
+        U, nz, ne, ne1 = C.trajectories(net, data[split], rect, dev, counts=True, msgs=msgs[split])
+        save_traj(os.path.join(args.out, "traj_%s.npz" % split), data[split], U, nz, ne, ne1)
         summary[split] = split_scores(data[split], U, tau, b0)
     with open(os.path.join(args.out, "summary.json"), "w") as fh:
         json.dump(summary, fh, indent=1)

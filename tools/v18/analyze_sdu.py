@@ -126,11 +126,11 @@ def main():
         for ri, items in by_rec.items():
             rec = recs[ri]
             msg = None if msgs is None else msgs[ri]
-            maps = C.rec_maps(rec, dev, msg=msg)
+            maps = C.rec_maps(rec, dev, msg=msg, track=C.needs_moments(net))
             idx = np.array([e for e, _, _ in items])
-            feat, ok = C.event_features(maps, rec, idx, rect, S, msg)
+            feat, ok, cue = C.event_features(maps, rec, idx, rect, S, msg, net)
             net(feat, ok, torch.as_tensor(rec["z0"][idx], device=dev),
-                torch.as_tensor(rec["pol"][idx].astype(np.int64), device=dev), keep=True)
+                torch.as_tensor(rec["pol"][idx].astype(np.int64), device=dev), keep=True, memb=cue)
             lam = net.extras["lam"].cpu().numpy()                     # [n, S, H] signed
             ms = net.extras["mass"].cpu().numpy()                     # [n, S, H]
             gt = net.extras["gates"].cpu().numpy().reshape(len(idx), S, -1, S, K)   # [n, step, H, window, box]
