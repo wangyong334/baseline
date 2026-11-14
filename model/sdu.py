@@ -340,7 +340,8 @@ class SpikingDecisionUnits(nn.Module):
     Ablations: pool "mean" (one attributed mean over all windows: waiting cannot accumulate evidence) or "sum" (every
     token independent), value signed, gate distance (receptive field only), gate none (no attribution: every box of the
     square weighs the same), context off, audit ledger (each window read
-    once, evidence added). Starts exactly at the prior: U(k) = z0 until the output weights move.
+    once, evidence added), pseudo=False (no pseudo-observation: a window without attributed events adds nothing; V18
+    ablation of the dendrite's leak conductance). Starts exactly at the prior: U(k) = z0 until the output weights move.
     Token form (how a box is read; rounds 1-3 used "mlp"):
         mlp     content + slot -> LayerNorm -> keys / values (d-dim), value head on GELU(value + W_c c)
         linear  the same without LayerNorm: keys / values linear in the features (folded into one 5 x d map + a slot
@@ -362,7 +363,7 @@ class SpikingDecisionUnits(nn.Module):
 
     def __init__(self, n_steps, r, dim=64, heads=4, value="ei", gate="attribution", pool="window", evidence="boxes",
                  context=True, audit="reaudit", tokens="mlp", ctx_ff=True, n_feat=N_FEAT, n_msg=0, track=False,
-                 memb=False):
+                 memb=False, pseudo=True):
         super(SpikingDecisionUnits, self).__init__()
         self.n_feat = Fn = int(n_feat)                                      # box statistics read by the dendrite
         self.n_msg = int(n_msg)                                             # V18: decision-spike types (lateral)
@@ -380,6 +381,7 @@ class SpikingDecisionUnits(nn.Module):
         self.n_steps, self.n_box, self.dim, self.heads, self.hd = int(n_steps), len(r), int(dim), int(heads), \
             int(dim) // int(heads)
         self.value, self.gate, self.pool, self.evidence = value, gate, pool, evidence
+        self.pseudo = evidence == "events" and bool(pseudo)                # leak conductance of the dendrite
         self.context, self.audit, self.tokens, self.ctx_ff = bool(context), audit, tokens, bool(ctx_ff)
         self.register_buffer("r2", torch.as_tensor(r ** 2, dtype=torch.float32))
         sign = [1.0] * heads if value == "signed" else [1.0] * (heads // 2) + [-1.0] * (heads // 2)
@@ -426,14 +428,14 @@ class SpikingDecisionUnits(nn.Module):
                                                torch.zeros(1) for g in groups])
         self.log_sigma = nn.Parameter(log_sigma)
         self.rf_bias = nn.Parameter(torch.zeros(heads))
-        if evidence == "events":
+        if self.pseudo:
             self.sink_logit = nn.Parameter(torch.zeros(heads))             # weight of the pseudo-observation
             self.sink_val = nn.Linear(dim, heads)                          # its evidence, given the context
         if self.n_msg:                                                      # lateral synapses: one weight per age,
             self.lat = nn.Parameter(torch.zeros(S, K, self.n_msg))         # box and spike type (0 = silent start)
         zero = (self.dcoef,) if tokens == "glm" else (self.v_out,)
         with torch.no_grad():                                              # U = z0 and an unused audit at the start
-            for lin in zero + (self.wm,) + ((self.sink_val,) if evidence == "events" else ()):
+            for lin in zero + (self.wm,) + ((self.sink_val,) if self.pseudo else ()):
                 lin.weight.zero_()
                 lin.bias.zero_()
 
@@ -520,7 +522,7 @@ class SpikingDecisionUnits(nn.Module):
         w = a * cnt[:, None, :] if self.evidence == "events" else a
         num = (w * v).view(B, H, n_win, K).sum(-1)
         den = w.view(B, H, n_win, K).sum(-1)
-        if self.evidence == "events":                                      # pseudo-observation of every window
+        if self.pseudo:                                                    # pseudo-observation of every window
             a0 = torch.sigmoid(self.sink_logit)[None, :, None] * wm[:, None, :]
             v0 = self.sink_val(c)
             if self.value == "ei":
@@ -654,7 +656,7 @@ class SpikingDecisionUnits(nn.Module):
             fixed += ctx + (4 * d * d if self.ctx_ff else 0)              # context update
             if self.audit == "ledger":
                 fixed += 2 * H * (Fn if self.tokens == "glm" else self.hd)   # running sums and their mean
-        if self.evidence == "events":
+        if self.pseudo:
             fixed += d * H                                                # pseudo-observation value
         fixed += K * self.n_msg                                           # lateral synapses (every box, an upper bound)
         c0 = (4 if self.memb else 2) * d + d * d
@@ -686,7 +688,7 @@ class SpikingDecisionUnits(nn.Module):
         out = {"sigma_px": [round(v, 2) for v in self.sigma().detach().cpu().tolist()],
                "rf_bias": [round(v, 3) for v in self.rf_bias.detach().cpu().tolist()],
                "head_sign": self.head_sign.cpu().tolist()}
-        if self.evidence == "events":
+        if self.pseudo:
             out["pseudo_observation_weight"] = [round(v, 3) for v in
                                                 torch.sigmoid(self.sink_logit).detach().cpu().tolist()]
         if self.n_msg:                         # lateral synaptic weight per box level (mean over ages), by spike type

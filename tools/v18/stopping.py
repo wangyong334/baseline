@@ -95,14 +95,18 @@ def bound_from_window(m, change, alpha, level, n_w=None):
     return float("inf") if first == 0 else float(ms[first - 1])
 
 
-def calibrate(Z, last, tau, alpha, delta, collapse=True, rule="window"):
+def calibrate(Z, last, tau, alpha, delta, collapse=True, rule="window", factor=4):
     """Bounds b_0 .. b_{C-1} of a split's trajectories Z [N, C] (column 0 = prior); last [N] = last available column.
     collapse: a unit's bound never widens from one step to the next (b_c <= b_{c-1} for c >= 2): with less still to
     come, the same margin is at least as safe. It replaces an infinite bound where too few held-out events remain open
-    to certify one; the realised change rate on test checks the assumption. rule: "window" (V18) or "isotonic" (V17)."""
+    to certify one; the realised change rate on test checks the assumption. rule: "window" (V18) or "isotonic" (V17);
+    factor: window rule only, n_w = factor x the fewest events that certify alpha without any change."""
     if rule not in ("window", "isotonic"):
         raise ValueError("unknown stopping rule %r" % (rule,))
-    fit = bound_from_window if rule == "window" else bound_from_changes
+    if rule == "window":
+        fit = lambda m, ch, a, lv: bound_from_window(m, ch, a, lv, window_size(a, lv, factor))  # noqa: E731
+    else:
+        fit = bound_from_changes
     n, C = Z.shape
     final = Z[np.arange(n), last] >= tau
     open_ = np.ones(n, bool)

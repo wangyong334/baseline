@@ -105,7 +105,8 @@ def build_net(cfg, device):
                                ctx_ff=cfg.get("context_ff", "on") == "on",
                                n_feat=cfg.get("n_feat", N_FEAT), n_msg=cfg.get("n_msg", 0),
                                track={"off": False, "on": "recentre"}.get(cfg.get("track", "off"), cfg.get("track")),
-                               memb=cfg.get("membership", "off") == "on").to(device)
+                               memb=cfg.get("membership", "off") == "on",
+                               pseudo=cfg.get("pseudo", "on") == "on").to(device)
     return net, rect
 
 

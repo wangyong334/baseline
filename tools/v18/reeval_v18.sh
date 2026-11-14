@@ -4,13 +4,15 @@
 # Prints per run the old line (the rule it was evaluated with) and the new one: test four metrics, born waits, energy,
 # val (honest). Default rule "window" (V18); STOP=isotonic reproduces V17.
 # Usage (V18 code dir, after `conda activate evuav`):
-#   RUNS="<run dir> ..." [OUT=run/v18/reeval] [STOP=window] bash tools/v18/reeval_v18.sh
+#   RUNS="<run dir> ..." [OUT=run/v18/reeval] [STOP=window] [ARGS="--window-factor 8"] bash tools/v18/reeval_v18.sh
+#   (ARGS: more options of tools/v18/eval_sdu.py, e.g. --window-factor 2 | --alpha 0.02)
 # Last line: "REEVAL V18 DONE <n> runs".
 set -u
 cd "$(dirname "$0")/../.."
 OUT=${OUT:-run/v18/reeval}
 STOP=${STOP:-window}
 RUNS=${RUNS:?RUNS="<run dir> ..."}
+ARGS=${ARGS:-}
 mkdir -p "$OUT"
 n=0
 pick() { grep -o "test calibrated IoU .*" "$1" 2>/dev/null | tail -n 1 | sed -E 's/ [0-9.]+ MMAC\/window, (first population [0-9.]+ mJ, )?/ /' | cut -c21-; }
@@ -20,13 +22,13 @@ for r in $RUNS; do
     continue
   fi
   o="$OUT/$(basename "$(dirname "$r")")__$(basename "$r")"
-  if ! python -u tools/v18/eval_sdu.py --run "$r" --stop "$STOP" --out "$o" > "$o.log" 2>&1; then
+  if ! python -u tools/v18/eval_sdu.py --run "$r" --stop "$STOP" --out "$o" $ARGS > "$o.log" 2>&1; then
     echo "FAILED $r (see $o.log)"
     continue
   fi
   echo "$(basename "$(dirname "$r")")/$(basename "$r")"
   echo "  before: $(pick "$r/eval.log")"
-  echo "  $STOP: $(pick "$o.log")"
+  echo "  $STOP $ARGS: $(pick "$o.log")"
   n=$((n + 1))
 done
 echo "REEVAL V18 DONE $n runs"

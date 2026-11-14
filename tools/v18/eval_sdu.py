@@ -168,6 +168,9 @@ def main():
     ap.add_argument("--stop", choices=("window", "isotonic"), default="window",
                     help="how a bound is certified: by the events just below it (window, V18: robust to a rare late "
                          "flip of a confident unit) or by every isotonic block above it (isotonic, V17)")
+    ap.add_argument("--window-factor", type=int, default=4,
+                    help="window rule: events per certification window = factor x the fewest that certify alpha "
+                         "without any change (sensitivity of the one hand-set constant)")
     ap.add_argument("--z0-root", default=None, help="override the prior dir stored in the run (another machine)")
     ap.add_argument("--data-root", default=None, help="override the data root stored in the run")
     ap.add_argument("--device", default="cpu",
@@ -186,8 +189,9 @@ def main():
     dev = None if args.device == "none" else args.device
     val, test = (load(args.run, s, cfg, limit, rect, dev) for s in ("val", "test"))
     costs = {"val": step_costs(net, val, S), "test": step_costs(net, test, S)}
-    bounds = P.calibrate(val["Z"], val["last"], tau, args.alpha, args.delta, collapse, args.stop)
-    res = {"alpha": args.alpha, "delta": args.delta, "collapse": collapse, "stop": args.stop, "tau": tau,
+    bounds = P.calibrate(val["Z"], val["last"], tau, args.alpha, args.delta, collapse, args.stop, args.window_factor)
+    res = {"alpha": args.alpha, "delta": args.delta, "collapse": collapse, "stop": args.stop,
+           "window_factor": args.window_factor, "tau": tau,
            "bounds": [None if not np.isfinite(b) else round(b, 4) for b in bounds],
            "val": {}, "test": {}, "macs_per_step": [net.step_macs(k) for k in range(S)]}
     recs_v = np.unique(val["rec"])
@@ -197,7 +201,8 @@ def main():
         L = np.zeros(len(val["last"]), np.int64)
         for a, b in ((half, ~half), (~half, half)):
             sub = {k: val[k][a] for k in ("Z", "last")}
-            bd = P.calibrate(sub["Z"], sub["last"], tau, args.alpha, args.delta, collapse, args.stop)
+            bd = P.calibrate(sub["Z"], sub["last"], tau, args.alpha, args.delta, collapse, args.stop,
+                             args.window_factor)
             L[b] = columns_of(name, {"Z": val["Z"][b], "last": val["last"][b]}, tau, bd, args.alpha)
         honest[name] = L
     for split, d in (("val", val), ("test", test)):

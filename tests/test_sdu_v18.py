@@ -206,12 +206,12 @@ def membership_ref(rec, e):
 
 def unit(value="ei", gate="attribution", pool="window", evidence="boxes", context=True, audit="reaudit", n_steps=4,
          levels=2, nonzero=True, tokens="mlp", ctx_ff=True, n_feat=S.N_FEAT, seed=1, n_msg=0, track=False,
-         memb=False):
+         memb=False, pseudo=True):
     torch.manual_seed(seed)
     _, r, _ = S.box_layout(levels)
     net = S.SpikingDecisionUnits(n_steps, r, dim=16, heads=4, value=value, gate=gate, pool=pool, evidence=evidence,
                                  context=context, audit=audit, tokens=tokens, ctx_ff=ctx_ff, n_feat=n_feat,
-                                 n_msg=n_msg, track=track, memb=memb)
+                                 n_msg=n_msg, track=track, memb=memb, pseudo=pseudo)
     if nonzero:
         with torch.no_grad():
             if n_msg:
@@ -224,7 +224,7 @@ def unit(value="ei", gate="attribution", pool="window", evidence="boxes", contex
                 net.v_out.weight.normal_(0, 0.5)
                 net.v_out.bias.normal_(0, 0.5)
             net.wm.weight.normal_(0, 0.3)
-            if evidence == "events":
+            if net.pseudo:
                 net.sink_val.weight.normal_(0, 0.5)
                 net.sink_logit.normal_(0, 1.0)
     return net.eval()
@@ -387,6 +387,23 @@ class UnitTests(unittest.TestCase):
                 U = unit(tokens="glm", gate="none", evidence="events", audit=audit, ctx_ff=False, nonzero=False)(
                     feat, valid, z0, pol)
             self.assertLess(float((U - z0[:, None]).abs().max()), 1e-5)
+
+    def test_no_pseudo_observation(self):
+        """pseudo=False (V18 ablation): no leak conductance; a window without events in the unit's boxes then adds
+        nothing (with it, the pseudo-observation still moves the membrane); starts at the prior; costs d H less."""
+        feat, valid, z0, pol = unit_inputs()
+        feat[:, 2, :, :2] = 0.0                                        # window 2: no events in any box
+        kw = dict(tokens="glm", gate="distance", evidence="events", audit="ledger", ctx_ff=False)
+        with torch.no_grad():
+            U_off = unit(pseudo=False, **kw)(feat, valid, z0, pol)
+            U_on = unit(pseudo=True, **kw)(feat, valid, z0, pol)
+            U0 = unit(pseudo=False, nonzero=False, **kw)(feat, valid, z0, pol)
+        self.assertLess(float((U_off[:, 2] - U_off[:, 1]).abs().max()), 1e-5)
+        self.assertGreater(float((U_on[:, 2] - U_on[:, 1]).abs().max()), 1e-3)
+        self.assertLess(float((U0 - z0[:, None]).abs().max()), 1e-5)
+        self.assertFalse(hasattr(unit(pseudo=False, **kw), "sink_logit"))
+        on, off = unit(pseudo=True, **kw), unit(pseudo=False, **kw)
+        self.assertEqual(on.step_macs(1, 0, 0) - off.step_macs(1, 0, 0), 16 * 4)
 
     def test_step_cost_grows(self):
         net = unit()
@@ -807,6 +824,24 @@ class StoppingTests(unittest.TestCase):
         easy = np.r_[m, 20.0 + rng.rand(10 ** 6)]          # a million easy events far above the bound
         self.assertLess(abs(P.bound_from_window(easy, np.r_[change, np.zeros(10 ** 6, bool)], 0.01, level) - b),
                         1e-9)
+
+    def test_window_factor(self):
+        """The window size is the rule's one hand-set constant: calibrate(factor=f) uses f x the fewest events that
+        certify alpha; factor 4 is the default; a smaller window certifies a lower observed rate, so its bound is not
+        below that of a larger window here, and every factor still keeps the realised change rate below alpha."""
+        rng = np.random.RandomState(3)
+        n, C, tau = 40000, 4, 0.0
+        z0 = rng.randn(n) * 4.0
+        flip = rng.rand(n) < 0.5 * np.exp(-np.abs(z0))       # change probability falls with the margin
+        Z = np.stack([z0] + [np.where(flip, -z0, z0) * (1 + 0.1 * c) for c in range(1, C)], 1)
+        last = np.full(n, C - 1)
+        self.assertEqual(P.calibrate(Z, last, tau, 0.01, 0.1), P.calibrate(Z, last, tau, 0.01, 0.1, factor=4))
+        b2, b8 = (P.calibrate(Z, last, tau, 0.01, 0.1, factor=f) for f in (2, 8))
+        self.assertGreaterEqual(b2[0], b8[0] - 1e-9)
+        for b in (b2, b8):
+            L = P.commit(Z, last, tau, b)
+            final = Z[np.arange(n), last] >= tau
+            self.assertLess(((Z[np.arange(n), L] >= tau) != final).mean(), 0.01)
 
     def test_calibrate_and_commit(self):
         rng = np.random.RandomState(1)
