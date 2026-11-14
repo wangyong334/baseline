@@ -181,6 +181,10 @@ def main():
     ap.add_argument("--membership", choices=("on", "off"), default="off",
                     help="V18 membership cue: the unit's initial state also reads the event's distance from the "
                          "prior-weighted centroid of the other events of its +-13 px square in its own window")
+    ap.add_argument("--spikes", choices=("synapse", "feature"), default="synapse",
+                    help="with --stage1: how a unit hears the decision spikes -- lateral synapses on the soma (each "
+                         "spike adds a learned weight by box, age and type) or two more box statistics of the dendrite "
+                         "(V18 first version, server run 11-13)")
     ap.add_argument("--martingale", type=float, default=0.0,
                     help="weight of the martingale-consistency term (drift of the posterior given its value)")
     ap.add_argument("--sample-cap", type=int, default=50000,
@@ -217,7 +221,9 @@ def main():
     else:
         cfg = {k: getattr(args, k) for k in ("levels", "dim", "heads", "value", "gate", "pool", "evidence", "context",
                                              "context_ff", "audit", "tokens", "martingale", "track", "membership")}
-        cfg.update(n_steps=n_steps, window_ms=wms, tau=tau, n_feat=N_FEAT, n_msg=N_MSG if args.stage1 else 0,
+        feature = bool(args.stage1) and args.spikes == "feature"
+        cfg.update(n_steps=n_steps, window_ms=wms, tau=tau, n_feat=N_FEAT + N_MSG if feature else N_FEAT,
+                   n_msg=N_MSG if (args.stage1 and not feature) else 0, spikes=args.spikes if args.stage1 else "",
                    stage1=os.path.abspath(args.stage1) if args.stage1 else "")
     cfg.update(z0_root=os.path.abspath(args.z0_root), data_root=os.path.abspath(args.data_root), seed=args.seed)
     net, rect = build_net(cfg, dev)

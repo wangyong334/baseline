@@ -557,13 +557,19 @@ class V18Tests(unittest.TestCase):
         self.assertLess(float(S.martingale_penalty(noisy, vm, w)), 0.1 * float(S.martingale_penalty(drift, vm, w)))
 
     def test_cooperative_stream_equals_offline(self):
+        """Both ways a unit hears decision spikes: lateral synapses on the soma (--spikes synapse) and spike counts as
+        two more box statistics of the dendrite (--spikes feature, V18 first version)."""
+        for second in ({"n_msg": S.N_MSG}, {"n_feat": S.N_FEAT + S.N_MSG}):
+            self.check_cooperative(second)
+
+    def check_cooperative(self, second):
         rec = recording(n=700, W=40, H=30, n_win=8, seed=6)
         rect, _, _ = S.box_layout(2)
         n_steps, tau = 4, -1.2
         bounds1, bounds2 = [2.5, 2.0, 1.5, 1.0, 0.0], [2.2, 1.8, 1.4, 0.9, 0.0]
         kw = dict(n_steps=n_steps, tokens="glm", gate="distance", evidence="events", audit="ledger", ctx_ff=False)
         net1 = unit(**kw)
-        net2 = unit(n_msg=S.N_MSG, seed=2, **kw)
+        net2 = unit(seed=2, **dict(kw, **second))
         step, typ, spikes, F_ = first_population(rec, net1, rect, n_steps, tau, bounds1)
         maps2 = S.EvidenceMaps(rec["x"], rec["y"], rec["win"], rec["pol"], rec["z0"], rec["n_win"], rec["H"],
                                rec["W"], "cpu", messages=spikes)
