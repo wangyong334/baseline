@@ -468,8 +468,8 @@ class SpikingDecisionUnits(nn.Module):
         if self.clutter:                # divisive clutter normalisation n / (1 + expected clutter)^kappa, kappa = 1
             self.clutter_k = nn.Parameter(torch.full((heads,), math.log(math.e - 1.0)))
         if dendrite == "existence":     # detection-or-miss: miss probability 1 - P_D of each hypothesis, given c
-            self.miss_logit = nn.Parameter(torch.zeros(heads))
-            self.miss_ctx = nn.Linear(dim, heads)
+            self.miss_logit = nn.Parameter(torch.zeros(2))                 # target, background
+            self.miss_ctx = nn.Linear(dim, 2)
         zero = (self.dcoef,) if tokens == "glm" else (self.v_out,)
         if dendrite == "existence":
             zero = zero + (self.miss_ctx,)
@@ -595,9 +595,11 @@ class SpikingDecisionUnits(nn.Module):
         """Log association prior of the tokens of n_win windows: [H, T], or [B, H, T] when the expanding ring needs a
         per-unit age (k [B], one window). Fixed field: b_h - r^2 / (2 sigma_h^2). Expanding ring (V19): a source of
         unknown direction that moves about v_h px per window is, a windows after the event, on a ring of radius v_h a
-        that widens: b_h - (r - v_h a)^2 / (2 s_h(a)^2) - log(s_h(a)^2 / sigma_h^2), s_h(a)^2 = sigma_h^2 + (w_h a)^2
-        (the last term: the same mass spread over a larger area); a = the window offset of the token (the step k for
-        one window, 0 .. n_win - 1 for a re-audit). gate none: b_h only (no attribution)."""
+        that widens: b_h - (r - v_h a)^2 / (2 s_h(a)^2) - log(s_h(a) (v_h a + s_h(a)) / sigma_h^2), s_h(a)^2 =
+        sigma_h^2 + (w_h a)^2 (the last term keeps the mass: the area of that ring, ~ s (R + s), relative to the disc
+        of the event's own window); a = the window offset of the token (the step k for one window, 0 .. n_win - 1 for a
+        re-audit). b_h is the log weight of reader h among the readers of its hypothesis (existence dendrite). gate
+        none: b_h only (no attribution)."""
         H, K = self.heads, self.n_box
         if self.gate == "none":
             return self.rf_bias[:, None].expand(H, n_win * K)
@@ -612,29 +614,38 @@ class SpikingDecisionUnits(nn.Module):
             if age.dim() == 1:                                             # stream: one age per unit
                 return self.association_prior_units(age)
             a = age.to(s2.dtype).expand(K)
-        rr = self.r.repeat(n_win)
-        sa2 = s2 + (w[:, None] * a[None]) ** 2
-        return self.rf_bias[:, None] - (rr[None] - v[:, None] * a[None]) ** 2 / (2.0 * sa2) - torch.log(sa2 / s2)
+        return self._ring(self.r.repeat(n_win)[None], a[None], s2, v[:, None], w[:, None], self.rf_bias[:, None])
 
     def association_prior_units(self, age):
         """Expanding-ring prior for units of different ages age [B] (one window each): [B, H, K]."""
         s2 = self.sigma()[None, :, None] ** 2
         v, w = F.softplus(self.ring_v)[None, :, None], F.softplus(self.ring_w)[None, :, None]
-        a = age.to(s2.dtype)[:, None, None]
+        return self._ring(self.r[None, None, :], age.to(s2.dtype)[:, None, None], s2, v, w, self.rf_bias[None, :, None])
+
+    @staticmethod
+    def _ring(r, a, s2, v, w, b):
+        """Log density of the expanding ring at distance r after a windows (broadcast): radius R = v a, spread
+        s^2 = sigma^2 + (w a)^2, normalised by the ring's area s (R + s) relative to sigma^2 (= 1 at a = 0)."""
         sa2 = s2 + (w * a) ** 2
-        return self.rf_bias[None, :, None] - (self.r[None, None, :] - v * a) ** 2 / (2.0 * sa2) - torch.log(sa2 / s2)
+        sa = torch.sqrt(sa2)
+        R = v * a
+        return b - (r - R) ** 2 / (2.0 * sa2) - torch.log(sa * (R + sa) / s2)
 
     def _existence(self, c, tok, n_win, prior, win_mask):
         """Existence dendrite (V19), Eq. E1-E3 of docs/V19_DESIGN.md. One window is one chance for the source of
-        hypothesis h to be detected: either it was missed (probability 1 - P_D(c)) or one of the window's events is
-        its detection. With the events of a box sharing a score, the likelihood ratio of the window against clutter
-        alone (integrated PDA) is  miss_h + sum_b n_b exp(score_hb),  score = association prior (geometry, time) +
-        content log-likelihood ratio (the box statistics, context-shifted) - kappa_h log(1 + expected clutter events of
-        the box) (divisive normalisation; the clutter density is the background-like events of the unit's square per
-        px). The channel current is log(miss + D) = log miss (evidence of absence, <= 0) + softplus(log D - log miss)
-        (detection, >= 0); the soma adds sign_h x current (target channels excite, background ones inhibit). The
-        posterior association of a box (PDA beta) n_b exp(score) / (miss + D) is the gate it reports; the attributed
-        mass is the detection probability 1 - beta_0 summed over windows. prior: [1 or B, H, T]."""
+        hypothesis g (target, background) to be detected: either it was missed (probability 1 - P_D(c)) or one of the
+        window's events is its detection. The readers h of a hypothesis (heads, near and far) are components of its
+        association prior (b_h = log weight), so they share ONE detection: with the events of a box sharing a score,
+        the likelihood ratio of the window against clutter alone (integrated PDA) is
+            miss_g + sum_{h in g} sum_b n_b exp(score_hb),
+        score = association prior (geometry, time) + content log-likelihood ratio (the box statistics, context-
+        shifted) - kappa_h log(1 + expected clutter events of the box) (divisive normalisation; the clutter density is
+        the background-like events of the unit's square per px). The hypothesis current log(miss + D) = log miss
+        (evidence of absence, <= 0) + softplus(log D - log miss) (detection, >= 0); the soma adds target - background
+        (each reader carries 1 / readers of its hypothesis' current, so the head-signed sum is exactly that). The
+        posterior association of a reader and box (PDA beta) n_b exp(score_hb) / (miss + D) is the gate it reports;
+        the attributed mass of a reader is its share of the detection probability 1 - beta_0, summed over windows.
+        prior: [1 or B, H, T]."""
         cnt = tok["cnt"]
         B, T = cnt.shape
         K, H, Fn = self.n_box, self.heads, self.n_feat
@@ -650,11 +661,14 @@ class SpikingDecisionUnits(nn.Module):
         live = (cnt > 0.5) & (wm.repeat_interleave(K, 1) > 0)
         z = torch.where(live[:, None, :], torch.log(cnt.clamp(min=0.5))[:, None, :] + score,
                         torch.full_like(score, -1e4))
-        logd = torch.logsumexp(z.view(B, H, n_win, K), -1)                 # log sum_b n_b exp(score) [B, H, n_win]
-        log_miss = F.logsigmoid(self.miss_logit[None] + self.miss_ctx(c))[:, :, None]
+        hg = H // 2                                                        # readers per hypothesis
+        zg = z.view(B, 2, hg, n_win, K).permute(0, 1, 3, 2, 4).reshape(B, 2, n_win, hg * K)
+        logd = torch.logsumexp(zg, -1)                                     # log D per hypothesis [B, 2, n_win]
+        log_miss = F.logsigmoid(self.miss_logit[None] + self.miss_ctx(c))[:, :, None]   # [B, 2, 1]
         total = log_miss + F.softplus(logd - log_miss)                    # log(miss + D)
-        lam = (total * wm[:, None, :]).sum(-1)
-        resp = torch.exp(z - total.repeat_interleave(K, 2))               # posterior association [B, H, T]
+        cur = (total * wm[:, None, :]).sum(-1)                             # hypothesis currents [B, 2]
+        lam = cur.repeat_interleave(hg, 1) / hg                            # per reader: sum_h sign_h lam_h = T - B
+        resp = torch.exp(z - total.repeat_interleave(hg, 1).repeat_interleave(K, 2))   # posterior association
         mass = resp.sum(-1)
         ubar = torch.einsum("bht,btf->bhf", resp, tok["x"]) / mass[..., None].clamp(min=EPS)
         return lam, mass, ubar.reshape(B, -1), resp
@@ -824,8 +838,11 @@ class SpikingDecisionUnits(nn.Module):
             out["ring_spread_px_per_window"] = [round(v, 3) for v in F.softplus(self.ring_w).detach().cpu().tolist()]
         if self.clutter:
             out["clutter_exponent"] = [round(v, 3) for v in F.softplus(self.clutter_k).detach().cpu().tolist()]
-        if self.dendrite == "existence":
+        if self.dendrite == "existence":     # per hypothesis (target, background), and each reader's mixture weight
             out["miss_probability"] = [round(v, 3) for v in torch.sigmoid(self.miss_logit).detach().cpu().tolist()]
+            hg = self.heads // 2
+            wts = torch.softmax(self.rf_bias.detach().cpu().view(2, hg), 1).reshape(-1)
+            out["reader_weight"] = [round(v, 3) for v in wts.tolist()]
         if self.n_msg:                         # lateral synaptic weight per box level (mean over ages), by spike type
             j = torch.arange(self.n_box)
             lev = torch.where(j < 9, torch.zeros_like(j), (j - 9) // 8 + 1)    # box_layout order: 9 + 8 per level

@@ -642,8 +642,9 @@ class V19Tests(unittest.TestCase):
             self.assertLess(float((U - z0[:, None]).abs().max()), 1e-5, str(kw))
 
     def test_formula_one_window(self):
-        """lambda_h = log(miss_h + sum_b n_b exp(prior + content - kappa_h log(1 + density x px))), the attributed
-        mass is the detection probability D / (miss + D) and the gates are n_b exp(score) / (miss + D)."""
+        """Per hypothesis g: log(miss_g + sum over its readers h and boxes b of n_b exp(prior + content - kappa_h
+        log(1 + density x px))), each reader carrying half of it; a reader's attributed mass is its share D_h /
+        (miss_g + D_g) and the gates n_b exp(score) / (miss_g + D_g) sum to at most 1 per hypothesis."""
         net = unit(evidence="events", **V19)
         feat, valid, z0, pol = unit_inputs(B=3)
         Fn, H = S.N_FEAT, 4
@@ -658,25 +659,32 @@ class V19Tests(unittest.TestCase):
                      - torch.nn.functional.softplus(net.clutter_k)[None, :, None]
                      * torch.log1p(dens[:, None] * tok["px"])[:, None, :])
             n = tok["cnt"] * (tok["cnt"] > 0.5).float()
-            D = (n[:, None, :] * torch.exp(score)).sum(-1)
-            miss = torch.sigmoid(net.miss_logit[None] + net.miss_ctx(c))
-        np.testing.assert_allclose(lam.numpy(), torch.log(miss + D).numpy(), rtol=1e-4, atol=1e-4)
-        np.testing.assert_allclose(mass.numpy(), (D / (miss + D)).numpy(), rtol=1e-4, atol=1e-5)
+            Dh = (n[:, None, :] * torch.exp(score)).sum(-1)                  # per reader [3, 4]
+            Dg = Dh.view(3, 2, 2).sum(-1)                                    # per hypothesis [3, 2]
+            miss = torch.sigmoid(net.miss_logit[None] + net.miss_ctx(c))     # [3, 2]
+            cur = torch.log(miss + Dg)
+        np.testing.assert_allclose(lam.numpy(), (cur.repeat_interleave(2, 1) / 2).numpy(), rtol=1e-4, atol=1e-4)
+        np.testing.assert_allclose(mass.numpy(), (Dh / (miss + Dg).repeat_interleave(2, 1)).numpy(),
+                                   rtol=1e-4, atol=1e-5)
         np.testing.assert_allclose(resp.sum(-1).numpy(), mass.numpy(), rtol=1e-5, atol=1e-6)
-        self.assertTrue(bool((resp >= 0).all()) and bool((resp.sum(-1) <= 1 + 1e-5).all()))
+        per_hyp = resp.sum(-1).view(3, 2, 2).sum(-1)
+        self.assertTrue(bool((resp >= 0).all()) and bool((per_hyp <= 1 + 1e-5).all()))
+        np.testing.assert_allclose((lam * net.head_sign).sum(-1).numpy(), (cur[:, 0] - cur[:, 1]).numpy(),
+                                   rtol=1e-4, atol=1e-4)
 
     def test_empty_window_is_evidence_of_absence(self):
-        """A window without events in the unit's boxes adds sum_h sign_h log miss_h: when the target hypothesis
-        expects detections (small miss), nothing seen pulls the membrane towards background."""
+        """A window without events in the unit's boxes adds log miss_target - log miss_background: when the target
+        hypothesis expects detections (small miss), nothing seen pulls the membrane towards background."""
         feat, valid, z0, pol = unit_inputs()
         feat[:, 2, :, :2] = 0.0
         net = unit(evidence="events", **V19)
         with torch.no_grad():
             net.miss_ctx.weight.zero_()
             net.miss_ctx.bias.zero_()
-            net.miss_logit.copy_(torch.tensor([-2.0, -1.0, 0.5, 1.0]))
+            net.miss_logit.copy_(torch.tensor([-2.0, 1.0]))
             U = net(feat, valid, z0, pol)
-            expect = float((torch.nn.functional.logsigmoid(net.miss_logit) * net.head_sign).sum())
+            lm = torch.nn.functional.logsigmoid(net.miss_logit)
+            expect = float(lm[0] - lm[1])
         self.assertLess(expect, 0.0)
         np.testing.assert_allclose((U[:, 2] - U[:, 1]).numpy(), expect, rtol=1e-5, atol=1e-5)
 
@@ -715,8 +723,10 @@ class V19Tests(unittest.TestCase):
         c = [net.step_macs(k, 5, 5) for k in range(4)]
         self.assertTrue(all(v > 0 for v in c))
         lc = net.learned_constants()
-        for key in ("ring_speed_px_per_window", "ring_spread_px_per_window", "clutter_exponent", "miss_probability"):
+        for key in ("ring_speed_px_per_window", "ring_spread_px_per_window", "clutter_exponent", "reader_weight"):
             self.assertEqual(len(lc[key]), 4)
+        self.assertEqual(len(lc["miss_probability"]), 2)
+        self.assertAlmostEqual(sum(lc["reader_weight"][:2]), 1.0, places=2)
         self.assertFalse(hasattr(net, "sink_logit"))
         self.assertEqual(tuple(net.coef.shape[1:3]), (net.n_ring, 4))
         with self.assertRaises(ValueError):
