@@ -628,6 +628,7 @@ class V18Tests(unittest.TestCase):
 
 EXIST = dict(tokens="glm", gate="distance", audit="ledger", ctx_ff=False, dendrite="existence")
 V19 = dict(EXIST, ring=True, clutter=True, content="ring")
+V19F = dict(EXIST, clutter=True)                 # final V19 (11-14 night): content per box, no ring
 
 
 class V19Tests(unittest.TestCase):
@@ -636,7 +637,7 @@ class V19Tests(unittest.TestCase):
 
     def test_starts_at_prior(self):
         feat, valid, z0, pol = unit_inputs()
-        for kw in ({}, {"ring": True}, {"ring": True, "clutter": True, "content": "ring"}):
+        for kw in ({}, {"ring": True}, {"ring": True, "clutter": True, "content": "ring"}, {"clutter": True}):
             with torch.no_grad():
                 U = unit(nonzero=False, evidence="events", **dict(EXIST, **kw))(feat, valid, z0, pol)
             self.assertLess(float((U - z0[:, None]).abs().max()), 1e-5, str(kw))
@@ -645,7 +646,10 @@ class V19Tests(unittest.TestCase):
         """Per hypothesis g: log(miss_g + sum over its readers h and boxes b of n_b exp(prior + content - kappa_h
         log(1 + density x px))), each reader carrying half of it; a reader's attributed mass is its share D_h /
         (miss_g + D_g) and the gates n_b exp(score) / (miss_g + D_g) sum to at most 1 per hypothesis."""
-        net = unit(evidence="events", **V19)
+        for cfg in (V19, V19F):
+            self.check_formula(unit(evidence="events", **cfg))
+
+    def check_formula(self, net):
         feat, valid, z0, pol = unit_inputs(B=3)
         Fn, H = S.N_FEAT, 4
         with torch.no_grad():
@@ -717,6 +721,7 @@ class V19Tests(unittest.TestCase):
     def test_cooperative(self):
         """Both populations with the existence dendrite; the second reads the decision spikes as box statistics."""
         V18Tests.check_cooperative(self, dict(V19, n_feat=S.N_FEAT + S.N_MSG), first=V19)
+        V18Tests.check_cooperative(self, dict(V19F, n_feat=S.N_FEAT + S.N_MSG), first=V19F)
 
     def test_cost_and_constants(self):
         net = unit(evidence="events", **V19)
@@ -909,6 +914,54 @@ class HelperTests(unittest.TestCase):
                 self.assertEqual(U[0].shape, (len(rec["x"]), 4))
                 self.assertTrue(bool((ne1[0] <= ne[0]).all()))
                 np.testing.assert_allclose(U[0], np.repeat(rec["z0"][:, None], 4, 1), atol=1e-5)   # starts at prior
+
+    def test_window_segments(self):
+        """Long recordings (EV-Flying) are read in window segments: the trajectories, box counts and first-population
+        spikes' features equal those of whole-recording maps; one segment when the maps fit (EV-UAV)."""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("v18_common_seg", os.path.join(ROOT, "tools", "v18", "common.py"))
+        C = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(C)
+        mv = moving_recording(n_noise=500, W=C.SENSOR[1], H=C.SENSOR[0], n_win=17, seed=12)
+        rec = {"x": mv["x"].astype(np.int32), "y": mv["y"].astype(np.int32), "win": mv["win"].astype(np.int32),
+               "pol": mv["pol"].astype(np.int8), "z0": mv["z0"], "n_win": mv["n_win"], "lab": mv["target"],
+               "F": np.minimum(3, mv["n_win"] - 1 - mv["win"]).astype(np.int16)}
+        self.assertEqual(len(C.window_segments(160, 11)), 1)                    # an EV-UAV recording: one segment
+        for kw in ({}, dict(EXIST, ring=True, clutter=True, content="ring")):
+            cfg = dict(levels=2, dim=16, heads=4, value="ei", gate="distance", pool="window", evidence="events",
+                       context="on", context_ff="off", audit="ledger", tokens="glm", n_steps=4)
+            cfg.update({k: ("on" if v is True else v) for k, v in kw.items() if k not in ("tokens", "gate", "audit",
+                                                                                        "ctx_ff")})
+            net, rect = C.build_net(cfg, "cpu")
+            with torch.no_grad():
+                for p in net.parameters():
+                    p.normal_(0, 0.3)
+            whole = C.trajectories(net, [rec], rect, "cpu", counts=True)
+            per_win = (C.SENSOR[0] + 1) * (C.SENSOR[1] + 1) * 16 * 3
+            old = C.MAP_GB
+            try:
+                C.MAP_GB = (5 + 3) * per_win / 2 ** 30                         # 5 windows per segment
+                self.assertEqual(len(C.window_segments(rec["n_win"], 4)), 4)
+                seg = C.trajectories(net, [rec], rect, "cpu", counts=True)
+            finally:
+                C.MAP_GB = old
+            for a, b in zip(whole, seg):                    # other batches -> fp32 summation order (~1e-5)
+                np.testing.assert_allclose(a[0], b[0], rtol=1e-4, atol=1e-4)
+        msg = {"own_step": np.where(np.arange(len(rec["x"])) % 7 == 0, 1, -1), "own_type": np.ones(len(rec["x"]), int),
+               "mx": rec["x"][::9], "my": rec["y"][::9], "mwin": np.minimum(rec["win"][::9] + 1, rec["n_win"] - 1),
+               "mtype": (np.arange(len(rec["x"][::9])) % 2)}
+        idx = np.arange(0, len(rec["x"]), 3)
+        f_whole, ok_whole = C.event_features(C.rec_maps(rec, "cpu", msg=msg), rec, idx, rect, 4, msg)
+        old = C.MAP_GB
+        try:
+            C.MAP_GB = (5 + 3) * (C.SENSOR[0] + 1) * (C.SENSOR[1] + 1) * 24 * 3 / 2 ** 30
+            f_seg = torch.zeros_like(f_whole)
+            for maps, rs, ms, local, sel in C.segmented(rec, idx, 4, "cpu", msg):
+                f_seg[sel] = C.event_features(maps, rs, local, rect, 4, ms)[0]
+        finally:
+            C.MAP_GB = old
+        np.testing.assert_array_equal(f_seg.numpy(), f_whole.numpy())
+
 
 class StoppingTests(unittest.TestCase):
     def test_bound_where_changes_stop(self):

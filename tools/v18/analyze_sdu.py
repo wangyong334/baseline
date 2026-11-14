@@ -126,29 +126,29 @@ def main():
         for ri, items in by_rec.items():
             rec = recs[ri]
             msg = None if msgs is None else msgs[ri]
-            maps = C.rec_maps(rec, dev, msg=msg, track=C.needs_moments(net))
             idx = np.array([e for e, _, _ in items])
-            feat, ok, cue = C.event_features(maps, rec, idx, rect, S, msg, net)
-            net(feat, ok, torch.as_tensor(rec["z0"][idx], device=dev),
-                torch.as_tensor(rec["pol"][idx].astype(np.int64), device=dev), keep=True, memb=cue)
-            lam = net.extras["lam"].cpu().numpy()                     # [n, S, H] signed
-            ms = net.extras["mass"].cpu().numpy()                     # [n, S, H]
-            gt = net.extras["gates"].cpu().numpy().reshape(len(idx), S, -1, S, K)   # [n, step, H, window, box]
-            okn = ok.cpu().numpy()
-            for j, (e, L, ty) in enumerate(items):
-                key = "target_units" if ty < 2 else "background_units"
-                v = okn[j]
-                ev[key][v, 0] += lam[j, v][:, sign > 0].sum(1)
-                ev[key][v, 1] += lam[j, v][:, sign < 0].sum(1)
-                mass[key][v] += ms[j, v].sum(1)
-                cnt[key][v] += 1
-                k = L - 1                                              # commit step
-                for ch, hs in enumerate((sign > 0, sign < 0)):
-                    gk = gt[j, k][hs].mean(0)                          # [window, box]
-                    for lv in range(n_lev):
-                        gate[key][ch, lv, :k + 1] += gk[:k + 1, lev == lv].mean(1)
-                gcnt[key][:, :k + 1] += 1
-            del maps
+            for maps, rs, mg, local, sel in C.segmented(rec, idx, S, dev, msg, C.needs_moments(net)):
+                feat, ok, cue = C.event_features(maps, rs, local, rect, S, mg, net)
+                net(feat, ok, torch.as_tensor(rs["z0"][local], device=dev),
+                    torch.as_tensor(rs["pol"][local].astype(np.int64), device=dev), keep=True, memb=cue)
+                lam = net.extras["lam"].cpu().numpy()                 # [n, S, H] signed
+                ms = net.extras["mass"].cpu().numpy()                 # [n, S, H]
+                gt = net.extras["gates"].cpu().numpy().reshape(len(local), S, -1, S, K)   # [n, step, H, window, box]
+                okn = ok.cpu().numpy()
+                for j, (e, L, ty) in enumerate(items[i] for i in sel):
+                    key = "target_units" if ty < 2 else "background_units"
+                    v = okn[j]
+                    ev[key][v, 0] += lam[j, v][:, sign > 0].sum(1)
+                    ev[key][v, 1] += lam[j, v][:, sign < 0].sum(1)
+                    mass[key][v] += ms[j, v].sum(1)
+                    cnt[key][v] += 1
+                    k = L - 1                                          # commit step
+                    for ch, hs in enumerate((sign > 0, sign < 0)):
+                        gk = gt[j, k][hs].mean(0)                      # [window, box]
+                        for lv in range(n_lev):
+                            gate[key][ch, lv, :k + 1] += gk[:k + 1, lev == lv].mean(1)
+                    gcnt[key][:, :k + 1] += 1
+                del maps
     res["evidence_by_step"] = {k: {"target_channel": (ev[k][:, 0] / np.maximum(cnt[k], 1)).round(4).tolist(),
                                    "background_channel": (ev[k][:, 1] / np.maximum(cnt[k], 1)).round(4).tolist(),
                                    "attributed_mass": (mass[k] / np.maximum(cnt[k], 1)).round(3).tolist(),

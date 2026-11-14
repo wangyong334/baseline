@@ -53,14 +53,14 @@ def normalization(recs, probs, rect, n_steps, device, seed, per_rec=400, msgs=No
         if not idx.size:
             continue
         msg = None if msgs is None else msgs[ri]
-        maps = C.rec_maps(rec, device, msg=msg, track=C.needs_moments(net))
-        feat, ok, _ = C.event_features(maps, rec, idx, rect, n_steps, msg, net)
-        x = feat[ok][..., :n_feat].reshape(-1, n_feat).double().cpu().numpy()   # evidence statistics only
-        s1 += x.sum(0)
-        s2 += (x * x).sum(0)
-        cnt += x.shape[0]
+        for maps, rs, ms, local, _ in C.segmented(rec, idx, n_steps, device, msg, C.needs_moments(net)):
+            feat, ok, _ = C.event_features(maps, rs, local, rect, n_steps, ms, net)
+            x = feat[ok][..., :n_feat].reshape(-1, n_feat).double().cpu().numpy()   # evidence statistics only
+            s1 += x.sum(0)
+            s2 += (x * x).sum(0)
+            cnt += x.shape[0]
+            del maps
         zs.append(rec["z0"][idx])
-        del maps
     mu = s1 / cnt
     z = np.concatenate(zs)
     return mu, np.sqrt(np.maximum(s2 / cnt - mu * mu, 1e-8)), float(z.mean()), float(z.std())
@@ -72,27 +72,32 @@ def train_epoch(net, opt, recs, probs, rect, n_steps, device, rng, batch, pool_e
     order = rng.permutation(len(recs))
     losses, n_batches, n_events = [], 0, 0
     i = 0
-    while i < len(order):
+    pending = []                                   # sampled events of the current recording, pieces of <= pool_events
+    while i < len(order) or pending:
         parts = []
         total = 0
-        while i < len(order) and total < pool_events:              # a pool of recordings, at least pool_events events
-            rec, p = recs[order[i]], probs[order[i]]
-            msg = None if msgs is None else msgs[order[i]]
-            i += 1
-            idx = np.nonzero(rng.rand(len(p)) < p)[0]
-            if not idx.size:
-                continue
-            maps = C.rec_maps(rec, device, msg=msg, track=C.needs_moments(net))
-            for a in range(0, idx.size, 8192):
-                sub = idx[a:a + 8192]
-                feat, ok, cue = C.event_features(maps, rec, sub, rect, n_steps, msg, net)
-                parts.append((feat.half(), ok, torch.as_tensor(rec["z0"][sub], device=device),
-                              torch.as_tensor(rec["pol"][sub].astype(np.int64), device=device),
-                              torch.as_tensor(rec["lab"][sub].astype(np.float32), device=device),
-                              torch.as_tensor(1.0 / p[sub], dtype=torch.float32, device=device),
-                              torch.zeros(len(sub), 2, device=device) if cue is None else cue))
+        while total < pool_events and (pending or i < len(order)):   # a pool of at least pool_events events
+            if not pending:
+                r = order[i]
+                i += 1
+                idx = np.nonzero(rng.rand(len(probs[r])) < probs[r])[0]
+                if not idx.size:
+                    continue
+                pending = [(r, idx[a:a + pool_events]) for a in range(0, idx.size, pool_events)]
+            r, idx = pending.pop(0)                # EV-UAV: one piece per recording (as before); EV-Flying: several
+            rec, p = recs[r], probs[r]
+            msg = None if msgs is None else msgs[r]
+            for maps, rs, ms, local, sel in C.segmented(rec, idx, n_steps, device, msg, C.needs_moments(net)):
+                for a in range(0, local.size, 8192):
+                    li, sub = local[a:a + 8192], idx[sel[a:a + 8192]]       # indices in the segment / the recording
+                    feat, ok, cue = C.event_features(maps, rs, li, rect, n_steps, ms, net)
+                    parts.append((feat.half(), ok, torch.as_tensor(rec["z0"][sub], device=device),
+                                  torch.as_tensor(rec["pol"][sub].astype(np.int64), device=device),
+                                  torch.as_tensor(rec["lab"][sub].astype(np.float32), device=device),
+                                  torch.as_tensor(1.0 / p[sub], dtype=torch.float32, device=device),
+                                  torch.zeros(len(sub), 2, device=device) if cue is None else cue))
+                del maps
             total += idx.size
-            del maps
         if not parts:
             continue
         feat, ok, z0, pol, y, w, cue = (torch.cat([q[j] for q in parts]) for j in range(7))
@@ -214,6 +219,7 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     dev = torch.device(args.device)
+    C.check_sensor(args.data_root)                     # EV-Flying x4 needs EVUAV_SENSOR=180,320
     os.makedirs(args.out, exist_ok=True)
     probe = C.load_split(args.z0_root, args.data_root, "val", 1, limit=1)[0]
     wms = probe["window_ms"]
@@ -241,7 +247,8 @@ def main():
         cfg.update(n_steps=n_steps, window_ms=wms, tau=tau, n_feat=N_FEAT + N_MSG if feature else N_FEAT,
                    n_msg=N_MSG if (args.stage1 and not feature) else 0, spikes=args.spikes if args.stage1 else "",
                    stage1=os.path.abspath(args.stage1) if args.stage1 else "")
-    cfg.update(z0_root=os.path.abspath(args.z0_root), data_root=os.path.abspath(args.data_root), seed=args.seed)
+    cfg.update(z0_root=os.path.abspath(args.z0_root), data_root=os.path.abspath(args.data_root), seed=args.seed,
+               sensor=list(C.SENSOR))
     net, rect = build_net(cfg, dev)
     msgs = {s: None for s in data}
     if cfg.get("stage1"):                                      # decision spikes of the frozen first population

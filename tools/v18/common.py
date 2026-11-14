@@ -26,7 +26,13 @@ torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
 THRESHOLD = 0.9
-SENSOR = (260, 346)                       # EV-UAV (height, width)
+# Sensor (height, width): EV-UAV 260,346 (default); EV-Flying x4 180,320 -- set EVUAV_SENSOR=180,320 for every step
+# of such a run (training records it in the run config and the later steps check it). It sizes the evidence maps and
+# the official Pd / Fa (false alarms per pixel).
+SENSOR = tuple(int(v) for v in os.environ.get("EVUAV_SENSOR", "260,346").split(","))
+# Integral images of at most this many GB at once: long recordings (EV-Flying: 2 - 5 min, 2401 - 6002 windows) are read
+# in window segments with identical features; EV-UAV's 8 s recordings stay one segment.
+MAP_GB = float(os.environ.get("EVUAV_MAP_GB", "1.5"))
 
 
 def logit(p):
@@ -74,7 +80,21 @@ def local_paths(cfg, z0_root=None, data_root=None):
         cfg["z0_root"] = z0_root
     if data_root:
         cfg["data_root"] = data_root
+    if cfg.get("sensor") and tuple(int(v) for v in cfg["sensor"]) != SENSOR:
+        raise ValueError("run trained for sensor %s, this process has %s: set EVUAV_SENSOR=%d,%d"
+                         % (tuple(cfg["sensor"]), SENSOR, cfg["sensor"][0], cfg["sensor"][1]))
     return cfg
+
+
+def check_sensor(data_root):
+    """A dataset with a data card (EV-Flying x4) must run with its valid resolution as the sensor."""
+    card = os.path.join(data_root, "data_card.json")
+    if os.path.exists(card):
+        with open(card, encoding="utf-8") as fh:
+            w, h = json.load(fh)["valid_resolution"]
+        if (int(h), int(w)) != SENSOR:
+            raise ValueError("%s is %d x %d px but the sensor is %s: set EVUAV_SENSOR=%d,%d"
+                             % (data_root, w, h, SENSOR, h, w))
 
 
 def margin_bin(z0, tau, width):
@@ -118,6 +138,55 @@ def rec_maps(rec, device, sensor=SENSOR, msg=None, track=False):
     messages = None if msg is None else (msg["mx"], msg["my"], msg["mwin"], msg["mtype"])
     return EvidenceMaps(rec["x"], rec["y"], rec["win"], rec["pol"], rec["z0"], rec["n_win"], sensor[0], sensor[1],
                         device, messages=messages, track=track)
+
+
+def window_segments(n_win, n_steps, n_ch=4, track=False, sensor=SENSOR):
+    """Window ranges [a, b) whose integral images, with the n_steps - 1 windows a unit reads after them, stay under
+    MAP_GB (int32 maps, int64 moments with track; x3 for the peak of the two cumulative sums)."""
+    per_win = (sensor[0] + 1) * (sensor[1] + 1) * (4 * n_ch + (16 if track else 0)) * 3
+    L = max(1, int(MAP_GB * 2 ** 30) // per_win - (n_steps - 1))
+    return [(a, min(a + L, n_win)) for a in range(0, n_win, L)]
+
+
+def sub_recording(rec, a, b, n_steps, msg=None):
+    """The events of windows a .. b + n_steps - 2 with windows counted from a, and the spikes of those windows: the
+    maps the units of the events of windows a .. b - 1 read. Returns (sub, its spikes, pos = event index in rec ->
+    index in sub, -1 outside)."""
+    hi = min(b + n_steps - 1, int(rec["n_win"]))
+    keep = (rec["win"] >= a) & (rec["win"] < hi)
+    n = len(rec["win"])
+    sub = {k: (v[keep] if isinstance(v, np.ndarray) and v.ndim and v.shape[0] == n else v) for k, v in rec.items()}
+    sub["win"] = (rec["win"][keep] - a).astype(rec["win"].dtype)
+    sub["n_win"] = int(hi - a)
+    pos = np.full(n, -1, np.int64)
+    pos[keep] = np.arange(int(keep.sum()))
+    smsg = None
+    if msg is not None:
+        sp = (msg["mwin"] >= a) & (msg["mwin"] < hi)
+        smsg = {"own_step": msg["own_step"][keep], "own_type": msg["own_type"][keep], "mx": msg["mx"][sp],
+                "my": msg["my"][sp], "mwin": (msg["mwin"][sp] - a).astype(msg["mwin"].dtype), "mtype": msg["mtype"][sp]}
+    return sub, smsg, pos
+
+
+def segmented(rec, idx, n_steps, device, msg=None, track=False, sensor=SENSOR):
+    """Evidence maps for the events idx of rec, one window segment at a time (window_segments): yields (maps, rec_s,
+    msg_s, local, sel) with sel = positions in idx of the segment's events and local = their indices in rec_s. One
+    segment (EV-UAV) = the whole recording, as before; the features of a segment equal those of whole-recording maps."""
+    idx = np.asarray(idx, np.int64)
+    segs = window_segments(int(rec["n_win"]), n_steps, 6 if msg is not None else 4, track, sensor)
+    if len(segs) == 1:
+        yield rec_maps(rec, device, sensor, msg, track), rec, msg, idx, np.arange(len(idx))
+        return
+    w = rec["win"][idx]
+    for a, b in segs:
+        sel = np.nonzero((w >= a) & (w < b))[0]
+        if not sel.size:
+            continue
+        sub, smsg, pos = sub_recording(rec, a, b, n_steps, msg)
+        maps = rec_maps(sub, device, sensor, smsg, track)
+        yield maps, sub, smsg, pos[idx[sel]], sel
+        del maps
+        release(device)
 
 
 def event_features(maps, rec, idx, rect, n_steps, msg=None, net=None):
@@ -236,24 +305,25 @@ def trajectories(net, recs, rect, device, chunk=4096, sensor=SENSOR, counts=Fals
     with torch.no_grad():
         for ri, rec in enumerate(recs):
             msg = None if msgs is None else msgs[ri]
-            maps = rec_maps(rec, device, sensor, msg, track=needs_moments(net))
             n = rec["z0"].shape[0]
             U = np.zeros((n, net.n_steps), np.float32)
             c = (np.zeros((n, net.n_steps), np.int16), np.zeros((n, net.n_steps), np.int32),
                  np.zeros((n, net.n_steps), np.int32))
-            for a in range(0, n, chunk):
-                idx = np.arange(a, min(a + chunk, n))
-                feat, ok, cue = event_features(maps, rec, idx, rect, net.n_steps, msg, net)
-                z0 = torch.as_tensor(rec["z0"][idx], device=maps.device)
-                pol = torch.as_tensor(rec["pol"][idx].astype(np.int64), device=maps.device)
-                U[idx] = net(feat, ok, z0, pol, memb=cue).float().cpu().numpy()
-                if counts:
-                    for arr, t in zip(c, box_counts(feat)):
-                        arr[idx] = t.cpu().numpy()
+            for maps, rs, ms, local, sel in segmented(rec, np.arange(n), net.n_steps, device, msg, needs_moments(net),
+                                                      sensor):
+                for a in range(0, len(local), chunk):
+                    li, gi = local[a:a + chunk], sel[a:a + chunk]           # indices in the segment / the recording
+                    feat, ok, cue = event_features(maps, rs, li, rect, net.n_steps, ms, net)
+                    z0 = torch.as_tensor(rs["z0"][li], device=maps.device)
+                    pol = torch.as_tensor(rs["pol"][li].astype(np.int64), device=maps.device)
+                    U[gi] = net(feat, ok, z0, pol, memb=cue).float().cpu().numpy()
+                    if counts:
+                        for arr, t in zip(c, box_counts(feat)):
+                            arr[gi] = t.cpu().numpy()
+                del maps
             out.append(U)
             for lst, arr in zip(cnt, c):
                 lst.append(arr)
-            del maps
             release(device)
     return (out,) + cnt if counts else out
 
@@ -263,17 +333,17 @@ def split_counts(recs, rect, n_steps, device, chunk=8192, sensor=SENSOR, track=F
     cnt = ([], [], [])
     with torch.no_grad():
         for rec in recs:
-            maps = rec_maps(rec, device, sensor, track=track)
             n = rec["z0"].shape[0]
             c = (np.zeros((n, n_steps), np.int16), np.zeros((n, n_steps), np.int32), np.zeros((n, n_steps), np.int32))
-            for a in range(0, n, chunk):
-                idx = np.arange(a, min(a + chunk, n))
-                feat, _ = event_features(maps, rec, idx, rect, n_steps)
-                for arr, t in zip(c, box_counts(feat)):
-                    arr[idx] = t.cpu().numpy()
+            for maps, rs, _, local, sel in segmented(rec, np.arange(n), n_steps, device, None, track, sensor):
+                for a in range(0, len(local), chunk):
+                    li, gi = local[a:a + chunk], sel[a:a + chunk]
+                    feat, _ = event_features(maps, rs, li, rect, n_steps)
+                    for arr, t in zip(c, box_counts(feat)):
+                        arr[gi] = t.cpu().numpy()
+                del maps
             for lst, arr in zip(cnt, c):
                 lst.append(arr)
-            del maps
             release(device)
     return tuple(np.concatenate(lst) for lst in cnt)
 
