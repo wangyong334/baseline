@@ -186,6 +186,7 @@ def build_config(args):
     check_periodic_reset(getattr(args, "reset_every", 0), getattr(args, "reset_offset", 0))
     if getattr(args, "reset_every", 0) and args.mode != "eval":
         raise ValueError("--reset-every 仅用于 eval")
+    memory_options(cfg)
     return cfg
 
 
@@ -195,6 +196,57 @@ def check_periodic_reset(every, offset):
     if every < 0 or (every == 0 and offset != 0) or (every > 0 and not 0 <= offset < every):
         raise ValueError("--reset-every 必须 >= 0，且开启时 0 <= --reset-offset < --reset-every")
     return every, offset
+
+
+def memory_options(cfg):
+    """V20 过去信息消融（11-14）的两个配置项，训练、每轮验证、正式评估、导出先验一致生效；缺省 = 原实现。
+
+    memory_reset_every = L > 0：录像第 k 窗（k > 0 且 k % L == 0）递推前把全部状态清零，即每 L 窗切一段、段间不传记忆
+    （L = 1 每窗清零）。window_steps = T > 1：每窗把同一输入重复 T 步（传统 SNN 的多时间步），段内连续递推，只用最后
+    一步读出；需要 state_mode carry（否则窗内各步互不相连）。返回 (L, T)。"""
+    every = int(cfg.get("memory_reset_every") or 0)
+    steps = 1 if cfg.get("window_steps") is None else int(cfg["window_steps"])
+    if every < 0 or steps < 1:
+        raise ValueError("memory_reset_every 必须 >= 0，window_steps 必须 >= 1")
+    if steps > 1 and cfg.get("state_mode", "carry") != "carry":
+        raise ValueError("window_steps > 1 需要 state_mode carry（清零用 memory_reset_every）")
+    return every, steps
+
+
+def resets_before(k, every, diag_every=0, diag_offset=0):
+    """录像第 k 窗递推前是否清零：配置的分段清零（memory_reset_every）或评估时的诊断清零（--reset-every）。"""
+    return k > 0 and ((every > 0 and k % every == 0) or (diag_every > 0 and (k - diag_offset) % diag_every == 0))
+
+
+def expand_window_steps(x, events, keep, valid, steps):
+    """窗内 T 步：x [W,B,...] -> [W*T,B,...]（同一输入重复 T 步）；事件在每窗最后一步读出；keep 的清零放在每窗第一步。"""
+    if steps == 1:
+        return x, events, keep, valid
+    x = x.repeat_interleave(steps, dim=0)
+    events = dict(events)
+    events["t"] = events["t"] * steps + (steps - 1)
+    if "bg" in events:
+        events["bg"] = events["bg"].repeat_interleave(steps, dim=0)
+    if keep is not None:
+        k = torch.ones((keep.shape[0] * steps,) + tuple(keep.shape[1:]), dtype=keep.dtype, device=keep.device)
+        k[::steps] = keep
+        keep = k
+    if valid is not None:
+        valid = valid.repeat_interleave(steps, dim=0)
+    return x, events, keep, valid
+
+
+def window_forward(net, x, events, states, cfg, k, state_mode, collect=False, diag_every=0, diag_offset=0):
+    """逐窗推理一步（录像第 k 窗），按 memory_options 处理分段清零与窗内多步。返回 (logits, states, info)。"""
+    every, steps = memory_options(cfg)
+    if resets_before(k, every, diag_every, diag_offset):
+        states = None
+    if steps == 1:
+        return net(x, events, states, state_mode=state_mode, collect=collect)
+    ev = dict(events)
+    ev["t"] = torch.full((int(events["y"].shape[0]),), steps - 1, dtype=torch.long, device=events["y"].device)
+    return net.forward_chunk(x.unsqueeze(0).repeat_interleave(steps, dim=0), ev, states, state_mode=state_mode,
+                             collect=collect)
 
 
 def seed_everything(seed, deterministic):
@@ -890,6 +942,11 @@ def assemble_streams(sources, pieces, steps, cfg, device, dtype):
                 bg[offset:offset + (hi - lo), b] = events["bg"][:, 0]
             if new_start:
                 keep[offset, b] = 0
+            every = memory_options(cfg)[0]
+            if every:                                # V20: segment the stream every L windows of the recording
+                for j in range(hi - lo):
+                    if resets_before(lo + j, every):
+                        keep[offset + j, b] = 0
             parts["t"].append(events["t"] + int(offset))
             parts["b"].append(torch.full_like(events["t"], b))
             for key in ("y", "x", "p", "t_local"):
@@ -983,6 +1040,7 @@ def train_streams(net, dataset, lengths, optimizer, cfg, q99, pos_weight, device
         for offset, pieces in enumerate(block):
             x, events, labels, keep = assemble_streams(sources, pieces, k, cfg, device, dtype)
             valid = stream_valid(pieces, k, device, dtype)
+            x, events, keep, valid = expand_window_steps(x, events, keep, valid, memory_options(cfg)[1])
             total_valid = float(valid.sum())
             for g, (lo, hi) in enumerate(bounds):
                 if len(bounds) == 1:
@@ -1061,15 +1119,15 @@ def run_sequence(net, seq, cfg, q99, device, state_mode, monitor=None, timer=Non
     调用方负责 torch.no_grad() 与 net.eval()。
     execution=layer 时每 eval_chunk 个窗口调用一次 forward_chunk（吞吐快，但不能用来测单窗延迟，timer 必须为空）。
     input_stats 不为空时，累计输入中非零元素的个数与总数（事件驱动口径的能耗要用，见 estimate_operations）。
-    reset_every=M>0（记忆长度诊断，只用于 step 执行）：窗号 k>0 且 (k-reset_offset)%M==0 时先把全部状态清零，
+    reset_every=M>0（记忆长度诊断）：窗号 k>0 且 (k-reset_offset)%M==0 时先把全部状态清零，
     于是第 k 窗看到的历史长度 h = k - 最近一次清零的窗号 + 1（k=0 本来就从零状态开始）；M=1 等价于 reset_each_window。
+    cfg 的 memory_reset_every / window_steps（V20，见 memory_options）在两种执行方式下同样生效。
     """
     execution, _ = speed_options(cfg)
     if execution == "layer" and timer is not None:
         raise ValueError("逐窗延迟只能在 execution=step 下测量")
     reset_every, reset_offset = check_periodic_reset(reset_every, reset_offset)
-    if reset_every and execution == "layer":
-        raise ValueError("周期清零只支持 execution=step")
+    every, steps = memory_options(cfg)
     threshold = float(cfg["threshold"])
     source = make_window_source(seq, cfg, q99, device, next(net.parameters()).dtype)
     states = None
@@ -1081,8 +1139,13 @@ def run_sequence(net, seq, cfg, q99, device, state_mode, monitor=None, timer=Non
             end = min(start + size, seq.n_windows)
             x, events, _, idx = source.chunk(start, end)
             count_nonzero_input(input_stats, x)
+            keep = None
+            if every or reset_every:                 # V20 segments / memory-length diagnostic, as in the step path
+                keep = torch.tensor([[0.0 if resets_before(kk, every, reset_every, reset_offset) else 1.0]
+                                     for kk in range(start, end)], dtype=x.dtype, device=x.device)
+            x, events, keep, _ = expand_window_steps(x, events, keep, None, steps)
             logits, states, info = net.forward_chunk(x, events, states, state_mode=state_mode,
-                                                     collect=monitor is not None)
+                                                     collect=monitor is not None, keep=keep)
             prob = torch.sigmoid(logits).float().cpu().numpy()
             if monitor is not None:
                 monitor.update(info)
@@ -1096,12 +1159,11 @@ def run_sequence(net, seq, cfg, q99, device, state_mode, monitor=None, timer=Non
                 offset += count
     else:
         for k in range(seq.n_windows):
-            if reset_every and k > 0 and (k - reset_offset) % reset_every == 0:
-                states = None
             t0 = timer.now() if timer else None
             x, events, _, idx = source.window(k)
             t1 = timer.now() if timer else None
-            logits, states, info = net(x, events, states, state_mode=state_mode, collect=monitor is not None)
+            logits, states, info = window_forward(net, x, events, states, cfg, k, state_mode, monitor is not None,
+                                                  reset_every, reset_offset)
             t2 = timer.now() if timer else None
             prob = torch.sigmoid(logits).float().cpu().numpy()
             if timer:
@@ -1630,7 +1692,8 @@ def mode_eval(args, cfg):
                "subthreshold_parameters": subthreshold_parameter_statistics(net),
                "memory_ablation": memory_ablation,
                "memory_off_layers": list(net.dual_memory_layers) if memory_ablation == "off" else (off_layers or []),
-               "reset_every": reset_every, "reset_offset": reset_offset, "bg_ablation": bg_ablation}
+               "reset_every": reset_every, "reset_offset": reset_offset, "bg_ablation": bg_ablation,
+               "memory_reset_every": memory_options(train_cfg)[0], "window_steps": memory_options(train_cfg)[1]}
     # 周期清零时只跑 carry：M=1 即 reset_each_window，常规评估里已有
     for mode in (("carry",) if (reset_every or getattr(args, "carry_only", False)) else ("carry", "reset_each_window")):
         if device.type == "cuda":

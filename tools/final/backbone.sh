@@ -42,9 +42,9 @@ python tools/select_checkpoint.py --run $OUT --data-root $ROOT --height $HEIGHT 
   > ${LOG}_select.log 2>&1 || fail select ${LOG}_select.log
 sed -n '1,4p' ${LOG}_select.log
 CK=$OUT/selected_seed${SEED}.pt
-for split in val test; do
+for split in ${EVAL_SPLITS:-val test}; do                     # EVAL_SPLITS=test (V20 ablation runs)
   python -u train_stream_v1.py --config $CFG --mode eval --device ${DEVICE:-cuda:0} --split $split --overwrite --checkpoint $CK \
-    > ${LOG}_eval_$split.log 2>&1 || fail eval_$split ${LOG}_eval_$split.log
+    ${EVAL_EXTRA:-} > ${LOG}_eval_$split.log 2>&1 || fail eval_$split ${LOG}_eval_$split.log   # EVAL_EXTRA=--carry-only (V20)
   echo "  $split：$(grep '^\[carry\]' ${LOG}_eval_$split.log | cut -c1-90)"
 done
 for split in $NOISE_SPLITS; do

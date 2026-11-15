@@ -1,0 +1,2 @@
+# shell scripts run on the Linux server: keep LF in the working tree too (core.autocrlf=true here)
+*.sh text eol=lf

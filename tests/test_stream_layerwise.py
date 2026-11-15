@@ -304,8 +304,11 @@ class TrainingLoopTests(unittest.TestCase):
         for every, offset in ((-1, 0), (0, 1), (5, 5), (5, -1)):
             with self.assertRaises(ValueError):
                 T.check_periodic_reset(every, offset)
-        with self.assertRaises(ValueError):
-            T.run_sequence(net, seq, dict(CFG, execution="layer"), Q99, device, "carry", reset_every=4)
+        with torch.no_grad():                                                   # V20: layer execution supports it too
+            layer = T.run_sequence(net, seq, dict(CFG, execution="layer"), Q99, device, "carry", reset_every=5,
+                                   reset_offset=2)
+        self.assertLess(float(np.abs(layer[0] - periodic[0]).max()), 1e-6)
+        self.assertTrue(np.array_equal(layer[1], periodic[1]))
         base = dict(config="configs/evisseg_stream_v1.yaml", seed=None, state_mode=None, neuron=None,
                     save_root=None, execution=None, input_device=None, train_subset_every=None, tbptt_k=None)
         with self.assertRaises(ValueError):

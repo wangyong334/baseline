@@ -61,7 +61,8 @@ def main():
         with torch.no_grad():
             for k in range(seq.n_windows):
                 x, events, _, idx = source.window(k)
-                logits, states, _ = net(x, events, states, state_mode="carry")
+                # the backbone's own memory scheme (V20: segment resets / steps per window; default = plain carry)
+                logits, states, _ = T.window_forward(net, x, events, states, cfg, k, cfg.get("state_mode", "carry"))
                 z[idx] = logits.float().cpu().numpy() - log_w
         if args.check_traj:
             with np.load(os.path.join(args.check_traj, name)) as tr:
