@@ -9,7 +9,9 @@ Usage:
         --column "Streaming SNN=prior:<export dir>" --column "SDNet=final:<export dir>" \
         [--zoom test_022=150,230,90,170,2000,4000] [--view 18,-58] [--max-bg 60000] [--result-bg none|faint]
     kinds: prob = dump_competitor.py output (target iff prob >= 0.9); prior / final = export_preds.py output (target
-    iff logit >= tau of its meta.json). A column whose directory is missing is drawn as an empty placeholder.
+    iff logit >= tau of its meta.json); host = plug-in prior dir of plugin/dump_*_z0.py (RVT / SAST / YOLOv10: target
+    iff the event's box score >= the host's val threshold thr* in host_meta.json, i.e. the host's own detections).
+    A column whose directory is missing is drawn as an empty placeholder.
     Scenes and time windows come from tools/vis/scene_stats.py (ranked by stated criteria); the Input column shows all
     events (background subsampled), result and GT columns only the decided / labelled targets unless --result-bg faint.
 """
@@ -36,14 +38,17 @@ def load_events(path):
     return loc[:, 0].astype(np.float32), loc[:, 1].astype(np.float32), loc[:, 2].astype(np.float64), norm[:, 4] > 0.5
 
 
-def prediction(kind, folder, name, n):
+def prediction(kind, folder, name, n, split="test"):
     """Binary per-event prediction of one method for one recording, or None if it is not available."""
-    f = os.path.join(folder, name)
+    f = os.path.join(folder, "z0_" + split, name) if kind == "host" else os.path.join(folder, name)
     if not os.path.exists(f):
         return None
     d = np.load(f)
     if kind == "prob":
         p = d["prob"] >= 0.9
+    elif kind == "host":                                   # plug-in host: box score >= its own val threshold thr*
+        with open(os.path.join(folder, "host_meta.json")) as fh:
+            p = d["score"] >= json.load(fh)["thr"]
     else:
         with open(os.path.join(folder, "meta.json")) as fh:
             tau = json.load(fh)["tau"]
@@ -107,7 +112,7 @@ def main():
             elif kind == "gt":
                 cat = np.where(lab, "target", "background").astype(object)
             else:
-                pred = prediction(kind, folder, name, len(t)) if folder else None
+                pred = prediction(kind, folder, name, len(t), args.split) if folder else None
                 if pred is None:
                     ax.set_axis_off()
                     ax.text2D(0.5, 0.5, "n/a", transform=ax.transAxes, ha="center", va="center", color="#888888")

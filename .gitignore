@@ -4,6 +4,7 @@ __pycache__/
 log/
 run/
 Res/
+plugin/
 .venv-stream-check/
 .venv-gpu/
 configs/stream_v1_train_stats.json
