@@ -1,0 +1,38 @@
+# Official EV-Seg config (References/同类竞品/EV-Seg/configs/evisseg_evuav.yaml), copied 11-15 for the qualitative figure.
+# Only the data root, model_save_root and model_path were changed (server paths); every other value is official.
+STRUCTURE:
+  model_name: evissgnet
+  width: 12
+  block_residual: True
+  block_reps: 2
+  use_coords: True
+
+DATA:
+  input_channel: 4
+#  root: /media/admin1/123/EV-UAV
+  root: /media/stephen/nvme0n1/wy_data/datasets/EV-UAV-dataset
+  whole_t: 8000 #ms
+  res: [346,260]
+
+TRAIN:
+  epochs: 50
+  batch_size: 1
+  train_workers: 8
+  optim: Adam # Adam or SGD
+  lr: 0.001
+  k: 3
+  t: 5
+  max_events_num : 700000
+  model_save_root: /media/stephen/nvme0n1/wy_data/competitors/EV-Seg/log/model
+
+TEST:
+  vis: False
+  eval: True
+  roc: True
+  pd_detT: 50
+  correct_thresh: 0.0001
+  save: True
+  model_path: /media/stephen/nvme0n1/wy_data/competitors/EV-Seg/log/model/best_iou_seed37.pt
+
+
+

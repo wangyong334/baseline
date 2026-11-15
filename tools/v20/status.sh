@@ -4,7 +4,7 @@
 cd "$(dirname "$0")/../.."
 date '+%m-%d %H:%M:%S'
 nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader -i 1,2,3
-for c in A B C D E F G H W1 W2; do [ -f run/v20/card$c.log ] && { echo "== card $c"; tail -n 3 run/v20/card$c.log; }; done
+for f in run/v20/card*.log; do echo "== $(basename $f .log)"; tail -n 3 $f; done
 echo "== backbones"
 for cfg in configs/final/v20_*.yaml; do
   n=$(basename $cfg .yaml)

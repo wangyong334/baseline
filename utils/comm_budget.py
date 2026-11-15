@@ -69,14 +69,27 @@ def window_rates(net, memories, prev_states, keep):
             for i, (block, memory) in enumerate(zip(net.blocks(), memories))]
 
 
+def _layer_spikes(block, u_pre):
+    """LIF 一层在每个 (窗, 流) 上的脉冲数 [T,B]（前向精确，反向用神经元自己的代理梯度，与训练任务损失同一条路）。"""
+    spikes, _ = block.neuron.activate(u_pre)
+    return spikes.flatten(2).sum(2)
+
+
 def window_messages(net, memories, prev_states, keep):
-    """每个 (窗, 流) 实际发出的消息数 [T,B]：message_layers() 中各层 |Δq| 之和（只计算这些层）。"""
+    """每个 (窗, 流) 实际发出的消息数 [T,B]：message_layers() 中各层之和（只计算这些层）。
+
+    TIF：|Δq|（与上一窗比较）；LIF（V20，11-15）：脉冲数（一个脉冲一条消息，与评估 messages_mean 同口径），
+    memories 为 forward_chunk(collect=True) 的 u_pre，不需要上一状态。
+    """
     sending = set(net.message_layers())
-    reset = _reset_mask(memories, keep)
+    reset = _reset_mask(memories, keep) if net.is_tif else None
     total = None
     for i, (name, block, memory) in enumerate(zip(LAYER_NAMES, net.blocks(), memories)):
         if name in sending:
-            term = _layer_delta(block, memory, None if prev_states is None else prev_states[i], reset)
+            if net.is_tif:
+                term = _layer_delta(block, memory, None if prev_states is None else prev_states[i], reset)
+            else:
+                term = _layer_spikes(block, memory)
             total = term if total is None else total + term
     return total
 
@@ -102,8 +115,8 @@ class CommBudget(object):
         budget = cfg.get("comm_budget_messages")
         if budget is None:
             return None
-        if not (net.is_tif and net.tif_config["quantize"]):
-            raise ValueError("通信预算训练只用于 neuron: tif 且 tif.quantize: true（消息是 Δq）")
+        if not ((net.is_tif and net.tif_config["quantize"]) or net.spiking):
+            raise ValueError("通信预算训练只用于 neuron: tif 且 tif.quantize: true（消息是 Δq），或 neuron: lif（消息是脉冲）")
         if cfg.get("trainer", "sequence") != "streams":
             raise ValueError("通信预算训练只实现了 trainer: streams")
         if cfg.get("comm_budget_mode", "peak") != "peak":
@@ -168,7 +181,12 @@ def window_message_summary(net, tif_stats):
         return None
     values = sum(np.asarray(tif_stats[n]["per_window_rate"], dtype=np.float64) * float(tif_stats[n]["neurons"])
                  for n in sending)
-    values = np.atleast_1d(values)
+    return window_value_summary(values)
+
+
+def window_value_summary(values):
+    """逐窗消息数 -> {windows, mean, p50, p95, p99, max}（TIF 与 LIF 的评估共用）；没有窗时返回 None。"""
+    values = np.atleast_1d(np.asarray(values, dtype=np.float64))
     if values.size == 0:
         return None
     return {"windows": int(values.size), "mean": float(values.mean()), "p50": float(np.percentile(values, 50)),

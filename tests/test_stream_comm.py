@@ -1,7 +1,7 @@
 """通信预算训练（utils/comm_budget.py：每窗消息数的峰值约束；Stream-SNN-Innovations.md 12.13~12.21、12.35、12.36）。
 
 CPU、float64 小网络，不需要数据集。
-    1. CommBudget.from_config：没有预算时为 None（关闭）；只接受 TIF 量化网络 + trainer=streams；
+    1. CommBudget.from_config：没有预算时为 None（关闭）；只接受 TIF 量化网络或 LIF（V20）+ trainer=streams；
        平均预算 mean、旧键 comm_budget_sop / comm_accounting 都报错
     2. 网络声明的发送层（message_layers）与 forward 的实际连接一致：逐层扰动输出，看是否影响其他层或 logits
        （LIF / TIF、原形式 / 合并解码器四种网络）
@@ -95,8 +95,10 @@ class CommBudgetConfigTests(unittest.TestCase):
                 CommBudget.from_config(dict(budget_cfg(1e3), **bad), net)
         with self.assertRaises(ValueError):                                 # 旧配置（只有 SOP 预算）不会被静默关闭
             CommBudget.from_config(stream_cfg(comm_budget_sop=1e5), net)
-        with self.assertRaises(ValueError):
-            CommBudget.from_config(budget_cfg(1e3), EvSpSegNetStream(channels=SMALL, neuron="lif"))
+        self.assertIsNotNone(CommBudget.from_config(budget_cfg(1e3), make_lif_net()))   # V20：LIF 消息 = 脉冲
+        for kind in ("graded", "relu"):                                       # 层间是实数，没有消息可数
+            with self.assertRaises(ValueError):
+                CommBudget.from_config(budget_cfg(1e3), EvSpSegNetStream(channels=SMALL, neuron=kind))
         with self.assertRaises(ValueError):
             CommBudget.from_config(budget_cfg(1e3), make_tif_net(quantize=False))
 
@@ -359,6 +361,66 @@ class PeakConstraintTests(unittest.TestCase):
                               comm=tight)
         self.assertGreater(tight.mu, 0.5)
         self.assertEqual((out["comm"]["mu_start"], out["comm"]["mu_end"]), (0.5, tight.mu))
+        self.assertEqual(out["comm"]["violation_mean"], 1.0)
+        self.assertTrue(any(not torch.equal(pa, pc) for pa, pc in zip(net_a.parameters(), net_c.parameters())))
+        self.assertEqual(out["missing_grads"], [])
+
+
+class LifBudgetTests(unittest.TestCase):
+    """V20（11-15）：LIF 按同一预算训练（消息 = 发送层脉冲），评估给出与 TIF 同格式的逐窗消息分布。"""
+
+    def test_counts_match_forward_and_gradient(self):
+        net = make_lif_net()
+        source = TorchWindowSource(synthetic_sequence(0), CFG, Q99, CPU, torch.float64)
+        x, events, _, _ = source.chunk(0, 6)
+        _, _, info = net.forward_chunk(x, events, None, collect=True)
+        per_window = window_messages(net, info["u_pre"], None, None)                        # [T,B]
+        expected = sum((s > 0).flatten(2).sum(2).double() for n, s in zip(LAYER_NAMES, info["spikes"])
+                       if n in MESSAGE_LAYERS)
+        self.assertTrue(torch.equal(per_window.detach(), expected))
+        self.assertGreater(float(expected.sum()), 0.0)
+        per_window.sum().backward()                                                         # 代理梯度
+        self.assertGreater(sum(float(p.grad.abs().sum()) for p in net.parameters() if p.grad is not None), 0.0)
+
+    def test_evaluation_distribution(self):
+        net = make_lif_net().eval()
+        source = TorchWindowSource(synthetic_sequence(0), CFG, Q99, CPU, torch.float64)
+        monitor = T.LayerMonitor(net.v_threshold)
+        states, counts = None, []
+        with torch.no_grad():
+            for k in range(12):
+                x, events, _, _ = source.window(k)
+                _, states, info = net(x, events, states, collect=True)
+                monitor.update(info)
+                counts.append(sum(float((s > 0).sum()) for n, s in zip(LAYER_NAMES, info["spikes"])
+                                  if n in MESSAGE_LAYERS))
+        values = monitor.window_messages(net.message_layers())
+        np.testing.assert_allclose(values, counts, rtol=0, atol=0)
+        summary = T.window_value_summary(values)
+        self.assertEqual(summary["windows"], 12)
+        self.assertAlmostEqual(summary["mean"], mean_messages(net, monitor.summary()), delta=1e-9 * summary["mean"])
+        self.assertIsNone(monitor.window_messages(["nope"]))
+
+    def test_train_streams(self):
+        data = [synthetic_sequence(seed) for seed in (0, 1, 2)]
+        lengths = [seq.n_windows for seq in data]
+        plan = [(0, [(0, 12)]), (1, [(1, 12), (2, 12)])]
+        net_a = make_lif_net()
+        net_b, net_c = copy.deepcopy(net_a), copy.deepcopy(net_a)
+        opts = [torch.optim.SGD(n.parameters(), lr=0.05) for n in (net_a, net_b, net_c)]
+        T.train_streams(net_a, data, lengths, opts[0], stream_cfg(), Q99, POS_WEIGHT, CPU, None, plan=plan)
+        slack = CommBudget.from_config(budget_cfg(1e30), net_b)
+        out_b = T.train_streams(net_b, data, lengths, opts[1], stream_cfg(), Q99, POS_WEIGHT, CPU, None, plan=plan,
+                                comm=slack)
+        self.assertEqual(slack.mu, 0.0)
+        for (name, pa), (_, pb) in zip(net_a.named_parameters(), net_b.named_parameters()):
+            self.assertTrue(torch.equal(pa, pb), name)                      # 约束不紧时与关闭逐位相同
+        self.assertGreater(out_b["comm"]["messages_est_mean"], 0.0)
+        tight = CommBudget.from_config(budget_cfg(1e-3), net_c)
+        tight.mu = 0.5
+        out = T.train_streams(net_c, data, lengths, opts[2], stream_cfg(), Q99, POS_WEIGHT, CPU, None, plan=plan,
+                              comm=tight)
+        self.assertGreater(tight.mu, 0.5)
         self.assertEqual(out["comm"]["violation_mean"], 1.0)
         self.assertTrue(any(not torch.equal(pa, pc) for pa, pc in zip(net_a.parameters(), net_c.parameters())))
         self.assertEqual(out["missing_grads"], [])

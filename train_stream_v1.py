@@ -40,7 +40,7 @@ from model.evspsegnet_stream import (LAYER_NAMES, EvSpSegNetStream, calibrate_ga
                                      count_parameters, estimate_operations, tif_settings, window_sop_summary)
 from model.lif2d_stream import (StreamingLIF2d, StreamingDualMemoryLIF2d, StreamingTIF2d,  # noqa: E402
                                 detach_states)
-from utils.comm_budget import CommBudget, mean_messages, window_message_summary  # noqa: E402
+from utils.comm_budget import CommBudget, mean_messages, window_message_summary, window_value_summary  # noqa: E402
 from utils.stream_common import (health_warnings, linear_epoch_lr, load_flat_config,  # noqa: E402
                                  make_chunks, select_subset, subset_due, summarize_history)
 from utils.stream_metrics import (SWEEP_THRESHOLDS, FastRoc, first_detection_latencies, iou_from_counts,  # noqa: E402
@@ -457,6 +457,7 @@ class LayerMonitor(object):
                          "big": torch.zeros((), device=spikes.device, dtype=torch.float64)}
                     self.data[name] = d
                 d["spike_sum"] += active.sum().double()
+                d.setdefault("window_spikes", []).append(active.flatten(2).sum(2).flatten())   # 逐窗脉冲数（LIF 消息分布）
                 d["elements"] += active.numel()
                 d["windows"] += int(spikes.shape[0])
                 d["channel_spikes"] += active.sum(dim=(0, 1, 3, 4)).double()
@@ -523,6 +524,12 @@ class LayerMonitor(object):
                     "correction_abs_sum", torch.zeros((), device=correction.device,
                                                        dtype=torch.float64)) + correction.abs().double().sum()
                 d["correction_elements"] = d.get("correction_elements", 0) + correction.numel()
+
+    def window_messages(self, names):
+        """给定各层逐窗脉冲数之和 [窗数]（LIF 每窗发出的消息数，评估口径与通信预算训练相同）；没有数据时返回 None。"""
+        if not names or any(n not in self.data for n in names):
+            return None
+        return sum(torch.cat(self.data[n]["window_spikes"]).double() for n in names).cpu().numpy()
 
     def summary(self):
         """返回 {层名: 统计字典}。"""
@@ -1277,6 +1284,10 @@ def evaluate_split(net, cfg, q99, device, split, state_mode, names=None, full=Fa
             for layer in tif_stats.values():
                 layer.pop("per_window_rate", None)
             result["tif"] = tif_stats
+        if net.spiking:                       # LIF 每窗消息数的分布（V20：与 BIR 按同一预算比较，11-15）
+            window_msg = window_value_summary(monitor.window_messages(net.message_layers()))
+            if window_msg is not None:
+                result["messages_per_window"] = window_msg
         # 每窗实际发出的消息数的平均（TIF 为发送层 |Δq| 之和，LIF 为发送层脉冲数之和；同结构 LIF 的值即通信预算）
         messages = mean_messages(net, result["layers"], result.get("tif"))
         if messages is not None:

@@ -1,0 +1,33 @@
+# Official PACT config (References/同类竞品/PACT/configs/evisseg_evuav.yaml), copied 11-15 for the qualitative figure.
+# Only the data root, model_save_root and model_path were changed (server paths); every other value is official.
+STRUCTURE:
+  model_name: PACT
+  width: 12
+  block_residual: True
+  block_reps: 4
+  use_coords: True
+
+DATA:
+  input_channel: 4
+  root: /media/stephen/nvme0n1/wy_data/datasets/EV-UAV-dataset
+  whole_t: 8000
+  res: [352,288]
+TRAIN:
+  epochs: 50
+  batch_size: 2
+  train_workers: 8
+  optim: Adam
+  lr: 0.001
+  k: 3
+  t: 5
+  max_events_num : 100000
+  model_save_root: /media/stephen/nvme0n1/wy_data/competitors/PACT/checkpoint
+
+TEST:
+  vis: False
+  eval: True
+  roc: True
+  pd_detT: 50
+  correct_thresh: 0.0001
+  save: True
+  model_path: /media/stephen/nvme0n1/wy_data/competitors/PACT/checkpoint/best_iou_seed37.pt
