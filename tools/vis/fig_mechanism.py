@@ -1,7 +1,7 @@
 """Mechanism figure (V20, 11-15): what SDM does over time, for one target of one recording.
     (a) time-space view (t horizontal, x vertical) of the events around the target, decided by the streaming SNN alone
     (b) the same events decided by SDNet; events SDM corrected are ringed, events it made wrong crossed
-    (c) decision variable U - tau of the events that got a decision neuron, column by column (prior, then the event's
+    (c) decision variable u - tau of the events that got a decision neuron, column by column (prior, then the event's
         own slice, then each following slice), with the calibrated bound +-b that collapses toward the deadline; a dot
         marks the column where each event was decided
 Inputs: the recording (dataset npz) and an export_preds.py directory (prior, final, commit column, trajectories,
@@ -119,7 +119,7 @@ def main():
     ax.set_xticks(pos)
     ax.set_xticklabels(["prior"] + [str(int(v)) for v in pos[1:]], fontsize=7)
     ax.set_xlabel("slices waited (%d ms each)" % wms)
-    ax.set_ylabel(r"$U-\tau$")
+    ax.set_ylabel(r"$u-\tau$")
     ax.set_title("(c) Decision variable", fontsize=10)
     lim = np.nanmax(np.abs(b[1:])) * 1.6 if np.isfinite(b[1:]).any() else 8.0
     ax.set_ylim(-lim, lim)

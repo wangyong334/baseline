@@ -12,6 +12,7 @@ References/
 .idea/
 .pytest_cache/
 CLAUDE/
+tools/
 CLAUDE.md
 outputs/
 tmp/
